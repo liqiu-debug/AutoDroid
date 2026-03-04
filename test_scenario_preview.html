@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>场景测试报告 - Core Flow Smoke Test</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f2f3f5;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+            border: 1px solid #ebeef5;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            background: #fff;
+            color: #303133;
+            padding: 30px 40px;
+            border-bottom: 1px solid #ebeef5;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .header .meta {
+            color: #909399;
+            font-size: 14px;
+        }
+
+        /* Summary Cards */
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+            padding: 30px 40px;
+            background: #fafafa;
+        }
+
+        .stat-card {
+            background: #fff;
+            border-radius: 8px;
+            border: 1px solid #ebeef5;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+        }
+
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .stat-card .label {
+            color: #909399;
+            font-size: 13px;
+        }
+
+        .stat-card.success .value {
+            color: #67C23A;
+        }
+
+        .stat-card.failed .value {
+            color: #F56C6C;
+        }
+
+        .stat-card.total .value {
+            color: #409EFF;
+        }
+
+        .stat-card.duration .value {
+            color: #E6A23C;
+        }
+
+        /* Progress Bar */
+        .progress-section {
+            padding: 0 40px 30px;
+            background: #fafafa;
+        }
+
+        .progress-bar {
+            height: 10px;
+            background: #ebeef5;
+            border-radius: 5px;
+            overflow: hidden;
+            display: flex;
+        }
+
+        .progress-passed {
+            background: #67C23A;
+            transition: width 0.5s ease;
+        }
+
+        .progress-failed {
+            background: #F56C6C;
+            transition: width 0.5s ease;
+        }
+
+        /* Cases Section */
+        .cases-section {
+            padding: 30px 40px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #303133;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .section-title::before {
+            content: '';
+            width: 4px;
+            height: 18px;
+            background: #409EFF;
+            border-radius: 2px;
+        }
+
+        .case-item {
+            background: #fff;
+            border: 1px solid #ebeef5;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            overflow: hidden;
+            transition: all 0.2s;
+        }
+
+        .case-item:hover {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+            border-color: #dcdfe6;
+            transform: translateY(-1px);
+        }
+
+        .case-header {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            gap: 15px;
+            background: #fafafa;
+            cursor: pointer;
+            border-bottom: 1px solid transparent;
+        }
+
+        .case-header:hover {
+            background: #f5f7fa;
+        }
+
+        .case-item.expanded .case-header {
+            border-bottom: 1px solid #ebeef5;
+        }
+
+        .case-index {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #ebeef5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 13px;
+            color: #909399;
+            flex-shrink: 0;
+        }
+
+        .case-item.expanded .case-index {
+            background: #409EFF;
+            color: #fff;
+        }
+
+        .case-info {
+            flex: 1;
+        }
+
+        .case-title {
+            font-weight: 500;
+            color: #303133;
+            font-size: 15px;
+            margin-bottom: 2px;
+        }
+
+        .case-meta {
+            font-size: 12px;
+            color: #909399;
+        }
+
+        .case-status {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .case-status.success {
+            color: #67C23A;
+        }
+
+        .case-status.failed {
+            color: #F56C6C;
+        }
+
+        /* Step List within Case */
+        .step-list {
+            display: none;
+            padding: 0;
+        }
+
+        .case-item.expanded .step-list {
+            display: block;
+        }
+
+        .step-row {
+            display: flex;
+            padding: 12px 20px;
+            border-bottom: 1px solid #ebeef5;
+            align-items: flex-start;
+            font-size: 13px;
+        }
+
+        .step-row:last-child {
+            border-bottom: none;
+        }
+
+        .step-row:hover {
+            background: #fdfdfd;
+        }
+
+        .step-status-icon {
+            width: 28px;
+            text-align: center;
+            margin-right: 12px;
+            font-weight: bold;
+            font-size: 14px;
+            padding-top: 2px;
+        }
+
+        .step-status-icon.success {
+            color: #67C23A;
+        }
+
+        .step-status-icon.failed {
+            color: #F56C6C;
+        }
+
+        .step-content {
+            flex: 1;
+        }
+
+        .step-desc {
+            color: #303133;
+            margin-bottom: 4px;
+            font-weight: 500;
+        }
+
+        .step-detail {
+            color: #909399;
+            font-size: 12px;
+            font-family: Monaco, Consolas, Courier, monospace;
+        }
+
+        .step-time {
+            color: #909399;
+            width: 60px;
+            text-align: right;
+            padding-top: 2px;
+        }
+
+        .step-error {
+            margin-top: 8px;
+            padding: 10px 14px;
+            background: #fef0f0;
+            border: 1px solid #fde2e2;
+            border-radius: 4px;
+            color: #F56C6C;
+            font-family: Monaco, Consolas, Courier, monospace;
+            white-space: pre-wrap;
+            font-size: 12px;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #909399;
+            font-size: 13px;
+            border-top: 1px solid #ebeef5;
+            background: #fafafa;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>📋 Core Flow Smoke Test</h1>
+            <div class="meta">
+                场景 ID: 10 |
+                执行时间: 2026-02-20 10:00:00 - 2026-02-20 10:05:00 |
+                总耗时: 300.0s
+            </div>
+        </div>
+
+        <!-- Summary -->
+        <div class="summary">
+            <div class="stat-card total">
+                <div class="value">2</div>
+                <div class="label">总用例</div>
+            </div>
+            <div class="stat-card success">
+                <div class="value">1</div>
+                <div class="label">通过用例</div>
+            </div>
+            <div class="stat-card failed">
+                <div class="value">1</div>
+                <div class="label">失败用例</div>
+            </div>
+            <div class="stat-card duration">
+                <div class="value">50.0%</div>
+                <div class="label">通过率</div>
+            </div>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="progress-section">
+            <div class="progress-bar">
+                <div class="progress-passed" style="width: 50.0%"></div>
+                
+                <div class="progress-failed" style="width: 50.0%"></div>
+                
+            </div>
+        </div>
+
+        <!-- Cases -->
+        <div class="cases-section">
+            <h2 class="section-title">执行详情</h2>
+
+            
+            <div class="case-item "
+                onclick="this.classList.toggle('expanded')">
+                <div class="case-header">
+                    <div class="case-index">1</div>
+                    <div class="case-info">
+                        <div class="case-title">Login Case</div>
+                        <div class="case-meta">Alias: - | ID: 1</div>
+                    </div>
+                    <div class="case-status success">
+                        通过
+                    </div>
+                </div>
+
+                <div class="step-list" onclick="event.stopPropagation()">
+                    
+                    <div class="step-row">
+                        <div class="step-status-icon success">
+                            ✓
+                        </div>
+                        <div class="step-content">
+                            <div class="step-desc">click - Click Login</div>
+                            <div class="step-detail">text: Login</div>
+                            
+                            
+                        </div>
+                        <div class="step-time">2.0s</div>
+                    </div>
+                    
+                </div>
+            </div>
+            
+            <div class="case-item expanded"
+                onclick="this.classList.toggle('expanded')">
+                <div class="case-header">
+                    <div class="case-index">2</div>
+                    <div class="case-info">
+                        <div class="case-title">Checkout Case</div>
+                        <div class="case-meta">Alias: - | ID: 2</div>
+                    </div>
+                    <div class="case-status failed">
+                        失败
+                    </div>
+                </div>
+
+                <div class="step-list" onclick="event.stopPropagation()">
+                    
+                    <div class="step-row">
+                        <div class="step-status-icon success">
+                            ✓
+                        </div>
+                        <div class="step-content">
+                            <div class="step-desc">click - Add to Cart</div>
+                            <div class="step-detail">id: btn_add</div>
+                            
+                            
+                        </div>
+                        <div class="step-time">1.0s</div>
+                    </div>
+                    
+                    <div class="step-row">
+                        <div class="step-status-icon failed">
+                            ✗
+                        </div>
+                        <div class="step-content">
+                            <div class="step-desc">click - Pay Now</div>
+                            <div class="step-detail">text: Pay</div>
+                            
+                            <div class="step-error">Timeout waiting for element</div>
+                            
+                            
+                        </div>
+                        <div class="step-time">10.0s</div>
+                    </div>
+                    
+                </div>
+            </div>
+            
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            AutoDroid-Pro 场景测试报告 | 生成于 2026-02-20 10:05:00
+        </div>
+    </div>
+</body>
+
+</html>

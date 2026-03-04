@@ -1,0 +1,38 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS
+.DS_Store
+
+# Logs and databases
+*.log
+*.db
+*.sqlite
+*.sqlite3
+auto_droid.db
+autodroid.db
+database.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.npm/
+
+# IDEs
+.vscode/
+.idea/
+
+# Uploads / Assets (unless you want to track them)
+# uploads/
+# reports/

@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>场景测试报告 - {{ scenario_name }}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f2f3f5;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+            border: 1px solid #ebeef5;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            background: #fff;
+            color: #303133;
+            padding: 30px 40px;
+            border-bottom: 1px solid #ebeef5;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .header .meta {
+            color: #909399;
+            font-size: 14px;
+        }
+
+        /* Summary Cards */
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+            padding: 30px 40px;
+            background: #fafafa;
+        }
+
+        .stat-card {
+            background: #fff;
+            border-radius: 8px;
+            border: 1px solid #ebeef5;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+        }
+
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .stat-card .label {
+            color: #909399;
+            font-size: 13px;
+        }
+
+        .stat-card.success .value {
+            color: #67C23A;
+        }
+
+        .stat-card.failed .value {
+            color: #F56C6C;
+        }
+
+        .stat-card.total .value {
+            color: #409EFF;
+        }
+
+        .stat-card.duration .value {
+            color: #E6A23C;
+        }
+
+        /* Progress Bar */
+        .progress-section {
+            padding: 0 40px 30px;
+            background: #fafafa;
+        }
+
+        .progress-bar {
+            height: 10px;
+            background: #ebeef5;
+            border-radius: 5px;
+            overflow: hidden;
+            display: flex;
+        }
+
+        .progress-passed {
+            background: #67C23A;
+            transition: width 0.5s ease;
+        }
+
+        .progress-failed {
+            background: #F56C6C;
+            transition: width 0.5s ease;
+        }
+
+        /* Cases Section */
+        .cases-section {
+            padding: 30px 40px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #303133;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .section-title::before {
+            content: '';
+            width: 4px;
+            height: 18px;
+            background: #409EFF;
+            border-radius: 2px;
+        }
+
+        .case-item {
+            background: #fff;
+            border: 1px solid #ebeef5;
+            border-radius: 4px;
+            margin-bottom: 16px;
+            overflow: hidden;
+            transition: all 0.2s;
+        }
+
+        .case-item:hover {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+            border-color: #dcdfe6;
+            transform: translateY(-1px);
+        }
+
+        .case-header {
+            display: flex;
+            align-items: center;
+            padding: 12px 20px;
+            gap: 15px;
+            background: #fafafa;
+            cursor: pointer;
+            border-bottom: 1px solid transparent;
+        }
+
+        .case-header:hover {
+            background: #f5f7fa;
+        }
+
+        .case-item.expanded .case-header {
+            border-bottom: 1px solid #ebeef5;
+        }
+
+        .case-index {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #ebeef5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 13px;
+            color: #909399;
+            flex-shrink: 0;
+        }
+
+        .case-item.expanded .case-index {
+            background: #409EFF;
+            color: #fff;
+        }
+
+        .case-info {
+            flex: 1;
+        }
+
+        .case-title {
+            font-weight: 500;
+            color: #303133;
+            font-size: 15px;
+            margin-bottom: 2px;
+        }
+
+        .case-meta {
+            font-size: 12px;
+            color: #909399;
+        }
+
+        .case-status {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .case-status.success {
+            color: #67C23A;
+        }
+
+        .case-status.failed {
+            color: #F56C6C;
+        }
+
+        .case-status.warning {
+            color: #E6A23C;
+        }
+
+        /* Step List within Case */
+        .step-list {
+            display: none;
+            padding: 0;
+        }
+
+        .case-item.expanded .step-list {
+            display: block;
+        }
+
+        .step-row {
+            display: flex;
+            padding: 12px 20px;
+            border-bottom: 1px solid #ebeef5;
+            align-items: flex-start;
+            font-size: 13px;
+        }
+
+        .step-row:last-child {
+            border-bottom: none;
+        }
+
+        .step-row:hover {
+            background: #fdfdfd;
+        }
+
+        .step-status-icon {
+            width: 28px;
+            text-align: center;
+            margin-right: 12px;
+            font-weight: bold;
+            font-size: 14px;
+            padding-top: 2px;
+        }
+
+        .step-status-icon.success {
+            color: #67C23A;
+        }
+
+        .step-status-icon.failed {
+            color: #F56C6C;
+        }
+
+        .step-status-icon.warning {
+            color: #E6A23C;
+        }
+
+        .step-content {
+            flex: 1;
+        }
+
+        .step-desc {
+            color: #303133;
+            margin-bottom: 4px;
+            font-weight: 500;
+        }
+
+        .step-detail {
+            color: #909399;
+            font-size: 12px;
+            font-family: Monaco, Consolas, Courier, monospace;
+        }
+
+        .step-time {
+            color: #909399;
+            width: 60px;
+            text-align: right;
+            padding-top: 2px;
+        }
+
+        .step-error {
+            margin-top: 8px;
+            padding: 10px 14px;
+            background: #fef0f0;
+            border: 1px solid #fde2e2;
+            border-radius: 4px;
+            color: #F56C6C;
+            font-family: Monaco, Consolas, Courier, monospace;
+            white-space: pre-wrap;
+            font-size: 12px;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #909399;
+            font-size: 13px;
+            border-top: 1px solid #ebeef5;
+            background: #fafafa;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>📋 {{ scenario_name }}</h1>
+            <div class="meta">
+                场景 ID: {{ scenario_id }} |
+                执行时间: {{ start_time }} - {{ end_time }} |
+                总耗时: {{ total_duration }}s
+            </div>
+        </div>
+
+        <!-- Summary -->
+        <div class="summary">
+            <div class="stat-card total">
+                <div class="value">{{ total_cases }}</div>
+                <div class="label">总用例</div>
+            </div>
+            <div class="stat-card success">
+                <div class="value">{{ passed_cases }}</div>
+                <div class="label">通过用例</div>
+            </div>
+            <div class="stat-card failed">
+                <div class="value">{{ failed_cases }}</div>
+                <div class="label">失败用例</div>
+            </div>
+            <div class="stat-card duration">
+                <div class="value">{{ pass_rate }}%</div>
+                <div class="label">通过率</div>
+            </div>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="progress-section">
+            <div class="progress-bar">
+                <div class="progress-passed" style="width: {{ pass_rate }}%"></div>
+                {% if failed_cases > 0 %}
+                <div class="progress-failed" style="width: {{ (failed_cases / total_cases * 100)|round(1) }}%"></div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Cases -->
+        <div class="cases-section">
+            <h2 class="section-title">执行详情</h2>
+
+            {% for case in cases_results %}
+            <div class="case-item {{ 'expanded' if case.status in ['failed', 'warning'] else '' }}"
+                onclick="this.classList.toggle('expanded')">
+                <div class="case-header">
+                    <div class="case-index">{{ loop.index }}</div>
+                    <div class="case-info">
+                        <div class="case-title">{{ case.case_name }}</div>
+                        <div class="case-meta">Alias: {{ case.alias or '-' }} | ID: {{ case.case_id }}</div>
+                    </div>
+                    <div class="case-status {{ case.status }}">
+                        {{ '通过' if case.status == 'success' else ('警告/忽略' if case.status == 'warning' else '失败') }}
+                    </div>
+                </div>
+
+                <div class="step-list" onclick="event.stopPropagation()">
+                    {% for step in case.steps %}
+                    <div class="step-row">
+                        <div class="step-status-icon {{ step.status }}">
+                            {{ '✓' if step.status == 'success' else ('!' if step.status == 'warning' else '✗') }}
+                        </div>
+                        <div class="step-content">
+                            <div class="step-desc">{{ step.action }} - {{ step.description }}</div>
+                            <div class="step-detail">{{ step.selector_type }}: {{ step.selector }}</div>
+                            {% if step.error %}
+                            <div class="step-error">{{ step.error }}</div>
+                            {% endif %}
+                            {% if step.screenshot %}
+                            <div class="step-screenshot" style="margin-top: 10px;">
+                                <a href="data:image/png;base64,{{ step.screenshot }}" target="_blank">
+                                    <img src="data:image/png;base64,{{ step.screenshot }}"
+                                        style="max-width: 300px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer;">
+                                </a>
+                            </div>
+                            {% endif %}
+                        </div>
+                        <div class="step-time">{{ step.duration }}s</div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            AutoDroid 场景测试报告 | 生成于 {{ generated_at }}
+        </div>
+    </div>
+</body>
+
+</html>
