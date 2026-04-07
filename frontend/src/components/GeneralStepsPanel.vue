@@ -1,19 +1,25 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { VideoPlay, Close, Back, House, Timer, Top, Bottom, Rank } from '@element-plus/icons-vue'
 import { VueDraggable } from 'vue-draggable-plus'
 import api from '@/api'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { ElMessage } from 'element-plus'
+import { createUuid } from '@/utils/uuid'
 
 // Props & Store
 const props = defineProps({
-  loading: Boolean
+  loading: Boolean,
+  deviceSerial: {
+    type: String,
+    default: ''
+  }
 })
 
 const caseStore = useCaseStore()
 const packageName = ref('com.ehaier.zgq.shop.mall')
 const emit = defineEmits(['action-start', 'action-end', 'refresh-needed'])
+const hasSelectedDevice = computed(() => !!props.deviceSerial)
 
 // Pre-defined draggable steps
 const draggableSteps = ref([
@@ -23,25 +29,35 @@ const draggableSteps = ref([
   { action: 'home', selector: '', description: '主页', icon: House },
   { action: 'swipe', selector: 'up', description: '上滑', icon: Top },
   { action: 'swipe', selector: 'down', description: '下滑', icon: Bottom },
+  { action: 'sleep', selector: '', value: '5', description: '强制等待 5 秒', icon: Timer },
   { action: 'wait_until_exists', selector: '', description: '等待元素', icon: Timer },
 ])
 
 const handleClone = (item) => {
   return {
-    uuid: crypto.randomUUID(),
+    uuid: createUuid(),
     action: item.action,
     selector: item.selector,
     selector_type: 'text',
-    value: '',
+    value: item.value || '',
     description: item.description,
     timeout: 10,
-    error_strategy: 'ABORT'
+    error_strategy: 'ABORT',
+    execute_on: ['android', 'ios'],
+    platform_overrides: {
+      android: null,
+      ios: null
+    }
   }
 }
 
 // Execute Action Immediately
 const executeAction = async (action, data = '') => {
   if (props.loading) return
+  if (!props.deviceSerial) {
+    ElMessage.warning('请先选择一台调试设备')
+    return
+  }
   
   // Specific checks
   if (action === 'start_app' && !packageName.value) {
@@ -57,7 +73,7 @@ const executeAction = async (action, data = '') => {
   
   emit('action-start')
   try {
-    const res = await api.interactDevice(0, 0, action, null, finalData)
+    const res = await api.interactDevice(0, 0, action, null, finalData, props.deviceSerial)
     
     if (res.data.step) {
       caseStore.addStep(res.data.step)
@@ -77,35 +93,36 @@ const executeAction = async (action, data = '') => {
 <template>
   <div class="general-panel">
     <div class="panel-header">通用步骤</div>
+    <div v-if="!hasSelectedDevice" class="panel-hint">请先在中间设备区选择调试设备，才可执行录制动作。</div>
     
     <div class="panel-section">
       <div class="section-title">应用管理</div>
       <el-input 
         v-model="packageName" 
-        placeholder="输入包名 (com.example.app)" 
+        placeholder="输入包名 / Bundle ID" 
         size="small"
         clearable
         class="pkg-input"
       />
       <div class="btn-grid">
-        <el-button size="small" :icon="VideoPlay" @click="executeAction('start_app')">启动</el-button>
-        <el-button size="small" :icon="Close" @click="executeAction('stop_app')">停止</el-button>
+        <el-button size="small" :icon="VideoPlay" @click="executeAction('start_app')" :disabled="!hasSelectedDevice">启动</el-button>
+        <el-button size="small" :icon="Close" @click="executeAction('stop_app')" :disabled="!hasSelectedDevice">停止</el-button>
       </div>
     </div>
 
     <div class="panel-section">
       <div class="section-title">导航控制</div>
       <div class="btn-grid">
-        <el-button size="small" :icon="Back" @click="executeAction('back')">返回</el-button>
-        <el-button size="small" :icon="House" @click="executeAction('home')">主页</el-button>
+        <el-button size="small" :icon="Back" @click="executeAction('back')" :disabled="!hasSelectedDevice">返回</el-button>
+        <el-button size="small" :icon="House" @click="executeAction('home')" :disabled="!hasSelectedDevice">主页</el-button>
       </div>
     </div>
 
     <div class="panel-section">
       <div class="section-title">滑动操作</div>
       <div class="btn-grid">
-        <el-button size="small" :icon="Top" @click="executeAction('swipe', 'up')">上滑</el-button>
-        <el-button size="small" :icon="Bottom" @click="executeAction('swipe', 'down')">下滑</el-button>
+        <el-button size="small" :icon="Top" @click="executeAction('swipe', 'up')" :disabled="!hasSelectedDevice">上滑</el-button>
+        <el-button size="small" :icon="Bottom" @click="executeAction('swipe', 'down')" :disabled="!hasSelectedDevice">下滑</el-button>
       </div>
     </div>
 
@@ -149,6 +166,16 @@ const executeAction = async (action, data = '') => {
   box-sizing: border-box;
   height: 50px; /* Match DeviceStage header height */
   flex-shrink: 0;
+}
+
+.panel-hint {
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #e6a23c;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 6px;
 }
 
 .panel-section {

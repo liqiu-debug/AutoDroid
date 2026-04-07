@@ -27,6 +27,10 @@ const ocrCropMode = computed(() => {
   return deviceStageRef.value?.ocrCropMode?.value || false
 })
 
+const activeImageCropStepUuid = computed(() => {
+  return deviceStageRef.value?.activeImageCropStepUuid?.value || ''
+})
+
 const initData = async () => {
     const id = route.params.id
     if (id) {
@@ -66,32 +70,95 @@ const handleRun = async () => {
   }
   
   const currentDevice = deviceStageRef.value?.selectedSerial
+  if (currentDevice) {
+    const check = await precheckCaseOnDevice(currentCase.value.id, currentDevice)
+    if (!check.ok) {
+      ElMessage.error(`运行前预检失败: ${check.reason}`)
+      return
+    }
+  }
   isRunning.value = true
   logConsoleRef.value?.connect(currentCase.value.id, envId.value, currentDevice)
 }
 
 const runDialogVisible = ref(false)
+const runDialogLoading = ref(false)
 const multiRunForm = ref({
   deviceSerials: []
 })
+
+const summarizePrecheckFailure = (payload) => {
+  if (!payload || typeof payload !== 'object') return '预检失败'
+  const globalFail = (payload.global_checks || []).find(item => item?.status === 'FAIL')
+  if (globalFail) return globalFail.message || globalFail.code || '全局检查失败'
+
+  const stepFail = (payload.steps || []).find(item => item?.status === 'FAIL')
+  if (stepFail) return stepFail.message || stepFail.code || '步骤预检失败'
+
+  if (!payload.has_runnable_steps) return '全部步骤将被跳过（当前设备无可执行步骤）'
+  return '预检失败'
+}
+
+const precheckCaseOnDevice = async (caseId, serial) => {
+  try {
+    const { data } = await api.precheckTestCase(caseId, envId.value, serial)
+    if (data?.ok) return { ok: true }
+    return { ok: false, reason: summarizePrecheckFailure(data) }
+  } catch (err) {
+    const detail = err?.response?.data?.detail || err?.message || '请求失败'
+    return { ok: false, reason: `预检接口调用失败: ${detail}` }
+  }
+}
+
 const submitMultiRun = async () => {
   if (multiRunForm.value.deviceSerials.length === 0) {
     ElMessage.warning('请至少选择一台设备')
     return
   }
   try {
-    const promises = multiRunForm.value.deviceSerials.map(serial => 
+    const runnable = []
+    const blocked = []
+    for (const serial of multiRunForm.value.deviceSerials) {
+      const check = await precheckCaseOnDevice(currentCase.value.id, serial)
+      if (check.ok) runnable.push(serial)
+      else blocked.push({ serial, reason: check.reason })
+    }
+
+    if (runnable.length === 0) {
+      const first = blocked[0]
+      ElMessage.error(`运行前预检未通过：${first ? `${first.serial} - ${first.reason}` : '无可执行设备'}`)
+      return
+    }
+
+    const promises = runnable.map(serial =>
       api.runTestCaseAsync(currentCase.value.id, envId.value, serial)
     )
     await Promise.all(promises)
-    ElMessage.success(`后台已开始在 ${promises.length} 台设备上执行用例`)
+    if (blocked.length > 0) {
+      const first = blocked[0]
+      ElMessage.warning(`已在 ${runnable.length} 台设备启动；${blocked.length} 台预检失败（示例：${first.serial} - ${first.reason}）`)
+    } else {
+      ElMessage.success(`后台已开始在 ${promises.length} 台设备上执行用例`)
+    }
     runDialogVisible.value = false
   } catch (err) {
     ElMessage.error('启动批量执行失败: ' + err.message)
   }
 }
 
-const handleRunCommand = (command) => {
+const openMultiRunDialog = async () => {
+  multiRunForm.value.deviceSerials = []
+  runDialogVisible.value = true
+  runDialogLoading.value = true
+  try {
+    await deviceStageRef.value?.refreshDevices?.()
+    multiRunForm.value.deviceSerials = deviceStageRef.value?.selectedSerial ? [deviceStageRef.value.selectedSerial] : []
+  } finally {
+    runDialogLoading.value = false
+  }
+}
+
+const handleRunCommand = async (command) => {
   if (command === 'multi') {
     if (!currentCase.value.id) {
       ElMessage.warning('请先保存用例')
@@ -101,8 +168,7 @@ const handleRunCommand = (command) => {
       ElMessage.warning('用例没有步骤')
       return
     }
-    multiRunForm.value.deviceSerials = deviceStageRef.value?.selectedSerial ? [deviceStageRef.value.selectedSerial] : []
-    runDialogVisible.value = true
+    await openMultiRunDialog()
   }
 }
 
@@ -127,17 +193,40 @@ const handleRequestOcrCrop = (step) => {
   }
 }
 
+const handleRequestImageCrop = (step) => {
+  if (deviceStageRef.value?.startImageCrop) {
+    deviceStageRef.value.startImageCrop(step)
+  }
+}
+
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info' }
+  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
   return map[status] || 'info'
 }
 
 /** 状态中文映射 */
 const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线' }
+  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
   return map[status] || status
 }
+
+const connectedRunDevices = computed(() => deviceStageRef.value?.connectedDevices || [])
+const recordingDeviceSerial = computed(() => {
+  const selected = deviceStageRef.value?.selectedSerial
+  if (!selected) return ''
+  return typeof selected === 'string' ? selected : (selected.value || '')
+})
+const isDeviceSelectable = (device) => device?.status === 'IDLE'
+
+const deviceUnavailableReason = (device) => {
+  if (!device) return ''
+  if (device.status === 'WDA_DOWN') return 'WDA 未就绪'
+  if (device.status === 'BUSY') return '设备正忙'
+  return ''
+}
+
+const hasWdaDownDevice = computed(() => connectedRunDevices.value.some(d => d.status === 'WDA_DOWN'))
 
 onMounted(() => {
     initData()
@@ -196,6 +285,7 @@ onMounted(() => {
       <el-aside width="220px" class="general-pane">
         <GeneralStepsPanel
           :loading="loading"
+          :device-serial="recordingDeviceSerial"
           :ocr-crop-mode="ocrCropMode"
           @action-start="loading = true"
           @action-end="loading = false"
@@ -206,8 +296,11 @@ onMounted(() => {
       <el-aside width="350px" class="right-pane">
         <StepBuilder 
           :env-id="envId"
+          :device-serial="recordingDeviceSerial"
+          :active-image-crop-step-uuid="activeImageCropStepUuid"
           @refresh-needed="handleRefreshNeeded"
           @request-ocr-crop="handleRequestOcrCrop"
+          @request-image-crop="handleRequestImageCrop"
         >
           <template #header-actions>
             <el-dropdown 
@@ -244,7 +337,7 @@ onMounted(() => {
       title="选择多设备执行"
       width="400px"
     >
-      <el-form :model="multiRunForm" label-width="100px">
+      <el-form v-loading="runDialogLoading" :model="multiRunForm" label-width="100px">
         <el-form-item label="设备列表">
           <el-select
             v-model="multiRunForm.deviceSerials"
@@ -252,27 +345,36 @@ onMounted(() => {
             multiple
             collapse-tags
             collapse-tags-tooltip
+            :disabled="runDialogLoading"
             style="width: 100%"
           >
             <el-option
-              v-for="d in deviceStageRef?.connectedDevices || []"
+              v-for="d in connectedRunDevices"
               :key="d.serial"
               :label="d.custom_name || d.market_name || d.model || d.serial"
               :value="d.serial"
-              :disabled="d.status !== 'IDLE'"
+              :disabled="!isDeviceSelectable(d)"
             >
               <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                 <span>{{ d.custom_name || d.market_name || d.model || d.serial }}</span>
-                <el-tag :type="statusTagType(d.status)" size="small">{{ statusLabel(d.status) }}</el-tag>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                  <el-tag :type="statusTagType(d.status)" size="small">{{ statusLabel(d.status) }}</el-tag>
+                  <span v-if="deviceUnavailableReason(d)" style="font-size: 12px; color: #e6a23c;">
+                    {{ deviceUnavailableReason(d) }}
+                  </span>
+                </div>
               </div>
             </el-option>
           </el-select>
+          <div v-if="hasWdaDownDevice" class="run-warning-hint">
+            检测到 iOS 设备 WDA 异常，需在设备中心先执行“检测WDA”。
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="runDialogVisible = false">取消</el-button>
-          <el-button type="primary" @click="submitMultiRun">确定执行</el-button>
+          <el-button type="primary" :loading="runDialogLoading" :disabled="runDialogLoading" @click="submitMultiRun">确定执行</el-button>
         </span>
       </template>
     </el-dialog>
@@ -286,6 +388,12 @@ onMounted(() => {
   flex-direction: column;
   background: #f2f3f5;
   overflow: hidden;
+}
+
+.run-warning-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #e6a23c;
 }
 
 /* app-header removed */

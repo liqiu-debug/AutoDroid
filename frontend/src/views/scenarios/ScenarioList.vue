@@ -13,7 +13,7 @@ const router = useRouter()
 const scenarios = ref([])
 const loading = ref(false)
 const searchQuery = ref('')
-const filterStatus = ref('all') // all, success, failure
+const filterStatus = ref('all') // all, success, warning, failure
 
 // Pagination
 const currentPage = ref(1)
@@ -38,8 +38,9 @@ const fetchScenarios = async () => {
         // Status Filter (client-side)
         if (filterStatus.value !== 'all') {
             data = data.filter(s => {
-                const status = s.last_run_status?.toLowerCase() || 'not_run'
+                const status = normalizeRunStatus(s.last_run_status) || 'not_run'
                 if (filterStatus.value === 'success') return status === 'pass' || status === 'success'
+                if (filterStatus.value === 'warning') return status === 'warning'
                 if (filterStatus.value === 'failure') return status === 'fail' || status === 'failed'
                 return true
             })
@@ -88,6 +89,45 @@ const runForm = reactive({
 const environments = ref([])
 const devices = ref([])
 
+const summarizeScenarioPrecheckFailure = (payload) => {
+    if (!payload || typeof payload !== 'object') return '预检失败'
+
+    const failCase = (payload.cases || []).find(item => item?.status === 'FAIL')
+    if (failCase) {
+        const caseName = failCase.alias || failCase.case_name || `Case#${failCase.case_id || '?'}`
+        const reason = failCase.reason || '用例预检失败'
+        return `${caseName}: ${reason}`
+    }
+
+    if (!payload.has_runnable_cases) return '全部用例将被跳过（当前设备无可执行步骤）'
+    return '预检失败'
+}
+
+const summarizeHttpDetail = (err) => {
+    const detail = err?.response?.data?.detail
+    if (typeof detail === 'string' && detail) return detail
+    if (detail && typeof detail === 'object') {
+        if (detail.message) return detail.message
+        if (Array.isArray(detail.items) && detail.items.length > 0) {
+            const first = detail.items[0]
+            if (first?.device_serial || first?.reason) {
+                return `${first.device_serial || '未知设备'} - ${first.reason || '预检失败'}`
+            }
+        }
+    }
+    return err?.message || '请求失败'
+}
+
+const precheckScenarioOnDevice = async (scenarioId, serial) => {
+    try {
+        const { data } = await api.precheckScenario(scenarioId, runForm.envId, serial)
+        if (data?.ok) return { ok: true }
+        return { ok: false, reason: summarizeScenarioPrecheckFailure(data) }
+    } catch (err) {
+        return { ok: false, reason: `预检接口调用失败: ${summarizeHttpDetail(err)}` }
+    }
+}
+
 const fetchRunConfigOptions = async () => {
     try {
         const [envRes, devRes] = await Promise.all([
@@ -105,7 +145,10 @@ const fetchRunConfigOptions = async () => {
             runForm.envId = environments.value[0].id
         }
         if (devices.value.length > 0 && runForm.deviceSerials.length === 0) {
-            runForm.deviceSerials = [devices.value[0].serial]
+            const firstIdle = devices.value.find(d => d.status === 'IDLE')
+            if (firstIdle) {
+                runForm.deviceSerials = [firstIdle.serial]
+            }
         }
     } catch (err) {
         console.error('获取运行配置选项失败', err)
@@ -120,16 +163,42 @@ const handleRunClick = (row) => {
 
 const confirmRun = async () => {
     if (!runningScenarioId.value) return
+    if (!runForm.deviceSerials || runForm.deviceSerials.length === 0) {
+        ElMessage.warning('请至少选择一台设备')
+        return
+    }
     try {
-        await api.runScenario(runningScenarioId.value, runForm.envId, runForm.deviceSerials)
-        ElMessage.success('场景已开始批次执行')
+        const runnable = []
+        const blocked = []
+        for (const serial of runForm.deviceSerials) {
+            const check = await precheckScenarioOnDevice(runningScenarioId.value, serial)
+            if (check.ok) runnable.push(serial)
+            else blocked.push({ device_serial: serial, reason: check.reason })
+        }
+
+        if (runnable.length === 0) {
+            const first = blocked[0]
+            ElMessage.error(`运行前预检未通过：${first ? `${first.device_serial} - ${first.reason}` : '无可执行设备'}`)
+            return
+        }
+
+        const { data } = await api.runScenario(runningScenarioId.value, runForm.envId, runnable)
+        const backendBlocked = Array.isArray(data?.blocked_prechecks) ? data.blocked_prechecks : []
+        const allBlocked = blocked.concat(backendBlocked)
+        if (allBlocked.length > 0) {
+            const first = allBlocked[0]
+            ElMessage.warning(`已在 ${runnable.length} 台设备启动；${allBlocked.length} 台预检失败（示例：${first.device_serial} - ${first.reason}）`)
+        } else {
+            ElMessage.success(`场景已在 ${runnable.length} 台设备开始批次执行`)
+        }
+
         runDialogVisible.value = false
         // Optimistic update
         const item = scenarios.value.find(s => s.id === runningScenarioId.value)
         if (item) item.last_run_status = 'RUNNING'
         fetchScenarios() 
     } catch (err) {
-        ElMessage.error('启动失败')
+        ElMessage.error('启动失败: ' + summarizeHttpDetail(err))
     }
 }
 
@@ -154,15 +223,26 @@ const handleDelete = async (row) => {
 
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info' }
+  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
   return map[status] || 'info'
 }
 
 /** 状态中文映射 */
 const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线' }
+  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
   return map[status] || status
 }
+
+const isDeviceSelectable = (device) => device?.status === 'IDLE'
+
+const deviceUnavailableReason = (device) => {
+    if (!device) return ''
+    if (device.status === 'WDA_DOWN') return 'WDA 未就绪'
+    if (device.status === 'BUSY') return '设备正忙'
+    return ''
+}
+
+const hasWdaDownDevice = computed(() => devices.value.some(d => d.status === 'WDA_DOWN'))
 
 const handleReport = (row) => {
     if (row.last_execution_id) {
@@ -193,12 +273,15 @@ const formatDate = (date) => {
 
 const getStatusColor = (status) => {
     if (!status) return '#909399' // Gray
-    const s = status.toLowerCase()
+    const s = normalizeRunStatus(status)
     if (s === 'pass' || s === 'success') return '#67C23A' // Green
     if (s === 'fail' || s === 'failed') return '#F56C6C' // Red
+    if (s === 'warning') return '#E6A23C' // Orange
     if (s === 'running') return '#409EFF' // Blue
     return '#E6A23C' // Warning
 }
+
+const normalizeRunStatus = (status) => (status || '').toString().toLowerCase()
 
 const getDuration = (row) => {
     if (!row.last_run_duration) return '-'
@@ -233,6 +316,7 @@ onMounted(() => {
                     <el-radio-group v-model="filterStatus" class="status-filter" @change="handleSearch">
                         <el-radio-button label="all">全部</el-radio-button>
                         <el-radio-button label="success">成功</el-radio-button>
+                        <el-radio-button label="warning">告警</el-radio-button>
                         <el-radio-button label="failure">失败</el-radio-button>
                     </el-radio-group>
                 </div>
@@ -266,17 +350,22 @@ onMounted(() => {
                             
                             <!-- L2: Status Message -->
                             <div class="row-status">
-                                <template v-if="item.last_run_status === 'PASS' || item.last_run_status === 'success'">
+                                <template v-if="normalizeRunStatus(item.last_run_status) === 'pass' || normalizeRunStatus(item.last_run_status) === 'success'">
                                     <span class="status-text success">
                                         <el-icon><Check /></el-icon> 上次运行成功
                                     </span>
                                 </template>
-                                <template v-else-if="item.last_run_status === 'FAIL' || item.last_run_status === 'failed'">
+                                <template v-else-if="normalizeRunStatus(item.last_run_status) === 'warning'">
+                                    <span class="status-text warning">
+                                        <el-icon><Timer /></el-icon> 上次运行有告警: {{ item.last_failed_step || '存在忽略错误或步骤跳过' }}
+                                    </span>
+                                </template>
+                                <template v-else-if="normalizeRunStatus(item.last_run_status) === 'fail' || normalizeRunStatus(item.last_run_status) === 'failed'">
                                     <span class="status-text failure">
                                         <el-icon><Close /></el-icon> 失败于步骤: {{ item.last_failed_step || '未知步骤' }}
                                     </span>
                                 </template>
-                                 <template v-else-if="item.last_run_status === 'RUNNING'">
+                                 <template v-else-if="normalizeRunStatus(item.last_run_status) === 'running'">
                                     <span class="status-text running">
                                         <el-icon class="is-loading"><Refresh /></el-icon> 执行中...
                                     </span>
@@ -369,14 +458,22 @@ onMounted(() => {
                             :key="dev.serial"
                             :label="dev.custom_name || dev.market_name || dev.model || dev.serial"
                             :value="dev.serial"
-                            :disabled="dev.status !== 'IDLE'"
+                            :disabled="!isDeviceSelectable(dev)"
                         >
                             <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                                 <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
-                                <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                    <span v-if="deviceUnavailableReason(dev)" style="font-size: 12px; color: #e6a23c;">
+                                        {{ deviceUnavailableReason(dev) }}
+                                    </span>
+                                </div>
                             </div>
                         </el-option>
                     </el-select>
+                    <div v-if="hasWdaDownDevice" class="run-warning-hint">
+                        检测到 iOS 设备 WDA 异常，需在设备中心先执行“检测WDA”。
+                    </div>
                 </el-form-item>
                 <el-form-item label="运行环境">
                     <el-select v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
@@ -529,6 +626,7 @@ onMounted(() => {
     font-weight: 500;
 }
 .status-text.success { color: #67C23A; }
+.status-text.warning { color: #E6A23C; }
 .status-text.failure { color: #F56C6C; }
 .status-text.running { color: #409EFF; }
 .status-text.neutral { color: #909399; }
@@ -548,6 +646,12 @@ onMounted(() => {
 }
 .meta-avatar {
     font-size: 8px; /* For text avatars */
+}
+
+.run-warning-hint {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #e6a23c;
 }
 
 /* 3. Action Area */

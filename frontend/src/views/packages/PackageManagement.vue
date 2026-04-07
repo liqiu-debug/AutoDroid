@@ -73,7 +73,7 @@ const beforeUpload = (file) => {
 const handleDownload = (row) => {
   const url = api.getPackageDownloadUrl(row.id)
   const token = localStorage.getItem('token')
-  // 创建一个临时 a 标签触发下载
+  // 通过动态 a 标签触发浏览器下载
   const link = document.createElement('a')
   link.href = `${url}?token=${token}`
   link.download = `${row.app_name}_${row.version_name}.apk`
@@ -110,7 +110,7 @@ const openInstallDialog = async (row) => {
   deviceLoading.value = true
   try {
     const { data } = await api.getDeviceList()
-    deviceList.value = data || []
+    deviceList.value = (data || []).filter(d => (d.platform || 'android') === 'android')
   } catch (e) {
     ElMessage.error('获取设备列表失败')
     deviceList.value = []
@@ -136,6 +136,11 @@ const handleInstall = async () => {
     installLoading.value = false
   }
 }
+
+/** 设备名称展示 */
+const getDeviceDisplayName = (device) => (
+  device?.custom_name || device?.market_name || device?.model || device?.serial || ''
+)
 
 /** 文件大小格式化 */
 const formatSize = (size) => {
@@ -304,12 +309,12 @@ onMounted(() => {
               v-for="d in deviceList"
               :key="d.serial"
               :value="d.serial"
-              :label="(d.custom_name || d.model) + ' (' + d.serial + ')'"
+              :label="getDeviceDisplayName(d)"
               :disabled="d.status !== 'IDLE'"
             >
-              <span>{{ d.custom_name || d.model }}</span>
+              <span>{{ getDeviceDisplayName(d) }}</span>
               <span style="float: right; color: #909399; font-size: 12px;">
-                {{ d.status === 'IDLE' ? '🟢 空闲' : d.status === 'BUSY' ? '🔴 运行中' : '⚫ 离线' }}
+                {{ d.status === 'IDLE' ? '🟢 空闲' : d.status === 'BUSY' ? '🔴 运行中' : d.status === 'WDA_DOWN' ? '🟠 WDA异常' : '⚫ 离线' }}
               </span>
             </el-option>
           </el-select>

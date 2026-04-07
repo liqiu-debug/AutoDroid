@@ -9,6 +9,7 @@ import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import JMuxer from 'jmuxer'
 import { VideoPlay, VideoPause, Refresh, Loading } from '@element-plus/icons-vue'
 import api from '@/api'
+import { findBestRecordableNode } from '@/utils/recordableNode'
 
 const props = defineProps({
   /** 设备序列号 */
@@ -110,12 +111,38 @@ function getVideoRenderArea() {
   return { rect, renderWidth, renderHeight, offsetX, offsetY }
 }
 
+function getCoordinateSpace() {
+  const explicitWidth = Number(props.deviceWidth) || 0
+  const explicitHeight = Number(props.deviceHeight) || 0
+  if (explicitWidth > 0 && explicitHeight > 0) {
+    return { width: explicitWidth, height: explicitHeight }
+  }
+
+  let maxX = 0
+  let maxY = 0
+  for (const node of props.nodes) {
+    maxX = Math.max(maxX, Number(node?.x2) || 0)
+    maxY = Math.max(maxY, Number(node?.y2) || 0)
+  }
+  if (maxX > 0 && maxY > 0) {
+    return { width: maxX, height: maxY }
+  }
+
+  const video = videoRef.value
+  if (video?.videoWidth && video?.videoHeight) {
+    return { width: video.videoWidth, height: video.videoHeight }
+  }
+
+  return null
+}
+
 /**
  * 将鼠标客户端坐标映射为设备真实坐标
  */
 function mapToDeviceCoords(clientX, clientY) {
   const area = getVideoRenderArea()
-  if (!area) return null
+  const target = getCoordinateSpace()
+  if (!area || !target) return null
 
   const { rect, renderWidth, renderHeight, offsetX, offsetY } = area
 
@@ -124,13 +151,9 @@ function mapToDeviceCoords(clientX, clientY) {
 
   if (clickX < 0 || clickY < 0 || clickX > renderWidth || clickY > renderHeight) return null
 
-  // 使用设备真实分辨率（如果提供），否则回退到视频分辨率
-  const targetW = props.deviceWidth || videoRef.value.videoWidth
-  const targetH = props.deviceHeight || videoRef.value.videoHeight
-
   return {
-    x: Math.round((clickX / renderWidth) * targetW),
-    y: Math.round((clickY / renderHeight) * targetH),
+    x: Math.min(target.width - 1, Math.max(0, Math.round((clickX / renderWidth) * target.width))),
+    y: Math.min(target.height - 1, Math.max(0, Math.round((clickY / renderHeight) * target.height))),
     // 提供在渲染区域中的相对位置（用于高亮计算）
     relX: clickX / renderWidth,
     relY: clickY / renderHeight
@@ -140,19 +163,7 @@ function mapToDeviceCoords(clientX, clientY) {
 // ==================== 元素高亮 ====================
 
 function findNodeAt(realX, realY) {
-  let best = null
-  let bestArea = Infinity
-
-  for (const node of props.nodes) {
-    if (realX >= node.x1 && realX <= node.x2 && realY >= node.y1 && realY <= node.y2) {
-      const area = (node.x2 - node.x1) * (node.y2 - node.y1)
-      if (area < bestArea) {
-        best = node
-        bestArea = area
-      }
-    }
-  }
-  return best
+  return findBestRecordableNode(props.nodes, realX, realY)
 }
 
 function onMouseMove(event) {
@@ -176,18 +187,16 @@ const overlayStyle = computed(() => {
   if (!hoveredNode.value || !videoRef.value) return { display: 'none' }
 
   const area = getVideoRenderArea()
-  if (!area) return { display: 'none' }
+  const target = getCoordinateSpace()
+  if (!area || !target) return { display: 'none' }
 
   const { rect, renderWidth, renderHeight, offsetX, offsetY } = area
   const containerRect = playerContentRef.value?.getBoundingClientRect()
   if (!containerRect) return { display: 'none' }
 
-  const targetW = props.deviceWidth || videoRef.value.videoWidth
-  const targetH = props.deviceHeight || videoRef.value.videoHeight
-
   const node = hoveredNode.value
-  const scaleX = renderWidth / targetW
-  const scaleY = renderHeight / targetH
+  const scaleX = renderWidth / target.width
+  const scaleY = renderHeight / target.height
 
   // 视频元素相对于 player-content 的偏移
   const videoOffsetX = rect.left - containerRect.left + offsetX
@@ -309,7 +318,7 @@ function handleClick(event) {
   const coords = mapToDeviceCoords(event.clientX, event.clientY)
   if (!coords) return
 
-  emit('touch', { x: coords.x, y: coords.y, action: 0 })
+  emit('touch', { x: coords.x, y: coords.y, action: 0, relX: coords.relX, relY: coords.relY })
 
   // 录制模式下不直接发送触控，由父组件通过 API 统一处理
   if (!props.recordMode) {

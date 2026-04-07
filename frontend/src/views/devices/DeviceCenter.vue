@@ -8,6 +8,7 @@ import api from '@/api'
 const devices = ref([])
 const loading = ref(false)
 const syncLoading = ref(false)
+const wdaCheckingSerial = ref('')
 
 // 快照弹窗
 const screenshotVisible = ref(false)
@@ -98,6 +99,31 @@ const handleReboot = async (device) => {
   }
 }
 
+/** iOS WDA 启动/修复 */
+const handleCheckWda = async (device) => {
+  if (!device || device.platform !== 'ios') return
+  wdaCheckingSerial.value = device.serial
+  try {
+    const { data } = await api.checkDeviceWda(device.serial)
+    device.status = data.status || device.status
+    if (data.wda_healthy) {
+      if (data.attempted_start) {
+        ElMessage.success(`设备 ${device.model} WDA 启动成功`)
+      } else if (data.recovered_by_cleanup) {
+        ElMessage.success(`设备 ${device.model} WDA 已修复`)
+      } else {
+        ElMessage.success(`设备 ${device.model} WDA 正常`)
+      }
+    } else {
+      ElMessage.warning(data.error || 'WDA 启动失败，请检查 WebDriverAgent 与 tidevice 环境')
+    }
+  } catch (e) {
+    ElMessage.error('WDA 启动失败：' + (e.response?.data?.detail || e.message))
+  } finally {
+    wdaCheckingSerial.value = ''
+  }
+}
+
 /** 进入就地编辑模式 */
 const startEditing = (device) => {
   editingSerial.value = device.serial
@@ -133,13 +159,13 @@ const cancelEditing = () => {
 
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info' }
+  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
   return map[status] || 'info'
 }
 
 /** 状态中文映射 */
 const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线' }
+  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
   return map[status] || status
 }
 
@@ -216,7 +242,7 @@ onMounted(() => {
             </div>
             <div class="info-row">
               <span class="info-label">系统版本</span>
-              <span class="info-value">Android {{ device.android_version || '—' }}</span>
+              <span class="info-value">{{ device.platform === 'ios' ? 'iOS' : 'Android' }} {{ device.os_version || device.android_version || '—' }}</span>
             </div>
             <div class="info-row">
               <span class="info-label">设备编号</span>
@@ -225,6 +251,9 @@ onMounted(() => {
             <div class="info-row">
               <span class="info-label">屏幕分辨率</span>
               <span class="info-value">{{ device.resolution || '—' }}</span>
+            </div>
+            <div v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" class="ios-hint down">
+              <span>WDA 未就绪：请先启动 WebDriverAgent，设备才可用于执行。</span>
             </div>
           </div>
 
@@ -247,9 +276,26 @@ onMounted(() => {
                 </el-button>
               </template>
             </el-popconfirm>
-            <el-button type="warning" link :icon="SwitchButton" @click="handleReboot(device)"
-              :disabled="device.status === 'OFFLINE'">
+            <el-button
+              v-if="device.platform !== 'ios'"
+              type="warning"
+              link
+              :icon="SwitchButton"
+              @click="handleReboot(device)"
+              :disabled="device.status === 'OFFLINE'"
+            >
               重启
+            </el-button>
+            <el-button
+              v-if="device.platform === 'ios'"
+              type="primary"
+              link
+              :icon="Refresh"
+              @click="handleCheckWda(device)"
+              :loading="wdaCheckingSerial === device.serial"
+              :disabled="device.status === 'OFFLINE' || device.status === 'BUSY'"
+            >
+              启动WDA
             </el-button>
           </div>
         </el-card>
@@ -437,6 +483,18 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ios-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.4;
+}
+
+.ios-hint.down {
+  color: #e6a23c;
+  font-weight: 500;
 }
 
 /* 卡片 Footer */

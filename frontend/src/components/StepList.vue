@@ -59,7 +59,7 @@ const removeStep = (index) => {
                 <el-option label="Input" value="input" />
                 <el-option label="Wait" value="wait_until_exists" />
                 <el-option label="Scroll" value="scroll_to" />
-                <el-option label="Assert" value="assert_text" />
+                <el-option label="Text Assert" value="assert_text" />
               </el-select>
               <el-input v-model="element.selector" placeholder="Selector (resourceId/text/xpath)" size="small" />
             </div>

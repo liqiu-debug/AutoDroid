@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onActivated, onDeactivated, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CaretRight } from '@element-plus/icons-vue'
@@ -12,6 +12,9 @@ const form = reactive({
     package_name: 'com.ehaier.zgq.shop.mall',
     duration_min: 30,
     throttle: 500,
+    enable_performance_monitor: true,
+    enable_jank_frame_monitor: false,
+    enable_local_replay: true,
     fault_tolerance: 'abort',
     capture_log: 'on',
     event_weight_mode: 'auto',
@@ -28,6 +31,9 @@ const buildPayload = () => ({
     package_name: form.package_name,
     duration: form.duration_min * 60,
     throttle: form.throttle,
+    enable_performance_monitor: form.enable_performance_monitor,
+    enable_jank_frame_monitor: form.enable_jank_frame_monitor,
+    enable_local_replay: form.enable_local_replay,
     ignore_crashes: form.fault_tolerance !== 'abort',
     capture_log: form.capture_log === 'on',
     enable_custom_event_weights: form.event_weight_mode === 'custom',
@@ -47,6 +53,7 @@ const submitting = ref(false)
 // ---- 最近一次任务状态 ----
 const latestTask = ref(null)
 let pollTimer = null
+let pageActive = false
 
 const fetchLatestTask = async () => {
     try {
@@ -117,13 +124,44 @@ const goToReports = () => {
     router.push({ path: '/execution/reports', query: { tab: 'fastbot' } })
 }
 
+const startPolling = () => {
+    if (pollTimer) return
+    pollTimer = setInterval(fetchLatestTask, 15000)
+}
+
+const stopPolling = () => {
+    if (!pollTimer) return
+    clearInterval(pollTimer)
+    pollTimer = null
+}
+
+const activatePage = () => {
+    if (pageActive) return
+    pageActive = true
+    startPolling()
+}
+
+const deactivatePage = () => {
+    if (!pageActive) return
+    pageActive = false
+    stopPolling()
+}
+
 onMounted(() => {
     fetchLatestTask()
-    pollTimer = setInterval(fetchLatestTask, 15000)
+    activatePage()
+})
+
+onActivated(() => {
+    activatePage()
+})
+
+onDeactivated(() => {
+    deactivatePage()
 })
 
 onUnmounted(() => {
-    if (pollTimer) clearInterval(pollTimer)
+    deactivatePage()
 })
 </script>
 
@@ -179,6 +217,26 @@ onUnmounted(() => {
                                         style="width: 280px"
                                     />
                                     <span class="unit-text">ms</span>
+                                </el-form-item>
+                            </div>
+                            <div class="monitor-options">
+                                <el-form-item label="性能监控">
+                                    <div class="monitor-option">
+                                        <el-switch v-model="form.enable_performance_monitor" />
+                                        <span class="monitor-tip">开启后采集 CPU、内存等性能指标</span>
+                                    </div>
+                                </el-form-item>
+                                <el-form-item label="卡顿帧监控">
+                                    <div class="monitor-option">
+                                        <el-switch v-model="form.enable_jank_frame_monitor" />
+                                        <span class="monitor-tip">开启后采集卡顿率，并在严重卡顿时自动录制 Perfetto Trace</span>
+                                    </div>
+                                </el-form-item>
+                                <el-form-item label="异常回放" class="local-replay-item">
+                                    <div class="monitor-option">
+                                        <el-switch v-model="form.enable_local_replay" />
+                                        <span class="monitor-tip">始终保留最近 30 秒画面，Crash / ANR 时自动导出本地回放</span>
+                                    </div>
                                 </el-form-item>
                             </div>
 
@@ -355,6 +413,25 @@ onUnmounted(() => {
     display: flex;
     gap: 16px;
     flex-wrap: wrap;
+}
+
+.monitor-options {
+    padding-top: 4px;
+}
+
+.monitor-option {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.local-replay-item :deep(.el-form-item__label) {
+    white-space: nowrap;
+}
+
+.monitor-tip {
+    color: #909399;
+    font-size: 12px;
 }
 
 .run-btn {

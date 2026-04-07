@@ -223,6 +223,29 @@ const runForm = reactive({
 const environments = ref([])
 const devices = ref([])
 
+const summarizePrecheckFailure = (payload) => {
+    if (!payload || typeof payload !== 'object') return '预检失败'
+    const globalFail = (payload.global_checks || []).find(item => item?.status === 'FAIL')
+    if (globalFail) return globalFail.message || globalFail.code || '全局检查失败'
+
+    const stepFail = (payload.steps || []).find(item => item?.status === 'FAIL')
+    if (stepFail) return stepFail.message || stepFail.code || '步骤预检失败'
+
+    if (!payload.has_runnable_steps) return '全部步骤将被跳过（当前设备无可执行步骤）'
+    return '预检失败'
+}
+
+const precheckCaseOnDevice = async (caseId, serial) => {
+    try {
+        const { data } = await api.precheckTestCase(caseId, runForm.envId, serial)
+        if (data?.ok) return { ok: true }
+        return { ok: false, reason: summarizePrecheckFailure(data) }
+    } catch (err) {
+        const detail = err?.response?.data?.detail || err?.message || '请求失败'
+        return { ok: false, reason: `预检接口调用失败: ${detail}` }
+    }
+}
+
 const fetchRunConfigOptions = async () => {
     try {
         const [envRes, devRes] = await Promise.all([
@@ -255,14 +278,43 @@ const fetchRunConfigOptions = async () => {
 
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info' }
+  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
   return map[status] || 'info'
 }
 
 /** 状态中文映射 */
 const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线' }
+  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
   return map[status] || status
+}
+
+const isDeviceSelectable = (device) => device?.status === 'IDLE'
+
+const deviceUnavailableReason = (device) => {
+    if (!device) return ''
+    if (device.status === 'WDA_DOWN') return 'WDA 未就绪'
+    if (device.status === 'BUSY') return '设备正忙'
+    return ''
+}
+
+const hasWdaDownDevice = () => devices.value.some(d => d.status === 'WDA_DOWN')
+
+const normalizeCaseRunStatus = (status) => {
+    const normalized = (status || '').toString().trim().toLowerCase()
+    if (normalized === 'pass' || normalized === 'success') return 'PASS'
+    if (normalized === 'fail' || normalized === 'failed' || normalized === 'error') return 'FAIL'
+    if (normalized === 'warning') return 'WARNING'
+    if (normalized === 'running' || normalized === 'running...') return 'RUNNING'
+    return ''
+}
+
+const caseRunStatusTagType = (status) => {
+    const normalized = normalizeCaseRunStatus(status)
+    if (normalized === 'PASS') return 'success'
+    if (normalized === 'WARNING') return 'warning'
+    if (normalized === 'FAIL') return 'danger'
+    if (normalized === 'RUNNING') return 'info'
+    return 'info'
 }
 
 const handleRunClick = (row) => {
@@ -280,16 +332,35 @@ const confirmRun = async () => {
     }
     
     try {
-        const promises = runForm.deviceSerials.map(serial => 
+        const runnable = []
+        const blocked = []
+        for (const serial of runForm.deviceSerials) {
+            const check = await precheckCaseOnDevice(runningCaseId.value, serial)
+            if (check.ok) runnable.push(serial)
+            else blocked.push({ serial, reason: check.reason })
+        }
+
+        if (runnable.length === 0) {
+            const first = blocked[0]
+            ElMessage.error(`运行前预检未通过：${first ? `${first.serial} - ${first.reason}` : '无可执行设备'}`)
+            return
+        }
+
+        const promises = runnable.map(serial =>
             api.runTestCaseAsync(runningCaseId.value, runForm.envId, serial)
         )
         await Promise.all(promises)
-        
-        ElMessage.success(`已在 ${runForm.deviceSerials.length} 台设备上开始后台执行`)
+
+        if (blocked.length > 0) {
+            const first = blocked[0]
+            ElMessage.warning(`已在 ${runnable.length} 台设备启动；${blocked.length} 台预检失败（示例：${first.serial} - ${first.reason}）`)
+        } else {
+            ElMessage.success(`已在 ${runForm.deviceSerials.length} 台设备上开始后台执行`)
+        }
         runDialogVisible.value = false
         // Update the item status optimistically
         const caseItem = cases.value.find(c => c.id === runningCaseId.value)
-        if (caseItem) caseItem.last_run_status = 'Running...'
+        if (caseItem) caseItem.last_run_status = 'RUNNING'
     } catch (err) {
         ElMessage.error('启动批量执行失败: ' + err.message)
     }
@@ -518,8 +589,13 @@ onMounted(() => {
 
                             <el-table-column label="状态" width="100" align="center">
                                 <template #default="{ row }">
-                                    <el-tag v-if="row.last_run_status === 'Pass'" type="success" size="small">PASS</el-tag>
-                                    <el-tag v-else-if="row.last_run_status === 'Fail'" type="danger" size="small">FAIL</el-tag>
+                                    <el-tag
+                                        v-if="normalizeCaseRunStatus(row.last_run_status)"
+                                        :type="caseRunStatusTagType(row.last_run_status)"
+                                        size="small"
+                                    >
+                                        {{ normalizeCaseRunStatus(row.last_run_status) }}
+                                    </el-tag>
                                     <span v-else class="text-gray">-</span>
                                 </template>
                             </el-table-column>
@@ -587,14 +663,22 @@ onMounted(() => {
                             :key="dev.serial"
                             :label="dev.custom_name || dev.market_name || dev.model || dev.serial"
                             :value="dev.serial"
-                            :disabled="dev.status !== 'IDLE'"
+                            :disabled="!isDeviceSelectable(dev)"
                         >
                             <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                                 <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
-                                <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                <div style="display: flex; align-items: center; gap: 6px;">
+                                    <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                    <span v-if="deviceUnavailableReason(dev)" style="font-size: 12px; color: #e6a23c;">
+                                        {{ deviceUnavailableReason(dev) }}
+                                    </span>
+                                </div>
                             </div>
                         </el-option>
                     </el-select>
+                    <div v-if="hasWdaDownDevice()" class="run-warning-hint">
+                        检测到 iOS 设备 WDA 异常，需在设备中心先执行“检测WDA”。
+                    </div>
                 </el-form-item>
                 <el-form-item label="运行环境">
                     <el-select v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
@@ -808,6 +892,12 @@ onMounted(() => {
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.run-warning-hint {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #e6a23c;
 }
 
 .search-input {

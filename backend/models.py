@@ -1,6 +1,7 @@
 from typing import List, Optional
 from datetime import datetime
 from sqlmodel import SQLModel, Field, Column
+from sqlalchemy import Integer, JSON
 from .schemas import TestCaseBase, Step, Variable
 from .json_type import PydanticListType
 
@@ -74,6 +75,8 @@ class TestExecution(SQLModel, table=True):
     start_time: datetime = Field(default_factory=datetime.now)
     end_time: Optional[datetime] = None
     status: str = Field(default="RUNNING") # RUNNING, PASS, FAIL, WARNING, ERROR
+    device_serial: Optional[str] = None
+    platform: Optional[str] = None  # android | ios
     device_info: Optional[str] = None
     scenario_name: str # Snapshot of scenario name at time of execution
     executor_name: Optional[str] = None # Snapshot of user name
@@ -142,20 +145,25 @@ class FastbotReport(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     task_id: int = Field(foreign_key="fastbottask.id")
     performance_data: Optional[str] = None   # JSON: [{time, cpu, mem}, ...]
+    jank_data: Optional[str] = None          # JSON: [{time, fps, jank_rate, ...}, ...]
+    jank_events: Optional[str] = None        # JSON: [{time, severity, reason, ...}, ...]
+    trace_artifacts: Optional[str] = None    # JSON: [{path, trigger_time, ...}, ...]
     crash_events: Optional[str] = None       # JSON: [{time, type, full_log}, ...]
     summary: Optional[str] = None            # JSON: {avg_cpu, max_cpu, avg_mem, max_mem, ...}
     created_at: datetime = Field(default_factory=datetime.now)
 
 
 class Device(SQLModel, table=True):
-    """设备管理表 - 记录由 ADB 同步的物理设备"""
+    """设备管理表 - 记录由 ADB / tidevice 同步的物理设备"""
     id: Optional[int] = Field(default=None, primary_key=True)
     serial: str = Field(unique=True, index=True)
+    platform: str = Field(default="android")  # "android" | "ios"
     model: str = Field(default="Unknown")
     brand: str = Field(default="")
     android_version: str = Field(default="")
+    os_version: str = Field(default="")        # 跨平台统一版本号
     resolution: str = Field(default="")
-    status: str = Field(default="IDLE")  # IDLE, BUSY, OFFLINE
+    status: str = Field(default="IDLE")  # IDLE, BUSY, OFFLINE, WDA_DOWN
     custom_name: Optional[str] = Field(default=None)  # 用户自定义设备名称
     market_name: Optional[str] = Field(default=None)  # 设备市场型号
     created_at: datetime = Field(default_factory=datetime.now)
@@ -195,3 +203,41 @@ class AppPackage(SQLModel, table=True):
     upload_time: datetime = Field(default_factory=datetime.now)
     uploader_id: Optional[int] = Field(default=None, foreign_key="user.id")
     uploader_name: Optional[str] = None
+
+
+class TestCaseStep(SQLModel, table=True):
+    """
+    跨端测试步骤表
+
+    支持"一套 JSON 数据，双端分发执行"：
+    - execute_on: 标记该步骤允许在哪些平台运行
+    - platform_overrides: 存储各平台的选择器覆盖配置
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    case_id: int = Field(foreign_key="testcase.id", index=True)
+    order: int = Field(
+        default=0,
+        sa_column=Column("step_order", Integer, default=0),
+    )
+    action: str = Field(default="click")
+    args: dict = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    value: Optional[str] = None
+    timeout: int = Field(default=10)
+    error_strategy: str = Field(default="ABORT")
+    description: Optional[str] = None
+
+    # 核心字段 1：允许执行的平台列表，默认双端
+    execute_on: List[str] = Field(
+        default=["android", "ios"],
+        sa_column=Column(PydanticListType(str)),
+    )
+
+    # 核心字段 2：各平台的选择器覆盖
+    # 结构示例: {"android": {"selector": "id/login", "by": "id"}, "ios": {"selector": "登录", "by": "label"}}
+    platform_overrides: dict = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )

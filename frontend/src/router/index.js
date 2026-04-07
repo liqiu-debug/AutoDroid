@@ -41,8 +41,8 @@ const routes = [
           {
             path: '',
             name: 'dashboard',
-            // TODO: 替换为真实的 Dashboard 组件
-            component: { template: '<div style="padding:40px;color:#999;font-size:20px;">🏠 运行大盘 - 开发中...</div>' }
+            meta: { keepAlive: true },
+            component: () => import('../views/dashboard/DashboardView.vue')
           }
         ]
       },
@@ -56,19 +56,19 @@ const routes = [
           {
             path: 'devices',
             name: 'device-center',
-            meta: { title: '设备管理中心' },
+            meta: { title: '设备管理中心', keepAlive: true },
             component: () => import('../views/devices/DeviceCenter.vue')
           },
           {
             path: 'variables',
             name: 'global-variables',
-            meta: { title: '全局变量库' },
+            meta: { title: '全局变量库', keepAlive: true },
             component: () => import('../views/variables/VariableLibrary.vue')
           },
           {
             path: 'packages',
             name: 'app-packages',
-            meta: { title: 'App包管理' },
+            meta: { title: 'App包管理', keepAlive: true },
             component: () => import('../views/packages/PackageManagement.vue')
           }
         ]
@@ -83,7 +83,7 @@ const routes = [
           {
             path: 'cases',
             name: 'case-list',
-            meta: { title: '用例管理' },
+            meta: { title: '用例管理', keepAlive: true },
             component: () => import('../views/cases/CaseList.vue')
           },
           {
@@ -101,7 +101,7 @@ const routes = [
           {
             path: 'scenarios',
             name: 'scenario-list',
-            meta: { title: '场景编排' },
+            meta: { title: '场景编排', keepAlive: true },
             component: () => import('../views/scenarios/ScenarioList.vue')
           },
           {
@@ -129,7 +129,7 @@ const routes = [
           {
             path: 'fastbot',
             name: 'FastbotStability',
-            meta: { title: '智能稳定性' },
+            meta: { title: '智能稳定性', keepAlive: true },
             component: () => import('@/views/special/Fastbot.vue')
           },
           {
@@ -141,7 +141,7 @@ const routes = [
           {
             path: 'fluency',
             name: 'FluencyAnalysis',
-            meta: { title: '流畅度分析' },
+            meta: { title: '流畅度分析', keepAlive: true },
             component: () => import('@/views/special/Fluency.vue')
           }
         ]
@@ -156,13 +156,13 @@ const routes = [
           {
             path: 'tasks',
             name: 'task-list',
-            meta: { title: '定时任务' },
+            meta: { title: '定时任务', keepAlive: true },
             component: () => import('../views/tasks/TaskList.vue')
           },
           {
             path: 'reports',
             name: 'report-list',
-            meta: { title: '报告中心' },
+            meta: { title: '报告中心', keepAlive: true },
             component: () => import('../views/reports/ReportList.vue')
           },
           {
@@ -182,7 +182,7 @@ const routes = [
           {
             path: 'notifications',
             name: 'notification-settings',
-            meta: { title: '通知设置' },
+            meta: { title: '通知设置', keepAlive: true },
             component: () => import('../views/settings/NotificationSettings.vue')
           }
         ]

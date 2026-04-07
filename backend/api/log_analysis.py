@@ -9,7 +9,7 @@
 import re
 import hashlib
 import logging
-from typing import Optional
+from typing import List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
@@ -25,6 +25,13 @@ router = APIRouter()
 # ==================== 内存缓存 ====================
 # Key: md5(cleaned_log), Value: analysis result string
 _analysis_cache: dict = {}
+
+ANR_ANCHOR_PATTERN = re.compile(r'ANR in', re.IGNORECASE)
+CRASH_ANCHOR_PATTERNS = [
+    re.compile(r'FATAL EXCEPTION', re.IGNORECASE),
+    re.compile(r'AndroidRuntime', re.IGNORECASE),
+    re.compile(r'Process:.*Crashing', re.IGNORECASE),
+]
 
 
 def _get_setting(session: Session, key: str, default: str = "") -> str:
@@ -52,18 +59,14 @@ def clean_log_for_ai(full_log: str, package_name: str) -> str:
     if not lines:
         return full_log
 
-    # Step 1: 定位关键起始行
-    anchor_patterns = [
-        re.compile(r'FATAL EXCEPTION', re.IGNORECASE),
-        re.compile(r'AndroidRuntime', re.IGNORECASE),
-        re.compile(r'ANR in', re.IGNORECASE),
-        re.compile(r'CRASH', re.IGNORECASE),
-        re.compile(r'Process:.*Crashing', re.IGNORECASE),
-    ]
+    anr_indices = [i for i, line in enumerate(lines) if ANR_ANCHOR_PATTERN.search(line)]
+    if anr_indices:
+        return _clean_anr_log_for_ai(lines, package_name, anr_indices)
 
+    # Step 1: 定位关键起始行
     start_indices = []
     for i, line in enumerate(lines):
-        for pattern in anchor_patterns:
+        for pattern in CRASH_ANCHOR_PATTERNS:
             if pattern.search(line):
                 start_indices.append(i)
                 break
@@ -115,7 +118,7 @@ def clean_log_for_ai(full_log: str, package_name: str) -> str:
 
             # 遇到下一个 FATAL/AndroidRuntime 标记，停止当前块
             is_new_block = False
-            for pattern in anchor_patterns[:2]:
+            for pattern in CRASH_ANCHOR_PATTERNS[:2]:
                 if pattern.search(line) and j != start_idx:
                     is_new_block = True
                     break
@@ -195,6 +198,86 @@ def clean_log_for_ai(full_log: str, package_name: str) -> str:
         result = result[:100]
 
     return '\n'.join(result)
+
+
+def _clean_anr_log_for_ai(lines: List[str], package_name: str, anr_indices: List[int]) -> str:
+    """针对 ANR 日志走单独清洗，优先保留原因、CPU 概览和主线程栈。"""
+    start_idx = anr_indices[-1]
+    end_idx = min(start_idx + 260, len(lines))
+    kept_lines: List[str] = []
+    seen: Set[str] = set()
+
+    pressure_lines = 0
+    package_cpu_lines = 0
+    logkit_stack_lines = 0
+    plain_stack_lines = 0
+    capture_plain_stack = False
+
+    for j in range(start_idx, end_idx):
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        keep = False
+
+        if any(
+            marker in line for marker in (
+                'ANR in',
+                'PID:',
+                'Reason:',
+                'Parent:',
+                'ErrorId:',
+                'Frozen:',
+                'Load:',
+                'CPU usage from',
+                ' TOTAL:',
+                'DropBoxManagerService: file :: /data/system/dropbox/data_app_anr',
+            )
+        ):
+            keep = True
+
+        if package_name and package_name in line and any(
+            marker in line for marker in ('ActivityManager:', '[Fastbot]:', 'Killing ', 'main thread')
+        ):
+            keep = True
+
+        if '/proc/pressure/' in line and pressure_lines < 6:
+            keep = True
+            pressure_lines += 1
+
+        if package_name and package_name in line and (
+            'ActivityManager:' in line or '[Fastbot]:' in line
+        ) and package_cpu_lines < 10:
+            keep = True
+            package_cpu_lines += 1
+
+        if 'LogKit_AnrCrashDumpRunnable' in line and logkit_stack_lines < 60:
+            keep = True
+            logkit_stack_lines += 1
+            if 'stackTrace=' in line or 'main thread' in line.lower():
+                capture_plain_stack = True
+
+        if re.match(r'^\s*at\s+', stripped):
+            if capture_plain_stack and plain_stack_lines < 30:
+                keep = True
+                plain_stack_lines += 1
+            elif not capture_plain_stack:
+                continue
+        elif capture_plain_stack and 'LogKit_AnrCrashDumpRunnable' not in line:
+            capture_plain_stack = False
+
+        if keep:
+            key = stripped
+            if key not in seen:
+                seen.add(key)
+                kept_lines.append(line)
+
+    if len(kept_lines) < 5:
+        fallback_start = max(0, start_idx - 5)
+        return '\n'.join(lines[fallback_start:min(fallback_start + 100, len(lines))])
+
+    return '\n'.join(kept_lines[:100])
 
 
 # ==================== LLM 调用 ====================
@@ -284,7 +367,7 @@ async def call_llm_service(
                 headers=headers,
             )
 
-            # 先记录原始响应用于调试
+            # 统一读取原始响应文本，供状态校验与错误诊断复用
             raw_text = resp.text
             logger.info(f"LLM 响应状态: {resp.status_code}, 长度: {len(raw_text)}")
 
@@ -375,7 +458,7 @@ async def analyze_log(
 
     # Step 2: MD5 缓存检查
     cache_key = hashlib.md5(cleaned_log.encode('utf-8')).hexdigest()
-    if cache_key in _analysis_cache:
+    if not req.force_refresh and cache_key in _analysis_cache:
         logger.info(f"命中缓存: {cache_key}")
         return LogAnalysisResponse(
             success=True,

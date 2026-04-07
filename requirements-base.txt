@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlmodel
+pydantic
+Pillow
+jinja2
+requests
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+apscheduler
+httpx
+bcrypt==4.0.1
+websockets>=11.0
+perfetto

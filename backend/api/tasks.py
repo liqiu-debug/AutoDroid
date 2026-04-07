@@ -23,11 +23,19 @@ router = APIRouter()
 
 def _run_scheduled_scenario(task_id: int):
     """调度器回调：根据任务类型执行 UI 场景或 Fastbot 探索"""
-    from backend.api.scenarios import execute_scenario_batch_background
+    from backend.api.scenarios import (
+        _summarize_precheck_failure,
+        execute_scenario_batch_background,
+        precheck_scenario_execution,
+    )
     from backend.models import TestExecution, TestResult
     from backend.notification_service import NotificationService
     from sqlmodel import Session as SQLSession
     from backend.database import engine
+
+    runnable_device_serials: List[str] = []
+    blocked_prechecks: List[dict] = []
+    env_id = None
 
     with SQLSession(engine) as session:
         task = session.get(ScheduledTask, task_id)
@@ -45,6 +53,43 @@ def _run_scheduled_scenario(task_id: int):
                 config = json.loads(task.strategy_config)
             except (json.JSONDecodeError, TypeError):
                 config = {}
+        task_type = config.get("_task_type", "ui")
+        env_id = config.get("env_id")
+
+        # UI 场景任务：执行前按设备做预检，过滤明显不可执行设备。
+        runnable_device_serials = list(device_serials)
+        if (
+            task_type == "ui"
+            and scenario_id is not None
+            and device_serials
+        ):
+            runnable_device_serials = []
+            for serial in device_serials:
+                try:
+                    precheck = precheck_scenario_execution(
+                        session=session,
+                        scenario_id=scenario_id,
+                        device_serial=serial,
+                        env_id=env_id,
+                    )
+                except Exception as exc:
+                    blocked_prechecks.append(
+                        {
+                            "device_serial": serial,
+                            "reason": str(exc),
+                        }
+                    )
+                    continue
+
+                if precheck.get("ok"):
+                    runnable_device_serials.append(serial)
+                else:
+                    blocked_prechecks.append(
+                        {
+                            "device_serial": serial,
+                            "reason": _summarize_precheck_failure(precheck),
+                        }
+                    )
 
     task_type = config.get("_task_type", "ui")
 
@@ -56,10 +101,34 @@ def _run_scheduled_scenario(task_id: int):
             logger.error(f"[定时任务] UI 任务 #{task_id} 缺少 scenario_id")
             return
             
-        env_id = config.get("env_id")
-        logger.info(f"[定时任务] 开始执行场景 #{scenario_id} (任务: {task_name}, env_id: {env_id}, device_serials: {device_serials})")
+        if blocked_prechecks:
+            first = blocked_prechecks[0]
+            logger.warning(
+                "[定时任务] 场景预检拦截 %d 台设备，示例: serial=%s reason=%s",
+                len(blocked_prechecks),
+                first.get("device_serial"),
+                first.get("reason"),
+            )
+
+        if device_serials and not runnable_device_serials:
+            logger.error(
+                "[定时任务] 场景预检全部失败，取消执行: scenario=%s task=%s",
+                scenario_id,
+                task_name,
+            )
+            return
+
+        target_serials = runnable_device_serials if device_serials else device_serials
+        logger.info(
+            f"[定时任务] 开始执行场景 #{scenario_id} (任务: {task_name}, env_id: {env_id}, device_serials: {target_serials})"
+        )
         
-        batch_id = execute_scenario_batch_background(scenario_id, f"定时任务: {task_name}", env_id, device_serials)
+        batch_id = execute_scenario_batch_background(
+            scenario_id,
+            f"定时任务: {task_name}",
+            env_id,
+            target_serials,
+        )
 
         if enable_notification and batch_id:
             try:

@@ -3,12 +3,13 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { VueDraggable } from 'vue-draggable-plus'
 import api from '@/api'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { 
   VideoPlay, Delete, Rank, Document, 
   Search, Upload, ArrowLeft, FolderOpened
 } from '@element-plus/icons-vue'
 import LogConsole from '@/components/LogConsole.vue'
+import { createUuid } from '@/utils/uuid'
 
 const route = useRoute()
 const router = useRouter()
@@ -49,18 +50,21 @@ watch(caseSearchQuery, (val) => {
 
 // Init
 const devices = ref([])
+const devicesLoading = ref(false)
 
 const fetchDevices = async () => {
+  devicesLoading.value = true
   try {
     const res = await api.getDeviceList()
     devices.value = res.data
   } catch (err) {
     ElMessage.error('获取设备列表失败')
+  } finally {
+    devicesLoading.value = false
   }
 }
 
 onMounted(async () => {
-    fetchDevices()
     if (scenarioId.value) {
         // Must fetch cases first to ensure dictionary is ready
         await fetchCases()
@@ -98,7 +102,7 @@ const fetchCases = async () => {
     const cases = casesRes.data.items || casesRes.data
     caseLibrary.value = cases.map(c => ({
       ...c,
-      uuid: crypto.randomUUID(),
+      uuid: createUuid(),
       type: 'case'
     }))
 
@@ -129,7 +133,7 @@ const fetchScenarioSteps = async () => {
         const originalCase = caseLibrary.value.find(c => c.id === step.case_id)
         return {
             ...(originalCase || { name: '未知用例', id: step.case_id }), 
-            uuid: crypto.randomUUID(),
+            uuid: createUuid(),
             alias: step.alias,
             scenario_step_id: step.id,
             id: step.case_id 
@@ -179,11 +183,58 @@ const saveSteps = async () => {
   }
 }
 
+const summarizeScenarioPrecheckFailure = (payload) => {
+  if (!payload || typeof payload !== 'object') return '预检失败'
+
+  const failCase = (payload.cases || []).find(item => item?.status === 'FAIL')
+  if (failCase) {
+    const caseName = failCase.alias || failCase.case_name || `Case#${failCase.case_id || '?'}`
+    const reason = failCase.reason || '用例预检失败'
+    return `${caseName}: ${reason}`
+  }
+
+  if (!payload.has_runnable_cases) return '全部用例将被跳过（当前设备无可执行步骤）'
+  return '预检失败'
+}
+
+const summarizeHttpDetail = (err) => {
+  const detail = err?.response?.data?.detail
+  if (typeof detail === 'string' && detail) return detail
+  if (detail && typeof detail === 'object') {
+    if (detail.message) return detail.message
+    if (Array.isArray(detail.items) && detail.items.length > 0) {
+      const first = detail.items[0]
+      if (first?.device_serial || first?.reason) {
+        return `${first.device_serial || '未知设备'} - ${first.reason || '预检失败'}`
+      }
+    }
+  }
+  return err?.message || '请求失败'
+}
+
+const precheckScenarioOnDevice = async (serial) => {
+  try {
+    const { data } = await api.precheckScenario(scenarioId.value, envId.value, serial)
+    if (data?.ok) return { ok: true }
+    return { ok: false, reason: summarizeScenarioPrecheckFailure(data) }
+  } catch (err) {
+    return { ok: false, reason: `预检接口调用失败: ${summarizeHttpDetail(err)}` }
+  }
+}
+
 const runScenario = async (selectedSerial) => {
   await saveSteps()
   
   // If save failed or still no ID, stop
-  if (!scenarioId.value) return 
+  if (!scenarioId.value) return false
+
+  if (selectedSerial) {
+    const check = await precheckScenarioOnDevice(selectedSerial)
+    if (!check.ok) {
+      ElMessage.error(`运行前预检失败: ${check.reason}`)
+      return false
+    }
+  }
 
   running.value = true
   if (logConsoleRef.value) {
@@ -262,6 +313,7 @@ const runScenario = async (selectedSerial) => {
            }
       }
   }
+  return true
 }
 
 const selectedStep = ref(null)
@@ -283,22 +335,43 @@ const submitMultiRun = async () => {
 
   // Single Selection: Use Real-time WebSocket execution
   if (multiRunForm.value.deviceSerials.length === 1) {
-      runScenario(multiRunForm.value.deviceSerials[0])
-      runDialogVisible.value = false
+      const started = await runScenario(multiRunForm.value.deviceSerials[0])
+      if (started) runDialogVisible.value = false
       return
   }
 
   // Multiple Selection: Background Batch Execution
   try {
-    await api.runScenario(scenarioId.value, envId.value, multiRunForm.value.deviceSerials)
-    ElMessage.success(`后台已开始在 ${multiRunForm.value.deviceSerials.length} 台设备上执行场景`)
+    const runnable = []
+    const blocked = []
+    for (const serial of multiRunForm.value.deviceSerials) {
+      const check = await precheckScenarioOnDevice(serial)
+      if (check.ok) runnable.push(serial)
+      else blocked.push({ device_serial: serial, reason: check.reason })
+    }
+
+    if (runnable.length === 0) {
+      const first = blocked[0]
+      ElMessage.error(`运行前预检未通过：${first ? `${first.device_serial} - ${first.reason}` : '无可执行设备'}`)
+      return
+    }
+
+    const { data } = await api.runScenario(scenarioId.value, envId.value, runnable)
+    const backendBlocked = Array.isArray(data?.blocked_prechecks) ? data.blocked_prechecks : []
+    const allBlocked = blocked.concat(backendBlocked)
+    if (allBlocked.length > 0) {
+      const first = allBlocked[0]
+      ElMessage.warning(`已在 ${runnable.length} 台设备启动；${allBlocked.length} 台预检失败（示例：${first.device_serial} - ${first.reason}）`)
+    } else {
+      ElMessage.success(`后台已开始在 ${runnable.length} 台设备上执行场景`)
+    }
     runDialogVisible.value = false
   } catch (err) {
-    ElMessage.error('启动批量执行失败: ' + err.message)
+    ElMessage.error('启动批量执行失败: ' + summarizeHttpDetail(err))
   }
 }
 
-const openRunDialog = () => {
+const openRunDialog = async () => {
   if (!scenarioId.value) {
     ElMessage.warning('请先保存场景')
     return
@@ -309,19 +382,31 @@ const openRunDialog = () => {
   }
   multiRunForm.value.deviceSerials = []
   runDialogVisible.value = true
+  await fetchDevices()
 }
 
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info' }
+  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
   return map[status] || 'info'
 }
 
 /** 状态中文映射 */
 const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线' }
+  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
   return map[status] || status
 }
+
+const isDeviceSelectable = (device) => device?.status === 'IDLE'
+
+const deviceUnavailableReason = (device) => {
+  if (!device) return ''
+  if (device.status === 'WDA_DOWN') return 'WDA 未就绪'
+  if (device.status === 'BUSY') return '设备正忙'
+  return ''
+}
+
+const hasWdaDownDevice = computed(() => devices.value.some(d => d.status === 'WDA_DOWN'))
 
 const handleStepClick = (step) => {
     selectedStep.value = step
@@ -337,7 +422,7 @@ const handleCaseTreeClick = (data) => {
 const addCaseToScenario = (item) => {
     const newStep = {
         ...item,
-        uuid: crypto.randomUUID(),
+        uuid: createUuid(),
         alias: item.name 
     }
     scenarioSteps.value.push(newStep)
@@ -363,9 +448,11 @@ const isStepExpanded = (index) => expandedPreviewSteps.value.has(index)
 
 const actionOptions = [
   { value: 'click', label: '点击 (Click)' },
+  { value: 'click_image', label: '图像点击 (Click Image)' },
   { value: 'input', label: '输入 (Input)' },
   { value: 'wait_until_exists', label: '等待元素 (Wait)' },
-  { value: 'assert_text', label: '断言文本 (Assert)' },
+  { value: 'assert_text', label: '文本断言 (Assert)' },
+  { value: 'assert_image', label: '图像断言 (Assert Image)' },
   { value: 'swipe', label: '滑动 (Swipe)' },
   { value: 'sleep', label: '强制等待 (Sleep)' },
   { value: 'extract_by_ocr', label: 'OCR提取变量 (OCR)' },
@@ -378,6 +465,11 @@ const getStepTitle = (step) => {
   let target = step.selector ? (step.selector.length > 25 ? step.selector.slice(0, 25) + '...' : step.selector) : '?'
   if (step.action === 'sleep') {
     target = step.value ? `${step.value}s` : '5s'
+  } else if (step.action === 'assert_text') {
+    target = step.value || '-'
+  } else if (step.action === 'assert_image') {
+    const matchMode = step.options?.match_mode === 'not_exists' ? '不存在' : '存在'
+    target = `${matchMode} ${target}`
   } else if (step.action === 'extract_by_ocr') {
     target = step.value || 'OCR_VAR'
   }
@@ -387,9 +479,11 @@ const getStepTitle = (step) => {
 const getActionColor = (action) => {
   const colors = {
     click: '#667eea',
+    click_image: '#764ba2',
     input: '#f093fb',
     wait_until_exists: '#4facfe',
     assert_text: '#fa709a',
+    assert_image: '#ff8a65',
     swipe: '#30cfd0',
     sleep: '#e6a23c',
     extract_by_ocr: '#67c23a',
@@ -641,7 +735,7 @@ const getActionColor = (action) => {
       title="选择多设备执行"
       width="400px"
     >
-      <el-form :model="multiRunForm" label-width="100px">
+      <el-form v-loading="devicesLoading" :model="multiRunForm" label-width="100px">
         <el-form-item label="设备列表">
           <el-select
             v-model="multiRunForm.deviceSerials"
@@ -649,6 +743,7 @@ const getActionColor = (action) => {
             multiple
             collapse-tags
             collapse-tags-tooltip
+            :disabled="devicesLoading"
             style="width: 100%"
           >
             <el-option
@@ -656,20 +751,28 @@ const getActionColor = (action) => {
               :key="d.serial"
               :label="d.custom_name || d.market_name || d.model || d.serial"
               :value="d.serial"
-              :disabled="d.status !== 'IDLE'"
+              :disabled="!isDeviceSelectable(d)"
             >
               <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                 <span>{{ d.custom_name || d.market_name || d.model || d.serial }}</span>
-                <el-tag :type="statusTagType(d.status)" size="small">{{ statusLabel(d.status) }}</el-tag>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                  <el-tag :type="statusTagType(d.status)" size="small">{{ statusLabel(d.status) }}</el-tag>
+                  <span v-if="deviceUnavailableReason(d)" style="font-size: 12px; color: #e6a23c;">
+                    {{ deviceUnavailableReason(d) }}
+                  </span>
+                </div>
               </div>
             </el-option>
           </el-select>
+          <div v-if="hasWdaDownDevice" class="run-warning-hint">
+            检测到 iOS 设备 WDA 异常，需在设备中心先执行“检测WDA”。
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
         <span class="dialog-footer">
           <el-button @click="runDialogVisible = false">取消</el-button>
-          <el-button type="primary" @click="submitMultiRun">确定执行</el-button>
+          <el-button type="primary" :loading="devicesLoading" :disabled="devicesLoading" @click="submitMultiRun">确定执行</el-button>
         </span>
       </template>
     </el-dialog>
@@ -684,6 +787,12 @@ const getActionColor = (action) => {
   flex-direction: column;
   background: #f2f3f5;
   overflow: hidden;
+}
+
+.run-warning-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #e6a23c;
 }
 
 /* app-header styles removed */

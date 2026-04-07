@@ -24,6 +24,10 @@ auto_droid.db
 autodroid.db
 database.db
 
+# Runtime files
+.backend.pid
+.frontend.pid
+
 # Frontend
 frontend/node_modules/
 frontend/dist/
@@ -33,6 +37,23 @@ frontend/.npm/
 .vscode/
 .idea/
 
-# Uploads / Assets (unless you want to track them)
-# uploads/
-# reports/
+# Local generated data and artifacts
+/uploads/
+/reports/
+/static/images/
+
+# Mobile packages
+*.apk
+*.ipa
+
+# Root-level local review snapshots
+/case_editor_multi_run_button.png
+/case_list_pagination_fixed.webp
+/report_pagination_check_1.webp
+/reports_page.png
+/reports_page_batch_grouped.png
+/scenario_pagination_check_1.webp
+/scenarios_page.png
+/smart_stability_multi_run_dialog.png
+/smart_stability_multi_run_dialog_fixed.png
+/tasks_env_list_preview.png

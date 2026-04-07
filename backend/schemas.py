@@ -1,12 +1,13 @@
 from typing import List, Optional, Any, Dict
 from enum import Enum
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 class ActionType(str, Enum):
     CLICK = "click"
     INPUT = "input"
     WAIT_UNTIL_EXISTS = "wait_until_exists"
     ASSERT_TEXT = "assert_text"
+    ASSERT_IMAGE = "assert_image"
     SWIPE = "swipe"
     CLICK_IMAGE = "click_image"  # 图像匹配点击
     START_APP = "start_app"
@@ -33,7 +34,7 @@ class Step(BaseModel):
     action: ActionType
     selector: Optional[str] = None
     selector_type: Optional[SelectorType] = None
-    value: Optional[str] = None  # For input or assert_text
+    value: Optional[str] = None  # For input / assert_text 等兼容字段
     options: Optional[dict] = Field(default_factory=dict)
     description: Optional[str] = None
     timeout: int = 10  # Default timeout in seconds
@@ -79,6 +80,7 @@ class InteractionRequest(BaseModel):
     action_data: Optional[str] = None # package name or swipe direction
     xml_dump: Optional[str] = None
     device_serial: Optional[str] = None
+    record_step: bool = True
 
 # ---- Scenario Schemas ----
 
@@ -203,6 +205,9 @@ class FastbotTaskCreate(BaseModel):
     package_name: str
     duration: int = 600
     throttle: int = 500
+    enable_performance_monitor: bool
+    enable_jank_frame_monitor: bool
+    enable_local_replay: bool = True
     ignore_crashes: bool = False
     capture_log: bool = True
     device_serial: str
@@ -235,9 +240,49 @@ class FastbotReportRead(BaseModel):
     id: int
     task_id: int
     performance_data: Optional[List[Dict[str, Any]]] = None
+    jank_data: Optional[List[Dict[str, Any]]] = None
+    jank_events: Optional[List[Dict[str, Any]]] = None
+    trace_artifacts: Optional[List[Dict[str, Any]]] = None
     crash_events: Optional[List[Dict[str, Any]]] = None
     summary: Optional[Dict[str, Any]] = None
     created_at: Any
+
+    class Config:
+        from_attributes = True
+
+
+class FluencySessionStartRequest(BaseModel):
+    package_name: str
+    device_serial: str
+    enable_performance_monitor: bool = True
+    enable_jank_frame_monitor: bool = True
+    capture_log: bool = True
+    auto_launch_app: bool = True
+
+
+class FluencyMarkerCreate(BaseModel):
+    label: str
+
+
+class FluencyMarkerRead(BaseModel):
+    label: str
+    time: str
+    activity: Optional[str] = None
+
+
+class FluencySessionRead(BaseModel):
+    task_id: int
+    package_name: str
+    device_serial: str
+    status: str
+    executor_name: Optional[str] = None
+    created_at: Any
+    started_at: Any = None
+    finished_at: Any = None
+    report_ready: bool = False
+    marker_count: int = 0
+    markers: List[FluencyMarkerRead] = Field(default_factory=list)
+    summary: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -246,7 +291,7 @@ class DeviceStatusRead(BaseModel):
     serial: str
     device_name: str = ""
     ready: bool = False
-    status: str = "IDLE"  # IDLE, RUNNING, FASTBOT_RUNNING
+    status: str = "IDLE"  # IDLE, RUNNING, FASTBOT_RUNNING, WDA_DOWN
 
 
 # ---- Log Analysis Schemas ----
@@ -255,6 +300,7 @@ class LogAnalysisRequest(BaseModel):
     log_text: str  # 原始 500 行日志
     package_name: str  # 用于过滤堆栈
     device_info: Optional[str] = None  # 辅助判断，如 "Xiaomi 14, Android 14"
+    force_refresh: bool = False
 
 class LogAnalysisResponse(BaseModel):
     success: bool
@@ -263,14 +309,28 @@ class LogAnalysisResponse(BaseModel):
     cached: bool = False  # 是否命中缓存
 
 
+class JankAiSummaryRequest(BaseModel):
+    trace_path: str
+    force_refresh: bool = False
+
+
+class JankAiSummaryResponse(BaseModel):
+    success: bool
+    analysis_result: str = ""
+    token_usage: int = 0
+    cached: bool = False
+
+
 # ---- Device Management Schemas ----
 
 class DeviceRead(BaseModel):
     id: int
     serial: str
+    platform: str = "android"
     model: str = "Unknown"
     brand: str = ""
     android_version: str = ""
+    os_version: str = ""
     resolution: str = ""
     status: str = "IDLE"
     custom_name: Optional[str] = None
@@ -352,3 +412,65 @@ class GlobalVariableUpdate(BaseModel):
     value: Optional[str] = None
     is_secret: Optional[bool] = None
     description: Optional[str] = None
+
+
+# ---- Cross-Platform Step Schemas (跨端步骤) ----
+
+class PlatformSelector(BaseModel):
+    """单端选择器配置"""
+    model_config = ConfigDict(extra="forbid")
+
+    selector: str = Field(..., description="定位值，如 resourceId / label / xpath")
+    by: str = Field(..., description="定位策略，如 id / text / xpath / label / name")
+
+class PlatformOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    """
+    双端选择器覆盖配置。
+
+    结构示例::
+
+        {
+            "android": {"selector": "id/login_btn", "by": "id"},
+            "ios": {"selector": "登录", "by": "label"}
+        }
+    """
+    android: Optional[PlatformSelector] = None
+    ios: Optional[PlatformSelector] = None
+
+class TestCaseStepWrite(BaseModel):
+    """跨端测试步骤 — 写入模型（不含 case_id）"""
+    order: int = Field(default=0, ge=0, description="步骤顺序，值越小越先执行")
+    action: str = Field(..., description="标准动作名（建议小写）")
+    args: Dict[str, Any] = Field(default_factory=dict, description="动作参数")
+    value: Optional[str] = Field(default=None, description="兼容旧模型保留字段")
+    execute_on: List[str] = Field(default_factory=lambda: ["android", "ios"])
+    platform_overrides: PlatformOverrides = Field(default_factory=PlatformOverrides)
+    timeout: int = Field(default=10, ge=1)
+    error_strategy: str = Field(default="ABORT", description="ABORT | CONTINUE | IGNORE")
+    description: Optional[str] = None
+
+class TestCaseStepCreate(TestCaseStepWrite):
+    """跨端测试步骤 — 创建入参"""
+    case_id: int = Field(..., description="所属用例 ID")
+
+class TestCaseStepUpdate(BaseModel):
+    """跨端测试步骤 — 单步更新入参（可选字段）"""
+    order: Optional[int] = Field(default=None, ge=0)
+    action: Optional[str] = None
+    args: Optional[Dict[str, Any]] = None
+    value: Optional[str] = None
+    execute_on: Optional[List[str]] = None
+    platform_overrides: Optional[PlatformOverrides] = None
+    timeout: Optional[int] = Field(default=None, ge=1)
+    error_strategy: Optional[str] = None
+    description: Optional[str] = None
+
+class TestCaseStepRead(TestCaseStepWrite):
+    """跨端测试步骤 — 读取响应（包含 id/case_id）"""
+    id: int
+    case_id: int
+
+    class Config:
+        from_attributes = True

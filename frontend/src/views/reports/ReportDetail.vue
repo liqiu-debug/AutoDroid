@@ -29,18 +29,49 @@ const fetchDevices = async () => {
     }
 }
 
-const formatDeviceName = (serial_or_info) => {
-    if (!serial_or_info) return 'Unknown'
-    const dev = devices.value.find(d => serial_or_info.includes(d.serial))
+const formatDeviceName = (deviceSerial, fallbackInfo) => {
+    const dev = deviceSerial ? devices.value.find(d => d.serial === deviceSerial) : null
     if (dev) {
         const name = dev.custom_name || dev.market_name || dev.model
         if (name) return name
     }
-    
-    if (typeof serial_or_info === 'string') {
-        return serial_or_info.replace(/\s*\([^)]+\)$/, '')
+
+    const serial = String(deviceSerial || '').trim()
+    const info = String(fallbackInfo || '').trim()
+
+    if (info) {
+        const cleanedInfo = info.replace(/\s*\([^)]+\)$/, '').trim()
+        if (cleanedInfo) return cleanedInfo
     }
-    return serial_or_info
+
+    const serialLike = /^[0-9A-Za-z-]{8,}$/.test(serial)
+    if (serialLike) return 'Unknown Device'
+    return serial || 'Unknown Device'
+}
+
+const normalizeStatus = (status) => String(status || '').toUpperCase()
+
+const getStatusTagType = (status) => {
+    const s = normalizeStatus(status)
+    if (s === 'PASS') return 'success'
+    if (s === 'WARNING') return 'warning'
+    if (s === 'SKIP') return 'info'
+    if (s === 'RUNNING') return ''
+    return 'danger'
+}
+
+const getMessageClass = (status) => {
+    const s = normalizeStatus(status)
+    if (s === 'WARNING') return 'warning-text'
+    if (s === 'SKIP') return 'skip-text'
+    return 'error-text'
+}
+
+const formatStepMessage = (row) => {
+    if (!row?.error_message) return ''
+    return normalizeStatus(row.status) === 'SKIP'
+        ? `跳过原因: ${row.error_message}`
+        : row.error_message
 }
 
 const fetchDetail = async () => {
@@ -81,10 +112,15 @@ const fetchDetail = async () => {
                     display_name: stepDesc
                 })
                 c.duration += (step.duration || 0)
-                
-                if (step.status === 'FAIL') {
+
+                const status = normalizeStatus(step.status)
+                if (status === 'FAIL') {
                     c.status = 'FAIL'
                     c.hasError = true
+                } else if (status === 'WARNING' && c.status !== 'FAIL') {
+                    c.status = 'WARNING'
+                } else if (status === 'SKIP' && c.status === 'PASS') {
+                    c.status = 'WARNING'
                 }
             })
             
@@ -140,9 +176,12 @@ const getDuration = (ms) => {
 }
 
 const tableRowClassName = ({ row }) => {
-    if (row.status !== 'PASS') {
+    const status = normalizeStatus(row?.status)
+    if (status === 'FAIL') {
         return 'error-row'
     }
+    if (status === 'WARNING') return 'warning-row'
+    if (status === 'SKIP') return 'skip-row'
     return ''
 }
 
@@ -160,14 +199,14 @@ onMounted(() => {
             <div class="header-left">
                 <el-button link :icon="ArrowLeft" @click="handleBack">返回</el-button>
                 <h2 v-if="execution">{{ execution.scenario_name }}</h2>
-                <el-tag v-if="execution" :type="execution.status === 'PASS' ? 'success' : (execution.status === 'WARNING' ? 'warning' : 'danger')">
+                <el-tag v-if="execution" :type="getStatusTagType(execution.status)">
                     {{ execution.status }}
                 </el-tag>
             </div>
              <div class="header-right" v-if="execution">
                  <span class="meta-item"><el-icon><User /></el-icon> {{ execution.executor_name || 'System' }}</span>
                  <span class="meta-item"><el-icon><Timer /></el-icon> {{ formatDate(execution.start_time) }}</span>
-                 <span class="meta-item"><el-icon><Monitor /></el-icon> {{ formatDeviceName(execution.device_info) || 'Unknown Device' }}</span>
+                 <span class="meta-item"><el-icon><Monitor /></el-icon> {{ formatDeviceName(execution.device_serial, execution.device_info) || 'Unknown Device' }}</span>
             </div>
         </div>
 
@@ -185,7 +224,7 @@ onMounted(() => {
                              <div class="case-title">{{ caseItem.name }}</div>
                              <div class="case-meta">
                                  耗时: {{ getDuration(caseItem.duration) }}
-                                 <el-tag :type="caseItem.status === 'PASS' ? 'success' : (caseItem.status === 'WARNING' ? 'warning' : 'danger')" size="small" class="ml-2">
+                                 <el-tag :type="getStatusTagType(caseItem.status)" size="small" class="ml-2">
                                      {{ caseItem.status }}
                                  </el-tag>
                              </div>
@@ -209,9 +248,10 @@ onMounted(() => {
                                  <template #default="{ row }">
                                      <div class="step-name">
                                          {{ row.display_name || row.step_name }}
-                                         <el-tag v-if="row.status === 'WARNING'" size="small" type="warning" effect="light" style="margin-left: 8px;">已忽略错误</el-tag>
+                                         <el-tag v-if="normalizeStatus(row.status) === 'WARNING'" size="small" type="warning" effect="light" style="margin-left: 8px;">已忽略错误</el-tag>
+                                         <el-tag v-if="normalizeStatus(row.status) === 'SKIP'" size="small" type="info" effect="light" style="margin-left: 8px;">步骤跳过</el-tag>
                                      </div>
-                                     <div v-if="row.error_message" :class="row.status === 'WARNING' ? 'warning-text' : 'error-text'">{{ row.error_message }}</div>
+                                     <div v-if="row.error_message" :class="getMessageClass(row.status)">{{ formatStepMessage(row) }}</div>
                                  </template>
                              </el-table-column>
                              
@@ -223,7 +263,7 @@ onMounted(() => {
                              
                              <el-table-column label="状态" width="100" align="center">
                                  <template #default="{ row }">
-                                     <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'WARNING' ? 'warning' : 'danger')" size="small" effect="plain">
+                                     <el-tag :type="getStatusTagType(row.status)" size="small" effect="plain">
                                          {{ row.status }}
                                      </el-tag>
                                  </template>
@@ -328,6 +368,12 @@ onMounted(() => {
     margin-top: 4px;
 }
 
+.skip-text {
+    font-size: 12px;
+    color: #909399;
+    margin-top: 4px;
+}
+
 .screenshot-wrapper {
     display: flex;
     justify-content: center;
@@ -424,5 +470,14 @@ onMounted(() => {
 
 :deep(.el-table .warning-row:hover > td.el-table__cell) {
     background-color: #fcf1e3 !important;
+}
+
+/* Skip Row Highlight */
+:deep(.el-table .skip-row) {
+    background-color: #f4f4f5 !important;
+}
+
+:deep(.el-table .skip-row:hover > td.el-table__cell) {
+    background-color: #ebedef !important;
 }
 </style>

@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from sqlmodel import Session, select, col, func
 
 from backend.database import get_session
-from backend.models import AppPackage, User
+from backend.models import AppPackage, Device, User
 from backend.schemas import AppPackageRead, PaginatedAppPackageRead
 from backend.api.deps import get_current_user
 from backend.utils.apk_parser import parse_apk_info
@@ -26,6 +26,15 @@ router = APIRouter()
 # 存储目录
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads", "apps")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _ensure_android_install_device(device: Device) -> None:
+    platform = str(device.platform or "android").strip().lower()
+    if platform != "android":
+        raise HTTPException(
+            status_code=400,
+            detail="P2002_ADB_ANDROID_ONLY: APK 安装仅支持 Android 设备，iOS 设备仅支持执行。",
+        )
 
 
 @router.post("/upload", response_model=AppPackageRead, summary="上传 APK 文件")
@@ -212,13 +221,14 @@ async def install_package(
         raise HTTPException(status_code=404, detail="APK 文件已被删除")
 
     # 2. 校验设备状态
-    from backend.models import Device
     device = session.exec(
         select(Device).where(Device.serial == req.serial)
     ).first()
 
     if not device:
         raise HTTPException(status_code=404, detail=f"设备 {req.serial} 不存在")
+
+    _ensure_android_install_device(device)
 
     if device.status != "IDLE":
         raise HTTPException(

@@ -1,19 +1,4 @@
-fastapi
-uvicorn
-sqlmodel
-uiautomator2
-pydantic
-Pillow
-jinja2
-findit
-opencv-python
-adbutils
-python-jose[cryptography]
-passlib[bcrypt]
-python-multipart
-apscheduler
-httpx
-bcrypt==4.0.1
-websockets>=11.0
-openai>=1.0
-androguard
+-r requirements-base.txt
+-r requirements-android.txt
+-r requirements-ios.txt
+-r requirements-ai.txt

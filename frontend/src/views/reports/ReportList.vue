@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onActivated, onDeactivated, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { Search, Refresh, Timer, Download, Delete, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -35,18 +35,26 @@ const fetchDevices = async () => {
     }
 }
 
-const formatDeviceName = (identifier) => {
-    if (!identifier) return '未知设备'
-    const dev = devicesMap.value[identifier]
+const formatDeviceName = (deviceSerial, fallbackInfo) => {
+    const dev = deviceSerial ? devicesMap.value[deviceSerial] : null
     if (dev) {
         const namePart = dev.custom_name || dev.market_name || dev.model
         if (namePart) return namePart
     }
+
+    const serial = String(deviceSerial || '').trim()
+    const info = String(fallbackInfo || '').trim()
+
     // Handle historical data format "Model (serial)" -> "Model"
-    if (typeof identifier === 'string') {
-        return identifier.replace(/\s*\([^)]+\)$/, '')
+    if (info) {
+        const cleanedInfo = info.replace(/\s*\([^)]+\)$/, '').trim()
+        if (cleanedInfo) return cleanedInfo
     }
-    return identifier
+
+    // iOS UDID / serial-like fallback should not be shown in report center.
+    const serialLike = /^[0-9A-Za-z-]{8,}$/.test(serial)
+    if (serialLike) return '未知设备'
+    return serial || '未知设备'
 }
 
 const fetchData = async () => {
@@ -94,17 +102,20 @@ const fetchData = async () => {
         grouped.forEach(g => {
             let anyRunning = false
             let anyFail = false
+            let anyWarning = false
             let maxDuration = 0
             
             g.executions.forEach(e => {
                 if (e.status === 'RUNNING' || e.status === 'PENDING') anyRunning = true
                 else if (e.status === 'FAIL' || e.status === 'ERROR') anyFail = true
+                else if (e.status === 'WARNING') anyWarning = true
                 
                 if (e.duration > maxDuration) maxDuration = e.duration
             })
             
             if (anyRunning) g.status = 'RUNNING'
             else if (anyFail) g.status = 'FAIL'
+            else if (anyWarning) g.status = 'WARNING'
             else g.status = 'PASS'
             
             g.duration = maxDuration
@@ -132,6 +143,7 @@ const getStatusColor = (status) => {
     if (!status) return '#909399'
     const s = status.toLowerCase()
     if (s === 'pass') return '#67C23A'
+    if (s === 'warning') return '#E6A23C'
     if (s === 'fail') return '#F56C6C'
     if (s === 'error') return '#E6A23C'
     if (s === 'running') return '#409EFF'
@@ -150,13 +162,17 @@ const fbLoading = ref(false)
 const fbTasks = ref([])
 const fbSearch = ref('')
 let fbPollTimer = null
+let pageActive = false
 
 const fetchFbTasks = async () => {
+    fbLoading.value = true
     try {
         const res = await api.getFastbotTasks()
         fbTasks.value = res.data || []
     } catch (err) {
         console.error('获取探索任务失败', err)
+    } finally {
+        fbLoading.value = false
     }
 }
 
@@ -212,22 +228,73 @@ const getFbDuration = (task) => {
 }
 
 const handleTabChange = (tab) => {
-    if (tab === 'fastbot' && fbTasks.value.length === 0) {
+    fetchDevices()
+    if (tab === 'fastbot') {
         fetchFbTasks()
+        return
     }
+    fetchData()
 }
 
-onMounted(() => {
-    fetchDevices()
-    fetchData()
-    if (activeTab.value === 'fastbot') fetchFbTasks()
+const startFbPolling = () => {
+    if (fbPollTimer) return
     fbPollTimer = setInterval(() => {
         if (activeTab.value === 'fastbot') fetchFbTasks()
     }, 15000)
+}
+
+const stopFbPolling = () => {
+    if (!fbPollTimer) return
+    clearInterval(fbPollTimer)
+    fbPollTimer = null
+}
+
+const activatePage = () => {
+    if (pageActive) return
+    pageActive = true
+    startFbPolling()
+}
+
+const deactivatePage = () => {
+    if (!pageActive) return
+    pageActive = false
+    stopFbPolling()
+}
+
+const refreshReportCenter = () => {
+    fetchDevices()
+    fetchData()
+    fetchFbTasks()
+}
+
+watch(
+    () => route.query.tab,
+    (tab) => {
+        activeTab.value = tab === 'fastbot' ? 'fastbot' : 'ui'
+        if (pageActive && activeTab.value === 'fastbot' && fbTasks.value.length === 0) {
+            fetchFbTasks()
+        }
+    }
+)
+
+onMounted(() => {
+    if (!route.meta?.keepAlive) {
+        refreshReportCenter()
+        activatePage()
+    }
+})
+
+onActivated(() => {
+    refreshReportCenter()
+    activatePage()
+})
+
+onDeactivated(() => {
+    deactivatePage()
 })
 
 onUnmounted(() => {
-    if (fbPollTimer) clearInterval(fbPollTimer)
+    deactivatePage()
 })
 </script>
 
@@ -252,6 +319,7 @@ onUnmounted(() => {
                             <el-radio-group v-model="filterStatus" @change="handleSearch">
                                 <el-radio-button label="all">全部</el-radio-button>
                                 <el-radio-button label="pass">成功</el-radio-button>
+                                <el-radio-button label="warning">告警</el-radio-button>
                                 <el-radio-button label="fail">失败</el-radio-button>
                             </el-radio-group>
                         </div>
@@ -270,7 +338,7 @@ onUnmounted(() => {
                                             <el-table-column label="设备" width="200">
                                                 <template #default="{ row: subRow }">
                                                     <span style="font-family: monospace; color: #606266;">
-                                                        📱 {{ formatDeviceName(subRow.device_info || subRow.device_serial) }}
+                                                        📱 {{ formatDeviceName(subRow.device_serial, subRow.device_info) }}
                                                     </span>
                                                 </template>
                                             </el-table-column>

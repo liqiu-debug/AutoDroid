@@ -17,6 +17,7 @@ import queue
 from typing import Dict, Optional, Generator, List, Set
 
 import adbutils
+from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
 
 # 配置日志
 logger = logging.getLogger("ScrcpyManager")
@@ -51,6 +52,82 @@ class DeviceInfo:
         self.reader_thread: Optional[threading.Thread] = None
         self.running: bool = True
         self.sps_pps_packets: List[bytes] = [] # 缓存 SPS/PPS 用于新连接初始化
+        self.last_keyframe_packet: Optional[bytes] = None # 缓存最近 IDR，用于新连接首帧初始化
+        self.recorder: Optional[RollingScrcpyRecorderSession] = None
+
+
+def _collect_h264_nal_types(data: bytes) -> Set[int]:
+    """
+    从 Annex-B 格式的 H.264 数据中提取 NAL 类型集合。
+
+    scrcpy 推送的数据通常带 start code；这里兼容 3/4 字节 start code。
+    如果未找到 start code，则退化为按单 NAL 处理。
+    """
+    nal_types: Set[int] = set()
+    length = len(data)
+    i = 0
+
+    while i < length - 3:
+        start_code_len = 0
+        if data[i:i + 4] == b"\x00\x00\x00\x01":
+            start_code_len = 4
+        elif data[i:i + 3] == b"\x00\x00\x01":
+            start_code_len = 3
+
+        if not start_code_len:
+            i += 1
+            continue
+
+        nal_index = i + start_code_len
+        if nal_index < length:
+            nal_types.add(data[nal_index] & 0x1F)
+        i = nal_index
+
+    if not nal_types and data:
+        # 兜底处理没有 start code 的单 NAL 数据。
+        nal_types.add(data[0] & 0x1F)
+
+    return nal_types
+
+
+def _update_h264_init_cache(dev_info: DeviceInfo, data: bytes) -> Set[int]:
+    """
+    更新新客户端初始化所需的缓存包。
+
+    - SPS/PPS：用于初始化解码器
+    - 最近 IDR：确保新客户端在画面静止时也能立即解出首帧
+    """
+    nal_types = _collect_h264_nal_types(data)
+
+    if 7 in nal_types:
+        # 新 SPS 到来通常意味着编码参数切换，旧关键帧已不再可靠。
+        dev_info.sps_pps_packets = []
+        dev_info.last_keyframe_packet = None
+
+    if 7 in nal_types or 8 in nal_types:
+        if data not in dev_info.sps_pps_packets:
+            dev_info.sps_pps_packets.append(data)
+
+    if 5 in nal_types:
+        dev_info.last_keyframe_packet = data
+
+    return nal_types
+
+
+def _get_h264_init_packets(dev_info: DeviceInfo) -> List[bytes]:
+    """返回新客户端接入时应补发的初始化包，去重并保持顺序。"""
+    packets: List[bytes] = []
+    seen: Set[bytes] = set()
+
+    for packet in dev_info.sps_pps_packets:
+        if packet and packet not in seen:
+            packets.append(packet)
+            seen.add(packet)
+
+    if dev_info.last_keyframe_packet and dev_info.last_keyframe_packet not in seen:
+        packets.append(dev_info.last_keyframe_packet)
+
+    return packets
 
 
 class ScrcpyDeviceManager:
@@ -170,8 +247,8 @@ class ScrcpyDeviceManager:
             try:
                 device.shell("pkill -f scrcpy 2>/dev/null || true")
                 time.sleep(0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("预清理 scrcpy 进程失败（忽略）: serial=%s error=%s", serial, e)
 
             # 4. 设置端口转发
             device.forward(f"tcp:{local_port}", "localabstract:scrcpy")
@@ -228,21 +305,7 @@ class ScrcpyDeviceManager:
                     self._devices[serial] = dev_info
                 return
 
-            # 7. 读取 dummy byte（server 在第一个连接上发送）
-            try:
-                self._recv_exactly(video_sock, 1)  # dummy byte
-                logger.info("收到 dummy byte")
-            except Exception as e:
-                logger.error(f"读取 dummy byte 失败: {e}")
-                dev_info.error = f"Dummy byte 失败: {e}"
-                video_sock.close()
-                proc.terminate()
-                self._release_port(local_port)
-                with self._lock:
-                    self._devices[serial] = dev_info
-                return
-
-            # 8. 建立 control socket（第二个连接，scrcpy 需要双连接）
+            # 7. 建立 control socket（第二个连接，scrcpy 需要双连接）
             try:
                 ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 ctrl_sock.settimeout(3)
@@ -253,6 +316,21 @@ class ScrcpyDeviceManager:
                 logger.error(f"Control socket 连接失败: {e}")
                 dev_info.error = f"Control socket 失败: {e}"
                 video_sock.close()
+                proc.terminate()
+                self._release_port(local_port)
+                with self._lock:
+                    self._devices[serial] = dev_info
+                return
+
+            # 8. 读取 dummy byte（在 video/control 双连接建立后再读，避免握手时序问题）
+            try:
+                self._recv_exactly(video_sock, 1)  # dummy byte
+                logger.info("收到 dummy byte")
+            except Exception as e:
+                logger.error(f"读取 dummy byte 失败: {e}")
+                dev_info.error = f"Dummy byte 失败: {e}"
+                video_sock.close()
+                ctrl_sock.close()
                 proc.terminate()
                 self._release_port(local_port)
                 with self._lock:
@@ -302,10 +380,8 @@ class ScrcpyDeviceManager:
             with self._lock:
                 self._devices[serial] = dev_info
 
-        except Exception as e:
-            logger.error(f"设备 {serial} 初始化失败: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("设备流初始化异常: serial=%s", serial)
 
 
     def _on_device_disconnected(self, serial: str):
@@ -319,6 +395,14 @@ class ScrcpyDeviceManager:
         if not dev_info:
             return
 
+        if dev_info.recorder:
+            try:
+                dev_info.recorder.stop(cleanup_buffer=True)
+            except Exception as e:
+                logger.debug("停止录制器失败（忽略）: serial=%s error=%s", serial, e)
+            finally:
+                dev_info.recorder = None
+
         # 停止广播线程
         dev_info.running = False
         if dev_info.reader_thread:
@@ -328,20 +412,20 @@ class ScrcpyDeviceManager:
         if dev_info.video_socket:
             try:
                 dev_info.video_socket.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("关闭视频 socket 失败（忽略）: serial=%s error=%s", serial, e)
         if dev_info.control_socket:
             try:
                 dev_info.control_socket.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("关闭控制 socket 失败（忽略）: serial=%s error=%s", serial, e)
 
         # 终止 scrcpy 进程
         if dev_info.scrcpy_process:
             try:
                 dev_info.scrcpy_process.terminate()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("终止 scrcpy 进程失败（忽略）: serial=%s error=%s", serial, e)
 
         # 释放端口
         self._release_port(dev_info.local_port)
@@ -351,8 +435,8 @@ class ScrcpyDeviceManager:
             adb = adbutils.AdbClient()
             device = adb.device(serial)
             device.forward_remove(f"tcp:{dev_info.local_port}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("移除端口转发失败（忽略）: serial=%s port=%s error=%s", serial, dev_info.local_port, e)
 
         logger.info(f"设备 {serial} 资源已清理")
 
@@ -409,14 +493,17 @@ class ScrcpyDeviceManager:
             """广播一帧给所有客户端队列"""
             if not data:
                 return
-            # 缓存 SPS/PPS
-            if len(data) > 4:
-                nal_type = data[4] & 0x1F
-                if nal_type == 7 or nal_type == 8:
-                    logger.info(f"收到 SPS/PPS (type={nal_type}, len={len(data)})")
-                    if nal_type == 7:
-                        dev_info.sps_pps_packets = []
-                    dev_info.sps_pps_packets.append(data)
+            nal_types = _update_h264_init_cache(dev_info, data)
+            recorder = dev_info.recorder
+            if recorder:
+                try:
+                    recorder.ingest(data)
+                except Exception as e:
+                    logger.warning("写入本地复现录制失败（忽略）: serial=%s error=%s", dev_info.serial, e)
+            if 7 in nal_types or 8 in nal_types:
+                logger.info("收到视频初始化包: serial=%s nal_types=%s len=%s", dev_info.serial, sorted(nal_types), len(data))
+            if 5 in nal_types:
+                logger.info("缓存最近关键帧: serial=%s len=%s", dev_info.serial, len(data))
 
             queues = list(dev_info.input_queues)
             for q in queues:
@@ -424,8 +511,8 @@ class ScrcpyDeviceManager:
                     try:
                         while not q.empty():
                             q.get_nowait()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("清空视频队列失败（忽略）: serial=%s error=%s", serial, e)
                 try:
                     q.put_nowait(data)
                 except queue.Full:
@@ -556,10 +643,11 @@ class ScrcpyDeviceManager:
         dev_info.input_queues.append(client_queue)
         logger.info(f"客户端加入视频流: {serial} (当前客户端数: {len(dev_info.input_queues)})")
 
-        # 如果有缓存的 SPS/PPS，先发送给新客户端（数据已包含 Annex-B Start Code）
-        if dev_info.sps_pps_packets:
-            logger.info(f"向新客户端发送缓存的 {len(dev_info.sps_pps_packets)} 个 SPS/PPS 包")
-            for packet in dev_info.sps_pps_packets:
+        # 先补发解码初始化包，避免画面静止时新客户端拿不到首帧。
+        init_packets = _get_h264_init_packets(dev_info)
+        if init_packets:
+            logger.info(f"向新客户端发送缓存初始化包: serial={serial} packets={len(init_packets)}")
+            for packet in init_packets:
                 try:
                     client_queue.put(packet)
                 except queue.Full:
@@ -607,6 +695,63 @@ class ScrcpyDeviceManager:
         except Exception as e:
             logger.error(f"触控事件发送失败: {e}")
             raise
+
+    def start_recording(
+        self,
+        serial: str,
+        task_id: int,
+        report_dir: str,
+        pre_roll_sec: int = 30,
+        post_roll_sec: int = 5,
+        segment_sec: int = 5,
+    ) -> RollingScrcpyRecorderSession:
+        dev_info = self._devices.get(serial)
+        if not dev_info or not dev_info.ready:
+            raise ValueError(f"设备 {serial} 未就绪")
+
+        if dev_info.recorder:
+            try:
+                dev_info.recorder.stop(cleanup_buffer=True)
+            except Exception:
+                logger.exception("替换已有录制器失败: serial=%s", serial)
+
+        recorder = RollingScrcpyRecorderSession(
+            serial=serial,
+            task_id=task_id,
+            report_dir=report_dir,
+            project_root=PROJECT_ROOT,
+            pre_roll_sec=pre_roll_sec,
+            post_roll_sec=post_roll_sec,
+            segment_sec=segment_sec,
+        )
+        recorder.seed_init_packets(_get_h264_init_packets(dev_info))
+        dev_info.recorder = recorder
+        logger.info("已启动本地复现录制: serial=%s task_id=%s", serial, task_id)
+        return recorder
+
+    def capture_replay(
+        self,
+        serial: str,
+        event_type: str,
+        event_time: str,
+    ) -> ReplayCaptureResult:
+        dev_info = self._devices.get(serial)
+        if not dev_info or not dev_info.recorder:
+            return ReplayCaptureResult(
+                status="UNAVAILABLE",
+                error=f"device recorder unavailable: {serial}",
+            )
+        return dev_info.recorder.capture_replay(event_type=event_type, event_time=event_time)
+
+    def stop_recording(self, serial: str) -> None:
+        dev_info = self._devices.get(serial)
+        if not dev_info or not dev_info.recorder:
+            return
+        try:
+            dev_info.recorder.stop(cleanup_buffer=True)
+        finally:
+            dev_info.recorder = None
+        logger.info("已停止本地复现录制: serial=%s", serial)
 
     # ==================== 重连 ====================
 

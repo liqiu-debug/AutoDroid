@@ -1,44 +1,55 @@
-from typing import Type, List, Any
-from sqlalchemy.types import TypeDecorator, JSON
-from pydantic import BaseModel, parse_obj_as
+from typing import Any, List, Type
+
+from sqlalchemy.types import JSON, TypeDecorator
+
+try:
+    from pydantic import TypeAdapter
+except ImportError:  # pragma: no cover - pydantic v1
+    TypeAdapter = None
+
+try:
+    from pydantic import parse_obj_as
+except ImportError:  # pragma: no cover - pydantic v2 always exports TypeAdapter
+    parse_obj_as = None
+
 
 class PydanticListType(TypeDecorator):
     """
-    SQLAlchemy TypeDecorator to store a list of Pydantic models as a JSON column.
+    SQLAlchemy TypeDecorator to store a list of Pydantic models or primitive values
+    as a JSON column.
     """
+
     impl = JSON
     cache_ok = True
 
-    def __init__(self, pydantic_model: Type[BaseModel], *args, **kwargs):
+    def __init__(self, pydantic_model: Type[Any], *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pydantic_model = pydantic_model
 
+    @staticmethod
+    def _dump_item(item: Any) -> Any:
+        if hasattr(item, "model_dump"):
+            return item.model_dump()
+        if hasattr(item, "dict"):
+            return item.dict()
+        return item
+
     def process_bind_param(self, value: Any, dialect):
-        """Converting the list of Pydantic models to a list of dicts for storage."""
+        """Convert Python list items to JSON-serializable values for storage."""
         if value is None:
             return None
-        # Verify it's a list
         if not isinstance(value, list):
-            return value # Should probably raise error or let SQLAlchemy handle it
-        
-        # Convert each item to dict if it's a Pydantic model
-        return [item.dict() if hasattr(item, 'dict') else item for item in value]
+            return value
+        return [self._dump_item(item) for item in value]
 
     def process_result_value(self, value: Any, dialect):
-        """Converting the JSON list of dicts back to a list of Pydantic models."""
+        """Convert JSON list values back to typed Python objects."""
         if value is None:
             return None
-        
-        # Use Pydantic's parse_obj_as to valid/convert list
-        # Note: In Pydantic v2 use TypeAdapter, but we are likely on v1 compatible mode or v2.
-        # Let's check installed version: pydantic 2.x
-        # For Pydantic 2, .dict() is deprecated (use model_dump), and parse_obj_as is deprecated (use TypeAdapter).
-        # But let's try to support both or stick to v2 as per requirements.txt
-        
-        try:
-            from pydantic import TypeAdapter
-            adapter = TypeAdapter(List[self.pydantic_model])
-            return adapter.validate_python(value)
-        except ImportError:
-            # Fallback for Pydantic v1
-            return parse_obj_as(List[self.pydantic_model], value)
+
+        item_list_type = List[self.pydantic_model]
+        if TypeAdapter is not None:
+            return TypeAdapter(item_list_type).validate_python(value)
+        if parse_obj_as is not None:  # pragma: no cover - pydantic v1 fallback
+            return parse_obj_as(item_list_type, value)
+        return value

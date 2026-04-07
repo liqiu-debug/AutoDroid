@@ -1,0 +1,5 @@
+uiautomator2
+adbutils
+opencv-python
+findit
+androguard

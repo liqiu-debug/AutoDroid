@@ -86,7 +86,20 @@ const getVisibleChildren = (route) => {
 
       <!-- 右侧内容区 -->
       <el-main class="layout-main">
-        <RouterView />
+        <RouterView v-slot="{ Component, route: currentRoute }">
+          <KeepAlive>
+            <component
+              :is="Component"
+              v-if="currentRoute.meta?.keepAlive"
+              :key="String(currentRoute.name || currentRoute.path)"
+            />
+          </KeepAlive>
+          <component
+            :is="Component"
+            v-if="!currentRoute.meta?.keepAlive"
+            :key="currentRoute.fullPath"
+          />
+        </RouterView>
       </el-main>
     </el-container>
   </el-container>
@@ -108,6 +121,8 @@ const getVisibleChildren = (route) => {
 .layout-body {
   flex: 1;
   overflow: hidden;
+  min-height: 0;
+  min-width: 0;
 }
 
 .layout-sidebar {
@@ -126,6 +141,8 @@ const getVisibleChildren = (route) => {
   padding: 0;
   overflow: hidden;
   height: 100%;
+  min-height: 0;
+  min-width: 0;
   position: relative;
   display: flex;
   flex-direction: column;
