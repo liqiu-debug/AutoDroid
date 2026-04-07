@@ -1,8 +1,8 @@
 # AutoDroid
 
-**Android 录制 + Android/iOS 执行 的低代码自动化测试平台**
+**Android/iOS 录制+执行 的低代码自动化测试平台**
 
-AutoDroid 是一个基于 Web 的自动化测试工具，支持 Android 设备可视化录制步骤，并将同一套标准步骤分发到 Android/iOS 执行，无需编写代码。
+AutoDroid 是一个基于 Web 的自动化测试工具，支持 Android/iOS 设备可视化录制步骤，并将同一套标准步骤分发到 Android/iOS 执行，无需编写代码。
 
 ## 技术栈
 
