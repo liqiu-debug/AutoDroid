@@ -574,7 +574,8 @@ def get_report_detail(execution_id: int, session: Session = Depends(get_session)
     return detail
 
 
-@router.get("/executions/dashboard/stats", response_model=DashboardStats)
+@router.get("/dashboard/stats", response_model=DashboardStats)
+@router.get("/executions/dashboard/stats", response_model=DashboardStats, include_in_schema=False)
 def get_dashboard_stats(session: Session = Depends(get_session)):
     # Total Executions
     total = session.exec(select(func.count(TestExecution.id))).one()

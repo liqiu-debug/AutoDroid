@@ -1,13 +1,10 @@
 """
 Scrcpy 视频流 API 路由
 
-提供：
-- GET /devices — 设备列表
-- GET /devices/{serial} — 单设备信息
-- POST /devices/{serial}/touch — 触控事件转发
-- WebSocket /ws/scrcpy/{serial} — H.264 视频流
-
-注意：前端通过 /api 代理访问，Vite 会自动去掉 /api 前缀。
+REST 与 WebSocket 分离，便于在主应用中分别挂载：
+- REST canonical: /api/stream/devices/*
+- REST legacy: /devices* /api/devices*（兼容保留）
+- WebSocket: /ws/scrcpy/{serial}
 """
 import asyncio
 import logging
@@ -19,19 +16,21 @@ from .manager import device_manager
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+rest_router = APIRouter()
+ws_router = APIRouter()
+router = rest_router
 
 
 # ==================== REST API ====================
 
 
-@router.get("/devices")
+@rest_router.get("/devices")
 def list_devices():
     """获取所有已连接设备列表"""
     return device_manager.get_devices_list()
 
 
-@router.get("/devices/{serial}")
+@rest_router.get("/devices/{serial}")
 def get_device(serial: str):
     """获取单个设备信息"""
     info = device_manager.get_device(serial)
@@ -47,7 +46,7 @@ class TouchEvent(BaseModel):
     y: int
 
 
-@router.post("/devices/{serial}/touch")
+@rest_router.post("/devices/{serial}/touch")
 def send_touch(serial: str, event: TouchEvent):
     """向设备发送触控事件"""
     try:
@@ -59,7 +58,7 @@ def send_touch(serial: str, event: TouchEvent):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/devices/{serial}/reconnect")
+@rest_router.post("/devices/{serial}/reconnect")
 def reconnect_device(serial: str):
     """重新连接设备（清理旧连接 + 重新初始化 scrcpy）"""
     device_manager.reconnect_device(serial)
@@ -70,7 +69,7 @@ def reconnect_device(serial: str):
 # ==================== WebSocket 视频流 ====================
 
 
-@router.websocket("/ws/scrcpy/{serial}")
+@ws_router.websocket("/ws/scrcpy/{serial}")
 async def video_stream(websocket: WebSocket, serial: str):
     """
     WebSocket 端点：推送 H.264 原始视频流。

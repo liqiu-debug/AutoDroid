@@ -18,11 +18,12 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 from pydantic import BaseModel, Field
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +34,8 @@ from .runner import TestRunner, register_device_abort, unregister_device_abort
 from .socket_manager import manager
 from .utils.pydantic_compat import dump_model
 from .report_generator import report_generator
-from .device_stream.router import router as stream_router
+from .device_stream.router import rest_router as stream_rest_router
+from .device_stream.router import ws_router as stream_ws_router
 from .device_stream.manager import device_manager
 from .wda_port_manager import wda_relay_manager
 
@@ -47,6 +49,8 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 STATIC_DIR = PROJECT_ROOT / "static"
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 FRONTEND_INDEX_FILE = FRONTEND_DIST_DIR / "index.html"
+REPORT_ASSET_API_PREFIX = "/api/report-assets"
+REPORT_API_RESERVED_SEGMENTS = {"executions", "dashboard"}
 SPA_EXCLUDED_PREFIXES = (
     "api",
     "auth",
@@ -55,7 +59,6 @@ SPA_EXCLUDED_PREFIXES = (
     "scenarios",
     "reports",
     "tasks",
-    "settings",
     "fastbot",
     "devices",
     "device",
@@ -224,10 +227,9 @@ from backend.utils import calculate_element_from_coordinates
 app = FastAPI(title="AutoDroid", description="Android UI 自动化低代码平台")
 api_router = APIRouter(prefix="/api")
 
-# Mount reports directory for static access (screenshots, html)
+# Mount reports directory for canonical static asset access
 REPORTS_DIR.mkdir(exist_ok=True)
-app.mount("/reports", StaticFiles(directory=str(REPORTS_DIR)), name="reports")
-app.mount("/api/reports", StaticFiles(directory=str(REPORTS_DIR)), name="api_reports")
+app.mount(REPORT_ASSET_API_PREFIX, StaticFiles(directory=str(REPORTS_DIR)), name="report_assets")
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -247,26 +249,69 @@ from backend.api import environments
 from backend.api import ai
 
 
-def _register_http_routers(target) -> None:
-    target.include_router(auth.router, prefix="/auth", tags=["auth"])
-    target.include_router(cases.router, prefix="/cases", tags=["cases"])
-    target.include_router(folders.router, prefix="/folders", tags=["folders"])
-    target.include_router(scenarios.router, prefix="/scenarios", tags=["scenarios"])
-    target.include_router(reports.router, tags=["reports"])
-    target.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
-    target.include_router(settings.router, prefix="/settings", tags=["settings"])
-    target.include_router(fastbot.router, prefix="/fastbot", tags=["fastbot"])
-    target.include_router(log_analysis.router, prefix="/fastbot", tags=["log_analysis"])
-    target.include_router(devices.router, prefix="/devices", tags=["devices"])
-    target.include_router(packages.router, prefix="/packages", tags=["packages"])
-    target.include_router(environments.router, prefix="/environments", tags=["environments"])
-    target.include_router(ai.router, prefix="/api/ai", tags=["ai"])
-    target.include_router(stream_router)
+def _register_http_routers(
+    target,
+    *,
+    include_in_schema: bool,
+    ai_prefix: Optional[str] = "/ai",
+    include_settings_alias: bool = True,
+    reports_prefix: str = "/reports",
+) -> None:
+    target.include_router(auth.router, prefix="/auth", tags=["auth"], include_in_schema=include_in_schema)
+    target.include_router(cases.router, prefix="/cases", tags=["cases"], include_in_schema=include_in_schema)
+    target.include_router(folders.router, prefix="/folders", tags=["folders"], include_in_schema=include_in_schema)
+    target.include_router(scenarios.router, prefix="/scenarios", tags=["scenarios"], include_in_schema=include_in_schema)
+    target.include_router(reports.router, prefix=reports_prefix, tags=["reports"], include_in_schema=include_in_schema)
+    target.include_router(tasks.router, prefix="/tasks", tags=["tasks"], include_in_schema=include_in_schema)
+    if include_settings_alias:
+        target.include_router(settings.router, prefix="/settings", tags=["settings"], include_in_schema=include_in_schema)
+    target.include_router(fastbot.router, prefix="/fastbot", tags=["fastbot"], include_in_schema=include_in_schema)
+    target.include_router(log_analysis.router, prefix="/fastbot", tags=["log_analysis"], include_in_schema=include_in_schema)
+    target.include_router(devices.router, prefix="/devices", tags=["devices"], include_in_schema=include_in_schema)
+    target.include_router(packages.router, prefix="/packages", tags=["packages"], include_in_schema=include_in_schema)
+    target.include_router(environments.router, prefix="/environments", tags=["environments"], include_in_schema=include_in_schema)
+    if ai_prefix:
+        target.include_router(ai.router, prefix=ai_prefix, tags=["ai"], include_in_schema=include_in_schema)
 
 
-_register_http_routers(app)
-_register_http_routers(api_router)
-app.include_router(api_router, include_in_schema=False)
+_register_http_routers(api_router, include_in_schema=True, ai_prefix="/ai", reports_prefix="/reports")
+_register_http_routers(app, include_in_schema=False, ai_prefix=None, include_settings_alias=False, reports_prefix="")
+
+api_router.include_router(
+    stream_rest_router,
+    prefix="/stream",
+    tags=["device_stream"],
+    include_in_schema=True,
+)
+app.include_router(stream_rest_router, prefix="/api", include_in_schema=False)
+app.include_router(stream_rest_router, include_in_schema=False)
+app.include_router(stream_ws_router)
+app.include_router(api_router)
+
+
+def _build_report_asset_url(report_path: str) -> str:
+    normalized = str(report_path or "").strip().lstrip("/")
+    if not normalized:
+        raise HTTPException(status_code=404, detail="Report asset not found")
+    return f"{REPORT_ASSET_API_PREFIX}/{quote(normalized, safe='/')}"
+
+
+@app.get("/reports/{report_path:path}", include_in_schema=False)
+def redirect_legacy_report_asset(report_path: str):
+    return RedirectResponse(url=_build_report_asset_url(report_path))
+
+
+@app.get("/api/reports/{report_path:path}", include_in_schema=False)
+def redirect_legacy_api_report_asset(report_path: str):
+    normalized = str(report_path or "").strip().lstrip("/")
+    if not normalized:
+        raise HTTPException(status_code=404, detail="Report asset not found")
+
+    head = normalized.split("/", 1)[0]
+    if head in REPORT_API_RESERVED_SEGMENTS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return RedirectResponse(url=_build_report_asset_url(normalized))
 
 
 app.add_middleware(
@@ -350,7 +395,7 @@ def _restore_scheduled_tasks():
 
 
 @app.post("/api/run/{case_id}", include_in_schema=False)
-@app.post("/run/{case_id}")
+@app.post("/run/{case_id}", include_in_schema=False)
 def run_test_case_legacy_alias(
     case_id: int,
     background_tasks: BackgroundTasks,
@@ -382,8 +427,8 @@ def run_test_case_legacy_alias(
     return response
 
 
-@app.get("/api/device/dump", include_in_schema=False)
-@app.get("/device/dump")
+@app.get("/api/device/dump")
+@app.get("/device/dump", include_in_schema=False)
 def dump_device_info(
     serial: Optional[str] = None,
     include_device_info: bool = True,
@@ -412,24 +457,6 @@ def dump_device_info(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _cleanup_recording_device(cleanup)
-
-
-@app.get("/reports/{report_id}")
-def download_report(report_id: str):
-    """下载测试报告"""
-    # Reports dir is at project root/reports. main.py is in project root/backend
-    # So .. from main.py is project root
-    reports_dir = os.path.join(os.path.dirname(__file__), "..", "reports")
-    report_path = os.path.join(reports_dir, report_id)
-    
-    if not os.path.exists(report_path):
-        raise HTTPException(status_code=404, detail="报告不存在")
-    
-    return FileResponse(
-        path=report_path, 
-        filename=report_id, 
-        media_type="text/html"
-    )
 
 
 def _take_screenshot_base64(device) -> str:
@@ -712,8 +739,8 @@ class CropTemplateRequest(BaseModel):
     y2: int = Field(..., description="裁剪区域右下角 Y 坐标（像素）")
 
 
-@app.post("/api/device/crop_template", include_in_schema=False)
-@app.post("/device/crop_template")
+@app.post("/api/device/crop_template")
+@app.post("/device/crop_template", include_in_schema=False)
 def crop_template(req: CropTemplateRequest):
     """
     手动截取图像模板：裁剪截图中的指定区域并保存为模板图。
@@ -751,8 +778,8 @@ def crop_template(req: CropTemplateRequest):
     return {"image_path": image_path}
 
 
-@app.post("/api/device/inspect", include_in_schema=False)
-@app.post("/device/inspect")
+@app.post("/api/device/inspect")
+@app.post("/device/inspect", include_in_schema=False)
 def inspect_device(
     x: int,
     y: int,
@@ -793,8 +820,8 @@ def inspect_device(
         _cleanup_recording_device(cleanup)
 
 
-@app.post("/api/device/interact", include_in_schema=False)
-@app.post("/device/interact")
+@app.post("/api/device/interact")
+@app.post("/device/interact", include_in_schema=False)
 def interact_with_device(req: InteractionRequest, session: Session = Depends(get_session)):
     """
     交互模式：分析元素 → 执行点击 → 返回新状态。
@@ -978,8 +1005,8 @@ def _cross_platform_result_to_legacy_payload(result: Dict[str, Any]) -> Dict[str
         "output": result.get("output"),
     }
 
-@app.post("/api/device/execute_step", include_in_schema=False)
-@app.post("/device/execute_step")
+@app.post("/api/device/execute_step")
+@app.post("/device/execute_step", include_in_schema=False)
 def execute_single_step(payload: SingleStepPayload, session: Session = Depends(get_session)):
     """
     执行单个步骤并返回最新 UI 快照。

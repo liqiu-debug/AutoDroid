@@ -5,6 +5,11 @@ const api = axios.create({
     timeout: 30000  // 30 seconds default
 })
 
+const buildReportAssetUrl = (path) => {
+    const normalized = String(path || '').trim().replace(/^\/+/, '')
+    return normalized ? `/api/report-assets/${encodeURI(normalized)}` : ''
+}
+
 // Request interceptor
 api.interceptors.request.use(
     (config) => {
@@ -172,30 +177,33 @@ export default {
 
     // Scrcpy 设备流
     getDevices() {
-        return api.get('/devices')
+        return api.get('/stream/devices')
     },
     getDevice(serial) {
-        return api.get(`/devices/${serial}`)
+        return api.get(`/stream/devices/${serial}`)
     },
     sendTouch(serial, action, x, y) {
-        return api.post(`/devices/${serial}/touch`, { action, x, y })
+        return api.post(`/stream/devices/${serial}/touch`, { action, x, y })
     },
 
     // Reports
     getReports(params) {
-        return api.get('/executions', { params })
+        return api.get('/reports/executions', { params })
     },
     getReport(id) {
-        return api.get(`/executions/${id}`)
+        return api.get(`/reports/executions/${id}`)
     },
     getReportDownloadUrl(id) {
-        return `/api/executions/${id}/download`
+        return `/api/reports/executions/${id}/download`
+    },
+    getReportAssetUrl(path) {
+        return buildReportAssetUrl(path)
     },
     getDashboardStats() {
-        return api.get('/executions/dashboard/stats')
+        return api.get('/reports/dashboard/stats')
     },
     getDashboardOverview(params) {
-        return api.get('/dashboard/overview', { params })
+        return api.get('/reports/dashboard/overview', { params })
     },
 
     // Tasks (定时任务)
@@ -337,6 +345,6 @@ export default {
 
     // AI (NL2Script) - 自然语言生成测试步骤
     generateAISteps(text) {
-        return api.post('/api/ai/generate-steps', { text }, { timeout: 120000 })
+        return api.post('/ai/generate-steps', { text }, { timeout: 120000 })
     }
 }

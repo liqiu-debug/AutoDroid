@@ -34,7 +34,7 @@
     </div>
     
     <div class="console-footer" v-if="reportId">
-      <a :href="`/api/reports/${reportId}`" download target="_blank" class="report-link">
+      <a :href="reportUrl" download target="_blank" class="report-link">
         📥 下载测试报告
       </a>
     </div>
@@ -43,6 +43,7 @@
 
 <script setup>
 import { ref, watch, nextTick, onUnmounted, computed } from 'vue'
+import api from '@/api'
 
 const props = defineProps({
   caseId: {
@@ -68,6 +69,8 @@ const statusText = computed(() => {
     default: return '待执行'
   }
 })
+
+const reportUrl = computed(() => api.getReportAssetUrl(reportId.value))
 
 // 连接 WebSocket
 const connect = (caseId, envId = null, deviceSerial = null) => {
