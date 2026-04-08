@@ -175,7 +175,7 @@ class NotificationService:
             return
 
         base_url = cls._get_setting("system_base_url") or "http://localhost:5173"
-        report_url = f"{base_url.rstrip('/')}/reports/{execution_id}"
+        report_url = f"{base_url.rstrip('/')}/execution/reports/{execution_id}"
 
         card = cls._build_card(
             task_name=task_name,

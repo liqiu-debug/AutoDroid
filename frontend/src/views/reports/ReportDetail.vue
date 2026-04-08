@@ -159,7 +159,7 @@ const handleBack = () => {
 
 const viewScreenshot = (path) => {
     if (!path) return
-    currentScreenshot.value = `/api/reports/${path}` 
+    currentScreenshot.value = api.getReportAssetUrl(path)
     showScreenshot.value = true
 }
 

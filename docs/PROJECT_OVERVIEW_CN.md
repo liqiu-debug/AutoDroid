@@ -34,7 +34,7 @@ AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 | 设备中心 | ADB+tidevice 一键同步、解锁、重启、截图、WDA 检测 | `backend/api/devices.py` |
 | 流媒体 | Scrcpy H.264 WebSocket 推流、触控转发、多客户端广播 | `backend/device_stream/manager.py` |
 | 报告中心 | 执行列表、详情、下载，DB 数据兜底生成 HTML 报告 | `backend/api/reports.py`、`backend/report_generator.py` |
-| 运行大盘 | KPI、趋势、状态分布、失败 Top、告警、即将执行任务 | `backend/api/reports.py` `/dashboard/overview` |
+| 运行大盘 | KPI、趋势、状态分布、失败 Top、告警、即将执行任务 | `backend/api/reports.py` `/api/reports/dashboard/overview` |
 | 稳定性探索 | Fastbot 智能探索、性能曲线、Crash/ANR 统计 | `backend/api/fastbot.py`、`backend/fastbot_runner.py` |
 | AI 能力 | 自然语言生成步骤（NL2Step）、日志 AI 根因分析 | `backend/api/ai.py`、`backend/api/log_analysis.py` |
 | 配置与通知 | 系统配置中心、飞书测试报告卡片通知 | `backend/api/settings.py`、`backend/notification_service.py` |
@@ -271,11 +271,12 @@ API/WS：
 
 报告中心：
 
-- 执行列表：`GET /executions`
-- 执行详情：`GET /executions/{id}`
-- 下载报告：`GET /executions/{id}/download`（支持 DB 回填生成 HTML）
+- 执行列表：`GET /api/reports/executions`
+- 执行详情：`GET /api/reports/executions/{id}`
+- 下载报告：`GET /api/reports/executions/{id}/download`（支持 DB 回填生成 HTML）
+- 报告静态资源：`GET /api/report-assets/{path}`
 
-Dashboard（`GET /dashboard/overview`）输出：
+Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
 - KPI：执行总量、通过率、失败场景数、平均耗时、运行中执行、空闲设备、启用任务
 - 趋势：24h / 7d / 30d

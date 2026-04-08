@@ -7,7 +7,7 @@ from backend.database import get_session
 from backend.models import User
 from backend.core.security import SECRET_KEY, ALGORITHM
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)) -> User:

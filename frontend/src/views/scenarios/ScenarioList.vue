@@ -253,7 +253,7 @@ const handleReport = (row) => {
     
     if (row.last_report_id) {
         // Legacy: Open static HTML report
-        const url = `/api/reports/${row.last_report_id}`
+        const url = api.getReportAssetUrl(row.last_report_id)
         window.open(url, '_blank')
         return
     }
