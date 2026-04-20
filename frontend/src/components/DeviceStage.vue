@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, onBeforeUnmount, onDeactivated, onActivated, watch } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { ElMessage } from 'element-plus'
@@ -957,7 +957,7 @@ const getOverlayStyle = () => {
 // Fetch device dump
 const fetchDump = async () => {
   clearQuickImagePrompt()
-  if (!selectedSerial.value) {
+  if (!isStageActive || !selectedSerial.value) {
     screenshot.value = ''
     hierarchyXml.value = ''
     hierarchyHash.value = ''
@@ -970,16 +970,23 @@ const fetchDump = async () => {
     return
   }
   loading.value = true
+  const { signal, release } = createDumpRequestSignal()
   try {
     const res = await api.getDeviceDump(selectedSerial.value, {
       includeScreenshot: true,
       includeHierarchy: true,
-      includeDeviceInfo: shouldRequestDeviceInfo()
+      includeDeviceInfo: shouldRequestDeviceInfo(),
+      signal
     })
+    if (!isStageActive) return
     updateStateFromDump(res.data)
   } catch (err) {
-    ElMessage.error('获取设备状态失败: ' + (err.response?.data?.detail || err.message))
+    if (!isAbortError(err)) {
+      ElMessage.error('获取设备状态失败: ' + (err.response?.data?.detail || err.message))
+    }
   } finally {
+    release()
+    if (!isStageActive) return
     loading.value = false
   }
 }
@@ -988,11 +995,14 @@ const fetchDump = async () => {
 
 // 获取设备列表
 const fetchDevices = async () => {
+  if (!isStageActive) return
   try {
     const [deviceRes, streamRes] = await Promise.all([
       api.getDeviceList().catch(() => ({ data: [] })),
       api.getDevices().catch(() => ({ data: [] }))
     ])
+
+    if (!isStageActive) return
 
     connectedDevices.value = Array.isArray(deviceRes.data) ? deviceRes.data : []
     streamDevices.value = Array.isArray(streamRes.data) ? streamRes.data : []
@@ -1017,6 +1027,40 @@ let liveStreamPollTimer = null
 let livePreviewPollTimer = null
 let iosLivePreviewLightDumpCount = 0
 let livePreviewBoostUntil = 0
+let isStageActive = true
+const activeDumpControllers = new Set()
+
+const isAbortError = (err) => {
+  return err?.name === 'CanceledError'
+    || err?.code === 'ERR_CANCELED'
+    || err?.name === 'AbortError'
+}
+
+const createDumpRequestSignal = () => {
+  if (!isStageActive || typeof AbortController === 'undefined') {
+    return { signal: undefined, release: () => {} }
+  }
+
+  const controller = new AbortController()
+  activeDumpControllers.add(controller)
+  return {
+    signal: controller.signal,
+    release: () => {
+      activeDumpControllers.delete(controller)
+    }
+  }
+}
+
+const cancelActiveDumpRequests = () => {
+  activeDumpControllers.forEach((controller) => controller.abort())
+  activeDumpControllers.clear()
+}
+
+const teardownStagePolling = () => {
+  stopLiveStreamPolling()
+  stopLivePreviewPolling()
+  cancelActiveDumpRequests()
+}
 
 const shouldRequestDeviceInfo = () => {
   return !deviceInfo.value || String(deviceInfo.value?.serial || '') !== String(selectedSerial.value || '')
@@ -1052,8 +1096,9 @@ const getLiveDumpOptions = ({ forceHierarchy = false } = {}) => {
 }
 
 const startLiveStreamPolling = () => {
-  if (liveStreamPollTimer) return
+  if (!isStageActive || liveStreamPollTimer) return
   liveStreamPollTimer = setInterval(() => {
+    if (!isStageActive) return
     fetchDevices()
   }, 2000)
 }
@@ -1095,11 +1140,11 @@ const clearLivePreviewPollTimer = () => {
 }
 
 const startLivePreviewPolling = ({ immediate = false } = {}) => {
-  if (!shouldPollLivePreview.value || livePreviewPollTimer) return
+  if (!isStageActive || !shouldPollLivePreview.value || livePreviewPollTimer) return
   const delay = immediate ? 0 : getLivePreviewPollInterval()
   livePreviewPollTimer = setTimeout(async () => {
     livePreviewPollTimer = null
-    if (!shouldPollLivePreview.value) return
+    if (!isStageActive || !shouldPollLivePreview.value) return
     if (!shouldPauseLivePreviewPolling.value) {
       await fetchLiveHierarchy()
     }
@@ -1248,7 +1293,7 @@ const selectedDeviceScreenSize = computed(() => parseResolution(selectedDevice.v
 
 // 投屏模式下获取 UI 层级（用于元素高亮）
 const fetchLiveHierarchy = async ({ showLoading = false, forceHierarchy = false } = {}) => {
-  if (!selectedSerial.value) {
+  if (!isStageActive || !selectedSerial.value) {
     liveHierarchyStatus.value = 'idle'
     liveHierarchyError.value = ''
     return
@@ -1263,8 +1308,13 @@ const fetchLiveHierarchy = async ({ showLoading = false, forceHierarchy = false 
   if (showLoading) {
     loading.value = true
   }
+  const { signal, release } = createDumpRequestSignal()
   try {
-    const res = await api.getDeviceDump(selectedSerial.value, dumpOptions)
+    const res = await api.getDeviceDump(selectedSerial.value, {
+      ...dumpOptions,
+      signal
+    })
+    if (!isStageActive) return
     updateStateFromDump(res.data)
     if (hierarchyRequested) {
       if (res?.data?.hierarchy_xml) {
@@ -1274,9 +1324,13 @@ const fetchLiveHierarchy = async ({ showLoading = false, forceHierarchy = false 
       }
     }
   } catch (err) {
-    console.warn('获取投屏层级失败:', err.response?.data?.detail || err.message)
-    markLiveHierarchyStale(err.response?.data?.detail || err.message)
+    if (!isAbortError(err)) {
+      console.warn('获取投屏层级失败:', err.response?.data?.detail || err.message)
+      markLiveHierarchyStale(err.response?.data?.detail || err.message)
+    }
   } finally {
+    release()
+    if (!isStageActive) return
     liveHierarchyLoading.value = false
     if (showLoading) {
       loading.value = false
@@ -1352,15 +1406,30 @@ const onScrcpyTouch = async ({ x, y, relX, relY }) => {
 }
 
 onMounted(async () => {
+  isStageActive = true
   await fetchDevices()
-  if (selectedSerial.value) {
+  if (isStageActive && selectedSerial.value) {
     fetchDump()
   }
 })
 
+onActivated(() => {
+  isStageActive = true
+  syncLivePreviewPolling({ immediate: Boolean(liveMode.value && selectedSerial.value) })
+})
+
+onBeforeUnmount(() => {
+  isStageActive = false
+  teardownStagePolling()
+})
+
+onDeactivated(() => {
+  isStageActive = false
+  teardownStagePolling()
+})
+
 onUnmounted(() => {
-  stopLiveStreamPolling()
-  stopLivePreviewPolling()
+  teardownStagePolling()
 })
 
 const updateStateFromDump = (dump) => {
