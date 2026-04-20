@@ -108,6 +108,7 @@ export default {
 
     // Device
     getDeviceDump(serial, options = {}) {
+        const signal = options?.signal
         const params = {}
         if (serial) params.serial = serial
         if (Object.prototype.hasOwnProperty.call(options, 'includeDeviceInfo')) {
@@ -119,7 +120,11 @@ export default {
         if (Object.prototype.hasOwnProperty.call(options, 'includeScreenshot')) {
             params.include_screenshot = options.includeScreenshot
         }
-        return api.get('/device/dump', { params })
+        const requestConfig = { params }
+        if (signal) {
+            requestConfig.signal = signal
+        }
+        return api.get('/device/dump', requestConfig)
     },
     inspectDevice(x, y, serial) {
         const query = serial ? `&serial=${serial}` : ''
