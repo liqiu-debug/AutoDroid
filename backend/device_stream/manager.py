@@ -30,6 +30,11 @@ DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar"
 # 端口分配范围
 PORT_RANGE_START = 27183
 PORT_RANGE_END = 27283
+SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
+SCRCPY_POINTER_ID_GENERIC_FINGER = -2
+ANDROID_MOTION_EVENT_ACTION_DOWN = 0
+ANDROID_MOTION_EVENT_ACTION_UP = 1
+ANDROID_MOTION_EVENT_ACTION_MOVE = 2
 
 
 class DeviceInfo:
@@ -54,6 +59,7 @@ class DeviceInfo:
         self.sps_pps_packets: List[bytes] = [] # 缓存 SPS/PPS 用于新连接初始化
         self.last_keyframe_packet: Optional[bytes] = None # 缓存最近 IDR，用于新连接首帧初始化
         self.recorder: Optional[RollingScrcpyRecorderSession] = None
+        self.control_lock = threading.Lock()
 
 
 def _collect_h264_nal_types(data: bytes) -> Set[int]:
@@ -128,6 +134,85 @@ def _get_h264_init_packets(dev_info: DeviceInfo) -> List[bytes]:
         packets.append(dev_info.last_keyframe_packet)
 
     return packets
+
+
+def _offer_video_packet(
+    client_queue: queue.Queue,
+    data: bytes,
+    nal_types: Set[int],
+    init_packets: Optional[List[bytes]] = None,
+) -> bool:
+    """
+    将视频包放入客户端队列。
+
+    队列拥塞时：
+    - 非同步包（普通 P/B 帧）直接丢弃，避免把半截 GOP 塞给解码器导致花屏
+    - SPS/PPS/IDR 到来时，清空旧队列，仅保留最新的解码初始化序列
+    """
+    if not data:
+        return False
+
+    try:
+        client_queue.put_nowait(data)
+        return True
+    except queue.Full:
+        pass
+
+    is_sync_packet = any(nal_type in nal_types for nal_type in (5, 7, 8))
+    if not is_sync_packet:
+        return False
+
+    try:
+        while True:
+            client_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    packets = [packet for packet in (init_packets or []) if packet]
+    if data not in packets:
+        packets.append(data)
+
+    maxsize = int(getattr(client_queue, "maxsize", 0) or 0)
+    if maxsize > 0 and len(packets) > maxsize:
+        packets = packets[-maxsize:]
+
+    for packet in packets:
+        try:
+            client_queue.put_nowait(packet)
+        except queue.Full:
+            return False
+
+    return True
+
+
+def _build_touch_control_packet(
+    action: int,
+    x: int,
+    y: int,
+    screen_width: int,
+    screen_height: int,
+    *,
+    pointer_id: int = SCRCPY_POINTER_ID_GENERIC_FINGER,
+    pressure: float = 1.0,
+    action_button: int = 0,
+    buttons: int = 0,
+) -> bytes:
+    safe_pressure = max(0.0, min(1.0, float(pressure)))
+    pressure_u16 = int(round(safe_pressure * 0xFFFF))
+    return b"".join(
+        [
+            struct.pack(">B", SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT),
+            struct.pack(">B", int(action)),
+            struct.pack(">q", int(pointer_id)),
+            struct.pack(">I", max(0, int(x))),
+            struct.pack(">I", max(0, int(y))),
+            struct.pack(">H", max(0, int(screen_width))),
+            struct.pack(">H", max(0, int(screen_height))),
+            struct.pack(">H", pressure_u16),
+            struct.pack(">I", int(action_button)),
+            struct.pack(">I", int(buttons)),
+        ]
+    )
 
 
 class ScrcpyDeviceManager:
@@ -259,7 +344,7 @@ class ScrcpyDeviceManager:
                 f"adb -s {serial} shell "
                 f"CLASSPATH=/data/local/tmp/scrcpy-server.jar "
                 f"app_process / com.genymobile.scrcpy.Server 3.3.4 "
-                f"log_level=info tunnel_forward=true video=true audio=false "
+                f"log_level=info tunnel_forward=true video=true control=true audio=false "
                 f"send_frame_meta=true "
                 f"max_size=1280 "
                 f"video_bit_rate=2000000"
@@ -506,17 +591,16 @@ class ScrcpyDeviceManager:
                 logger.info("缓存最近关键帧: serial=%s len=%s", dev_info.serial, len(data))
 
             queues = list(dev_info.input_queues)
+            init_packets = _get_h264_init_packets(dev_info) if any(nal_type in nal_types for nal_type in (5, 7, 8)) else None
             for q in queues:
-                if q.full():
-                    try:
-                        while not q.empty():
-                            q.get_nowait()
-                    except Exception as e:
-                        logger.debug("清空视频队列失败（忽略）: serial=%s error=%s", serial, e)
-                try:
-                    q.put_nowait(data)
-                except queue.Full:
-                    pass
+                offered = _offer_video_packet(q, data, nal_types, init_packets=init_packets)
+                if not offered and q.full():
+                    logger.debug(
+                        "丢弃非关键视频包以追赶实时画面: serial=%s nal_types=%s len=%s",
+                        dev_info.serial,
+                        sorted(nal_types),
+                        len(data),
+                    )
 
         def _reader_loop():
             serial = dev_info.serial
@@ -682,16 +766,74 @@ class ScrcpyDeviceManager:
         if not dev_info or not dev_info.ready:
             raise ValueError(f"设备 {serial} 未就绪")
 
-        # 通过 adb shell 发送 input 事件（简化版，不走 scrcpy control socket）
+        screen_width = max(1, int(dev_info.screen_width or 0))
+        screen_height = max(1, int(dev_info.screen_height or 0))
+        clamped_x = min(screen_width - 1, max(0, int(x)))
+        clamped_y = min(screen_height - 1, max(0, int(y)))
+
+        control_sock = dev_info.control_socket
+        if control_sock:
+            try:
+                with dev_info.control_lock:
+                    if action == ANDROID_MOTION_EVENT_ACTION_MOVE:
+                        control_sock.sendall(
+                            _build_touch_control_packet(
+                                ANDROID_MOTION_EVENT_ACTION_MOVE,
+                                clamped_x,
+                                clamped_y,
+                                screen_width,
+                                screen_height,
+                                pressure=1.0,
+                            )
+                        )
+                    elif action == ANDROID_MOTION_EVENT_ACTION_UP:
+                        control_sock.sendall(
+                            _build_touch_control_packet(
+                                ANDROID_MOTION_EVENT_ACTION_UP,
+                                clamped_x,
+                                clamped_y,
+                                screen_width,
+                                screen_height,
+                                pressure=0.0,
+                            )
+                        )
+                    else:
+                        control_sock.sendall(
+                            _build_touch_control_packet(
+                                ANDROID_MOTION_EVENT_ACTION_DOWN,
+                                clamped_x,
+                                clamped_y,
+                                screen_width,
+                                screen_height,
+                                pressure=1.0,
+                            )
+                        )
+                        control_sock.sendall(
+                            _build_touch_control_packet(
+                                ANDROID_MOTION_EVENT_ACTION_UP,
+                                clamped_x,
+                                clamped_y,
+                                screen_width,
+                                screen_height,
+                                pressure=0.0,
+                            )
+                        )
+                return
+            except Exception as exc:
+                logger.warning("scrcpy control socket 注入失败，降级 adb input: serial=%s error=%s", serial, exc)
+
+        # 兜底通过 adb shell 发送 input 事件
         try:
             adb = adbutils.AdbClient()
             device = adb.device(serial)
-            if action == 0:
+            if action == ANDROID_MOTION_EVENT_ACTION_MOVE:
+                # move 事件需要成对 down/move/up，这里仅保留 no-op 兜底，优先依赖 control socket。
+                return
+            if action == ANDROID_MOTION_EVENT_ACTION_UP:
+                return
+            if action == ANDROID_MOTION_EVENT_ACTION_DOWN:
                 # 按下+抬起 = tap
-                device.shell(f"input tap {x} {y}")
-            elif action == 2:
-                # 移动事件（swipe 需要起止坐标，这里只做 tap）
-                pass
+                device.shell(f"input tap {clamped_x} {clamped_y}")
         except Exception as e:
             logger.error(f"触控事件发送失败: {e}")
             raise

@@ -54,11 +54,15 @@ const status = ref('disconnected')
 const errorMsg = ref('')
 const fps = ref(0)
 const hoveredNode = ref(null)
+const LIVE_EDGE_CHECK_INTERVAL_MS = 500
+const LIVE_EDGE_MAX_LAG_SECONDS = 0.25
+const LIVE_EDGE_SEEK_OFFSET_SECONDS = 0.05
 
 let jmuxer = null
 let ws = null
 let frameCount = 0
 let fpsTimer = null
+let liveEdgeTimer = null
 
 // ==================== 状态计算 ====================
 
@@ -244,6 +248,7 @@ function connect() {
     status.value = 'connected'
     emit('connected')
     startFpsCounter()
+    startLiveEdgeSync()
   }
 
   ws.onmessage = (event) => {
@@ -258,6 +263,7 @@ function connect() {
   ws.onerror = () => {
     status.value = 'error'
     errorMsg.value = '连接异常'
+    stopLiveEdgeSync()
     emit('error', '连接异常')
   }
 
@@ -265,6 +271,7 @@ function connect() {
     status.value = 'disconnected'
     emit('disconnected')
     stopFpsCounter()
+    stopLiveEdgeSync()
 
     if (event.code === 4004) {
       errorMsg.value = event.reason || '设备未就绪'
@@ -275,6 +282,7 @@ function connect() {
 
 function disconnect() {
   stopFpsCounter()
+  stopLiveEdgeSync()
   if (ws) {
     ws.onclose = null
     ws.close()
@@ -308,6 +316,41 @@ function stopFpsCounter() {
     fpsTimer = null
   }
   fps.value = 0
+}
+
+function keepVideoNearLiveEdge() {
+  const video = videoRef.value
+  if (!video || status.value !== 'connected') return
+
+  try {
+    const buffered = video.buffered
+    if (!buffered || buffered.length === 0) return
+
+    const liveEdge = buffered.end(buffered.length - 1)
+    const currentTime = Number(video.currentTime || 0)
+    if (!Number.isFinite(liveEdge) || !Number.isFinite(currentTime)) return
+
+    const lag = liveEdge - currentTime
+    if (lag > LIVE_EDGE_MAX_LAG_SECONDS) {
+      video.currentTime = Math.max(0, liveEdge - LIVE_EDGE_SEEK_OFFSET_SECONDS)
+    }
+  } catch (err) {
+    console.debug('播放器追赶实时边界失败:', err)
+  }
+}
+
+function startLiveEdgeSync() {
+  if (liveEdgeTimer) return
+  liveEdgeTimer = setInterval(() => {
+    keepVideoNearLiveEdge()
+  }, LIVE_EDGE_CHECK_INTERVAL_MS)
+}
+
+function stopLiveEdgeSync() {
+  if (liveEdgeTimer) {
+    clearInterval(liveEdgeTimer)
+    liveEdgeTimer = null
+  }
 }
 
 // ==================== 触控事件 ====================
