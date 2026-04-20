@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import unittest
 from unittest.mock import Mock, patch
 
@@ -93,6 +94,26 @@ class DeviceRecordingHelperTests(unittest.TestCase):
             "screenshot": base64.b64encode(raw_png).decode("utf-8"),
         })
         device.dump_hierarchy.assert_not_called()
+
+    def test_build_device_dump_payload_adds_hierarchy_hash(self):
+        device = Mock()
+        device.dump_hierarchy.return_value = "<hierarchy><node text='hello' /></hierarchy>"
+
+        payload = _build_device_dump_payload(
+            device,
+            platform="android",
+            serial="android-1",
+            include_device_info=False,
+            include_hierarchy=True,
+            include_screenshot=False,
+        )
+
+        expected_xml = "<hierarchy><node text='hello' /></hierarchy>"
+        self.assertEqual(payload["hierarchy_xml"], expected_xml)
+        self.assertEqual(
+            payload["hierarchy_hash"],
+            hashlib.sha1(expected_xml.encode("utf-8")).hexdigest(),
+        )
 
 
 if __name__ == "__main__":

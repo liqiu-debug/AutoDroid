@@ -254,18 +254,30 @@ const generateStepsFromAI = async () => {
 }
 // 全局变量引用
 const globalVarKeys = ref([])
-const fetchGlobalVarKeys = async () => {
+const normalizeEnvId = (value) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+const fetchGlobalVarKeys = async (envId = props.envId) => {
+  const normalizedEnvId = normalizeEnvId(envId)
+  if (!normalizedEnvId) {
+    globalVarKeys.value = []
+    return
+  }
+
   try {
-    const { data: envs } = await apiClient.getEnvironments()
-    const allKeys = []
-    for (const env of envs) {
-      const { data: vars } = await apiClient.getVariables(env.id)
-      for (const v of vars) {
-        if (!allKeys.includes(v.key)) allKeys.push(v.key)
-      }
-    }
-    globalVarKeys.value = allKeys
-  } catch { /* ignore */ }
+    const { data: vars } = await apiClient.getVariables(normalizedEnvId)
+    globalVarKeys.value = Array.from(
+      new Set(
+        (Array.isArray(vars) ? vars : [])
+          .map((item) => String(item?.key || '').trim())
+          .filter(Boolean)
+      )
+    )
+  } catch {
+    globalVarKeys.value = []
+  }
 }
 
 const appendVariable = (step, field, key, sourceStep = null) => {
@@ -290,6 +302,13 @@ onMounted(() => {
     ensureCrossPlatformConfig(step)
   })
 })
+
+watch(
+  () => props.envId,
+  (envId) => {
+    fetchGlobalVarKeys(envId)
+  }
+)
 
 watch(
   () => currentCase.value.steps,

@@ -12,6 +12,7 @@ import os
 import io
 import time
 import base64
+import hashlib
 import logging
 import threading
 from pathlib import Path
@@ -574,6 +575,14 @@ def _get_device_info_payload(device, platform: str, serial: Optional[str]) -> Di
     return device.info
 
 
+def _build_hierarchy_payload(device, platform: str) -> Dict[str, str]:
+    hierarchy_xml = _get_device_hierarchy_xml(device, platform=platform)
+    payload = {"hierarchy_xml": hierarchy_xml}
+    if hierarchy_xml:
+        payload["hierarchy_hash"] = hashlib.sha1(hierarchy_xml.encode("utf-8")).hexdigest()
+    return payload
+
+
 def _build_device_dump_payload(
     device,
     platform: str,
@@ -586,7 +595,7 @@ def _build_device_dump_payload(
     if include_device_info:
         payload["device_info"] = _get_device_info_payload(device, platform=platform, serial=serial)
     if include_hierarchy:
-        payload["hierarchy_xml"] = _get_device_hierarchy_xml(device, platform=platform)
+        payload.update(_build_hierarchy_payload(device, platform=platform))
     if include_screenshot:
         payload["screenshot"] = _take_screenshot_base64(device)
     return payload

@@ -33,13 +33,22 @@ const selectedRecordingDevice = computed(() =>
 const selectedRecordingPlatform = computed(() =>
   String(selectedRecordingDevice.value?.platform || 'android').toLowerCase()
 )
+const isSelectedDeviceBusy = computed(() =>
+  String(selectedRecordingDevice.value?.status || '').toUpperCase() === 'BUSY'
+)
 const isIosLivePreview = computed(() =>
   Boolean(liveMode.value && selectedSerial.value && selectedRecordingPlatform.value === 'ios')
 )
 const previewMode = computed({
   get: () => (liveMode.value ? 'live' : 'static'),
   set: (value) => {
-    liveMode.value = value === 'live'
+    const nextLiveMode = value === 'live'
+    if (!nextLiveMode && isSelectedDeviceBusy.value) {
+      ElMessage.warning('当前设备执行中，仅支持实时只读观察')
+      liveMode.value = true
+      return
+    }
+    liveMode.value = nextLiveMode
   }
 })
 const interactionMode = computed({
@@ -53,6 +62,10 @@ const selectedStreamDevice = computed(() =>
 )
 const isSelectedStreamReady = computed(() => Boolean(selectedStreamDevice.value?.ready))
 const selectedStreamError = computed(() => String(selectedStreamDevice.value?.error || '').trim())
+const hierarchyHash = ref('')
+const liveHierarchyStatus = ref('idle')
+const liveHierarchyError = ref('')
+const liveHierarchyLastUpdatedAt = ref(0)
 
 
 
@@ -79,9 +92,23 @@ const skipNextStaticDump = ref(false)
 
 const QUICK_IMAGE_PROMPT_WIDTH = 248
 const QUICK_IMAGE_HINT_KEYWORDS = ['无 Desc/Text', '图像点击', '未识别到可录制元素']
+const IOS_LIVE_PREVIEW_POLL_MS = 900
+const ANDROID_LIVE_PREVIEW_POLL_IDLE_MS = 700
+const ANDROID_LIVE_PREVIEW_POLL_ACTIVE_MS = 300
+const LIVE_PREVIEW_BUSY_POLL_MS = 1800
+const LIVE_PREVIEW_POLL_ACTIVE_WINDOW_MS = 2500
 
 const getErrorDetail = (err, fallback = '操作失败') => {
   return err?.response?.data?.detail || err?.message || fallback
+}
+
+const canObserveDeviceInCurrentMode = (device) => {
+  const status = String(device?.status || '').trim().toUpperCase()
+  if (!status) return false
+  if (liveMode.value) {
+    return status !== 'OFFLINE' && status !== 'WDA_DOWN'
+  }
+  return status === 'IDLE'
 }
 
 const isQuickImageSuggestedError = (err) => {
@@ -737,6 +764,11 @@ function ensureInteractionReady(actionLabel = '录制') {
     return false
   }
 
+  if (String(device.status || '').toUpperCase() === 'BUSY') {
+    ElMessage.warning(`当前设备正在执行任务，暂不支持${actionLabel}，可继续观察实时投屏`)
+    return false
+  }
+
   if (device.status !== 'IDLE') {
     ElMessage.warning(`当前设备不可用于${actionLabel}（${statusLabel(device.status)}）`)
     return false
@@ -928,9 +960,13 @@ const fetchDump = async () => {
   if (!selectedSerial.value) {
     screenshot.value = ''
     hierarchyXml.value = ''
+    hierarchyHash.value = ''
     deviceInfo.value = null
     nodes.value = []
     liveNodes.value = []
+    liveHierarchyStatus.value = 'idle'
+    liveHierarchyError.value = ''
+    liveHierarchyLastUpdatedAt.value = 0
     return
   }
   loading.value = true
@@ -962,12 +998,15 @@ const fetchDevices = async () => {
     streamDevices.value = Array.isArray(streamRes.data) ? streamRes.data : []
 
     const idleDevice = recordingDevices.value.find(d => d.status === 'IDLE')
+    const fallbackDevice = liveMode.value
+      ? (idleDevice || recordingDevices.value.find(d => canObserveDeviceInCurrentMode(d)))
+      : idleDevice
     const selectedValid = recordingDevices.value.some(
-      d => d.serial === selectedSerial.value && d.status === 'IDLE'
+      d => d.serial === selectedSerial.value
     )
 
     if (!selectedValid) {
-      selectedSerial.value = idleDevice ? idleDevice.serial : ''
+      selectedSerial.value = fallbackDevice ? fallbackDevice.serial : ''
     }
   } catch (err) {
     console.error('获取设备列表失败:', err)
@@ -977,6 +1016,7 @@ const fetchDevices = async () => {
 let liveStreamPollTimer = null
 let livePreviewPollTimer = null
 let iosLivePreviewLightDumpCount = 0
+let livePreviewBoostUntil = 0
 
 const shouldRequestDeviceInfo = () => {
   return !deviceInfo.value || String(deviceInfo.value?.serial || '') !== String(selectedSerial.value || '')
@@ -985,7 +1025,7 @@ const shouldRequestDeviceInfo = () => {
 const getLiveDumpOptions = ({ forceHierarchy = false } = {}) => {
   if (!isIosLivePreview.value) {
     return {
-      includeScreenshot: true,
+      includeScreenshot: false,
       includeHierarchy: true,
       includeDeviceInfo: shouldRequestDeviceInfo()
     }
@@ -1034,28 +1074,64 @@ const shouldPauseLivePreviewPolling = computed(() => {
   )
 })
 
-const startLivePreviewPolling = () => {
-  if (livePreviewPollTimer) return
-  livePreviewPollTimer = setInterval(() => {
-    if (!liveMode.value || !isIosLivePreview.value || !selectedSerial.value || shouldPauseLivePreviewPolling.value) {
-      return
-    }
-    fetchLiveHierarchy()
-  }, 900)
+const shouldPollLivePreview = computed(() => {
+  if (!liveMode.value || !selectedSerial.value) return false
+  if (isIosLivePreview.value) return true
+  return isSelectedStreamReady.value
+})
+
+const getLivePreviewPollInterval = () => {
+  if (isSelectedDeviceBusy.value) return LIVE_PREVIEW_BUSY_POLL_MS
+  if (isIosLivePreview.value) return IOS_LIVE_PREVIEW_POLL_MS
+  return Date.now() < livePreviewBoostUntil
+    ? ANDROID_LIVE_PREVIEW_POLL_ACTIVE_MS
+    : ANDROID_LIVE_PREVIEW_POLL_IDLE_MS
 }
 
-const stopLivePreviewPolling = () => {
+const clearLivePreviewPollTimer = () => {
   if (!livePreviewPollTimer) return
-  clearInterval(livePreviewPollTimer)
+  clearTimeout(livePreviewPollTimer)
   livePreviewPollTimer = null
 }
 
-const syncLivePreviewPolling = () => {
-  if (liveMode.value && isIosLivePreview.value && selectedSerial.value) {
+const startLivePreviewPolling = ({ immediate = false } = {}) => {
+  if (!shouldPollLivePreview.value || livePreviewPollTimer) return
+  const delay = immediate ? 0 : getLivePreviewPollInterval()
+  livePreviewPollTimer = setTimeout(async () => {
+    livePreviewPollTimer = null
+    if (!shouldPollLivePreview.value) return
+    if (!shouldPauseLivePreviewPolling.value) {
+      await fetchLiveHierarchy()
+    }
     startLivePreviewPolling()
-    return
-  }
+  }, delay)
+}
+
+const stopLivePreviewPolling = () => {
+  clearLivePreviewPollTimer()
+}
+
+const syncLivePreviewPolling = ({ immediate = false } = {}) => {
   stopLivePreviewPolling()
+  if (shouldPollLivePreview.value) {
+    startLivePreviewPolling({ immediate })
+  }
+}
+
+const bumpLivePreviewPollingBoost = (durationMs = LIVE_PREVIEW_POLL_ACTIVE_WINDOW_MS) => {
+  livePreviewBoostUntil = Math.max(livePreviewBoostUntil, Date.now() + durationMs)
+  syncLivePreviewPolling({ immediate: true })
+}
+
+const markLiveHierarchyFresh = () => {
+  liveHierarchyStatus.value = 'fresh'
+  liveHierarchyError.value = ''
+  liveHierarchyLastUpdatedAt.value = Date.now()
+}
+
+const markLiveHierarchyStale = (errorMessage = '') => {
+  liveHierarchyStatus.value = 'stale'
+  liveHierarchyError.value = String(errorMessage || '').trim()
 }
 
 // 当选择设备变化时,根据当前模式刷新
@@ -1063,9 +1139,20 @@ const onDeviceChange = async () => {
   // 先刷新设备列表,获取最新状态
   clearQuickImagePrompt()
   cancelQuickImageCapture()
+  hierarchyXml.value = ''
+  hierarchyHash.value = ''
+  nodes.value = []
+  liveNodes.value = []
+  liveHierarchyStatus.value = 'idle'
+  liveHierarchyError.value = ''
+  liveHierarchyLastUpdatedAt.value = 0
   await fetchDevices()
 
   if (!selectedSerial.value) {
+    livePreviewBoostUntil = 0
+    hierarchyXml.value = ''
+    hierarchyHash.value = ''
+    liveNodes.value = []
     return
   }
   
@@ -1073,6 +1160,7 @@ const onDeviceChange = async () => {
   if (liveMode.value) {
     if (isIosLivePreview.value || isSelectedStreamReady.value) {
       iosLivePreviewLightDumpCount = 0
+      liveHierarchyStatus.value = 'syncing'
       fetchLiveHierarchy({ forceHierarchy: true })
     } else {
       liveNodes.value = []
@@ -1080,7 +1168,7 @@ const onDeviceChange = async () => {
   } else {
     fetchDump()
   }
-  syncLivePreviewPolling()
+  syncLivePreviewPolling({ immediate: Boolean(liveMode.value && selectedSerial.value) })
 }
 
 // 切换到投屏模式时自动获取设备列表和层级
@@ -1088,10 +1176,15 @@ watch(liveMode, async (val) => {
   clearQuickImagePrompt()
   cancelQuickImageCapture()
   if (val) {
+    liveHierarchyStatus.value = 'idle'
+    liveHierarchyError.value = ''
+    liveHierarchyLastUpdatedAt.value = 0
     await fetchDevices()
     startLiveStreamPolling()
     if (selectedSerial.value && (isIosLivePreview.value || isSelectedStreamReady.value)) {
       iosLivePreviewLightDumpCount = 0
+      liveHierarchyStatus.value = 'syncing'
+      bumpLivePreviewPollingBoost()
       fetchLiveHierarchy({ forceHierarchy: true })
     } else {
       liveNodes.value = []
@@ -1099,22 +1192,30 @@ watch(liveMode, async (val) => {
   } else {
     stopLiveStreamPolling()
     stopLivePreviewPolling()
+    livePreviewBoostUntil = 0
     if (skipNextStaticDump.value) {
       skipNextStaticDump.value = false
     } else if (selectedSerial.value) {
       fetchDump()
     }
+    liveHierarchyStatus.value = 'idle'
+    liveHierarchyError.value = ''
+    liveHierarchyLastUpdatedAt.value = 0
   }
-  syncLivePreviewPolling()
+  syncLivePreviewPolling({ immediate: Boolean(val && selectedSerial.value) })
 })
 
 watch(isSelectedStreamReady, (ready) => {
   if (!liveMode.value || isIosLivePreview.value) return
   if (ready && selectedSerial.value) {
+    liveHierarchyStatus.value = 'syncing'
+    bumpLivePreviewPollingBoost()
     fetchLiveHierarchy({ forceHierarchy: true })
   } else if (!ready) {
-    liveNodes.value = []
+    liveHierarchyStatus.value = 'stale'
+    liveHierarchyError.value = selectedStreamError.value || '投屏通道未就绪'
   }
+  syncLivePreviewPolling({ immediate: ready })
 })
 
 watch(
@@ -1122,9 +1223,10 @@ watch(
   ([isLive, serial, platform]) => {
     if (isLive && serial && platform === 'ios') {
       iosLivePreviewLightDumpCount = 0
+      liveHierarchyStatus.value = 'syncing'
       fetchLiveHierarchy({ forceHierarchy: true })
     }
-    syncLivePreviewPolling()
+    syncLivePreviewPolling({ immediate: Boolean(isLive && serial) })
   }
 )
 
@@ -1147,20 +1249,33 @@ const selectedDeviceScreenSize = computed(() => parseResolution(selectedDevice.v
 // 投屏模式下获取 UI 层级（用于元素高亮）
 const fetchLiveHierarchy = async ({ showLoading = false, forceHierarchy = false } = {}) => {
   if (!selectedSerial.value) {
-    liveNodes.value = []
+    liveHierarchyStatus.value = 'idle'
+    liveHierarchyError.value = ''
     return
   }
   if (liveHierarchyLoading.value) return
+  const dumpOptions = getLiveDumpOptions({ forceHierarchy })
+  const hierarchyRequested = Boolean(dumpOptions.includeHierarchy)
+  if (hierarchyRequested) {
+    liveHierarchyStatus.value = 'syncing'
+  }
   liveHierarchyLoading.value = true
   if (showLoading) {
     loading.value = true
   }
   try {
-    const res = await api.getDeviceDump(selectedSerial.value, getLiveDumpOptions({ forceHierarchy }))
+    const res = await api.getDeviceDump(selectedSerial.value, dumpOptions)
     updateStateFromDump(res.data)
+    if (hierarchyRequested) {
+      if (res?.data?.hierarchy_xml) {
+        markLiveHierarchyFresh()
+      } else {
+        markLiveHierarchyStale('层级结果为空')
+      }
+    }
   } catch (err) {
     console.warn('获取投屏层级失败:', err.response?.data?.detail || err.message)
-    liveNodes.value = []
+    markLiveHierarchyStale(err.response?.data?.detail || err.message)
   } finally {
     liveHierarchyLoading.value = false
     if (showLoading) {
@@ -1177,15 +1292,15 @@ const onScrcpyTouch = async ({ x, y, relX, relY }) => {
   clearQuickImagePrompt()
 
   if (!syncMode.value) {
-    loading.value = true
     try {
-      await executeRawTapAndRefresh(x, y)
+      await api.sendTouch(selectedSerial.value, 0, x, y)
+      liveHierarchyStatus.value = 'syncing'
+      liveHierarchyError.value = ''
+      bumpLivePreviewPollingBoost()
       ElMessage.success('操作成功')
     } catch (err) {
       console.error('实时投屏交互失败:', err)
       ElMessage.error(getErrorDetail(err, '交互失败'))
-    } finally {
-      loading.value = false
     }
     return
   }
@@ -1215,6 +1330,8 @@ const onScrcpyTouch = async ({ x, y, relX, relY }) => {
       ElMessage.success('操作成功并添加步骤')
     }
     updateStateFromDump(res.data.dump)
+    markLiveHierarchyFresh()
+    bumpLivePreviewPollingBoost()
   } catch (err) {
     if (fallbackNode && isQuickImageSuggestedError(err)) {
       showLiveQuickImagePrompt({
@@ -1255,10 +1372,22 @@ const updateStateFromDump = (dump) => {
     deviceInfo.value = dump.device_info
   }
   if (dump.hierarchy_xml) {
-    hierarchyXml.value = dump.hierarchy_xml
-    const parsedNodes = parseHierarchy(hierarchyXml.value, deviceInfo.value)
-    nodes.value = parsedNodes
-    liveNodes.value = parsedNodes
+    const nextHierarchyXml = String(dump.hierarchy_xml || '')
+    const nextHierarchyHash = String(dump.hierarchy_hash || '').trim()
+    const shouldReparse = Boolean(
+      !nextHierarchyHash
+      || nextHierarchyHash !== hierarchyHash.value
+      || nextHierarchyXml !== hierarchyXml.value
+    )
+
+    hierarchyXml.value = nextHierarchyXml
+    hierarchyHash.value = nextHierarchyHash
+
+    if (shouldReparse) {
+      const parsedNodes = parseHierarchy(nextHierarchyXml, dump.device_info || deviceInfo.value)
+      nodes.value = parsedNodes
+      liveNodes.value = parsedNodes
+    }
   }
 }
 
@@ -1306,7 +1435,7 @@ defineExpose({
             :key="d.serial"
             :label="d.custom_name || d.market_name || d.model || d.serial"
             :value="d.serial"
-            :disabled="d.status !== 'IDLE'"
+            :disabled="!canObserveDeviceInCurrentMode(d)"
           >
             <div class="device-option-row">
               <span class="device-option-name">{{ d.custom_name || d.market_name || d.model || d.serial }}</span>
@@ -1319,8 +1448,8 @@ defineExpose({
       </div>
       <div class="toolbar-right">
         <slot name="before-refresh"></slot>
-        <el-button v-if="liveMode" :icon="Refresh" @click="fetchLiveHierarchy({ showLoading: true, forceHierarchy: true })" :loading="loading" :disabled="!selectedSerial">刷新层级</el-button>
-        <el-button v-if="!liveMode" :icon="Refresh" @click="fetchDump" :loading="loading" :disabled="!selectedSerial">刷新</el-button>
+        <el-button v-if="liveMode" :icon="Refresh" @click="fetchLiveHierarchy({ showLoading: true, forceHierarchy: true })" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">刷新层级</el-button>
+        <el-button v-if="!liveMode" :icon="Refresh" @click="fetchDump" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">刷新</el-button>
       </div>
     </div>
 
@@ -1334,7 +1463,7 @@ defineExpose({
       </div>
       <div class="mode-group">
         <span class="mode-group-label">交互方式</span>
-        <el-radio-group v-model="interactionMode" size="small" class="mode-segmented">
+        <el-radio-group v-model="interactionMode" size="small" class="mode-segmented" :disabled="isSelectedDeviceBusy">
           <el-radio-button label="explore">探索模式</el-radio-button>
           <el-radio-button label="record">录制模式</el-radio-button>
         </el-radio-group>

@@ -42,7 +42,7 @@ def get_device(serial: str):
 
 class TouchEvent(BaseModel):
     """触控事件请求体"""
-    action: int = 0  # 0=按下(tap), 1=抬起, 2=移动
+    action: int = 0  # 兼容语义：0=tap, 1=抬起, 2=移动
     x: int
     y: int
 
