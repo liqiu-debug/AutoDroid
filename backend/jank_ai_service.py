@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from backend.api.log_analysis import _get_setting
+from backend.openai_compat import parse_chat_completion_payload
 
 logger = logging.getLogger(__name__)
 
@@ -250,10 +251,12 @@ async def summarize_jank_analysis(
         ],
         "temperature": 0.2,
         "max_tokens": 1800,
+        "stream": False,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
     try:
@@ -267,7 +270,7 @@ async def summarize_jank_analysis(
                     detail=f"AI 服务返回错误 (HTTP {resp.status_code}): {raw_text[:300]}",
                 )
 
-            data = resp.json()
+            data = parse_chat_completion_payload(raw_text)
             if "choices" not in data or not data["choices"]:
                 raise HTTPException(status_code=502, detail="AI 服务返回格式异常（缺少 choices）。")
 

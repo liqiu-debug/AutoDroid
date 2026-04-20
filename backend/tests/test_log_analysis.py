@@ -1,8 +1,14 @@
+import json
 import unittest
 from typing import List
 from unittest.mock import AsyncMock, patch
 
-from backend.api.log_analysis import _analysis_cache, analyze_log, clean_log_for_ai
+from backend.api.log_analysis import (
+    _analysis_cache,
+    analyze_log,
+    call_llm_service,
+    clean_log_for_ai,
+)
 from backend.schemas import LogAnalysisRequest
 
 
@@ -123,6 +129,58 @@ class AnalyzeLogApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third.analysis_result, "second")
 
         self.assertEqual(llm_mock.await_count, 2)
+
+    async def test_call_llm_service_accepts_sse_response(self):
+        class _FakeStreamingResponse:
+            status_code = 200
+            text = "\n".join(
+                [
+                    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"定位到"}}]}',
+                    'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"主线程阻塞"}}],"usage":{"total_tokens":56}}',
+                    "data: [DONE]",
+                ]
+            )
+
+            def json(self):
+                raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+        class _FakeStreamingAsyncClient:
+            last_json = None
+            last_headers = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                type(self).last_json = json
+                type(self).last_headers = headers
+                return _FakeStreamingResponse()
+
+        with patch(
+            "backend.api.log_analysis._get_setting",
+            side_effect=["test-key", "https://api.openai.com/v1", "gpt-4o-mini"],
+        ), patch("httpx.AsyncClient", _FakeStreamingAsyncClient):
+            result = await call_llm_service(
+                cleaned_log=CRASH_LOG,
+                package_name=PACKAGE_NAME,
+                device_info="device-1",
+                session=object(),
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["analysis_result"], "定位到主线程阻塞")
+        self.assertEqual(result["token_usage"], 56)
+        self.assertFalse(_FakeStreamingAsyncClient.last_json["stream"])
+        self.assertEqual(
+            _FakeStreamingAsyncClient.last_headers["Accept"],
+            "application/json",
+        )
 
 
 if __name__ == "__main__":

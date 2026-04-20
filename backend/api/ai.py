@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from backend.schemas import ActionType, SelectorType, ErrorStrategy
 from backend.database import get_session
 from backend.api.log_analysis import _get_setting
+from backend.openai_compat import parse_chat_completion_payload
 from backend.step_contract import (
     SELECTOR_TYPE_TO_BY,
     normalize_action,
@@ -478,11 +479,13 @@ async def _call_llm_service(text: str, session: Session) -> str:
         ],
         "temperature": 0.3,
         "max_tokens": 3000,
+        "stream": False,
     }
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
     logger.info(f"LLM 请求: {request_url}, 模型: {model}")
@@ -507,7 +510,7 @@ async def _call_llm_service(text: str, session: Session) -> str:
                 return None
 
             try:
-                data = resp.json()
+                data = parse_chat_completion_payload(raw_text)
             except Exception as json_err:
                 logger.error(f"JSON 解析失败: {json_err}")
                 return None
