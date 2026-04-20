@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import wda
 
 from .base_driver import BaseDriver
+from backend.utils import evaluate_page_text_assertion
 from backend.utils.ocr_compat import create_paddle_ocr_engine, extract_ocr_text, iter_ocr_text_items, run_paddle_ocr
 
 logger = logging.getLogger(__name__)
@@ -1142,14 +1143,7 @@ class IOSDriver(BaseDriver):
                     if str(match).strip()
                 )
 
-        deduped: List[str] = []
-        seen = set()
-        for item in values:
-            if item in seen:
-                continue
-            seen.add(item)
-            deduped.append(item)
-        return deduped
+        return values
 
     # ------------------------------------------------------------------ #
     #  BaseDriver 接口实现
@@ -1475,7 +1469,10 @@ class IOSDriver(BaseDriver):
                 raise ValueError("assert_text expected_text 不能为空")
 
             candidates = self._collect_page_text_candidates()
-            matched = [candidate for candidate in candidates if expected in candidate]
+            evaluation = evaluate_page_text_assertion(candidates, expected)
+            matched = bool(evaluation.get("matched"))
+            preview = evaluation.get("preview") or candidates[:5]
+            match_source = evaluation.get("match_source") or ""
 
             if normalized_mode == "contains" and matched:
                 self._log_action_success(
@@ -1484,6 +1481,7 @@ class IOSDriver(BaseDriver):
                     expected_text=expected,
                     match_mode=normalized_mode,
                     candidates=len(candidates),
+                    match_source=match_source,
                 )
                 return
             if normalized_mode == "not_contains" and not matched:
@@ -1496,7 +1494,6 @@ class IOSDriver(BaseDriver):
                 )
                 return
 
-            preview = matched[:5] if matched else candidates[:5]
             final_exc = AssertionError(
                 f"断言失败: 期望页面{'不包含' if normalized_mode == 'not_contains' else '包含'} {expected!r}, 实际={preview!r}"
             )

@@ -83,6 +83,40 @@ class IOSDriverLocatorFallbackTests(unittest.TestCase):
 
         self.assertIn({"predicate": predicate}, session.calls)
 
+    def test_assert_text_matches_joined_page_text_when_target_sequence_appears_late(self):
+        driver = self._new_driver()
+        driver._collect_page_text_candidates = Mock(
+            return_value=["购物车", "订单", "购物车", "支付成功"]
+        )
+
+        with self.assertLogs("backend.drivers.ios_driver", level="INFO") as logs:
+            IOSDriver.assert_text(
+                driver,
+                expected_text="购物车支付成功",
+                match_mode="contains",
+            )
+
+        output = "\n".join(logs.output)
+        self.assertIn("iOS.assert_text success", output)
+        self.assertIn("match_source='page_joined'", output)
+
+    def test_assert_text_not_contains_fails_when_joined_page_text_matches_late_sequence(self):
+        driver = self._new_driver()
+        driver._collect_page_text_candidates = Mock(
+            return_value=["购物车", "订单", "购物车", "支付成功"]
+        )
+
+        with self.assertLogs("backend.drivers.ios_driver", level="WARNING") as logs:
+            with self.assertRaises(AssertionError) as context:
+                IOSDriver.assert_text(
+                    driver,
+                    expected_text="购物车支付成功",
+                    match_mode="not_contains",
+                )
+
+        self.assertIn("购物车订单购物车支付成功", str(context.exception))
+        self.assertIn("iOS.assert_text failed", "\n".join(logs.output))
+
     def test_get_element_id_falls_back_to_label_name_predicate(self):
         driver = self._new_driver()
         element = Mock()

@@ -15,3 +15,4 @@ if os.path.exists(_legacy_path):
     # 导出公开 API
     parse_bounds = _module.parse_bounds
     calculate_element_from_coordinates = _module.calculate_element_from_coordinates
+    evaluate_page_text_assertion = _module.evaluate_page_text_assertion

@@ -113,6 +113,28 @@ class LegacyRunnerInputTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
 
+    def test_assert_text_matches_joined_page_text_when_target_sequence_appears_late(self):
+        runner = TestRunner(device_serial="android-1")
+        runner.d = _FakeDevice(
+            page_xml=(
+                '<hierarchy>'
+                '<node text="购物车"/>'
+                '<node text="订单"/>'
+                '<node text="购物车"/>'
+                '<node text="支付成功"/>'
+                '</hierarchy>'
+            )
+        )
+        step = Step(
+            action=ActionType.ASSERT_TEXT,
+            value="购物车支付成功",
+            options={"match_mode": "contains"},
+        )
+
+        result = runner.execute_step(step, variables={})
+
+        self.assertTrue(result["success"])
+
     def test_assert_text_checks_page_global_not_contains(self):
         runner = TestRunner(device_serial="android-1")
         runner.d = _FakeDevice(
@@ -127,6 +149,29 @@ class LegacyRunnerInputTests(unittest.TestCase):
         result = runner.execute_step(step, variables={})
 
         self.assertTrue(result["success"])
+
+    def test_assert_text_not_contains_fails_when_joined_page_text_matches_late_sequence(self):
+        runner = TestRunner(device_serial="android-1")
+        runner.d = _FakeDevice(
+            page_xml=(
+                '<hierarchy>'
+                '<node text="购物车"/>'
+                '<node text="订单"/>'
+                '<node text="购物车"/>'
+                '<node text="支付成功"/>'
+                '</hierarchy>'
+            )
+        )
+        step = Step(
+            action=ActionType.ASSERT_TEXT,
+            value="购物车支付成功",
+            options={"match_mode": "not_contains"},
+        )
+
+        result = runner.execute_step(step, variables={})
+
+        self.assertFalse(result["success"])
+        self.assertIn("购物车订单购物车支付成功", result["error"])
 
     def test_assert_image_checks_exists(self):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:

@@ -80,6 +80,40 @@ class AndroidDriverLogTests(unittest.TestCase):
         driver.click.assert_called_once_with(selector="确定", by="text")
         driver._device.image.wait.assert_not_called()
 
+    def test_assert_text_matches_joined_page_text_when_target_sequence_appears_late(self):
+        driver = self._new_driver()
+        driver._collect_page_text_candidates = Mock(
+            return_value=["购物车", "订单", "购物车", "支付成功"]
+        )
+
+        with self.assertLogs("backend.drivers.android_driver", level="INFO") as logs:
+            AndroidDriver.assert_text(
+                driver,
+                expected_text="购物车支付成功",
+                match_mode="contains",
+            )
+
+        output = "\n".join(logs.output)
+        self.assertIn("Android.assert_text success", output)
+        self.assertIn("match_source='page_joined'", output)
+
+    def test_assert_text_not_contains_fails_when_joined_page_text_matches_late_sequence(self):
+        driver = self._new_driver()
+        driver._collect_page_text_candidates = Mock(
+            return_value=["购物车", "订单", "购物车", "支付成功"]
+        )
+
+        with self.assertLogs("backend.drivers.android_driver", level="WARNING") as logs:
+            with self.assertRaises(AssertionError) as context:
+                AndroidDriver.assert_text(
+                    driver,
+                    expected_text="购物车支付成功",
+                    match_mode="not_contains",
+                )
+
+        self.assertIn("购物车订单购物车支付成功", str(context.exception))
+        self.assertIn("Android.assert_text failed", "\n".join(logs.output))
+
     def test_click_image_uses_template_wait_and_click_point(self):
         driver = self._new_driver()
         driver._device.image = Mock()
