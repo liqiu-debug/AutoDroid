@@ -17,6 +17,7 @@ import numpy as np
 import cv2
 
 from .schemas import Step, ActionType, SelectorType, Variable
+from .utils import evaluate_page_text_assertion
 from .utils.ocr_compat import create_paddle_ocr_engine, extract_ocr_text, run_paddle_ocr
 from .utils.template_match import find_template_match, image_to_bgr, load_image_bgr
 
@@ -397,14 +398,7 @@ class TestRunner:
                     if str(match).strip()
                 )
 
-        deduped: List[str] = []
-        seen = set()
-        for item in values:
-            if item in seen:
-                continue
-            seen.add(item)
-            deduped.append(item)
-        return deduped
+        return values
 
     def _perform_action(
         self,
@@ -625,7 +619,9 @@ class TestRunner:
                 raise ValueError(f"assert_text 不支持的 match_mode: {match_mode}")
 
             candidates = self._collect_page_text_candidates()
-            matched = [candidate for candidate in candidates if expected_text in candidate]
+            evaluation = evaluate_page_text_assertion(candidates, expected_text)
+            matched = bool(evaluation.get("matched"))
+            preview = evaluation.get("preview") or candidates[:5]
 
             if match_mode == "contains" and matched:
                 logger.info(f"全局断言成功: 页面包含 '{expected_text}'")
@@ -634,7 +630,6 @@ class TestRunner:
                 logger.info(f"全局断言成功: 页面不包含 '{expected_text}'")
                 return
 
-            preview = matched[:5] if matched else candidates[:5]
             if match_mode == "not_contains":
                 raise AssertionError(f"断言失败: 期望页面不包含 '{expected_text}'，实际命中={preview}")
             raise AssertionError(f"断言失败: 期望页面包含 '{expected_text}'，实际候选={preview}")

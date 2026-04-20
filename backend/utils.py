@@ -9,13 +9,107 @@ UI 元素分析工具模块
 import re
 import logging
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _DYNAMIC_TIME_RANGE_PATTERN = re.compile(
     r"^[\[\(]?\s*\d{1,2}:\d{2}\s*[,/\-~]\s*\d{1,2}:\d{2}\s*[\]\)]?$"
 )
+
+
+def _truncate_preview(text: str, max_len: int = 120) -> str:
+    raw = str(text or "")
+    if len(raw) <= max_len:
+        return raw
+    return f"{raw[: max_len - 3]}..."
+
+
+def _build_match_preview(text: str, expected_text: str, radius: int = 24, max_len: int = 120) -> str:
+    haystack = str(text or "")
+    needle = str(expected_text or "")
+    if not haystack:
+        return ""
+    if not needle:
+        return _truncate_preview(haystack, max_len=max_len)
+
+    start = haystack.find(needle)
+    if start < 0:
+        return _truncate_preview(haystack, max_len=max_len)
+
+    end = start + len(needle)
+    snippet_start = max(start - radius, 0)
+    snippet_end = min(end + radius, len(haystack))
+    snippet = haystack[snippet_start:snippet_end]
+
+    if len(snippet) > max_len:
+        room = max(max_len - len(needle) - 6, 0)
+        left_room = room // 2
+        right_room = room - left_room
+        snippet_start = max(start - left_room, 0)
+        snippet_end = min(end + right_room, len(haystack))
+        snippet = haystack[snippet_start:snippet_end]
+
+    prefix = "..." if snippet_start > 0 else ""
+    suffix = "..." if snippet_end < len(haystack) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+def evaluate_page_text_assertion(
+    candidates: Iterable[Any],
+    expected_text: str,
+) -> Dict[str, Any]:
+    """
+    评估页面级文本断言。
+
+    规则：
+    1. 先尝试单节点命中，兼容现有行为。
+    2. 再按页面顺序拼接整页文本，支持跨节点命中。
+    """
+    normalized_candidates: List[str] = []
+    for item in candidates or []:
+        value = str(item or "").strip()
+        if value:
+            normalized_candidates.append(value)
+
+    expected = str(expected_text or "")
+    matched_candidates = [item for item in normalized_candidates if expected and expected in item]
+    if matched_candidates:
+        return {
+            "matched": True,
+            "preview": matched_candidates[:5],
+            "match_source": "candidate",
+            "candidates": normalized_candidates,
+        }
+
+    aggregate_sources = []
+    joined_text = "".join(normalized_candidates)
+    if joined_text:
+        aggregate_sources.append(("page_joined", joined_text))
+
+    joined_with_newline = "\n".join(normalized_candidates)
+    if joined_with_newline and joined_with_newline != joined_text:
+        aggregate_sources.append(("page_lines", joined_with_newline))
+
+    joined_with_space = " ".join(normalized_candidates)
+    if joined_with_space and joined_with_space not in {joined_text, joined_with_newline}:
+        aggregate_sources.append(("page_spaced", joined_with_space))
+
+    for source_name, aggregate_text in aggregate_sources:
+        if expected and expected in aggregate_text:
+            return {
+                "matched": True,
+                "preview": [_build_match_preview(aggregate_text, expected)],
+                "match_source": source_name,
+                "candidates": normalized_candidates,
+            }
+
+    return {
+        "matched": False,
+        "preview": normalized_candidates[:5],
+        "match_source": "",
+        "candidates": normalized_candidates,
+    }
 
 
 def parse_bounds(bounds_str: str) -> Optional[Tuple[int, int, int, int]]:
