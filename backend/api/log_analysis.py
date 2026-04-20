@@ -16,6 +16,7 @@ from sqlmodel import Session, select
 
 from backend.database import get_session
 from backend.models import SystemSetting
+from backend.openai_compat import parse_chat_completion_payload
 from backend.schemas import LogAnalysisRequest, LogAnalysisResponse
 
 logger = logging.getLogger(__name__)
@@ -350,11 +351,13 @@ async def call_llm_service(
         ],
         "temperature": 0.3,
         "max_tokens": 2000,
+        "stream": False,
     }
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
     logger.info(f"LLM 请求 URL: {request_url}, 模型: {model}")
@@ -389,12 +392,16 @@ async def call_llm_service(
 
             # 尝试解析 JSON
             try:
-                data = resp.json()
+                data = parse_chat_completion_payload(raw_text)
             except Exception as json_err:
-                logger.error(f"JSON 解析失败, 原始响应前200字符: {raw_text[:200]}")
+                logger.error(
+                    "LLM 响应解析失败: %s, 原始响应前200字符: %s",
+                    json_err,
+                    raw_text[:200],
+                )
                 raise HTTPException(
                     status_code=502,
-                    detail=f"AI 服务返回非 JSON 数据（可能 API 地址不正确）。当前请求地址: {request_url}，响应内容: {raw_text[:150]}"
+                    detail=f"AI 服务返回无法解析的响应（非标准 JSON / SSE）。当前请求地址: {request_url}，响应内容: {raw_text[:150]}"
                 )
 
             # 检查返回结构
