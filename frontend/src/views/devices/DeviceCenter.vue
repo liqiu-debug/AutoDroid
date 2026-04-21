@@ -1,5 +1,5 @@
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit } from '@element-plus/icons-vue'
 import api from '@/api'
@@ -19,19 +19,29 @@ const screenshotDevice = ref(null)
 // 就地编辑
 const editingSerial = ref(null)
 const editingName = ref('')
+const autoRefreshTimer = ref(null)
+const autoRefreshing = ref(false)
+const DEVICE_LIST_REFRESH_INTERVAL_MS = 5000
 
 // ==================== 方法 ====================
 
 /** 获取当前设备列表 */
-const fetchDevices = async () => {
-  loading.value = true
+const fetchDevices = async ({ refreshIosWda = false, silent = false } = {}) => {
+  if (autoRefreshing.value) return
+  autoRefreshing.value = true
+  if (!silent) {
+    loading.value = true
+  }
   try {
-    const { data } = await api.getDeviceList()
+    const { data } = await api.getDeviceList({ refreshIosWda })
     devices.value = data
   } catch (e) {
     console.error(e)
   } finally {
-    loading.value = false
+    autoRefreshing.value = false
+    if (!silent) {
+      loading.value = false
+    }
   }
 }
 
@@ -157,6 +167,19 @@ const cancelEditing = () => {
   editingSerial.value = null
 }
 
+const startAutoRefresh = () => {
+  if (autoRefreshTimer.value) return
+  autoRefreshTimer.value = setInterval(() => {
+    fetchDevices({ refreshIosWda: true, silent: true })
+  }, DEVICE_LIST_REFRESH_INTERVAL_MS)
+}
+
+const stopAutoRefresh = () => {
+  if (!autoRefreshTimer.value) return
+  clearInterval(autoRefreshTimer.value)
+  autoRefreshTimer.value = null
+}
+
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
   const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
@@ -172,6 +195,11 @@ const statusLabel = (status) => {
 // ==================== 生命周期 ====================
 onMounted(() => {
   handleSync()
+  startAutoRefresh()
+})
+
+onBeforeUnmount(() => {
+  stopAutoRefresh()
 })
 </script>
 
