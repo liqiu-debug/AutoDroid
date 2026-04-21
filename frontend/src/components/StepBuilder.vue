@@ -144,12 +144,36 @@ const ensureCrossPlatformConfig = (step) => {
   }
 
   if (step.action === 'assert_text') {
+    step.selector = ''
+    step.selector_type = null
     ensureAssertTextOptions(step)
   } else if (step.action === 'assert_image') {
     ensureAssertImageOptions(step)
   } else if (step.action === 'extract_by_ocr') {
     ensureStepOptions(step)
   }
+}
+
+const buildExecutableStep = (step) => {
+  ensureCrossPlatformConfig(step)
+  const payloadStep = {
+    ...step,
+    options: step?.options && typeof step.options === 'object' ? { ...step.options } : {},
+    platform_overrides: {
+      android: step?.platform_overrides?.android ? { ...step.platform_overrides.android } : null,
+      ios: step?.platform_overrides?.ios ? { ...step.platform_overrides.ios } : null
+    }
+  }
+
+  const selectorType = String(payloadStep.selector_type || '').trim()
+  payloadStep.selector_type = selectorType || null
+
+  if (String(payloadStep.action || '').toLowerCase() === 'assert_text') {
+    payloadStep.selector = ''
+    payloadStep.selector_type = null
+  }
+
+  return payloadStep
 }
 
 const getPlatformOverride = (step, platform) => {
@@ -415,7 +439,7 @@ const resetStepDetailsForAction = (step) => {
   if (!step || typeof step !== 'object') return
 
   step.selector = ''
-  step.selector_type = ''
+  step.selector_type = null
   step.value = ''
   step.description = ''
   step.timeout = 10
@@ -493,7 +517,7 @@ const addCustomStep = () => {
     uuid: createUuid(),
     action: 'assert_text',
     selector: '',
-    selector_type: '',
+    selector_type: null,
     value: '',
     options: {},
     description: '文本断言',
@@ -535,7 +559,7 @@ const handleExecuteStep = async (step) => {
   }
   
   const payload = {
-    step,
+    step: buildExecutableStep(step),
     case_id: currentCase.value.id || null,
     env_id: props.envId,
     variables: currentCase.value.variables || [],
