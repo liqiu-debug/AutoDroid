@@ -286,8 +286,12 @@ export default {
     },
 
     // Device Management (设备管理)
-    getDeviceList() {
-        return api.get('/devices/')
+    getDeviceList(options = {}) {
+        const params = {}
+        if (Object.prototype.hasOwnProperty.call(options, 'refreshIosWda')) {
+            params.refresh_ios_wda = options.refreshIosWda
+        }
+        return api.get('/devices/', { params })
     },
     syncDevices() {
         return api.post('/devices/sync')

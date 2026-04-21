@@ -9,6 +9,8 @@
 - Python 依赖：`requests`、`tidevice`、`facebook-wda`。
 - 设备侧：iOS 设备已信任主机，WebDriverAgent 已可启动。
 - 服务侧：`ios_execution` 开关开启。
+- 启动策略：默认优先使用 `tidevice xctest` 拉起设备上已安装的 WDA；仅在 macOS 下检测到 runner 缺失或 bundle id 不匹配时，才回退 `xcodebuild` 做首次安装/修复。
+- 等待策略：`tidevice` 启动默认短等待；`xcodebuild` 首次编译/安装默认会自动扩展到更长等待窗口，避免 WDA 实际已启动但 `check` 接口过早返回失败。如需调整，可配置 `ios_wda_xcodebuild_start_retry_attempts`。
 
 ## 3. 健康检查入口
 

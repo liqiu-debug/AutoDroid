@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from backend.database import get_session, engine
+from backend.device_sorting import sort_devices_for_display
 from backend.models import FastbotTask, FastbotReport, User, Device
 from backend.schemas import (
     FastbotTaskCreate,
@@ -625,7 +626,7 @@ def get_fastbot_replay_file(task_id: int, filename: str):
 @router.get("/devices", response_model=List[DeviceRead])
 async def list_devices_with_status(session: Session = Depends(get_session)):
     """获取所有设备，包含下线设备并动态附加 Fastbot 占用状态，实时检查设备在线状态"""
-    devices = session.exec(select(Device).order_by(Device.status, Device.model)).all()
+    devices = sort_devices_for_display(session.exec(select(Device)).all())
     devices = [
         d for d in devices if str(d.platform or "android").strip().lower() == "android"
     ]
@@ -653,7 +654,7 @@ async def list_devices_with_status(session: Session = Depends(get_session)):
         if status_updated:
             session.commit()
             # 重新查询以获取最新状态
-            devices = session.exec(select(Device).order_by(Device.status, Device.model)).all()
+            devices = sort_devices_for_display(session.exec(select(Device)).all())
             devices = [
                 d for d in devices if str(d.platform or "android").strip().lower() == "android"
             ]
@@ -674,7 +675,7 @@ async def list_devices_with_status(session: Session = Depends(get_session)):
              d_dict["status"] = "IDLE"
 
         result.append(d_dict)
-    return result
+    return sort_devices_for_display(result)
 
 
 @router.post("/run", response_model=FastbotTaskRead)
