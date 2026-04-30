@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -144,9 +146,10 @@ class IOSWdaStartupTests(unittest.TestCase):
         )
 
     def test_build_xcodebuild_command_with_project_path(self):
+        project_path = str(Path(tempfile.gettempdir()) / "WebDriverAgent.xcodeproj")
         with patch("backend.api.devices.get_setting_value") as setting_mock, patch(
             "backend.api.devices._discover_wda_xcodeproj_path",
-            return_value="/tmp/WebDriverAgent.xcodeproj",
+            return_value=project_path,
         ), patch("backend.api.devices.os.path.exists", return_value=True):
             def _side_effect(_, key):
                 if key == "ios_wda_scheme.ios-1":
@@ -158,7 +161,7 @@ class IOSWdaStartupTests(unittest.TestCase):
 
         self.assertEqual(payload["command_source"], "xcodebuild")
         self.assertIn("-project", payload["command"])
-        self.assertIn("/tmp/WebDriverAgent.xcodeproj", payload["command"])
+        self.assertIn(project_path, payload["command"])
         self.assertIn("-destination", payload["command"])
         self.assertIn("id=ios-1", payload["command"])
         self.assertIn("test", payload["command"])

@@ -197,7 +197,7 @@ class AppPackage(SQLModel, table=True):
     package_name: str = Field(default="", index=True) # 包名
     version_name: str = Field(default="")             # 版本号
     version_code: str = Field(default="")             # 构建号
-    file_path: str = Field(default="")                # 文件存储路径
+    file_path: str = Field(default="")                # 项目内相对存储路径
     file_size: float = Field(default=0.0)             # 文件大小 (MB)
     is_latest: bool = Field(default=True)             # 是否为最新包
     upload_time: datetime = Field(default_factory=datetime.now)

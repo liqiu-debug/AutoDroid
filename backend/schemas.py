@@ -1,6 +1,6 @@
 from typing import List, Optional, Any, Dict
 from enum import Enum
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class ActionType(str, Enum):
     CLICK = "click"
@@ -39,6 +39,13 @@ class Step(BaseModel):
     description: Optional[str] = None
     timeout: int = 10  # Default timeout in seconds
     error_strategy: ErrorStrategy = ErrorStrategy.ABORT # Error routing strategy
+
+    @field_validator("selector_type", mode="before")
+    @classmethod
+    def empty_selector_type_to_none(cls, value):
+        if value == "":
+            return None
+        return value
 
 class Variable(BaseModel):
     key: str

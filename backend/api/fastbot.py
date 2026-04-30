@@ -39,13 +39,13 @@ from backend.api import deps
 from backend.device_stream.manager import device_manager
 from backend.device_stream.recorder import transcode_h264_to_mp4
 from backend.jank_ai_service import summarize_jank_analysis
+from backend.paths import project_path
 from backend.utils.pydantic_compat import dump_model
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-FASTBOT_REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "fastbot")
+FASTBOT_REPORTS_DIR = str(project_path("reports", "fastbot"))
 
 # 内存级设备锁，记录哪些设备正在跑 Fastbot
 _device_locks: Dict[str, int] = {}  # serial -> task_id

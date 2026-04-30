@@ -211,7 +211,8 @@ class JankAnalyzerTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["actual_frame_interval_p50_ms"], 16.667, places=3)
 
     def test_analyze_perfetto_trace_returns_missing_for_absent_file(self):
-        result = analyze_perfetto_trace("/tmp/does-not-exist.perfetto-trace", "com.example.app")
+        missing_path = os.path.join(tempfile.gettempdir(), "does-not-exist.perfetto-trace")
+        result = analyze_perfetto_trace(missing_path, "com.example.app")
 
         self.assertEqual(result["status"], "TRACE_MISSING")
         self.assertIsNone(result["analysis"])
