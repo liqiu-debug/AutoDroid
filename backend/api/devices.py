@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from backend.database import get_session
+from backend.device_sorting import sort_devices_for_display
 from backend.feature_flags import get_setting_value
 from backend.models import Device, TestExecution
 from backend.paths import project_path
@@ -38,6 +39,7 @@ DEFAULT_IOS_WDA_BUNDLE_ID = "com.facebook.WebDriverAgentRunner.xctrunner"
 DEFAULT_IOS_WDA_SCHEME = "WebDriverAgentRunner"
 DEFAULT_IOS_WDA_START_RETRY_ATTEMPTS = 8
 DEFAULT_IOS_WDA_START_RETRY_INTERVAL_SECONDS = 1.0
+DEFAULT_IOS_WDA_XCODEBUILD_START_RETRY_ATTEMPTS = 45
 _ios_wda_lock_guard = threading.Lock()
 _ios_wda_locks: Dict[str, threading.Lock] = {}
 
@@ -77,6 +79,7 @@ def _check_ios_wda_health(session: Session, udid: str) -> Dict[str, Any]:
 
         wda_url = resolve_ios_wda_url(session, udid)
         check_wda_health(wda_url)
+        _probe_ios_wda_actionability(wda_url)
         return {
             "healthy": True,
             "wda_url": wda_url,
@@ -94,6 +97,49 @@ def _check_ios_wda_health(session: Session, udid: str) -> Dict[str, Any]:
 def _is_ios_wda_healthy(session: Session, udid: str) -> bool:
     """兼容旧调用点：仅返回健康状态。"""
     return bool(_check_ios_wda_health(session, udid).get("healthy"))
+
+
+def _probe_ios_wda_actionability(wda_url: str) -> None:
+    import wda
+
+    started_at = time.time()
+    try:
+        client = wda.Client(wda_url)
+        unsafe_window_size = getattr(client, "_unsafe_window_size", None)
+        size = unsafe_window_size() if callable(unsafe_window_size) else client.window_size()
+        if min(int(size.width), int(size.height)) <= 0:
+            raise RuntimeError(f"invalid window size: {size}")
+        logger.info(
+            "WDA actionable probe passed: url=%s size=%sx%s duration=%.3fs",
+            wda_url,
+            size.width,
+            size.height,
+            time.time() - started_at,
+        )
+    except Exception as exc:
+        logger.warning(
+            "WDA actionable probe failed: url=%s duration=%.3fs error=%s",
+            wda_url,
+            time.time() - started_at,
+            exc,
+        )
+        raise RuntimeError(
+            f"P1005_WDA_UNAVAILABLE: WDA actionable probe failed: {wda_url}, error={exc}"
+        ) from exc
+
+
+def _is_ios_wda_runtime_failure(message: str) -> bool:
+    text = str(message or "").lower()
+    keywords = (
+        "wdarequesterror",
+        "unable to capture screen",
+        "not authorized for performing ui testing actions",
+        "stale element reference",
+        "application 'local.pid.0' is not running",
+        "ios wda 连接失败",
+        "wda actionable probe failed",
+    )
+    return any(keyword in text for keyword in keywords)
 
 
 def _get_ios_wda_lock(udid: str) -> threading.Lock:
@@ -415,6 +461,25 @@ def _build_ios_wda_xcodebuild_command(session: Session, udid: str) -> Dict[str, 
     }
 
 
+def _build_ios_wda_tidevice_command(
+    session: Session,
+    udid: str,
+    *,
+    bundle_id: Optional[str] = None,
+    command_source: str = "tidevice",
+    bundle_source: str = "resolved",
+) -> Dict[str, Any]:
+    resolved_bundle_id = str(bundle_id or _resolve_ios_wda_bundle_id(session, udid)).strip()
+    if not resolved_bundle_id:
+        raise RuntimeError("未解析到 iOS WDA bundle id")
+    return {
+        "command": ["tidevice", "-u", udid, "xctest", "--bundle_id", resolved_bundle_id],
+        "command_source": command_source,
+        "bundle_id": resolved_bundle_id,
+        "bundle_source": bundle_source,
+    }
+
+
 def _build_ios_wda_launch_command(session: Session, udid: str) -> Dict[str, Any]:
     raw_cmd = (
         get_setting_value(session, f"ios_wda_launch_cmd.{udid}")
@@ -436,16 +501,7 @@ def _build_ios_wda_launch_command(session: Session, udid: str) -> Dict[str, Any]
             "bundle_source": "resolved",
         }
 
-    if platform.system().lower() == "darwin":
-        return _build_ios_wda_xcodebuild_command(session, udid)
-
-    bundle_id = _resolve_ios_wda_bundle_id(session, udid)
-    return {
-        "command": ["tidevice", "-u", udid, "xctest", "--bundle_id", bundle_id],
-        "command_source": "tidevice",
-        "bundle_id": bundle_id,
-        "bundle_source": "resolved",
-    }
+    return _build_ios_wda_tidevice_command(session, udid)
 
 
 def _read_log_tail(path: Optional[str], *, max_lines: int = 20, max_chars: int = 2000) -> str:
@@ -468,17 +524,72 @@ def _is_no_app_matches_error(message: str) -> bool:
     return "no app matches" in text or "bundle id" in text and "not found" in text
 
 
-def _launch_ios_wda_process(session: Session, udid: str) -> Dict[str, Any]:
-    launch_meta = _build_ios_wda_launch_command(session, udid)
-    command = list(launch_meta["command"])
-    logger.info(
-        "启动 iOS WDA: udid=%s source=%s cmd=%s",
-        udid,
-        launch_meta.get("command_source"),
-        " ".join(command),
+def _is_tidevice_environment_error(message: str) -> bool:
+    text = str(message or "").lower()
+    keywords = (
+        "developerimage not found",
+        "invalidservice",
+        "mount developer image",
+        "developer image",
+        "testmanagerd",
     )
-    max_attempts = 2
-    for launch_attempt in range(1, max_attempts + 1):
+    return any(keyword in text for keyword in keywords)
+
+
+def _should_fallback_from_tidevice_to_xcodebuild(message: str) -> bool:
+    return _is_no_app_matches_error(message) or _is_tidevice_environment_error(message)
+
+
+def _is_process_alive(pid: Optional[int]) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(int(pid))],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        state = str(proc.stdout or "").strip().upper()
+        if state.startswith("Z"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _build_ios_wda_xcodebuild_fallback_command(session: Session, udid: str) -> Optional[Dict[str, Any]]:
+    if platform.system().lower() != "darwin":
+        return None
+    try:
+        return _build_ios_wda_xcodebuild_command(session, udid)
+    except Exception as exc:
+        logger.info("iOS WDA xcodebuild fallback unavailable: udid=%s error=%s", udid, exc)
+        return None
+
+
+def _launch_ios_wda_process(
+    session: Session,
+    udid: str,
+    *,
+    launch_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    launch_meta = dict(launch_meta or _build_ios_wda_launch_command(session, udid))
+    xcodebuild_fallback_used = False
+    while True:
+        command = list(launch_meta["command"])
+        logger.info(
+            "启动 iOS WDA: udid=%s source=%s cmd=%s",
+            udid,
+            launch_meta.get("command_source"),
+            " ".join(command),
+        )
         log_path = tempfile.NamedTemporaryFile(
             prefix=f"ios_wda_start_{udid}_",
             suffix=".log",
@@ -512,8 +623,7 @@ def _launch_ios_wda_process(session: Session, udid: str) -> Dict[str, Any]:
             reason = f"{reason}: {log_tail}"
 
         can_retry_with_discovered_bundle = (
-            launch_attempt == 1
-            and bool(command)
+            bool(command)
             and str(command[0]) == "tidevice"
             and str(launch_meta.get("command_source")) != "setting"
             and _is_no_app_matches_error(reason)
@@ -528,14 +638,34 @@ def _launch_ios_wda_process(session: Session, udid: str) -> Dict[str, Any]:
                     current_bundle,
                     discovered,
                 )
-                command = ["tidevice", "-u", udid, "xctest", "--bundle_id", discovered]
-                launch_meta["bundle_id"] = discovered
-                launch_meta["command_source"] = "tidevice.discovered"
+                launch_meta = _build_ios_wda_tidevice_command(
+                    session,
+                    udid,
+                    bundle_id=discovered,
+                    command_source="tidevice.discovered",
+                    bundle_source="discovered",
+                )
+                continue
+
+        can_fallback_to_xcodebuild = (
+            not xcodebuild_fallback_used
+            and bool(command)
+            and str(command[0]) == "tidevice"
+            and str(launch_meta.get("command_source")) != "setting"
+            and _should_fallback_from_tidevice_to_xcodebuild(reason)
+        )
+        if can_fallback_to_xcodebuild:
+            fallback_meta = _build_ios_wda_xcodebuild_fallback_command(session, udid)
+            if fallback_meta:
+                xcodebuild_fallback_used = True
+                logger.info(
+                    "tidevice 启动 WDA 失败，回退 xcodebuild 安装/修复: udid=%s",
+                    udid,
+                )
+                launch_meta = fallback_meta
                 continue
 
         raise RuntimeError(reason)
-
-    raise RuntimeError("启动 WDA 失败：未知错误")
 
 
 def _coerce_positive_int(value: Optional[str], default: int) -> int:
@@ -565,10 +695,31 @@ def _resolve_ios_wda_start_policy(session: Session, udid: str) -> Dict[str, Any]
         or get_setting_value(session, "ios_wda_start_retry_interval_seconds"),
         DEFAULT_IOS_WDA_START_RETRY_INTERVAL_SECONDS,
     )
+    xcodebuild_attempts = _coerce_positive_int(
+        get_setting_value(session, f"ios_wda_xcodebuild_start_retry_attempts.{udid}")
+        or get_setting_value(session, "ios_wda_xcodebuild_start_retry_attempts"),
+        DEFAULT_IOS_WDA_XCODEBUILD_START_RETRY_ATTEMPTS,
+    )
     return {
         "retry_attempts": attempts,
         "retry_interval_seconds": interval_seconds,
+        "xcodebuild_retry_attempts": xcodebuild_attempts,
     }
+
+
+def _is_xcodebuild_launch_source(command_source: Optional[str]) -> bool:
+    return str(command_source or "").strip().lower().startswith("xcodebuild")
+
+
+def _expand_start_attempts_for_launch_source(
+    attempts_left: int,
+    launch_meta: Dict[str, Any],
+    policy: Dict[str, Any],
+) -> int:
+    expanded = max(1, int(attempts_left or 0))
+    if _is_xcodebuild_launch_source(launch_meta.get("command_source")):
+        expanded = max(expanded, int(policy.get("xcodebuild_retry_attempts") or 0))
+    return expanded
 
 
 def _ensure_ios_wda_ready(
@@ -650,12 +801,18 @@ def _ensure_ios_wda_ready(
 
         startup_checks = 2
         last_check = second_check
+        xcodebuild_relaunch_used = False
         if launch_error is None:
-            for attempt in range(1, effective_attempts + 1):
-                if attempt > 1 and effective_interval > 0:
+            attempts_left = max(1, effective_attempts)
+            loop_index = 0
+            while attempts_left > 0:
+                attempts_left = _expand_start_attempts_for_launch_source(attempts_left, launch_meta, policy)
+                loop_index += 1
+                if loop_index > 1 and effective_interval > 0:
                     time.sleep(effective_interval)
                 startup_checks += 1
                 current = _check_ios_wda_health(session, device_id)
+                attempts_left -= 1
                 if bool(current.get("healthy")):
                     return {
                         "healthy": True,
@@ -672,6 +829,38 @@ def _ensure_ios_wda_ready(
                         "startup_checks": startup_checks,
                     }
                 last_check = current
+
+                can_relaunch_with_xcodebuild = (
+                    not xcodebuild_relaunch_used
+                    and not _is_process_alive(launch_meta.get("pid"))
+                    and str(launch_meta.get("command_source") or "").startswith("tidevice")
+                )
+                if can_relaunch_with_xcodebuild:
+                    exit_reason = _read_log_tail(launch_meta.get("log_path")) or str(current.get("error") or "")
+                    if _should_fallback_from_tidevice_to_xcodebuild(exit_reason):
+                        fallback_meta = _build_ios_wda_xcodebuild_fallback_command(session, device_id)
+                        if fallback_meta:
+                            logger.info(
+                                "iOS WDA tidevice 启动进程提前退出，回退 xcodebuild 安装/修复: udid=%s reason=%s",
+                                device_id,
+                                exit_reason,
+                            )
+                            xcodebuild_relaunch_used = True
+                            try:
+                                launch_meta = _launch_ios_wda_process(
+                                    session,
+                                    device_id,
+                                    launch_meta=fallback_meta,
+                                )
+                            except Exception as exc:
+                                launch_error = str(exc)
+                                logger.warning(
+                                    "iOS WDA xcodebuild 回退启动失败: udid=%s error=%s",
+                                    device_id,
+                                    launch_error,
+                                )
+                                break
+                            continue
 
         error_message = launch_error or last_check.get("error") or "WDA 启动后健康检查失败"
         launch_log_tail = _read_log_tail(launch_meta.get("log_path")) if launch_meta else ""
@@ -785,11 +974,14 @@ def _capture_ios_screenshot_bytes(serial: str, wda_url: str) -> bytes:
 
 
 @router.get("/", response_model=List[DeviceRead])
-async def list_devices(session: Session = Depends(get_session)):
-    """获取所有设备列表,并实时检查在线状态"""
-    devices = session.exec(select(Device).order_by(Device.status, Device.model)).all()
+async def list_devices(
+    refresh_ios_wda: bool = False,
+    session: Session = Depends(get_session),
+):
+    """获取所有设备列表，并在需要时刷新设备在线/WDA 状态。"""
+    devices = sort_devices_for_display(session.exec(select(Device)).all())
     
-    # 实时检查哪些 Android 设备在线（iOS 设备保持上次同步状态）
+    # 实时检查哪些 Android 设备在线（iOS 设备默认保持上次同步状态）
     try:
         raw = await _run_adb_command("devices")
         lines = raw.decode("utf-8", errors="replace").strip().splitlines()
@@ -820,9 +1012,29 @@ async def list_devices(session: Session = Depends(get_session)):
         if status_updated:
             session.commit()
             # 重新查询以获取最新状态
-            devices = session.exec(select(Device).order_by(Device.status, Device.model)).all()
+            devices = sort_devices_for_display(session.exec(select(Device)).all())
     except Exception as e:
         logger.warning(f"检查设备在线状态失败: {e}")
+
+    if refresh_ios_wda:
+        status_updated = False
+        for device in devices:
+            platform = str(getattr(device, "platform", "android") or "android").strip().lower()
+            if platform != "ios":
+                continue
+            if str(device.status or "").strip().upper() == "OFFLINE":
+                continue
+            wda_result = _check_ios_wda_health(session, device.serial)
+            target_status = _resolve_ios_device_status(device.status, bool(wda_result.get("healthy")))
+            if target_status != device.status:
+                device.status = target_status
+                device.updated_at = datetime.now()
+                session.add(device)
+                status_updated = True
+
+        if status_updated:
+            session.commit()
+            devices = sort_devices_for_display(session.exec(select(Device)).all())
     
     return devices
 
@@ -1047,7 +1259,7 @@ async def sync_devices(
     session.commit()
 
     # 查询最终结果
-    all_devices = session.exec(select(Device).order_by(Device.status, Device.model)).all()
+    all_devices = sort_devices_for_display(session.exec(select(Device)).all())
     total_offline = sum(1 for d in all_devices if d.status == "OFFLINE")
 
     return DeviceSyncResponse(
@@ -1078,6 +1290,7 @@ async def get_screenshot(serial: str, session: Session = Depends(get_session)):
             wda_url = resolve_ios_wda_url(session, serial)
             try:
                 await _run_blocking_call(check_wda_health, wda_url)
+                await _run_blocking_call(_probe_ios_wda_actionability, wda_url)
             except Exception as exc:
                 db_device.status = _resolve_ios_device_status(db_device.status, False)
                 db_device.updated_at = datetime.now()
@@ -1106,6 +1319,11 @@ async def get_screenshot(serial: str, session: Session = Depends(get_session)):
     except HTTPException:
         raise
     except Exception as e:
+        if is_ios_device and db_device and _is_ios_wda_runtime_failure(str(e)):
+            db_device.status = _resolve_ios_device_status(db_device.status, False)
+            db_device.updated_at = datetime.now()
+            session.add(db_device)
+            session.commit()
         raise HTTPException(status_code=500, detail=f"截图失败: {e}")
 
 

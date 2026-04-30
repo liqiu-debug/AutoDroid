@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed, reactive } from 'vue'
+import { ref, onActivated, computed, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { Plus, Search, VideoPlay, Edit, Delete, Refresh, MoreFilled, 
          Check, Close, Timer } from '@element-plus/icons-vue'
@@ -292,7 +292,7 @@ const getDuration = (row) => {
     return `${m}m ${s}s`
 }
 
-onMounted(() => {
+onActivated(() => {
     fetchScenarios()
 })
 </script>

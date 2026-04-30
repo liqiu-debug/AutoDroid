@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, reactive, nextTick } from 'vue'
+import { ref, onActivated, reactive, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, VideoPlay, CopyDocument, Delete, Search, Refresh, Edit, ArrowDown, FolderAdd, EditPen, Document, FolderOpened } from '@element-plus/icons-vue'
@@ -452,7 +452,7 @@ const formatTime = (time) => {
     return dayjs(time).format('YYYY-MM-DD HH:mm')
 }
 
-onMounted(() => {
+onActivated(() => {
     fetchFolderTree()
     fetchCases()
 })

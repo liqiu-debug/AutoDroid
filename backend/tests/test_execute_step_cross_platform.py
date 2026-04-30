@@ -79,6 +79,53 @@ class SingleStepCrossPlatformTests(unittest.TestCase):
         self.assertEqual(payload["step"]["action"], "click")
 
     @patch("backend.main.time.sleep", return_value=None)
+    @patch("backend.main._take_screenshot_base64", return_value="abc")
+    @patch("backend.main._resolve_recording_platform", return_value="android")
+    @patch("backend.main.TestRunner")
+    def test_execute_single_step_android_accepts_blank_selector_type_for_assert_text(
+        self,
+        runner_cls,
+        resolve_platform_mock,
+        screenshot_mock,
+        sleep_mock,
+    ):
+        session = Mock()
+
+        runner = Mock()
+        runner.d = Mock()
+        runner.d.info = {}
+        runner.d.dump_hierarchy.return_value = "<xml />"
+        runner.execute_step.return_value = {
+            "step": {"action": "assert_text", "selector_type": None},
+            "success": True,
+            "error": None,
+            "duration": 0.2,
+        }
+        runner_cls.return_value = runner
+
+        payload = SingleStepPayload(
+            step={
+                "action": "assert_text",
+                "selector": "",
+                "selector_type": "",
+                "value": "登录成功",
+                "options": {"match_mode": "contains"},
+                "description": "断言页面包含登录成功",
+            },
+            device_serial="android-1",
+        )
+
+        response = execute_single_step(payload, session=session)
+
+        self.assertTrue(response["result"]["success"])
+        self.assertEqual(response["dump"]["screenshot"], "abc")
+        step_model = runner.execute_step.call_args.args[0]
+        self.assertEqual(step_model.action.value, "assert_text")
+        self.assertIsNone(step_model.selector_type)
+        resolve_platform_mock.assert_called_once_with(session, "android-1")
+        runner.connect.assert_called_once()
+
+    @patch("backend.main.time.sleep", return_value=None)
     @patch("backend.main._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})
     @patch("backend.main.check_wda_health")
     @patch("backend.main.resolve_ios_wda_url", return_value="http://127.0.0.1:8200")

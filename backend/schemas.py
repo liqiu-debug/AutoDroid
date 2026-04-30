@@ -42,8 +42,10 @@ class Step(BaseModel):
 
     @field_validator("selector_type", mode="before")
     @classmethod
-    def empty_selector_type_to_none(cls, value):
-        if value == "":
+    def normalize_blank_selector_type(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
             return None
         return value
 
