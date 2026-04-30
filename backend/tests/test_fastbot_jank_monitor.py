@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from backend.fastbot_runner import (
@@ -19,6 +21,11 @@ from backend.fastbot_runner import (
     _resolve_jank_monitoring_mode,
     _should_export_perfetto_trace,
 )
+from backend.paths import project_path
+
+
+def _temp_path(*parts: str) -> str:
+    return str(Path(tempfile.gettempdir()).joinpath(*parts))
 
 
 SAMPLE_GFXINFO_OUTPUT = """
@@ -159,8 +166,8 @@ class FastbotJankMonitorTests(unittest.TestCase):
 
     def test_build_trace_artifact_preserves_capture_mode(self):
         artifact = _build_trace_artifact(
-            "/Users/liuzhenyu/Desktop/x/AutoDroid/reports/fastbot/38/continuous_trace_001.perfetto-trace",
-            PerfettoSessionState(report_dir="/tmp/report", capture_mode="continuous", frame_timeline_supported=True),
+            str(project_path("reports", "fastbot", "38", "continuous_trace_001.perfetto-trace")),
+            PerfettoSessionState(report_dir=_temp_path("report"), capture_mode="continuous", frame_timeline_supported=True),
             trigger_time="10:00:00",
             trigger_reason="TASK_COMPLETED",
         )
@@ -170,7 +177,7 @@ class FastbotJankMonitorTests(unittest.TestCase):
 
     def test_should_export_perfetto_trace_honors_cooldown_and_limit(self):
         now = datetime(2026, 3, 12, 21, 0, 0)
-        state = PerfettoSessionState(report_dir="/tmp", available=True)
+        state = PerfettoSessionState(report_dir=tempfile.gettempdir(), available=True)
 
         self.assertTrue(_should_export_perfetto_trace(state, now))
 
@@ -186,7 +193,7 @@ class FastbotJankMonitorTests(unittest.TestCase):
         self.assertFalse(_should_export_perfetto_trace(state, now))
 
     def test_resolve_jank_monitoring_mode_reflects_perfetto_state(self):
-        state = PerfettoSessionState(report_dir="/tmp", available=True)
+        state = PerfettoSessionState(report_dir=tempfile.gettempdir(), available=True)
 
         self.assertEqual(
             _resolve_jank_monitoring_mode(True, perfetto_state=state),
@@ -229,7 +236,7 @@ class FastbotJankMonitorTests(unittest.TestCase):
 class FastbotPerfettoSupportTests(unittest.IsolatedAsyncioTestCase):
     async def test_export_perfetto_trace_records_diagnostic_capture(self):
         state = PerfettoSessionState(
-            report_dir="/tmp/fastbot-report",
+            report_dir=_temp_path("fastbot-report"),
             available=True,
             capture_mode="diagnostic",
             frame_timeline_supported=True,
@@ -293,7 +300,7 @@ class FastbotPerfettoSupportTests(unittest.IsolatedAsyncioTestCase):
             "backend.fastbot_runner._adb_shell",
             side_effect=["31", "/system/bin/perfetto"],
         ):
-            state = await _detect_perfetto_support("emulator-5554", "/tmp/fastbot-report")
+            state = await _detect_perfetto_support("emulator-5554", _temp_path("fastbot-report"))
 
         self.assertTrue(state.available)
         self.assertTrue(state.frame_timeline_supported)
@@ -304,7 +311,7 @@ class FastbotPerfettoSupportTests(unittest.IsolatedAsyncioTestCase):
             "backend.fastbot_runner._adb_shell",
             side_effect=["28", "/system/bin/perfetto"],
         ):
-            state = await _detect_perfetto_support("emulator-5554", "/tmp/fastbot-report")
+            state = await _detect_perfetto_support("emulator-5554", _temp_path("fastbot-report"))
 
         self.assertFalse(state.available)
         self.assertFalse(state.frame_timeline_supported)

@@ -195,6 +195,13 @@ AutoDroid/
 ### 安装与启动
 
 ```bash
+# 一键本机/服务器启动（自动安装前端依赖并构建静态资源）
+bash scripts/start_lan.sh
+```
+
+如需分开启动前后端：
+
+```bash
 # ----- 后端服务 -----
 # 1. (推荐) 使用虚拟环境
 # python -m venv .venv

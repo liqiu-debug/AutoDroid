@@ -1,7 +1,8 @@
 import sqlite3
+from backend.database import sqlite_path
 
 def migrate():
-    conn = sqlite3.connect('autodroid.db')
+    conn = sqlite3.connect(str(sqlite_path))
     cursor = conn.cursor()
     
     # 检查 updater_id

@@ -4,8 +4,10 @@ APP 安装包管理 API
 提供 APK 文件的上传、解析、列表查询、下载和删除功能。
 """
 import os
+import shlex
 import uuid
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
@@ -15,6 +17,7 @@ from sqlmodel import Session, select, col, func
 
 from backend.database import get_session
 from backend.models import AppPackage, Device, User
+from backend.paths import project_path, project_relative_path, resolve_project_path
 from backend.schemas import AppPackageRead, PaginatedAppPackageRead
 from backend.api.deps import get_current_user
 from backend.utils.apk_parser import parse_apk_info
@@ -24,8 +27,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # 存储目录
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads", "apps")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+UPLOAD_DIR = project_path("uploads", "apps")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_package_file_path(stored_path: str) -> Path:
+    return resolve_project_path(stored_path, anchors=("uploads/apps",))
 
 
 def _ensure_android_install_device(device: Device) -> None:
@@ -54,7 +61,7 @@ async def upload_package(
     # 2. 保存文件 (UUID 重命名防冲突)
     ext = os.path.splitext(file.filename)[1]
     saved_name = f"{uuid.uuid4().hex}{ext}"
-    saved_path = os.path.join(UPLOAD_DIR, saved_name)
+    saved_path = UPLOAD_DIR / saved_name
 
     try:
         content = await file.read()
@@ -66,7 +73,7 @@ async def upload_package(
     file_size_mb = round(len(content) / (1024 * 1024), 2)
 
     # 3. 解析 APK 信息
-    apk_info = parse_apk_info(saved_path)
+    apk_info = parse_apk_info(str(saved_path))
 
     # 4. 将相同包名的旧包标记为 非最新
     if apk_info.get("package_name"):
@@ -85,7 +92,7 @@ async def upload_package(
         package_name=apk_info.get("package_name", ""),
         version_name=apk_info.get("version_name", ""),
         version_code=apk_info.get("version_code", ""),
-        file_path=saved_path,
+        file_path=project_relative_path(saved_path, anchors=("uploads/apps",)),
         file_size=file_size_mb,
         is_latest=True,
         uploader_id=current_user.id,
@@ -144,13 +151,14 @@ def download_package(
     if not pkg:
         raise HTTPException(status_code=404, detail="安装包不存在")
 
-    if not os.path.exists(pkg.file_path):
+    file_path = _resolve_package_file_path(pkg.file_path)
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件已被删除")
 
     # 生成有意义的下载文件名
     download_name = f"{pkg.app_name}_{pkg.version_name}.apk"
     return FileResponse(
-        path=pkg.file_path,
+        path=str(file_path),
         filename=download_name,
         media_type="application/vnd.android.package-archive",
     )
@@ -168,9 +176,10 @@ def delete_package(
         raise HTTPException(status_code=404, detail="安装包不存在")
 
     # 删除物理文件
-    if pkg.file_path and os.path.exists(pkg.file_path):
+    file_path = _resolve_package_file_path(pkg.file_path) if pkg.file_path else None
+    if file_path and file_path.exists():
         try:
-            os.remove(pkg.file_path)
+            file_path.unlink()
         except Exception as e:
             logger.warning(f"删除文件失败 {pkg.file_path}: {e}")
 
@@ -217,7 +226,8 @@ async def install_package(
     if not pkg:
         raise HTTPException(status_code=404, detail="安装包不存在")
 
-    if not os.path.exists(pkg.file_path):
+    file_path = _resolve_package_file_path(pkg.file_path)
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="APK 文件已被删除")
 
     # 2. 校验设备状态
@@ -254,7 +264,7 @@ async def install_package(
             raise HTTPException(status_code=500, detail=f"执行命令失败: {e}")
 
     # 4. 执行 ADB 安装
-    cmd = f'adb -s {req.serial} install -r -t -d "{pkg.file_path}"'
+    cmd = f"adb -s {shlex.quote(req.serial)} install -r -t -d {shlex.quote(str(file_path))}"
     logger.info(f"执行安装命令: {cmd}")
     output = await _run_adb(cmd)
     logger.info(f"ADB 安装输出: {output.strip()}")

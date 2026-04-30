@@ -9,14 +9,16 @@ from typing import List, Dict, Any, Optional
 from jinja2 import Environment, FileSystemLoader
 import uuid
 
+from backend.paths import project_path
+
 
 class ReportGenerator:
     """HTML 测试报告生成器"""
     
     def __init__(self):
-        templates_dir = os.path.join(os.path.dirname(__file__), "templates")
-        self.env = Environment(loader=FileSystemLoader(templates_dir))
-        self.reports_dir = os.path.join(os.path.dirname(__file__), "..", "reports")
+        templates_dir = project_path("backend", "templates")
+        self.env = Environment(loader=FileSystemLoader(str(templates_dir)))
+        self.reports_dir = str(project_path("reports"))
         os.makedirs(self.reports_dir, exist_ok=True)
     
     def generate_report(

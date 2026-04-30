@@ -1,10 +1,18 @@
 import logging
+import os
+from pathlib import Path
 from sqlmodel import Session, SQLModel, create_engine
+
+from backend.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
-sqlite_file_name = "database.db"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
+sqlite_file_name = os.getenv("AUTODROID_DB_PATH", "database.db")
+sqlite_path = Path(sqlite_file_name).expanduser()
+if not sqlite_path.is_absolute():
+    sqlite_path = PROJECT_ROOT / sqlite_path
+sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+sqlite_url = f"sqlite:///{sqlite_path.as_posix()}"
 
 # check_same_thread=False is needed for SQLite with multiple threads/FastAPI
 engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
@@ -192,7 +200,7 @@ def _run_migrations_with_conn(conn) -> None:
 def _run_migrations():
     import sqlite3
 
-    conn = sqlite3.connect(sqlite_file_name)
+    conn = sqlite3.connect(str(sqlite_path))
     try:
         _run_migrations_with_conn(conn)
     finally:

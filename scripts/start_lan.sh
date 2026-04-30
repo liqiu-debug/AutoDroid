@@ -29,9 +29,18 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   )
 fi
 
-LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
-if [[ -z "$LAN_IP" ]]; then
-  LAN_IP="$(ipconfig getifaddr en1 2>/dev/null || true)"
+LAN_IP=""
+if command -v ip >/dev/null 2>&1; then
+  LAN_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
+fi
+if [[ -z "$LAN_IP" ]] && command -v hostname >/dev/null 2>&1; then
+  LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+fi
+if [[ -z "$LAN_IP" ]] && command -v ipconfig >/dev/null 2>&1; then
+  LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || true)"
+  if [[ -z "$LAN_IP" ]]; then
+    LAN_IP="$(ipconfig getifaddr en1 2>/dev/null || true)"
+  fi
 fi
 
 echo "[AutoDroid] 服务启动中..."

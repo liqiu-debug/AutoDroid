@@ -134,7 +134,13 @@ const ensureCrossPlatformConfig = (step) => {
     step.timeout = 10
   }
 
-  if (step.action === 'click_image' || step.action === 'assert_image') {
+  if (step.action === 'assert_text') {
+    step.selector = ''
+    step.selector_type = null
+    step.platform_overrides.android = null
+    step.platform_overrides.ios = null
+    ensureAssertTextOptions(step)
+  } else if (step.action === 'click_image' || step.action === 'assert_image') {
     step.selector_type = 'image'
   } else if (isLogicalLocatorAction(step.action)) {
     const selectorType = String(step.selector_type || '').trim()
@@ -143,11 +149,7 @@ const ensureCrossPlatformConfig = (step) => {
     }
   }
 
-  if (step.action === 'assert_text') {
-    step.selector = ''
-    step.selector_type = null
-    ensureAssertTextOptions(step)
-  } else if (step.action === 'assert_image') {
+  if (step.action === 'assert_image') {
     ensureAssertImageOptions(step)
   } else if (step.action === 'extract_by_ocr') {
     ensureStepOptions(step)

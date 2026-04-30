@@ -7,9 +7,24 @@ from backend.main import (
     _normalize_single_step_for_runner,
     execute_single_step,
 )
+from backend.schemas import Step
 
 
 class SingleStepCrossPlatformTests(unittest.TestCase):
+    def test_step_validation_treats_blank_selector_type_as_none(self):
+        step = Step.model_validate(
+            {
+                "action": "assert_text",
+                "selector": "",
+                "selector_type": "",
+                "value": "登录成功",
+                "options": {"match_mode": "contains"},
+            }
+        )
+
+        self.assertIsNone(step.selector_type)
+        self.assertEqual(step.action, "assert_text")
+
     def test_normalize_single_step_preserves_cross_platform_fields(self):
         raw_step = {
             "action": "click",

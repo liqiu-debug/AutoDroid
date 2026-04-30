@@ -1,8 +1,7 @@
-import sys
-import os
 from jinja2 import Environment, FileSystemLoader
+from backend.paths import project_path
 
-env = Environment(loader=FileSystemLoader('/Users/liuzhenyu/Desktop/x/AutoDroid/backend/templates'))
+env = Environment(loader=FileSystemLoader(str(project_path("backend", "templates"))))
 
 template1 = env.get_template('report.html')
 html1 = template1.render(
@@ -16,7 +15,7 @@ html1 = template1.render(
     variables=[{"key": "USERNAME", "value": "admin"}, {"key": "PASSWORD", "value": "123456"}],
     generated_at="2026-02-20 10:01:00"
 )
-with open('/Users/liuzhenyu/Desktop/x/AutoDroid/test_report_preview.html', 'w') as f:
+with open(project_path("test_report_preview.html"), 'w') as f:
     f.write(html1)
 
 template2 = env.get_template('scenario_report.html')
@@ -39,6 +38,6 @@ html2 = template2.render(
     ],
     generated_at="2026-02-20 10:05:00"
 )
-with open('/Users/liuzhenyu/Desktop/x/AutoDroid/test_scenario_preview.html', 'w') as f:
+with open(project_path("test_scenario_preview.html"), 'w') as f:
     f.write(html2)
 print("Previews generated.")

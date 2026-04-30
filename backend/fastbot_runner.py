@@ -16,10 +16,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional, Callable, Awaitable
 
+from backend.paths import PROJECT_ROOT, project_path
+
 logger = logging.getLogger("FastbotRunner")
 
-PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-FASTBOT_ASSETS_DIR = os.path.join(PROJECT_ROOT, "resources", "fastbot")
+FASTBOT_ASSETS_DIR = str(project_path("resources", "fastbot"))
 
 DEVICE_JARS = [
     "framework.jar",
@@ -63,7 +64,7 @@ PERFETTO_CONTINUOUS_TRACE_BUFFER_KB = 12288
 PERFETTO_CONTINUOUS_META_BUFFER_KB = 2048
 PERFETTO_CONTINUOUS_FILE_WRITE_PERIOD_MS = 5000
 PERFETTO_CONTINUOUS_MAX_FILE_SIZE_BYTES = 64 * 1024 * 1024
-FASTBOT_REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports", "fastbot")
+FASTBOT_REPORTS_DIR = str(project_path("reports", "fastbot"))
 LOCAL_REPLAY_PRE_ROLL_SEC = 30
 LOCAL_REPLAY_POST_ROLL_SEC = 5
 LOCAL_REPLAY_SEGMENT_SEC = 5
@@ -479,7 +480,7 @@ def _build_trace_artifact(
     trigger_reason: str,
 ) -> Dict:
     return {
-        "path": os.path.relpath(local_trace_path, PROJECT_ROOT).replace(os.sep, "/"),
+        "path": os.path.relpath(local_trace_path, str(PROJECT_ROOT)).replace(os.sep, "/"),
         "trigger_time": trigger_time,
         "trigger_reason": trigger_reason,
         "analyzed": False,
@@ -668,7 +669,7 @@ def _analyze_exported_traces(
         if not relative_path:
             continue
 
-        local_trace_path = os.path.join(PROJECT_ROOT, relative_path)
+        local_trace_path = str(project_path(relative_path))
         result = analyze_perfetto_trace(
             local_trace_path,
             package_name,

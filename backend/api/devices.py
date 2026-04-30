@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -25,6 +26,7 @@ from backend.database import get_session
 from backend.device_sorting import sort_devices_for_display
 from backend.feature_flags import get_setting_value
 from backend.models import Device, TestExecution
+from backend.paths import project_path
 from backend.schemas import DeviceRead, DeviceSyncResponse, DeviceRenameRequest
 from backend.api.deps import get_current_user
 from backend.wda_port_manager import wda_relay_manager
@@ -317,22 +319,64 @@ def _discover_ios_wda_bundle_id(udid: str) -> Optional[str]:
 
 def _discover_wda_xcodeproj_path() -> Optional[str]:
     """
-    尝试发现本机 WebDriverAgent.xcodeproj。
+    尝试发现本机 WebDriverAgent.xcodeproj，避免绑定某台机器的固定目录。
     """
-    candidates = [
-        os.path.expanduser("~/Desktop/x/Apple/WebDriverAgent/WebDriverAgent.xcodeproj"),
-        os.path.expanduser("~/WebDriverAgent/WebDriverAgent.xcodeproj"),
-        os.path.expanduser("~/.appium/node_modules/appium-webdriveragent/WebDriverAgent.xcodeproj"),
-        os.path.expanduser(
-            "~/.appium/node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent/WebDriverAgent.xcodeproj"
-        ),
-        "/opt/homebrew/lib/node_modules/appium-webdriveragent/WebDriverAgent.xcodeproj",
-        "/usr/local/lib/node_modules/appium-webdriveragent/WebDriverAgent.xcodeproj",
+    candidates: List[Path] = [
+        project_path("WebDriverAgent", "WebDriverAgent.xcodeproj"),
+        project_path("resources", "WebDriverAgent", "WebDriverAgent.xcodeproj"),
+        Path.home() / "WebDriverAgent" / "WebDriverAgent.xcodeproj",
+        Path.home() / ".appium" / "node_modules" / "appium-webdriveragent" / "WebDriverAgent.xcodeproj",
+        Path.home()
+        / ".appium"
+        / "node_modules"
+        / "appium-xcuitest-driver"
+        / "node_modules"
+        / "appium-webdriveragent"
+        / "WebDriverAgent.xcodeproj",
     ]
+
+    env_project = os.getenv("IOS_WDA_XCODEPROJ_PATH")
+    if env_project:
+        candidates.insert(0, Path(env_project).expanduser())
+
+    try:
+        result = subprocess.run(
+            ["npm", "root", "-g"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        npm_root = Path(result.stdout.strip()).expanduser() if result.returncode == 0 else None
+    except Exception:
+        npm_root = None
+
+    if npm_root:
+        candidates.extend(
+            [
+                npm_root / "appium-webdriveragent" / "WebDriverAgent.xcodeproj",
+                npm_root
+                / "appium-xcuitest-driver"
+                / "node_modules"
+                / "appium-webdriveragent"
+                / "WebDriverAgent.xcodeproj",
+            ]
+        )
+
     for path in candidates:
-        if path and os.path.exists(path):
-            return path
+        if path and path.exists():
+            return str(path)
     return None
+
+
+def _resolve_host_path_setting(raw_path: Optional[str]) -> Optional[str]:
+    value = str(raw_path or "").strip()
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = project_path(value)
+    return str(path)
 
 
 def _resolve_ios_wda_xcodebuild_target(session: Session, udid: str) -> Dict[str, Optional[str]]:
@@ -341,25 +385,25 @@ def _resolve_ios_wda_xcodebuild_target(session: Session, udid: str) -> Dict[str,
     """
     scoped_workspace = get_setting_value(session, f"ios_wda_xcworkspace_path.{udid}")
     global_workspace = get_setting_value(session, "ios_wda_xcworkspace_path")
-    workspace_path = scoped_workspace or global_workspace
+    workspace_path = _resolve_host_path_setting(scoped_workspace or global_workspace)
     if workspace_path and not os.path.exists(workspace_path):
         raise RuntimeError(f"ios_wda_xcworkspace_path 不存在: {workspace_path}")
 
     scoped_project = get_setting_value(session, f"ios_wda_xcodeproj_path.{udid}")
     global_project = get_setting_value(session, "ios_wda_xcodeproj_path")
-    project_path = scoped_project or global_project or _discover_wda_xcodeproj_path()
-    if project_path and not os.path.exists(project_path):
-        raise RuntimeError(f"ios_wda_xcodeproj_path 不存在: {project_path}")
+    xcodeproj_path = _resolve_host_path_setting(scoped_project or global_project) or _discover_wda_xcodeproj_path()
+    if xcodeproj_path and not os.path.exists(xcodeproj_path):
+        raise RuntimeError(f"ios_wda_xcodeproj_path 不存在: {xcodeproj_path}")
 
     if workspace_path:
         return {
             "workspace_path": workspace_path,
             "project_path": None,
         }
-    if project_path:
+    if xcodeproj_path:
         return {
             "workspace_path": None,
-            "project_path": project_path,
+            "project_path": xcodeproj_path,
         }
     raise RuntimeError(
         "未找到 WebDriverAgent 工程，请配置 ios_wda_xcodeproj_path 或 ios_wda_xcworkspace_path"

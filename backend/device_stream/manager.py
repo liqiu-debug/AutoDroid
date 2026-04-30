@@ -17,14 +17,14 @@ import queue
 from typing import Dict, Optional, Generator, List, Set
 
 import adbutils
+from backend.paths import project_path
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
 
 # 配置日志
 logger = logging.getLogger("ScrcpyManager")
 logger.setLevel(logging.INFO)
 # scrcpy-server jar 路径（相对于项目根目录）
-PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-SCRCPY_SERVER_PATH = os.path.join(PROJECT_ROOT, "assets", "scrcpy-server.jar")
+SCRCPY_SERVER_PATH = str(project_path("assets", "scrcpy-server.jar"))
 DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar"
 
 # 端口分配范围
