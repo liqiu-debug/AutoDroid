@@ -11,7 +11,9 @@ const scenarios = ref([])
 const devices = ref([])
 const environments = ref([])
 const loading = ref(false)
+const scenariosLoading = ref(false)
 const searchQuery = ref('')
+let scenariosRequest = null
 
 // 弹窗
 const dialogVisible = ref(false)
@@ -64,13 +66,28 @@ const fetchTasks = async () => {
     }
 }
 
-const fetchScenarios = async () => {
-    try {
-        const res = await api.getScenarios()
-        scenarios.value = res.data.items || res.data || []
-    } catch (err) {
-        console.error('获取场景列表失败', err)
-    }
+const fetchScenarios = () => {
+    if (scenariosRequest) return scenariosRequest
+
+    scenariosLoading.value = true
+    scenariosRequest = api.getScenarios()
+        .then((res) => {
+            scenarios.value = res.data.items || res.data || []
+        })
+        .catch((err) => {
+            console.error('获取场景列表失败', err)
+            ElMessage.error('获取场景列表失败')
+        })
+        .finally(() => {
+            scenariosLoading.value = false
+            scenariosRequest = null
+        })
+
+    return scenariosRequest
+}
+
+const handleScenarioDropdownVisible = (visible) => {
+    if (visible) fetchScenarios()
 }
 
 const fetchDevices = async () => {
@@ -279,7 +296,6 @@ const weekDayOptions = [
 
 onMounted(() => {
     fetchTasks()
-    fetchScenarios()
     fetchDevices()
     fetchEnvironments()
 })
@@ -390,7 +406,13 @@ onMounted(() => {
 
                 <!-- UI 自动化专属：场景选择 -->
                 <el-form-item v-if="form.task_type === 'ui'" label="执行场景">
-                    <el-select v-model="form.scenario_id" placeholder="选择场景" style="width: 100%">
+                    <el-select
+                        v-model="form.scenario_id"
+                        placeholder="选择场景"
+                        style="width: 100%"
+                        :loading="scenariosLoading"
+                        @visible-change="handleScenarioDropdownVisible"
+                    >
                         <el-option
                             v-for="s in scenarios"
                             :key="s.id"
