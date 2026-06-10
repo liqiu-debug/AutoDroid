@@ -6,7 +6,7 @@
 
 AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 
-- Android 端可视化录制（点击页面直接生成步骤）
+- Android 实时投屏/静态截图录制，iOS WDA 静态截图录制（点击页面直接生成步骤）
 - 统一步骤模型（标准步骤 + 兼容 legacy）
 - Android / iOS 双端执行
 - 多设备并发、定时调度、报告与通知闭环
@@ -26,7 +26,7 @@ AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 | 业务域 | 功能能力 | 关键实现 |
 |---|---|---|
 | 用例管理 | 用例 CRUD、复制、目录树组织、标签、变量 | `backend/api/cases.py`、`backend/api/folders.py` |
-| 录制编排 | Android 截图录制、元素审查、交互录制、步骤拖拽编辑、单步执行 | `backend/main.py` `/device/*` + `frontend/src/components/DeviceStage.vue` `StepBuilder.vue` |
+| 录制编排 | Android 实时投屏/静态截图录制；iOS WDA 静态截图、元素审查、交互录制、步骤编辑与单步执行 | `backend/main.py` `/device/*` + `frontend/src/components/DeviceStage.vue` `StepBuilder.vue` |
 | 跨端执行 | 标准步骤下发 Android/iOS，容错策略控制流程 | `backend/drivers/cross_platform_runner.py`、`android_driver.py`、`ios_driver.py` |
 | 场景编排 | 多用例串联、别名、变量上下文跨用例传递 | `backend/api/scenarios.py` |
 | 并发运行 | 场景多设备并发批次执行，设备级预检过滤 | `backend/api/scenarios.py` `_schedule_concurrent_runs` |
@@ -38,6 +38,7 @@ AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 | 稳定性探索 | Fastbot 智能探索、性能曲线、Crash/ANR 统计 | `backend/api/fastbot.py`、`backend/fastbot_runner.py` |
 | AI 能力 | 自然语言生成步骤（NL2Step）、日志 AI 根因分析 | `backend/api/ai.py`、`backend/api/log_analysis.py` |
 | 配置与通知 | 系统配置中心、飞书测试报告卡片通知 | `backend/api/settings.py`、`backend/notification_service.py` |
+| 移动端适配 | 自动/PC/移动模式切换，提供概览、设备、用例/场景执行和报告查看 | `frontend/src/composables/useClientMode.js`、`frontend/src/layout/Index.vue` |
 
 ## 4. 技术架构概览
 
@@ -63,6 +64,17 @@ flowchart TD
 - iOS 自动化：facebook-wda + tidevice  
 - 图像/OCR：OpenCV + PaddleOCR（兼容封装）  
 - 实时通信：WebSocket（执行日志、Scrcpy 视频流）  
+
+### 移动端架构与边界
+
+前端通过 `useClientMode` 提供 `auto / pc / mobile` 三种模式：
+
+- 自动模式在视口宽度不超过 `768px` 或检测到触控型指针时启用移动布局。
+- 用户可在登录页、桌面导航栏或移动端页头手动切换模式，选择结果写入 `localStorage`。
+- 移动端使用独立页头和底部导航，主入口为概览、设备、用例、场景和报告。
+- 路由通过 `meta.mobileAvailable` 声明移动端可用性；未开放的页面统一展示 PC 模式提示。
+
+当前移动端聚焦查看和轻量执行：支持设备状态与常用运维、用例/场景发起执行、报告列表与详情查看；用例编辑、复杂场景编排、资产配置、调度和系统管理仍使用 PC 模式。
 
 ## 5. 核心实现机制（深度）
 
@@ -166,7 +178,6 @@ flowchart TD
 - `P1005_WDA_UNAVAILABLE`
 - `P1006_INVALID_ARGS`
 - `S1001_SCENARIO_PRECHECK_FAILED`
-- `P2001_RECORDING_ANDROID_ONLY`
 - `P2002_ADB_ANDROID_ONLY`
 - `P3001_FASTBOT_ANDROID_ONLY`
 - `P3002_WDA_IOS_ONLY`
@@ -185,13 +196,14 @@ flowchart TD
 
 | 能力 | Android | iOS | 说明 |
 |---|---|---|---|
-| 录制（`/device/dump/inspect/interact/execute_step`） | 支持 | 不支持 | iOS 调用会被边界拦截（`P2001/P2002`） |
+| 静态截图录制（`/device/dump/inspect/interact/execute_step`） | 支持 | 支持 | iOS 通过 WDA 获取截图、层级并执行交互 |
+| 实时投屏录制 | 支持 | 不支持 | Scrcpy 实时流仅支持 Android |
 | 用例执行 | 支持 | 支持（需开 `ios_execution` 且 WDA 健康） | 跨端 Runner 统一调度 |
 | 场景并发执行 | 支持 | 支持 | 设备级预检过滤 |
 | Fastbot 探索 | 支持 | 不支持 | `P3001_FASTBOT_ANDROID_ONLY` |
 | WDA 检测 | 不适用 | 支持 | `POST /devices/{serial}/wda/check` |
 
-结论：当前产品形态是“Android 录制 + Android/iOS 执行”。
+结论：当前产品形态是“Android 实时/静态录制 + iOS 静态录制 + Android/iOS 执行”。
 
 ## 7. 设备管理与稳定性保障
 
@@ -230,6 +242,8 @@ WDA relay 由 `backend/wda_port_manager.py` 管理，端口范围 `8200-8299`，
 - 回收设备状态，降低“设备卡 BUSY”概率
 
 ## 8. Scrcpy 实时流媒体能力
+
+Scrcpy 实时投屏当前仅支持 Android。iOS 录制使用 WDA 静态截图，设备交互完成后重新获取截图和页面层级，不建立实时视频流。
 
 设备流管理器 `backend/device_stream/manager.py` 负责：
 
@@ -333,8 +347,8 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
 ### 12.1 用例流（录制 -> 执行 -> 报告）
 
-1. 设备中心同步 Android 设备。  
-2. 用例编辑页选择设备，`/device/interact` 录制生成步骤。  
+1. 设备中心同步 Android 或 iOS 设备。
+2. 用例编辑页选择设备；Android 可使用实时投屏或静态截图，iOS 使用 WDA 静态截图，通过 `/device/interact` 录制生成步骤。
 3. `StepBuilder` 补充动作参数、容错策略、OCR/图像步骤。  
 4. 保存时 legacy 与标准步骤双轨持久化。  
 5. 运行前执行 `precheck`，拦截不可执行步骤。  
@@ -396,8 +410,8 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
 ## 16. 项目边界与当前形态总结
 
-- 当前明确定位：`Android 录制 + Android/iOS 执行`。  
-- iOS 录制不在支持范围内（仅执行）。  
+- 当前明确定位：`Android 实时/静态录制 + iOS 静态录制 + Android/iOS 执行`。
+- iOS 已支持 WDA 静态截图录制，暂不支持实时投屏。
 - Fastbot 仅 Android 支持。  
 - 跨端能力依赖标准步骤模型与预检，建议将预检作为运行前必经流程。  
 
