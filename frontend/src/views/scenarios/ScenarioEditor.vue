@@ -669,10 +669,10 @@ const getStepTitle = (step) => {
                         :value="env.id"
                       />
                     </el-select>
-                    <el-button 
-                      :type="running ? 'danger' : 'success'" 
+                    <el-button
+                      :type="running ? 'danger' : 'success'"
                       :icon="running ? CircleClose : VideoPlay"
-                      @click="openRunDialog" 
+                      @click="openRunDialog"
                       :disabled="terminatingRun"
                       style="margin-right: 12px"
                     >

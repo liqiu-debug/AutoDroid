@@ -405,7 +405,7 @@ onUnmounted(() => {
       </el-aside>
 
       <el-aside width="350px" class="right-pane">
-        <StepBuilder 
+        <StepBuilder
           :env-id="envId"
           :device-serial="recordingDeviceSerial"
           :active-image-crop-step-uuid="activeImageCropStepUuid"
@@ -414,10 +414,10 @@ onUnmounted(() => {
           @request-image-crop="handleRequestImageCrop"
         >
           <template #header-actions>
-            <el-dropdown 
-              split-button 
-              :type="isRunning ? 'danger' : 'primary'" 
-              @click="handleRun" 
+            <el-dropdown
+              split-button
+              :type="isRunning ? 'danger' : 'primary'"
+              @click="handleRun"
               @command="handleRunCommand"
               :disabled="!currentCase.id || terminatingRun"
               :icon="isRunning ? CircleClose : VideoPlay"

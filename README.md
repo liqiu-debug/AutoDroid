@@ -15,6 +15,7 @@ AutoDroid 是一个面向 Android/iOS 的低代码 UI 自动化测试平台，�
 | 跨端执行 | Android 使用 uiautomator2，iOS 使用 facebook-wda；支持统一动作与平台定位覆盖 |
 | 调度中心 | 单次、每天、每周、循环任务；支持 UI 场景和 Fastbot 任务 |
 | 智能稳定性 | Fastbot 探索、Crash/ANR、CPU/内存、framestats 卡顿检测、回放与 Trace 分析 |
+| 冷热启动专项 | ADB 启动计时、uiautomator2 首页就绪检查、慢启动 Perfetto 取证 |
 | 报告与大盘 | 用例/场景执行详情、失败截图、HTML 报告、趋势与设备状态概览 |
 | AI 辅助 | 自然语言生成测试步骤、Fastbot 日志根因分析、OpenAI 兼容接口 |
 | 系统管理 | JWT 登录、管理员用户管理、公开注册开关、资源删除权限、飞书通知 |
@@ -62,6 +63,7 @@ flowchart TD
 | 图像/OCR 步骤 | 支持 | 支持 | 具体动作与参数见执行规范 |
 | 实时 Scrcpy 画面 | 支持 | 不支持 | 用于 Android 预览和触控 |
 | Fastbot 探索 | 支持 | 不支持 | Android 专项能力 |
+| 冷热启动专项 | 支持 | 不支持 | Android 专项能力，首页就绪 P90 为主指标 |
 
 ## 移动端适配
 
@@ -94,7 +96,7 @@ AutoDroid/
 │   ├── runner.py               # Legacy 执行链路
 │   ├── step_contract.py        # 标准步骤与 Legacy 步骤转换
 │   ├── scheduler_service.py    # APScheduler 定时调度
-│   └── fastbot_runner.py       # Fastbot 与性能监控执行引擎
+│   └── fastbot_runner.py       # Fastbot、冷热启动与性能监控执行引擎
 ├── frontend/
 │   ├── src/api/                # HTTP API 封装
 │   ├── src/components/         # 设备画面、步骤编辑、日志等公共组件
@@ -205,7 +207,8 @@ npm run dev -- --host
 5. 将多个用例编排为场景，通过场景上下文传递运行时变量。
 6. 选择一台或多台设备执行场景；不满足条件的设备会被预检过滤。
 7. 在定时任务中创建单次、每日、每周或循环任务。
-8. 在报告中心和运行大盘查看结果、失败截图、趋势和设备告警。
+8. 在“专项测试 -> 冷热启动”中配置包名、启动模式、启动次数和首页就绪 locator，查看首页就绪 P90 与慢启动 Trace。
+9. 在报告中心和运行大盘查看结果、失败截图、趋势和设备告警。
 
 ## 执行模型
 
@@ -261,6 +264,7 @@ iOS WDA URL、设备映射、启动参数和故障处理见 [iOS WDA 运维手�
 
 - OpenAPI：`GET /docs`
 - 主要业务 API：`/api/auth`、`/api/cases`、`/api/scenarios`、`/api/devices`、`/api/tasks`、`/api/reports`、`/api/fastbot`
+- 冷热启动专项 API：`POST /api/fastbot/startup/run`、`GET /api/fastbot/startup/tasks`
 - 实时执行与视频流：`/ws/*`
 - 部分无 `/api` 前缀的路由继续保留，用于兼容历史客户端
 

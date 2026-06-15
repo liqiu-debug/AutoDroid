@@ -31,6 +31,8 @@ from backend.schemas import (
     FluencySessionRead,
     FluencySessionStartRequest,
     FluencyMarkerCreate,
+    StartupRunRequest,
+    StartupTaskRead,
     DeviceRead,
     DeviceStatusRead,
     JankAiSummaryRequest,
@@ -79,6 +81,7 @@ class _FluencyRuntime:
 
 
 _fluency_runtimes: Dict[int, _FluencyRuntime] = {}
+_startup_task_ids: set[int] = set()
 
 
 def _ensure_fastbot_android_device(device: Device) -> None:
@@ -344,6 +347,45 @@ def _build_fluency_session_read(
     }
 
 
+def _safe_load_summary(report: Optional[FastbotReport]) -> Dict[str, Any]:
+    if not report or not report.summary:
+        return {}
+    try:
+        loaded = json.loads(report.summary)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_startup_report(report: Optional[FastbotReport]) -> bool:
+    return _safe_load_summary(report).get("session_type") == "startup"
+
+
+def _build_startup_task_read(
+    task: FastbotTask,
+    report: Optional[FastbotReport] = None,
+) -> Dict[str, Any]:
+    summary = _safe_load_summary(report)
+    return {
+        "id": task.id,
+        "package_name": task.package_name,
+        "duration": task.duration,
+        "throttle": task.throttle,
+        "ignore_crashes": task.ignore_crashes,
+        "capture_log": task.capture_log,
+        "device_serial": task.device_serial,
+        "status": task.status,
+        "total_crashes": task.total_crashes,
+        "total_anrs": task.total_anrs,
+        "executor_name": task.executor_name,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "finished_at": task.finished_at,
+        "report_ready": bool(report),
+        "summary": summary if summary else None,
+    }
+
+
 @router.get("/tasks", response_model=List[FastbotTaskRead])
 def list_tasks(
     skip: int = 0,
@@ -351,10 +393,21 @@ def list_tasks(
     session: Session = Depends(get_session),
 ):
     """获取任务历史列表"""
+    candidate_limit = max((skip + limit) * 4, limit, 50)
     tasks = session.exec(
-        select(FastbotTask).order_by(FastbotTask.id.desc()).offset(skip).limit(limit)
+        select(FastbotTask).order_by(FastbotTask.id.desc()).limit(candidate_limit)
     ).all()
-    return tasks
+    task_ids = [task.id for task in tasks if task.id is not None]
+    reports = session.exec(
+        select(FastbotReport).where(FastbotReport.task_id.in_(task_ids))
+    ).all() if task_ids else []
+    report_by_task = {report.task_id: report for report in reports}
+
+    filtered = [
+        task for task in tasks
+        if task.id not in _startup_task_ids and not _is_startup_report(report_by_task.get(task.id))
+    ]
+    return filtered[skip:skip + limit]
 
 
 @router.get("/tasks/{task_id}", response_model=FastbotTaskRead)
@@ -678,6 +731,88 @@ async def list_devices_with_status(session: Session = Depends(get_session)):
     return sort_devices_for_display(result)
 
 
+@router.get("/startup/tasks", response_model=List[StartupTaskRead])
+def list_startup_tasks(
+    limit: int = 20,
+    session: Session = Depends(get_session),
+):
+    candidate_limit = max(limit * 6, 50)
+    tasks = session.exec(
+        select(FastbotTask).order_by(FastbotTask.id.desc()).limit(candidate_limit)
+    ).all()
+    task_ids = [task.id for task in tasks if task.id is not None]
+    reports = session.exec(
+        select(FastbotReport).where(FastbotReport.task_id.in_(task_ids))
+    ).all() if task_ids else []
+    report_by_task = {report.task_id: report for report in reports}
+
+    results: List[Dict[str, Any]] = []
+    for task in tasks:
+        report = report_by_task.get(task.id)
+        if task.id not in _startup_task_ids and not _is_startup_report(report):
+            continue
+        results.append(_build_startup_task_read(task, report=report))
+        if len(results) >= limit:
+            break
+    return results
+
+
+@router.post("/startup/run", response_model=List[StartupTaskRead])
+async def run_startup_test(
+    data: StartupRunRequest,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
+    devices_by_serial = {
+        device.serial: device
+        for device in session.exec(select(Device).where(Device.serial.in_(data.device_serials))).all()
+    }
+    missing = [serial for serial in data.device_serials if serial not in devices_by_serial]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"设备不存在: {', '.join(missing)}")
+
+    for serial in data.device_serials:
+        _ensure_fastbot_android_device(devices_by_serial[serial])
+        if _is_device_busy(serial):
+            raise HTTPException(status_code=400, detail=f"设备正忙，请稍后再试: {serial}")
+
+    online_serials = await _get_online_devices()
+    offline = [serial for serial in data.device_serials if serial not in online_serials]
+    if offline:
+        raise HTTPException(status_code=400, detail=f"设备不在线或未就绪: {', '.join(offline)}")
+
+    task_reads: List[Dict[str, Any]] = []
+    task_ids: List[int] = []
+    for serial in data.device_serials:
+        task = FastbotTask(
+            package_name=data.package_name,
+            duration=len(data.startup_modes) * data.iterations,
+            throttle=data.cooldown_sec * 1000,
+            ignore_crashes=True,
+            capture_log=data.capture_log,
+            device_serial=serial,
+            status="PENDING",
+            executor_id=current_user.id,
+            executor_name=current_user.full_name or current_user.username,
+        )
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+
+        _startup_task_ids.add(task.id)
+        _lock_device(serial, task.id)
+        task_ids.append(task.id)
+        task_reads.append(_build_startup_task_read(task))
+
+    background_tasks.add_task(
+        _execute_startup_batch_background,
+        task_ids,
+        dump_model(data),
+    )
+    return task_reads
+
+
 @router.post("/run", response_model=FastbotTaskRead)
 async def run_fastbot(
     data: FastbotTaskCreate,
@@ -856,6 +991,145 @@ async def _execute_fastbot_async(
                     session.commit()
         except Exception:
             pass
+
+
+def _execute_startup_batch_background(task_ids: List[int], config: Dict[str, Any]):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_execute_startup_batch_async(task_ids, config))
+    finally:
+        loop.close()
+
+
+async def _execute_startup_batch_async(task_ids: List[int], config: Dict[str, Any]):
+    await asyncio.gather(*[
+        _execute_startup_task_async(task_id, config)
+        for task_id in task_ids
+    ])
+
+
+async def _execute_startup_task_async(
+    task_id: int,
+    config: Dict[str, Any],
+):
+    from backend.fastbot_runner import run_startup_task
+    from sqlmodel import Session as SQLSession
+
+    serial = ""
+    try:
+        with SQLSession(engine) as session:
+            task = session.get(FastbotTask, task_id)
+            if not task:
+                return
+
+            serial = task.device_serial
+            if not task.started_at:
+                task.started_at = datetime.now()
+            task.status = "RUNNING"
+            session.add(task)
+
+            device = session.exec(select(Device).where(Device.serial == serial)).first()
+            if device:
+                device.status = "BUSY"
+                device.updated_at = datetime.now()
+                session.add(device)
+            session.commit()
+
+        result = await run_startup_task(
+            device_serial=serial,
+            package_name=str(config.get("package_name") or ""),
+            activity_name=config.get("activity_name") or None,
+            startup_modes=list(config.get("startup_modes") or ["cold", "hot"]),
+            iterations=int(config.get("iterations") or 3),
+            cooldown_sec=int(config.get("cooldown_sec") or 3),
+            capture_log=bool(config.get("capture_log", True)),
+            ready_check=dict(config.get("ready_check") or {}),
+            perfetto_slow_trace=dict(config.get("perfetto_slow_trace") or {}),
+            task_id=task_id,
+        )
+
+        with SQLSession(engine) as session:
+            task = session.get(FastbotTask, task_id)
+            if not task:
+                return
+
+            summary = result.get("summary", {})
+            task.status = "COMPLETED"
+            task.finished_at = datetime.now()
+            task.total_crashes = summary.get("total_crashes", 0)
+            task.total_anrs = summary.get("total_anrs", 0)
+            session.add(task)
+
+            report = FastbotReport(
+                task_id=task_id,
+                performance_data=json.dumps(result.get("performance_data", [])),
+                jank_data=json.dumps(result.get("jank_data", [])),
+                jank_events=json.dumps(result.get("jank_events", [])),
+                trace_artifacts=json.dumps(result.get("trace_artifacts", [])),
+                crash_events=json.dumps(result.get("crash_events", [])),
+                summary=json.dumps(summary),
+            )
+            session.add(report)
+            session.commit()
+
+        logger.info("冷热启动任务 #%s 执行完成", task_id)
+
+    except Exception as exc:
+        logger.error("冷热启动任务 #%s 执行失败: %s", task_id, exc)
+        failure_summary = {
+            "session_type": "startup",
+            "session_label": "冷热启动测试",
+            "performance_monitor_enabled": False,
+            "jank_frame_monitor_enabled": False,
+            "startup_config": config,
+            "startup_runs": [],
+            "startup_aggregate": {},
+            "slow_events": [],
+            "success_count": 0,
+            "fail_count": 1,
+            "success_rate": 0,
+            "slow_count": 0,
+            "total_crashes": 0,
+            "total_anrs": 0,
+            "error": str(exc),
+        }
+        with SQLSession(engine) as session:
+            task = session.get(FastbotTask, task_id)
+            if task:
+                serial = task.device_serial
+                task.status = "FAILED"
+                task.finished_at = datetime.now()
+                session.add(task)
+                existing_report = session.exec(
+                    select(FastbotReport).where(FastbotReport.task_id == task_id)
+                ).first()
+                if not existing_report:
+                    session.add(FastbotReport(
+                        task_id=task_id,
+                        performance_data=json.dumps([]),
+                        jank_data=json.dumps([]),
+                        jank_events=json.dumps([]),
+                        trace_artifacts=json.dumps([]),
+                        crash_events=json.dumps([]),
+                        summary=json.dumps(failure_summary),
+                    ))
+                session.commit()
+    finally:
+        if serial:
+            _unlock_device(serial)
+        try:
+            with SQLSession(engine) as session:
+                if serial:
+                    device = session.exec(select(Device).where(Device.serial == serial)).first()
+                    if device and device.status == "BUSY":
+                        device.status = "IDLE"
+                        device.updated_at = datetime.now()
+                        session.add(device)
+                        session.commit()
+        except Exception:
+            pass
+        _startup_task_ids.discard(task_id)
 
 
 def _execute_fluency_background(task_id: int):

@@ -313,6 +313,12 @@ export default {
     getFluencySessions(params) {
         return api.get('/fastbot/fluency/sessions', { params })
     },
+    getStartupTasks(params) {
+        return api.get('/fastbot/startup/tasks', { params })
+    },
+    runStartupTest(data) {
+        return api.post('/fastbot/startup/run', data)
+    },
     startFluencySession(data) {
         return api.post('/fastbot/fluency/start', data)
     },
