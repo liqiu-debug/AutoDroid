@@ -52,7 +52,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['stepUpdate', 'runComplete'])
+const emit = defineEmits(['stepUpdate', 'runStart', 'runComplete'])
 
 const isMinimized = ref(true)
 const logs = ref([])
@@ -66,6 +66,7 @@ const statusText = computed(() => {
     case 'running': return '执行中...'
     case 'success': return '✓ 完成'
     case 'failed': return '✗ 失败'
+    case 'aborted': return '已终止'
     default: return '待执行'
   }
 })
@@ -112,6 +113,7 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
         status: 'info',
         log: `📋 开始执行用例: ${data.case_name} (${data.total_steps} 步)`
       })
+      emit('runStart', data)
     }
     
     if (data.type === 'step_update') {
@@ -127,13 +129,13 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
     }
     
     if (data.type === 'run_complete') {
-      runStatus.value = data.success ? 'success' : 'failed'
+      runStatus.value = data.status === 'ABORTED' ? 'aborted' : (data.success ? 'success' : 'failed')
       reportId.value = data.report_id
       
       logs.value.push({
         timestamp: data.timestamp,
-        status: data.success ? 'success' : 'failed',
-        log: `${data.success ? '✓' : '✗'} 执行完成: ${data.passed} 通过, ${data.failed} 失败 (${data.total_duration}s)`
+        status: data.status === 'ABORTED' ? 'warning' : (data.success ? 'success' : 'failed'),
+        log: `${data.status === 'ABORTED' ? '已终止' : (data.success ? '✓' : '✗')} 执行完成: ${data.passed} 通过, ${data.failed} 失败 (${data.total_duration}s)`
       })
       
       emit('runComplete', data)
@@ -197,12 +199,23 @@ const setReportId = (id) => {
   reportId.value = id
 }
 
+const markAborted = () => {
+  runStatus.value = 'aborted'
+  logs.value.push({
+    timestamp: new Date().toISOString(),
+    status: 'warning',
+    log: '执行已被用户终止'
+  })
+  scrollToBottom()
+}
+
 // 暴露方法给父组件
 defineExpose({
   connect,
   clear,
   appendLog,
-  setReportId
+  setReportId,
+  markAborted
 })
 
 onUnmounted(() => {
@@ -283,6 +296,11 @@ onUnmounted(() => {
 
 .console-header .status.failed {
   background: #e53e3e;
+  color: #fff;
+}
+
+.console-header .status.aborted {
+  background: #909399;
   color: #fff;
 }
 

@@ -15,6 +15,7 @@ import base64
 import hashlib
 import logging
 import threading
+import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -35,6 +36,7 @@ from .runner import TestRunner, register_device_abort, unregister_device_abort
 from .socket_manager import manager
 from .utils.pydantic_compat import dump_model
 from .report_generator import report_generator
+from .run_control import ABORTED_STATUS, registry
 from .device_stream.router import rest_router as stream_rest_router
 from .device_stream.router import ws_router as stream_ws_router
 from .device_stream.manager import device_manager
@@ -199,7 +201,7 @@ class _RecordingIOSSessionPool:
 
 _recording_ios_session_pool = _RecordingIOSSessionPool()
 
-from .database import engine, create_db_and_tables, get_session
+from .database import backfill_legacy_asset_owners, engine, create_db_and_tables, get_session
 from backend.core.security import get_password_hash
 from backend.models import User
 from backend.cross_platform_execution import (
@@ -240,10 +242,12 @@ if STATIC_DIR.exists():
     app.mount("/api/static", StaticFiles(directory=str(STATIC_DIR)), name="api_static")
 
 from backend.api import auth, cases
+from backend.api import admin
 
 from backend.api import folders
 from backend.api import scenarios
 from backend.api import reports
+from backend.api import runs
 from backend.api import tasks
 from backend.api import settings
 from backend.api import fastbot
@@ -263,10 +267,12 @@ def _register_http_routers(
     reports_prefix: str = "/reports",
 ) -> None:
     target.include_router(auth.router, prefix="/auth", tags=["auth"], include_in_schema=include_in_schema)
+    target.include_router(admin.router, prefix="/admin", tags=["admin"], include_in_schema=include_in_schema)
     target.include_router(cases.router, prefix="/cases", tags=["cases"], include_in_schema=include_in_schema)
     target.include_router(folders.router, prefix="/folders", tags=["folders"], include_in_schema=include_in_schema)
     target.include_router(scenarios.router, prefix="/scenarios", tags=["scenarios"], include_in_schema=include_in_schema)
     target.include_router(reports.router, prefix=reports_prefix, tags=["reports"], include_in_schema=include_in_schema)
+    target.include_router(runs.router, prefix="/runs", tags=["runs"], include_in_schema=include_in_schema)
     target.include_router(tasks.router, prefix="/tasks", tags=["tasks"], include_in_schema=include_in_schema)
     if include_settings_alias:
         target.include_router(settings.router, prefix="/settings", tags=["settings"], include_in_schema=include_in_schema)
@@ -340,14 +346,16 @@ def on_startup():
         statement = select(User).where(User.username == "admin")
         user = session.exec(statement).first()
         if not user:
-            admin_user = User(
+            user = User(
                 username="admin",
                 hashed_password=get_password_hash("123456"),
                 role="admin",
                 full_name="Administrator"
             )
-            session.add(admin_user)
+            session.add(user)
             session.commit()
+            session.refresh(user)
+        backfill_legacy_asset_owners(session, user.id)
 
     # 初始化定时任务调度器并恢复活跃任务
     _restore_scheduled_tasks()
@@ -1146,6 +1154,9 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
 
     blocking_executor = ThreadPoolExecutor(max_workers=1)
     managed_device_serial = None
+    run_id = None
+    run_batch_id = None
+    abort_event = None
     try:
         runner = None
         case_name_for_report = f"case-{case_id}"
@@ -1162,14 +1173,26 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
                 and bool(device_serial)
             )
+            run_batch_id = str(uuid.uuid4())
+            abort_event = register_device_abort(device_serial) if device_serial else threading.Event()
+            managed_device_serial = device_serial if device_serial else None
+            run_record = registry.register(
+                kind="case",
+                target_id=case_id,
+                batch_id=run_batch_id,
+                device_serial=device_serial,
+                abort_event=abort_event,
+            )
+            run_id = run_record.run_id
+            case.last_run_status = "RUNNING"
+            case.last_run_time = datetime.now()
+            session.add(case)
+            session.commit()
 
             if use_cross_platform_runner:
                 if not device_serial:
                     await websocket.send_json({"type": "error", "message": "跨端执行必须指定设备"})
                     return
-
-                managed_device_serial = device_serial
-                abort_event = register_device_abort(device_serial)
 
                 platform = resolve_device_platform(session, device_serial)
                 driver_kwargs = {}
@@ -1188,7 +1211,14 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                     env_id=env_id,
                 )
 
-                await manager.broadcast_run_start(case_id, case.name, len(steps))
+                await manager.broadcast_run_start(
+                    case_id,
+                    case.name,
+                    len(steps),
+                    batch_id=run_batch_id,
+                    run_id=run_id,
+                    device_serial=device_serial,
+                )
 
                 device = session.exec(select(Device).where(Device.serial == device_serial)).first()
                 if device:
@@ -1212,6 +1242,14 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 failed = 0
 
                 for i, step in enumerate(steps):
+                    if abort_event and abort_event.is_set():
+                        await manager.broadcast_step_update(
+                            case_id,
+                            i,
+                            "warning",
+                            "执行已被用户终止",
+                        )
+                        break
                     desc = step.get("description", "") if isinstance(step, dict) else ""
                     action = step.get("action") if isinstance(step, dict) else ""
                     await manager.broadcast_step_update(
@@ -1226,6 +1264,36 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         runner.run_step,
                         step,
                     )
+                    if abort_event and abort_event.is_set():
+                        try:
+                            legacy_step = standard_step_to_legacy(step)
+                        except Exception:
+                            legacy_step = {
+                                "action": step.get("action"),
+                                "selector": None,
+                                "selector_type": None,
+                                "value": step.get("value"),
+                                "options": {},
+                                "description": step.get("description"),
+                                "timeout": step.get("timeout", 10),
+                                "error_strategy": step.get("error_strategy", "ABORT"),
+                            }
+                        steps_results.append(
+                            {
+                                **legacy_step,
+                                "status": "warning",
+                                "duration": round(float(step_result.get("duration") or 0), 2),
+                                "log": "执行已被用户终止",
+                                "error": "执行已被用户终止",
+                            }
+                        )
+                        await manager.broadcast_step_update(
+                            case_id,
+                            i,
+                            "warning",
+                            "执行已被用户终止",
+                        )
+                        break
                     status = str(step_result.get("status") or "FAIL").upper()
                     strategy = normalize_error_strategy(step_result.get("error_strategy", "ABORT"))
                     error_msg = step_result.get("error")
@@ -1359,7 +1427,14 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         variables_map[gv.key] = gv.value
 
                 # 广播执行开始
-                await manager.broadcast_run_start(case_id, case.name, len(steps))
+                await manager.broadcast_run_start(
+                    case_id,
+                    case.name,
+                    len(steps),
+                    batch_id=run_batch_id,
+                    run_id=run_id,
+                    device_serial=device_serial,
+                )
 
                 # 覆盖局部变量
                 for v in (variables if isinstance(variables, list) else []):
@@ -1374,6 +1449,7 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                     TestRunner,
                     device_serial=device_serial,
                 )
+                runner.abort_event = abort_event
                 try:
                     await _run_in_blocking_executor(blocking_executor, runner.connect)
                 except Exception as e:
@@ -1387,6 +1463,14 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 failed = 0
 
                 for i, step in enumerate(steps):
+                    if abort_event and abort_event.is_set():
+                        await manager.broadcast_step_update(
+                            case_id,
+                            i,
+                            "warning",
+                            "执行已被用户终止",
+                        )
+                        break
                     step_start = time.time()
 
                     # 广播步骤开始
@@ -1438,6 +1522,25 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         duration = time.time() - step_start
 
                         strategy = step.get("error_strategy", "ABORT") if isinstance(step, dict) else getattr(step, "error_strategy", "ABORT")
+                        if abort_event and abort_event.is_set():
+                            step_data = step if isinstance(step, dict) else dump_model(step)
+                            steps_results.append({
+                                **step_data,
+                                "status": "warning",
+                                "duration": round(duration, 2),
+                                "log": "执行已被用户终止",
+                                "error": "执行已被用户终止",
+                            })
+                            await manager.broadcast_step_update(
+                                case_id,
+                                i,
+                                "warning",
+                                "执行已被用户终止",
+                                duration,
+                                None,
+                                "执行已被用户终止",
+                            )
+                            break
 
                         # 失败时尝试截图
                         screenshot_base64 = None
@@ -1505,14 +1608,30 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
             variables=report_variables,
         )
 
+        final_status = ABORTED_STATUS if abort_event and abort_event.is_set() else ("PASS" if failed == 0 else "FAIL")
+        try:
+            with Session(engine) as status_session:
+                db_case = status_session.get(TestCase, case_id)
+                if db_case:
+                    db_case.last_run_status = final_status
+                    db_case.last_run_time = end_time
+                    status_session.add(db_case)
+                    status_session.commit()
+        except Exception:
+            logger.exception("failed to update websocket case status: case_id=%s", case_id)
+
         # 广播执行完成
         await manager.broadcast_run_complete(
             case_id,
-            success=(failed == 0),
+            success=(final_status == "PASS"),
             total_duration=total_duration,
             passed=passed,
             failed=failed,
-            report_id=report_id
+            report_id=report_id,
+            status=final_status,
+            batch_id=run_batch_id,
+            run_id=run_id,
+            device_serial=device_serial,
         )
 
     except WebSocketDisconnect:
@@ -1521,6 +1640,19 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
         logger.exception("Case WebSocket execution failed: case_id=%s", case_id)
         await websocket.send_json({"type": "error", "message": str(e)})
     finally:
+        try:
+            if run_id:
+                with Session(engine) as status_session:
+                    db_case = status_session.get(TestCase, case_id)
+                    if db_case and str(db_case.last_run_status or "").upper() == "RUNNING":
+                        db_case.last_run_status = (
+                            ABORTED_STATUS if abort_event and abort_event.is_set() else "ERROR"
+                        )
+                        db_case.last_run_time = datetime.now()
+                        status_session.add(db_case)
+                        status_session.commit()
+        except Exception:
+            logger.exception("failed to finalize websocket case status: case_id=%s", case_id)
         try:
             await _run_in_blocking_executor(
                 blocking_executor,
@@ -1540,6 +1672,7 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
             )
         if managed_device_serial:
             unregister_device_abort(managed_device_serial)
+        registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
         blocking_executor.shutdown(wait=True)
         manager.disconnect(websocket, case_id)
 

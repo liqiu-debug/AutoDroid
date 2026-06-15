@@ -1,13 +1,15 @@
 <script setup>
 import { ref, onActivated, onDeactivated, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Search, Refresh, Timer, Download, Delete, View } from '@element-plus/icons-vue'
+import { Search, Refresh, Timer, Download, Delete, View, CircleClose } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
+import { useClientMode } from '@/composables/useClientMode'
 
 const router = useRouter()
 const route = useRoute()
+const { isMobileMode } = useClientMode()
 
 // ========== 顶层 Tab ==========
 const resolveTab = (tab) => (tab === 'fastbot' || tab === 'startup' ? tab : 'ui')
@@ -22,6 +24,7 @@ const currentPage = ref(1)
 const pageSize = ref(20)
 const totalRecords = ref(0)
 const devicesMap = ref({})
+const stoppingDeviceSerial = ref('')
 
 const fetchDevices = async () => {
     try {
@@ -104,12 +107,14 @@ const fetchData = async () => {
             let anyRunning = false
             let anyFail = false
             let anyWarning = false
+            let anyAborted = false
             let maxDuration = 0
             
             g.executions.forEach(e => {
                 if (e.status === 'RUNNING' || e.status === 'PENDING') anyRunning = true
                 else if (e.status === 'FAIL' || e.status === 'ERROR') anyFail = true
                 else if (e.status === 'WARNING') anyWarning = true
+                else if (e.status === 'ABORTED') anyAborted = true
                 
                 if (e.duration > maxDuration) maxDuration = e.duration
             })
@@ -117,6 +122,7 @@ const fetchData = async () => {
             if (anyRunning) g.status = 'RUNNING'
             else if (anyFail) g.status = 'FAIL'
             else if (anyWarning) g.status = 'WARNING'
+            else if (anyAborted) g.status = 'ABORTED'
             else g.status = 'PASS'
             
             g.duration = maxDuration
@@ -135,6 +141,36 @@ const handleSizeChange = (val) => { pageSize.value = val; currentPage.value = 1;
 const handleCurrentChange = (val) => { currentPage.value = val; fetchData() }
 const handleView = (id) => { router.push(`/execution/reports/${id}`) }
 const handleDownload = (item) => { window.open(api.getReportDownloadUrl(item.id), '_blank') }
+
+const isExecutionRunning = (status) => {
+    const normalized = String(status || '').toUpperCase()
+    return normalized === 'RUNNING' || normalized === 'PENDING'
+}
+
+const handleStopExecutionFromReport = async (item) => {
+    if (!item?.device_serial) {
+        ElMessage.warning('该执行记录缺少设备信息，无法停止')
+        return
+    }
+    try {
+        await ElMessageBox.confirm(
+            `确定要停止 ${formatDeviceName(item.device_serial, item.device_info)} 当前执行吗？`,
+            '停止当前设备执行',
+            { type: 'warning', confirmButtonText: '停止执行', cancelButtonText: '取消' }
+        )
+        stoppingDeviceSerial.value = item.device_serial
+        const { data } = await api.stopDeviceExecution(item.device_serial)
+        const count = Number(data?.recovered_executions || 0)
+        ElMessage.success(count > 0 ? `已停止 ${count} 条运行中执行` : '已发送停止指令')
+        await Promise.all([fetchDevices(), fetchData()])
+    } catch (err) {
+        if (!['cancel', 'close'].includes(err)) {
+            ElMessage.error('停止失败：' + (err.response?.data?.detail || err.message))
+        }
+    } finally {
+        stoppingDeviceSerial.value = ''
+    }
+}
 
 const handleDeleteExecution = async (executionId) => {
     try {
@@ -388,7 +424,88 @@ onUnmounted(() => {
 </script>
 
 <template>
-    <div class="report-container">
+    <div v-if="isMobileMode" class="mobile-report-page">
+        <div class="mobile-report-toolbar">
+            <el-input
+                v-model="searchQuery"
+                placeholder="搜索场景..."
+                :prefix-icon="Search"
+                clearable
+                class="mobile-search-input"
+                @keyup.enter="handleSearch"
+                @clear="handleSearch"
+            />
+            <el-button :icon="Refresh" circle @click="fetchData" />
+        </div>
+
+        <el-radio-group v-model="filterStatus" class="mobile-status-filter" @change="handleSearch">
+            <el-radio-button value="all">全部</el-radio-button>
+            <el-radio-button value="pass">成功</el-radio-button>
+            <el-radio-button value="warning">告警</el-radio-button>
+            <el-radio-button value="fail">失败</el-radio-button>
+        </el-radio-group>
+
+        <div class="mobile-report-list" v-loading="loading">
+            <article
+                v-for="group in executions"
+                :key="group.batch_id"
+                class="mobile-report-card"
+            >
+                <header class="mobile-report-card-header">
+                    <div class="mobile-report-title">
+                        <strong>{{ group.batch_name }}</strong>
+                        <span>{{ formatDate(group.start_time) }} · {{ group.executions.length }} 台设备</span>
+                    </div>
+                    <el-tag :type="group.status === 'PASS' ? 'success' : (group.status === 'WARNING' ? 'warning' : (group.status === 'RUNNING' ? '' : 'danger'))" size="small">
+                        {{ group.status === 'RUNNING' ? '运行中' : group.status }}
+                    </el-tag>
+                </header>
+
+                <div class="mobile-report-executions">
+                    <div
+                        v-for="item in group.executions"
+                        :key="item.id"
+                        class="mobile-report-execution"
+                    >
+                        <div class="mobile-report-execution-main" @click="handleView(item.id)">
+                            <strong>{{ formatDeviceName(item.device_serial, item.device_info) }}</strong>
+                            <span>{{ getDuration(item.duration) }} · {{ item.executor_name || group.executor_name || '-' }}</span>
+                        </div>
+                        <div class="mobile-report-execution-actions">
+                            <el-tag size="small" :type="item.status === 'PASS' ? 'success' : (item.status === 'WARNING' ? 'warning' : (isExecutionRunning(item.status) ? '' : 'danger'))">
+                                {{ item.status }}
+                            </el-tag>
+                            <el-button
+                                v-if="isExecutionRunning(item.status)"
+                                type="danger"
+                                link
+                                :icon="CircleClose"
+                                :loading="stoppingDeviceSerial === item.device_serial"
+                                @click="handleStopExecutionFromReport(item)"
+                            >
+                                停止
+                            </el-button>
+                            <el-button v-else type="primary" link @click="handleView(item.id)">查看</el-button>
+                        </div>
+                    </div>
+                </div>
+            </article>
+            <el-empty v-if="!loading && executions.length === 0" description="暂无测试记录" :image-size="90" />
+        </div>
+
+        <div class="mobile-pagination" v-if="totalRecords > 0">
+            <el-pagination
+                v-model:current-page="currentPage"
+                :page-size="pageSize"
+                :background="true"
+                layout="prev, pager, next"
+                :total="totalRecords"
+                @current-change="handleCurrentChange"
+            />
+        </div>
+    </div>
+
+    <div v-else class="report-container">
         <div class="content-wrapper">
             <!-- 顶层 Tab 切换 -->
             <el-tabs v-model="activeTab" class="report-tabs" @tab-change="handleTabChange">
@@ -433,7 +550,7 @@ onUnmounted(() => {
                                             </el-table-column>
                                             <el-table-column label="状态" width="100">
                                                 <template #default="{ row: subRow }">
-                                                    <el-tag :type="subRow.status === 'PASS' ? 'success' : (subRow.status === 'WARNING' ? 'warning' : (subRow.status === 'RUNNING' ? '' : 'danger'))" size="small" effect="plain">
+                                                    <el-tag :type="subRow.status === 'PASS' ? 'success' : (subRow.status === 'WARNING' ? 'warning' : (subRow.status === 'RUNNING' ? '' : (subRow.status === 'ABORTED' ? 'info' : 'danger')))" size="small" effect="plain">
                                                         {{ subRow.status }}
                                                     </el-tag>
                                                 </template>
@@ -468,7 +585,7 @@ onUnmounted(() => {
                             
                             <el-table-column label="汇总状态" width="120">
                                 <template #default="{ row }">
-                                    <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'WARNING' ? 'warning' : (row.status === 'RUNNING' ? '' : 'danger'))">
+                                    <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'WARNING' ? 'warning' : (row.status === 'RUNNING' ? '' : (row.status === 'ABORTED' ? 'info' : 'danger')))">
                                         {{ row.status === 'RUNNING' ? '待完成' : row.status }}
                                     </el-tag>
                                 </template>
@@ -813,4 +930,126 @@ onUnmounted(() => {
 
 .text-danger { color: #F56C6C; font-weight: 600; }
 .text-warning { color: #E6A23C; font-weight: 600; }
+
+.mobile-report-page {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: #f6f7f9;
+    padding: 12px;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.mobile-report-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.mobile-search-input {
+    width: 100%;
+}
+
+.mobile-status-filter {
+    margin-bottom: 10px;
+    flex-shrink: 0;
+    overflow-x: auto;
+}
+
+.mobile-report-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mobile-report-card {
+    border: 1px solid #ebeef5;
+    border-radius: 8px;
+    background: #ffffff;
+    padding: 14px;
+}
+
+.mobile-report-card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.mobile-report-title {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mobile-report-title strong {
+    font-size: 15px;
+    color: #303133;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-report-title span {
+    font-size: 12px;
+    color: #909399;
+}
+
+.mobile-report-executions {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mobile-report-execution {
+    border-radius: 6px;
+    background: #f6f7f9;
+    padding: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.mobile-report-execution-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    cursor: pointer;
+}
+
+.mobile-report-execution-main strong {
+    font-size: 13px;
+    color: #303133;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-report-execution-main span {
+    font-size: 12px;
+    color: #909399;
+}
+
+.mobile-report-execution-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.mobile-pagination {
+    padding-top: 10px;
+    display: flex;
+    justify-content: center;
+    flex-shrink: 0;
+}
 </style>

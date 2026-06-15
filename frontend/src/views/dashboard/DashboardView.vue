@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { useClientMode } from '@/composables/useClientMode'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -26,6 +27,7 @@ use([
 ])
 
 const router = useRouter()
+const { isMobileMode } = useClientMode()
 
 const filters = reactive({
   range: '7d',
@@ -78,6 +80,23 @@ const kpiCards = computed(() => {
     { key: 'running_executions', title: '运行中执行数', value: k.running_executions || 0, route: '/execution/reports' },
     { key: 'active_tasks', title: '启用任务数', value: k.active_tasks || 0, route: '/execution/tasks' },
   ]
+})
+
+const mobileKpiCards = computed(() => {
+  const k = overview.value.kpis || {}
+  return [
+    { key: 'running', title: '运行中', value: k.running_executions || 0, route: '/execution/reports' },
+    { key: 'idle', title: '空闲设备', value: k.idle_devices || 0, route: '/assets/devices' },
+    { key: 'pass', title: `${rangeLabel.value}通过率`, value: `${Number(k.pass_rate || 0).toFixed(1)}%`, route: '/execution/reports' },
+    { key: 'failed', title: '失败场景', value: k.failed_scenarios || 0, route: '/ui/scenarios' },
+  ]
+})
+
+const recentProblemExecutions = computed(() => {
+  const problemStatuses = new Set(['FAIL', 'ERROR', 'WARNING'])
+  return (overview.value.recent_executions || [])
+    .filter(item => problemStatuses.has(String(item.status || '').toUpperCase()))
+    .slice(0, 5)
 })
 
 const trendOption = computed(() => {
@@ -135,6 +154,7 @@ const statusPieOption = computed(() => {
     WARNING: '告警',
     FAIL: '失败',
     ERROR: '错误',
+    ABORTED: '已终止',
     RUNNING: '运行中',
   }
   const colorMap = {
@@ -142,6 +162,7 @@ const statusPieOption = computed(() => {
     WARNING: '#E6A23C',
     FAIL: '#F56C6C',
     ERROR: '#D03050',
+    ABORTED: '#909399',
     RUNNING: '#409EFF',
   }
   const rows = (overview.value.status_distribution || [])
@@ -252,6 +273,7 @@ const statusTagType = (status) => {
   if (normalized === 'PASS') return 'success'
   if (normalized === 'WARNING') return 'warning'
   if (normalized === 'FAIL' || normalized === 'ERROR') return 'danger'
+  if (normalized === 'ABORTED') return 'info'
   if (normalized === 'RUNNING') return 'info'
   return 'info'
 }
@@ -295,7 +317,74 @@ onUnmounted(() => {
 
 <template>
   <div class="dashboard-page">
-    <div class="dashboard-scroll" v-loading="loading">
+    <div v-if="isMobileMode" class="mobile-dashboard" v-loading="loading">
+      <el-alert
+        v-if="errorMessage"
+        type="error"
+        :title="errorMessage"
+        show-icon
+        :closable="false"
+        class="error-alert"
+      />
+
+      <div class="mobile-kpi-grid">
+        <button
+          v-for="item in mobileKpiCards"
+          :key="item.key"
+          class="mobile-kpi-card"
+          type="button"
+          @click="handleKpiClick(item)"
+        >
+          <span>{{ item.title }}</span>
+          <strong>{{ item.value }}</strong>
+        </button>
+      </div>
+
+      <section class="mobile-panel">
+        <div class="mobile-panel-header">
+          <h3>最近异常</h3>
+          <el-button link type="primary" @click="router.push('/execution/reports')">全部报告</el-button>
+        </div>
+        <div v-if="recentProblemExecutions.length > 0" class="mobile-execution-list">
+          <article
+            v-for="item in recentProblemExecutions"
+            :key="item.id"
+            class="mobile-execution-item"
+            @click="handleOpenRecent(item)"
+          >
+            <div class="mobile-execution-main">
+              <strong>{{ item.scenario_name || '未命名场景' }}</strong>
+              <span>{{ formatDateTime(item.start_time) }} · {{ item.executor_name || 'System' }}</span>
+            </div>
+            <el-tag size="small" :type="statusTagType(item.status)">{{ item.status }}</el-tag>
+          </article>
+        </div>
+        <el-empty v-else description="暂无异常执行" :image-size="80" />
+      </section>
+
+      <section class="mobile-panel">
+        <div class="mobile-panel-header">
+          <h3>最近执行</h3>
+          <el-button link type="primary" @click="router.push('/execution/reports')">查看</el-button>
+        </div>
+        <div class="mobile-execution-list">
+          <article
+            v-for="item in (overview.recent_executions || []).slice(0, 5)"
+            :key="item.id"
+            class="mobile-execution-item"
+            @click="handleOpenRecent(item)"
+          >
+            <div class="mobile-execution-main">
+              <strong>{{ item.scenario_name || '未命名场景' }}</strong>
+              <span>{{ formatDateTime(item.start_time) }} · {{ formatDuration(item.duration) }}</span>
+            </div>
+            <el-tag size="small" :type="statusTagType(item.status)">{{ item.status }}</el-tag>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div v-else class="dashboard-scroll" v-loading="loading">
       <el-alert
         v-if="errorMessage"
         type="error"
@@ -507,6 +596,103 @@ onUnmounted(() => {
 
 .clickable-table :deep(.el-table__row) {
   cursor: pointer;
+}
+
+.mobile-dashboard {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: #f6f7f9;
+}
+
+.mobile-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mobile-kpi-card {
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mobile-kpi-card span {
+  font-size: 12px;
+  color: #606266;
+}
+
+.mobile-kpi-card strong {
+  font-size: 24px;
+  color: #303133;
+  line-height: 1;
+}
+
+.mobile-panel {
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.mobile-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.mobile-panel-header h3 {
+  margin: 0;
+  font-size: 15px;
+  color: #303133;
+}
+
+.mobile-execution-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mobile-execution-item {
+  border: 1px solid #f0f2f5;
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.mobile-execution-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mobile-execution-main strong {
+  font-size: 14px;
+  color: #303133;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-execution-main span {
+  font-size: 12px;
+  color: #909399;
 }
 
 @media (max-width: 1400px) {

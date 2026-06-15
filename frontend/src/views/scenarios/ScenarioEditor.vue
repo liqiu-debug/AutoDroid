@@ -1,12 +1,12 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { VueDraggable } from 'vue-draggable-plus'
 import api from '@/api'
 import { ElMessage } from 'element-plus'
 import {
   VideoPlay, Delete, Rank, Document,
-  Search, Upload, ArrowLeft, FolderOpened
+  Search, Upload, ArrowLeft, FolderOpened, CircleClose
 } from '@element-plus/icons-vue'
 import LogConsole from '@/components/LogConsole.vue'
 import { createUuid } from '@/utils/uuid'
@@ -27,6 +27,9 @@ const caseTreeRef = ref(null)
 
 const loading = ref(false)
 const running = ref(false)
+const activeRun = ref(null)
+const terminatingRun = ref(false)
+let activeRunTimer = null
 const logConsoleRef = ref(null)
 
 const envId = ref(null)
@@ -104,6 +107,7 @@ onMounted(async () => {
     }
     updateSnapshot()
     fetchEnvironments()
+    restoreActiveRun()
 })
 
 const fetchEnvironments = async () => {
@@ -250,6 +254,10 @@ const precheckScenarioOnDevice = async (serial) => {
 }
 
 const runScenario = async (selectedSerial) => {
+  if (running.value) {
+    await terminateActiveRun()
+    return false
+  }
   await saveSteps()
   
   // If save failed or still no ID, stop
@@ -264,6 +272,12 @@ const runScenario = async (selectedSerial) => {
   }
 
   running.value = true
+  activeRun.value = {
+    kind: 'scenario',
+    target_id: Number(scenarioId.value),
+    device_serials: selectedSerial ? [selectedSerial] : []
+  }
+  startActiveRunPolling()
   if (logConsoleRef.value) {
       logConsoleRef.value.clear()
   }
@@ -305,10 +319,22 @@ const runScenario = async (selectedSerial) => {
                        timestamp: data.timestamp
                    })
                }
+          } else if (data.type === 'run_start') {
+              activeRun.value = {
+                  kind: 'scenario',
+                  target_id: Number(scenarioId.value),
+                  batch_id: data.batch_id,
+                  execution_ids: data.execution_id ? [data.execution_id] : [],
+                  device_serials: data.device_serial ? [data.device_serial] : []
+              }
           } else if (data.type === 'run_complete') {
               running.value = false
+              activeRun.value = null
+              stopActiveRunPolling()
               if (data.success) {
                   ElMessage.success('场景执行完成')
+              } else if (data.status === 'ABORTED') {
+                  ElMessage.warning('场景执行已终止')
               } else {
                   ElMessage.warning('场景执行完成，存在失败步骤')
               }
@@ -335,6 +361,8 @@ const runScenario = async (selectedSerial) => {
   ws.onclose = () => {
       if (running.value) {
            running.value = false
+           activeRun.value = null
+           stopActiveRunPolling()
            if (logConsoleRef.value) {
                logConsoleRef.value.appendLog({ status: 'warning', log: '🔌 连接已断开' })
            }
@@ -392,6 +420,15 @@ const submitMultiRun = async () => {
     } else {
       ElMessage.success(`后台已开始在 ${runnable.length} 台设备上执行场景`)
     }
+    activeRun.value = {
+      kind: 'scenario',
+      target_id: Number(scenarioId.value),
+      batch_id: data?.batch_id,
+      execution_ids: data?.execution_ids || [],
+      device_serials: runnable
+    }
+    running.value = true
+    startActiveRunPolling()
     runDialogVisible.value = false
   } catch (err) {
     ElMessage.error('启动批量执行失败: ' + summarizeHttpDetail(err))
@@ -399,6 +436,10 @@ const submitMultiRun = async () => {
 }
 
 const openRunDialog = async () => {
+  if (running.value) {
+    await terminateActiveRun()
+    return
+  }
   if (!scenarioId.value) {
     ElMessage.warning('请先保存场景')
     return
@@ -411,6 +452,71 @@ const openRunDialog = async () => {
   runDialogVisible.value = true
   await fetchDevices()
 }
+
+const terminateActiveRun = async () => {
+  if (!activeRun.value || terminatingRun.value) return
+  terminatingRun.value = true
+  try {
+    await api.cancelRun({
+      kind: 'scenario',
+      target_id: Number(scenarioId.value),
+      batch_id: activeRun.value.batch_id || null,
+      execution_ids: activeRun.value.execution_ids || [],
+      device_serials: activeRun.value.device_serials || []
+    })
+    ElMessage.warning('已发送终止请求')
+    logConsoleRef.value?.markAborted?.()
+    running.value = false
+    activeRun.value = null
+    stopActiveRunPolling()
+  } catch (err) {
+    ElMessage.error('终止失败: ' + summarizeHttpDetail(err))
+  } finally {
+    terminatingRun.value = false
+  }
+}
+
+const restoreActiveRun = async () => {
+  if (!scenarioId.value) return
+  try {
+    const { data } = await api.getActiveRuns('scenario', Number(scenarioId.value))
+    const items = data?.items || []
+    if (items.length === 0) return
+    activeRun.value = {
+      kind: 'scenario',
+      target_id: Number(scenarioId.value),
+      batch_id: items[0]?.batch_id,
+      execution_ids: items.map(item => item.execution_id).filter(Boolean),
+      device_serials: items.map(item => item.device_serial).filter(Boolean)
+    }
+    running.value = true
+    startActiveRunPolling()
+  } catch {}
+}
+
+const startActiveRunPolling = () => {
+  stopActiveRunPolling()
+  activeRunTimer = setInterval(async () => {
+    if (!scenarioId.value || !activeRun.value) return
+    try {
+      const { data } = await api.getActiveRuns('scenario', Number(scenarioId.value))
+      if ((data?.items || []).length === 0) {
+        running.value = false
+        activeRun.value = null
+        stopActiveRunPolling()
+      }
+    } catch {}
+  }, 3000)
+}
+
+const stopActiveRunPolling = () => {
+  if (activeRunTimer) {
+    clearInterval(activeRunTimer)
+    activeRunTimer = null
+  }
+}
+
+onUnmounted(stopActiveRunPolling)
 
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
@@ -563,14 +669,14 @@ const getStepTitle = (step) => {
                         :value="env.id"
                       />
                     </el-select>
-                    <el-button 
-                      type="success" 
-                      :icon="VideoPlay"
-                      @click="openRunDialog" 
-                      :disabled="running"
+                    <el-button
+                      :type="running ? 'danger' : 'success'"
+                      :icon="running ? CircleClose : VideoPlay"
+                      @click="openRunDialog"
+                      :disabled="terminatingRun"
                       style="margin-right: 12px"
                     >
-                      运行
+                      {{ running ? '终止' : '运行' }}
                     </el-button>
                     <el-button type="primary" :icon="Upload" @click="saveSteps" :loading="loading">保存</el-button>
                 </div>

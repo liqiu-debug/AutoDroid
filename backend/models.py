@@ -74,7 +74,7 @@ class TestExecution(SQLModel, table=True):
     executor_id: Optional[int] = Field(default=None, foreign_key="user.id") # Nullable for compatibility
     start_time: datetime = Field(default_factory=datetime.now)
     end_time: Optional[datetime] = None
-    status: str = Field(default="RUNNING") # RUNNING, PASS, FAIL, WARNING, ERROR
+    status: str = Field(default="RUNNING") # RUNNING, PASS, FAIL, WARNING, ERROR, ABORTED
     device_serial: Optional[str] = None
     platform: Optional[str] = None  # android | ios
     device_info: Optional[str] = None

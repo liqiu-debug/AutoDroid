@@ -15,6 +15,7 @@ from backend.cross_platform_execution import (
 )
 from backend.feature_flags import FLAG_CROSS_PLATFORM_RUNNER, is_flag_enabled
 from backend.models import TestScenario, ScenarioStep, User, TestCase, Step, TestExecution, TestResult, Device
+from backend.run_control import ABORTED_STATUS, registry
 from backend.schemas import (
     PaginatedTestScenarioRead,
     ScenarioRunRequest,
@@ -518,6 +519,7 @@ def _finalize_scenario_execution(
     execution: TestExecution,
     cases_results: List[Dict[str, Any]],
     start_time: datetime,
+    status_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     from backend.report_generator import report_generator
 
@@ -551,8 +553,14 @@ def _finalize_scenario_execution(
         skipped_count=summary["skipped_count"],
         fail_count=summary["fail_count"],
     )
+    if status_override == ABORTED_STATUS:
+        summary_msg = "执行已被用户终止"
 
-    scenario.last_run_status = summary["scenario_status"]
+    scenario_status = str(status_override or summary["scenario_status"]).upper()
+    if status_override == ABORTED_STATUS:
+        summary["last_failed_step_name"] = "用户终止"
+
+    scenario.last_run_status = scenario_status
     scenario.last_run_time = end_time
     scenario.last_run_duration = int(total_duration)
     scenario.last_execution_id = execution.id
@@ -562,7 +570,7 @@ def _finalize_scenario_execution(
         scenario.last_report_id = report_id
     session.add(scenario)
 
-    execution.status = summary["scenario_status"]
+    execution.status = scenario_status
     execution.end_time = end_time
     execution.duration = total_duration
     if report_id:
@@ -577,6 +585,7 @@ def _finalize_scenario_execution(
         "total_duration": total_duration,
         "end_time": end_time,
         **summary,
+        "scenario_status": scenario_status,
     }
 
 
@@ -587,6 +596,15 @@ def _prepare_cross_platform_device_execution(
     device_serial: str,
 ):
     abort_event = register_device_abort(device_serial)
+    run_record = registry.register(
+        kind="scenario",
+        target_id=execution.scenario_id,
+        batch_id=execution.batch_id,
+        device_serial=device_serial,
+        abort_event=abort_event,
+        execution_id=execution.id,
+    )
+    setattr(abort_event, "_autodroid_run_id", run_record.run_id)
     resolved_meta = _resolve_device_meta(
         session,
         device_serial,
@@ -625,6 +643,15 @@ def _prepare_legacy_scenario_device_execution(
     abort_event = register_device_abort(device_serial)
     runner.abort_event = abort_event
     runner.runner.abort_event = abort_event
+    run_record = registry.register(
+        kind="scenario",
+        target_id=execution.scenario_id,
+        batch_id=execution.batch_id,
+        device_serial=device_serial,
+        abort_event=abort_event,
+        execution_id=execution.id,
+    )
+    setattr(abort_event, "_autodroid_run_id", run_record.run_id)
 
     resolved_meta = _resolve_device_meta(
         session,
@@ -700,6 +727,7 @@ def _execute_cross_platform_scenario_core(
         execution=execution,
         cases_results=cases_results,
         start_time=start_time,
+        status_override=ABORTED_STATUS if abort_event and abort_event.is_set() else None,
     )
 
     return {
@@ -797,11 +825,16 @@ def update_scenario(
     return db_scenario
 
 @router.delete("/{scenario_id}")
-def delete_scenario(scenario_id: int, session: Session = Depends(get_session)):
+def delete_scenario(
+    scenario_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
     """Delete a scenario"""
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
+    deps.ensure_owner_or_admin(scenario.user_id, current_user)
     
     # Cascade delete steps
     steps = session.exec(select(ScenarioStep).where(ScenarioStep.scenario_id == scenario_id)).all()
@@ -1244,6 +1277,8 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
         execution = session.get(TestExecution, execution_id)
         if not execution:
             return
+        if str(execution.status or "").upper() == ABORTED_STATUS:
+            return
 
         resolved_meta = _resolve_device_meta(
             session,
@@ -1335,10 +1370,12 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
                     execution=execution,
                     cases_results=legacy_state["cases_results"],
                     start_time=start_time,
+                    status_override=ABORTED_STATUS if abort_event and abort_event.is_set() else None,
                 )
         except Exception as e:
             logger.exception("background scenario execution failed: scenario_id=%s execution_id=%s", scenario_id, execution.id if execution else None)
-            scenario.last_run_status = "FAIL"
+            was_aborted = bool(abort_event and abort_event.is_set())
+            scenario.last_run_status = ABORTED_STATUS if was_aborted else "FAIL"
             scenario.last_execution_id = execution.id if 'execution' in locals() else None
             if 'start_time' in locals():
                 scenario.last_run_duration = int((datetime.now() - start_time).total_seconds())
@@ -1346,7 +1383,7 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
             
             # Fail the execution record if exists
             if 'execution' in locals():
-                execution.status = "ERROR"
+                execution.status = ABORTED_STATUS if was_aborted else "ERROR"
                 execution.end_time = datetime.now()
                 session.add(execution)
                 
@@ -1360,6 +1397,10 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
                     logger.warning("恢复设备状态失败（后台场景执行）: device=%s error=%s", device_serial, e)
                 # ★ 清除中止事件注册
                 unregister_device_abort(device_serial)
+            registry.complete(
+                getattr(abort_event, "_autodroid_run_id", None),
+                ABORTED_STATUS if abort_event and abort_event.is_set() else None,
+            )
 
 async def _schedule_concurrent_runs(execution_ids: List[int], scenario_id: int, device_serials: List[str], env_id: Optional[int] = None):
     """使用 ThreadPoolExecutor 并发执行每个设备的测试"""
@@ -2194,6 +2235,7 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
     blocking_executor = ThreadPoolExecutor(max_workers=1)
     legacy_ws_state = None
     device_serial_ws = device_serial
+    execution_id_ws = None
     try:
         # 1. Get Scenario Data
         from sqlmodel import Session as SQLSession
@@ -2213,6 +2255,7 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
                     
             # Create Execution Record
             start_time = datetime.now()
+            batch_id = str(uuid.uuid4())
             ws_init_meta = _resolve_device_meta(
                 session,
                 device_serial,
@@ -2228,16 +2271,32 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
                 device_serial=ws_init_meta.get("device_serial"),
                 platform=ws_init_meta.get("platform"),
                 device_info=ws_init_meta.get("device_info"),
+                batch_id=batch_id,
+                batch_name=f"{scenario.name} 实时运行",
             )
             session.add(execution)
             session.commit()
             session.refresh(execution)
+            execution_id_ws = execution.id
             
             # Get steps (ordered)
             steps_db = session.exec(select(ScenarioStep).where(ScenarioStep.scenario_id == scenario_id).order_by(ScenarioStep.order)).all()
             total_steps = len(steps_db)
             
             await manager.broadcast_log(ws_key, "info", f"🎬 开始执行场景: {scenario.name} (共 {total_steps} 个步骤)")
+            await manager.send_message(
+                ws_key,
+                {
+                    "type": "run_start",
+                    "status": "RUNNING",
+                    "scenario_id": scenario_id,
+                    "execution_id": execution.id,
+                    "batch_id": batch_id,
+                    "device_serial": device_serial,
+                    "total_steps": total_steps,
+                    "timestamp": datetime.now().isoformat(),
+                },
+            )
 
             use_cross_platform_runner = (
                 is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
@@ -2368,5 +2427,12 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
             logger.warning("恢复设备状态失败（场景 WebSocket）: device=%s error=%s", device_serial_ws, e)
         if device_serial_ws:
             unregister_device_abort(device_serial_ws)
+        if execution_id_ws is not None:
+            for record in registry.active(kind="scenario", target_id=scenario_id):
+                if record.execution_id == execution_id_ws:
+                    registry.complete(
+                        record.run_id,
+                        ABORTED_STATUS if record.abort_event.is_set() else None,
+                    )
         blocking_executor.shutdown(wait=True)
         manager.disconnect(websocket, ws_key)

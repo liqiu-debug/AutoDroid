@@ -352,6 +352,14 @@ class TestCaseRunner:
     def disconnect(self) -> None:
         self.driver.disconnect()
 
+    def _sleep_or_abort(self, seconds: float) -> bool:
+        if seconds <= 0:
+            return bool(self.abort_event and self.abort_event.is_set())
+        if self.abort_event:
+            return self.abort_event.wait(seconds)
+        time.sleep(seconds)
+        return False
+
     def _capture_screenshot_base64(self) -> Optional[str]:
         try:
             raw_png = self.driver.screenshot()
@@ -607,7 +615,8 @@ class TestCaseRunner:
         if action == "sleep":
             seconds = args.get("seconds", value if value is not None else 1)
             sleep_seconds = _parse_seconds(seconds, default=1.0)
-            time.sleep(sleep_seconds)
+            if self._sleep_or_abort(sleep_seconds):
+                raise RuntimeError("执行已被用户中止")
             return None
 
         if action == "swipe":
@@ -709,7 +718,8 @@ class TestCaseRunner:
             now = time.time()
             if now >= deadline:
                 break
-            time.sleep(min(0.4, max(0.0, deadline - now)))
+            if self._sleep_or_abort(min(0.4, max(0.0, deadline - now))):
+                raise RuntimeError("执行已被用户中止")
 
         elapsed = time.time() - started_at
         message = (

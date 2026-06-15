@@ -77,6 +77,15 @@ def unregister_device_abort(serial: str):
         _device_abort_events.pop(serial, None)
 
 
+def _sleep_or_abort(seconds: float, abort_event: Optional[threading.Event]) -> bool:
+    if seconds <= 0:
+        return bool(abort_event and abort_event.is_set())
+    if abort_event:
+        return abort_event.wait(seconds)
+    time.sleep(seconds)
+    return False
+
+
 def _get_ocr_engine() -> Any:
     global _ocr_engine
     if _ocr_engine is not None:
@@ -323,7 +332,13 @@ class TestRunner:
                     logger.info("步骤失败无需重试: action=%s error=%s", step.action, e)
                     break
                 if attempt < max_retries:
-                    time.sleep(retry_interval)
+                    if _sleep_or_abort(retry_interval, self.abort_event):
+                        return {
+                            "step": _dump_model(step),
+                            "success": False,
+                            "error": "已被用户中止",
+                            "duration": time.time() - start_time
+                        }
                 else:
                     logger.error(f"所有重试均失败: {step}")
 
@@ -563,7 +578,8 @@ class TestRunner:
             if seconds < 0:
                 raise ValueError("sleep 动作 value 不能小于 0")
             logger.info(f"强制等待 {seconds} 秒")
-            time.sleep(seconds)
+            if _sleep_or_abort(seconds, self.abort_event):
+                raise RuntimeError("已被用户中止")
             return
 
         if action == ActionType.EXTRACT_BY_OCR:

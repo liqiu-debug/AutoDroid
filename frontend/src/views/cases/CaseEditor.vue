@@ -1,6 +1,6 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { Upload, VideoPlay, Back } from '@element-plus/icons-vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { Upload, VideoPlay, Back, CircleClose } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
 import DeviceStage from '@/components/DeviceStage.vue'
 import StepBuilder from '@/components/StepBuilder.vue'
@@ -22,6 +22,9 @@ useUnsavedGuard(hasUnsavedChanges)
 const logConsoleRef = ref(null)
 const deviceStageRef = ref(null)
 const isRunning = ref(false)
+const activeRun = ref(null)
+const terminatingRun = ref(false)
+let activeRunTimer = null
 const envId = ref(null)
 const environments = ref([])
 
@@ -55,6 +58,7 @@ const initData = async () => {
     } catch (error) {
         console.error('获取环境列表失败', error)
     }
+    restoreActiveRun()
 }
 
 watch(() => route.params.id, () => {
@@ -66,6 +70,10 @@ const goBack = () => {
 }
 
 const handleRun = async () => {
+  if (isRunning.value) {
+    await terminateActiveRun()
+    return
+  }
   if (!currentCase.value.id) {
     ElMessage.warning('请先保存用例')
     return
@@ -85,6 +93,12 @@ const handleRun = async () => {
     }
   }
   isRunning.value = true
+  activeRun.value = {
+    kind: 'case',
+    target_id: currentCase.value.id,
+    device_serials: currentDevice ? [currentDevice] : []
+  }
+  startActiveRunPolling()
   logConsoleRef.value?.connect(currentCase.value.id, envId.value, currentDevice)
 }
 
@@ -137,16 +151,22 @@ const submitMultiRun = async () => {
       return
     }
 
-    const promises = runnable.map(serial =>
-      api.runTestCaseAsync(currentCase.value.id, envId.value, serial)
-    )
-    await Promise.all(promises)
+    const { data } = await api.runTestCaseBatch(currentCase.value.id, envId.value, runnable)
     if (blocked.length > 0) {
       const first = blocked[0]
       ElMessage.warning(`已在 ${runnable.length} 台设备启动；${blocked.length} 台预检失败（示例：${first.serial} - ${first.reason}）`)
     } else {
-      ElMessage.success(`后台已开始在 ${promises.length} 台设备上执行用例`)
+      ElMessage.success(`后台已开始在 ${runnable.length} 台设备上执行用例`)
     }
+    activeRun.value = {
+      kind: 'case',
+      target_id: currentCase.value.id,
+      batch_id: data?.batch_id,
+      run_ids: data?.run_ids || [],
+      device_serials: runnable
+    }
+    isRunning.value = true
+    startActiveRunPolling()
     runDialogVisible.value = false
   } catch (err) {
     ElMessage.error('启动批量执行失败: ' + err.message)
@@ -181,10 +201,88 @@ const handleRunCommand = async (command) => {
 
 const handleRunComplete = (data) => {
   isRunning.value = false
+  activeRun.value = null
+  stopActiveRunPolling()
   if (data.success) {
     ElMessage.success(`执行完成: ${data.passed} 通过`)
+  } else if (data.status === 'ABORTED') {
+    ElMessage.warning('执行已终止')
   } else {
     ElMessage.error(`执行失败: ${data.failed} 个步骤失败`)
+  }
+}
+
+const handleRunStart = (data) => {
+  activeRun.value = {
+    kind: 'case',
+    target_id: currentCase.value.id,
+    batch_id: data.batch_id,
+    run_ids: data.run_id ? [data.run_id] : [],
+    device_serials: data.device_serial ? [data.device_serial] : []
+  }
+}
+
+const terminateActiveRun = async () => {
+  if (!activeRun.value || terminatingRun.value) return
+  terminatingRun.value = true
+  try {
+    await api.cancelRun({
+      kind: 'case',
+      target_id: currentCase.value.id,
+      batch_id: activeRun.value.batch_id || null,
+      run_ids: activeRun.value.run_ids || [],
+      device_serials: activeRun.value.device_serials || []
+    })
+    ElMessage.warning('已发送终止请求')
+    logConsoleRef.value?.markAborted?.()
+    isRunning.value = false
+    activeRun.value = null
+    stopActiveRunPolling()
+    await deviceStageRef.value?.refreshDevices?.()
+  } catch (err) {
+    ElMessage.error('终止失败: ' + (err.response?.data?.detail || err.message))
+  } finally {
+    terminatingRun.value = false
+  }
+}
+
+const restoreActiveRun = async () => {
+  if (!currentCase.value.id) return
+  try {
+    const { data } = await api.getActiveRuns('case', currentCase.value.id)
+    const items = data?.items || []
+    if (items.length === 0) return
+    activeRun.value = {
+      kind: 'case',
+      target_id: currentCase.value.id,
+      batch_id: items[0]?.batch_id,
+      run_ids: items.map(item => item.run_id).filter(Boolean),
+      device_serials: items.map(item => item.device_serial).filter(Boolean)
+    }
+    isRunning.value = true
+    startActiveRunPolling()
+  } catch {}
+}
+
+const startActiveRunPolling = () => {
+  stopActiveRunPolling()
+  activeRunTimer = setInterval(async () => {
+    if (!currentCase.value.id || !activeRun.value) return
+    try {
+      const { data } = await api.getActiveRuns('case', currentCase.value.id)
+      if ((data?.items || []).length === 0) {
+        isRunning.value = false
+        activeRun.value = null
+        stopActiveRunPolling()
+      }
+    } catch {}
+  }, 3000)
+}
+
+const stopActiveRunPolling = () => {
+  if (activeRunTimer) {
+    clearInterval(activeRunTimer)
+    activeRunTimer = null
   }
 }
 
@@ -238,6 +336,10 @@ const hasWdaDownDevice = computed(() => connectedRunDevices.value.some(d => d.st
 onMounted(() => {
     initData()
 })
+
+onUnmounted(() => {
+  stopActiveRunPolling()
+})
 </script>
 
 <template>
@@ -284,6 +386,7 @@ onMounted(() => {
           <LogConsole 
             ref="logConsoleRef" 
             :case-id="currentCase.id"
+            @run-start="handleRunStart"
             @run-complete="handleRunComplete"
           />
         </div>
@@ -302,7 +405,7 @@ onMounted(() => {
       </el-aside>
 
       <el-aside width="350px" class="right-pane">
-        <StepBuilder 
+        <StepBuilder
           :env-id="envId"
           :device-serial="recordingDeviceSerial"
           :active-image-crop-step-uuid="activeImageCropStepUuid"
@@ -311,18 +414,19 @@ onMounted(() => {
           @request-image-crop="handleRequestImageCrop"
         >
           <template #header-actions>
-            <el-dropdown 
-              split-button 
-              type="primary" 
-              @click="handleRun" 
+            <el-dropdown
+              split-button
+              :type="isRunning ? 'danger' : 'primary'"
+              @click="handleRun"
               @command="handleRunCommand"
-              :disabled="!currentCase.id || isRunning"
+              :disabled="!currentCase.id || terminatingRun"
+              :icon="isRunning ? CircleClose : VideoPlay"
               style="margin-right: 12px"
             >
-              运行
+              {{ isRunning ? '终止' : '运行' }}
               <template #dropdown>
                 <el-dropdown-menu>
-                  <el-dropdown-item command="multi">选择多设备运行</el-dropdown-item>
+                  <el-dropdown-item command="multi" :disabled="isRunning">选择多设备运行</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
             </el-dropdown>

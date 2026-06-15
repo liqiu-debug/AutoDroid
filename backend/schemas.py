@@ -198,10 +198,46 @@ class ScheduledTaskUpdate(BaseModel):
     strategy_config: Optional[Dict[str, Any]] = None
     enable_notification: Optional[bool] = None
 
-class UserRegister(BaseModel):
+class UserRead(BaseModel):
+    id: int
     username: str
-    password: str
-    name: str
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    is_active: bool = True
+    created_at: Any
+
+    class Config:
+        from_attributes = True
+
+
+class CurrentUserRead(UserRead):
+    role: str = "user"
+
+
+class UserRegister(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=6)
+    name: str = Field(min_length=1)
+
+
+class UserCreateByAdmin(BaseModel):
+    username: str = Field(min_length=1)
+    initial_password: str = Field(min_length=6)
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+
+
+class UserStatusUpdate(BaseModel):
+    is_active: bool
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=6)
+
+
+class RegistrationStatus(BaseModel):
+    allow_registration: bool
 
 
 # ---- Case Folder Schemas ----

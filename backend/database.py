@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, col, create_engine, select
 
 from backend.paths import PROJECT_ROOT
 
@@ -223,6 +223,33 @@ def _run_migrations():
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
     _run_migrations()
+
+
+def backfill_legacy_asset_owners(session: Session, admin_user_id: int) -> dict:
+    """Assign legacy cases/scenarios without owners to the default admin."""
+    from backend.models import TestCase, TestScenario
+
+    if not admin_user_id:
+        return {"cases": 0, "scenarios": 0}
+
+    cases = session.exec(
+        select(TestCase).where(col(TestCase.user_id).is_(None))
+    ).all()
+    scenarios = session.exec(
+        select(TestScenario).where(col(TestScenario.user_id).is_(None))
+    ).all()
+
+    for case in cases:
+        case.user_id = admin_user_id
+        session.add(case)
+    for scenario in scenarios:
+        scenario.user_id = admin_user_id
+        session.add(scenario)
+
+    if cases or scenarios:
+        session.commit()
+
+    return {"cases": len(cases), "scenarios": len(scenarios)}
 
 
 def get_session():

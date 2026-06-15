@@ -1,10 +1,13 @@
 import logging
 import re
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from backend.api import deps
@@ -20,6 +23,7 @@ from backend.feature_flags import (
     is_flag_enabled,
 )
 from backend.models import CaseFolder, Device, TestCase, TestCaseStep, User
+from backend.run_control import ABORTED_STATUS, registry
 from backend.runner import register_device_abort, unregister_device_abort
 from backend.schemas import (
     PaginatedTestCaseRead,
@@ -45,6 +49,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AUTO_TEMPLATE_IMAGE_DIR = PROJECT_ROOT / "static" / "images"
 AUTO_TEMPLATE_IMAGE_RE = re.compile(r"^static/images/element_[0-9a-f]+\.png$", re.IGNORECASE)
 IMAGE_TEMPLATE_ACTIONS = {"click_image", "assert_image"}
+
+
+class CaseRunBatchRequest(BaseModel):
+    env_id: Optional[int] = None
+    device_serials: List[str] = Field(default_factory=list)
 
 
 class _CaseSnapshot:
@@ -252,6 +261,34 @@ def _update_case_run_status(session: Session, case_id: int, status: str) -> None
     session.commit()
 
 
+def _new_abort_event_for_device(device_serial: Optional[str]):
+    if device_serial:
+        return register_device_abort(device_serial)
+    return threading.Event()
+
+
+def _status_for_case_result(result: Any, abort_event=None) -> str:
+    if abort_event and abort_event.is_set():
+        return ABORTED_STATUS
+    return _summarize_case_result(result)["status"]
+
+
+def _make_case_run_record(
+    *,
+    case_id: int,
+    batch_id: Optional[str],
+    device_serial: Optional[str],
+):
+    abort_event = _new_abort_event_for_device(device_serial)
+    return registry.register(
+        kind="case",
+        target_id=case_id,
+        batch_id=batch_id,
+        device_serial=device_serial,
+        abort_event=abort_event,
+    )
+
+
 def _step_ui_status(step_result: Any) -> str:
     if not isinstance(step_result, dict):
         return "FAIL"
@@ -304,6 +341,26 @@ def _summarize_case_result(result: Any) -> Dict[str, Any]:
         "status": status,
         "all_skipped": all_skipped,
     }
+
+
+def _summarize_precheck_failure(payload: Dict[str, Any]) -> str:
+    global_fail = next(
+        (item for item in payload.get("global_checks", []) if item.get("status") == "FAIL"),
+        None,
+    )
+    if global_fail:
+        return global_fail.get("message") or global_fail.get("code") or "全局检查失败"
+
+    step_fail = next(
+        (item for item in payload.get("steps", []) if item.get("status") == "FAIL"),
+        None,
+    )
+    if step_fail:
+        return step_fail.get("message") or step_fail.get("code") or "步骤预检失败"
+
+    if not payload.get("has_runnable_steps", True):
+        return "全部步骤将被跳过（当前设备无可执行步骤）"
+    return "预检失败"
 
 
 def _row_to_standard_step_read(row: TestCaseStep) -> TestCaseStepRead:
@@ -717,6 +774,8 @@ def _run_case_background(
     session_factory,
     env_id: Optional[int] = None,
     device_serial: Optional[str] = None,
+    run_id: Optional[str] = None,
+    abort_event=None,
 ):
     # We need a new session for the background thread.
     with session_factory() as session:
@@ -727,7 +786,11 @@ def _run_case_background(
 
         from backend.runner import TestRunner
 
+        if abort_event is None:
+            abort_event = _new_abort_event_for_device(device_serial)
+
         runner = TestRunner(device_serial=device_serial)
+        runner.abort_event = abort_event
         try:
             runner.connect()
 
@@ -745,10 +808,13 @@ def _run_case_background(
             result = runner.run_case(case_snapshot, extra_variables=variables_map)
 
             # Update case status.
-            summary = _summarize_case_result(result)
-            _update_case_run_status(session, case_id, summary["status"])
+            _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
         except Exception:
-            _update_case_run_status(session, case_id, "FAIL")
+            _update_case_run_status(session, case_id, ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL")
+        finally:
+            if device_serial:
+                unregister_device_abort(device_serial)
+            registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
 
 
 def _run_case_background_cross_platform(
@@ -756,6 +822,8 @@ def _run_case_background_cross_platform(
     session_factory,
     env_id: Optional[int] = None,
     device_serial: Optional[str] = None,
+    run_id: Optional[str] = None,
+    abort_event=None,
 ):
     # Cross-platform path currently requires explicit target device.
     if not device_serial:
@@ -773,7 +841,8 @@ def _run_case_background_cross_platform(
             return
         case_snapshot = _build_case_snapshot(case)
 
-        abort_event = register_device_abort(device_serial)
+        if abort_event is None:
+            abort_event = register_device_abort(device_serial)
 
         try:
             device = session.exec(select(Device).where(Device.serial == device_serial)).first()
@@ -791,8 +860,7 @@ def _run_case_background_cross_platform(
                 abort_event=abort_event,
             )
 
-            summary = _summarize_case_result(result)
-            _update_case_run_status(session, case_id, summary["status"])
+            _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
         except Exception as exc:
             logger.exception(
                 "cross-platform case execution failed: case_id=%s device=%s error=%s",
@@ -800,7 +868,11 @@ def _run_case_background_cross_platform(
                 device_serial,
                 exc,
             )
-            _update_case_run_status(session, case_id, "FAIL")
+            _update_case_run_status(
+                session,
+                case_id,
+                ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL",
+            )
         finally:
             try:
                 restore_device_status_after_execution(session, device_serial)
@@ -810,6 +882,7 @@ def _run_case_background_cross_platform(
                     device_serial,
                 )
             unregister_device_abort(device_serial)
+            registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
 
 
 @router.post("/{case_id}/run")
@@ -837,12 +910,124 @@ def run_test_case(
         and bool(device_serial)
     )
     run_func = _run_case_background_cross_platform if use_cross_platform_runner else _run_case_background
-    background_tasks.add_task(run_func, case_id, session_factory, env_id, device_serial)
+    batch_id = str(uuid.uuid4())
+    run_record = _make_case_run_record(
+        case_id=case_id,
+        batch_id=batch_id,
+        device_serial=device_serial,
+    )
+    _update_case_run_status(session, case_id, "RUNNING")
+    background_tasks.add_task(
+        run_func,
+        case_id,
+        session_factory,
+        env_id,
+        device_serial,
+        run_record.run_id,
+        run_record.abort_event,
+    )
 
     return {
         "message": "Execution started",
         "case_id": case_id,
+        "batch_id": batch_id,
+        "run_id": run_record.run_id,
+        "device_serial": device_serial,
         "runner": "cross_platform" if use_cross_platform_runner else "legacy",
+    }
+
+
+@router.post("/{case_id}/run-batch")
+def run_test_case_batch(
+    case_id: int,
+    request: CaseRunBatchRequest,
+    session: Session = Depends(get_session),
+):
+    """Run one case on multiple devices as one cancellable batch."""
+    case = session.get(TestCase, case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    from backend.database import engine
+    from sqlmodel import Session as SQLSession
+
+    def session_factory():
+        return SQLSession(engine)
+
+    requested_serials = request.device_serials or [None]
+    runnable_serials: List[Optional[str]] = []
+    blocked_prechecks: List[Dict[str, Any]] = []
+
+    for serial in requested_serials:
+        if not serial:
+            runnable_serials.append(serial)
+            continue
+        try:
+            precheck = precheck_case_execution(
+                session=session,
+                case=case,
+                device_serial=serial,
+                env_id=request.env_id,
+            )
+        except Exception as exc:
+            blocked_prechecks.append({"device_serial": serial, "reason": str(exc)})
+            continue
+
+        if precheck.get("ok"):
+            runnable_serials.append(serial)
+        else:
+            blocked_prechecks.append(
+                {
+                    "device_serial": serial,
+                    "reason": _summarize_precheck_failure(precheck),
+                    "precheck": precheck,
+                }
+            )
+
+    if not runnable_serials:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "C1001_CASE_PRECHECK_FAILED",
+                "message": "case precheck failed for all selected devices",
+                "items": blocked_prechecks,
+            },
+        )
+
+    batch_id = str(uuid.uuid4())
+    run_ids: List[str] = []
+    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
+
+    _update_case_run_status(session, case_id, "RUNNING")
+
+    for serial in runnable_serials:
+        run_record = _make_case_run_record(
+            case_id=case_id,
+            batch_id=batch_id,
+            device_serial=serial,
+        )
+        run_ids.append(run_record.run_id)
+        run_func = _run_case_background_cross_platform if use_cross_platform_runner and serial else _run_case_background
+        threading.Thread(
+            target=run_func,
+            args=(
+                case_id,
+                session_factory,
+                request.env_id,
+                serial,
+                run_record.run_id,
+                run_record.abort_event,
+            ),
+            daemon=True,
+        ).start()
+
+    return {
+        "message": "Batch execution started",
+        "case_id": case_id,
+        "batch_id": batch_id,
+        "run_ids": run_ids,
+        "device_serials": runnable_serials,
+        "blocked_prechecks": blocked_prechecks,
     }
 
 
@@ -866,11 +1051,16 @@ def precheck_test_case(
 
 
 @router.delete("/{case_id}")
-def delete_test_case(case_id: int, session: Session = Depends(get_session)):
+def delete_test_case(
+    case_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
     """Delete a test case."""
     case = session.get(TestCase, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
+    deps.ensure_owner_or_admin(case.user_id, current_user)
 
     standard_steps = session.exec(select(TestCaseStep).where(TestCaseStep.case_id == case_id)).all()
     previous_image_paths = _collect_case_template_image_paths(case, standard_steps)

@@ -127,7 +127,7 @@ class DashboardOverview(BaseModel):
 # --- API Endpoints ---
 
 ALERT_FAIL_STATUSES = {"FAIL", "WARNING", "ERROR"}
-COMPLETED_STATUSES = {"PASS", "FAIL", "WARNING", "ERROR"}
+COMPLETED_STATUSES = {"PASS", "FAIL", "WARNING", "ERROR", "ABORTED"}
 
 
 def _normalize_report_asset_path(path: Optional[str]) -> Optional[str]:
@@ -491,7 +491,7 @@ def get_dashboard_overview(
 
     active_tasks = int(session.exec(select(func.count(ScheduledTask.id)).where(ScheduledTask.is_active == True)).one() or 0)
 
-    status_order = ["PASS", "WARNING", "FAIL", "ERROR", "RUNNING"]
+    status_order = ["PASS", "WARNING", "FAIL", "ERROR", "ABORTED", "RUNNING"]
     status_counter = {status: 0 for status in status_order}
     for execution in executions:
         status = str(execution.status or "").upper()

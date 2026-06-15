@@ -1,19 +1,27 @@
 <script setup>
-import { ref, onActivated, computed, reactive } from 'vue'
+import { ref, onActivated, onDeactivated, onUnmounted, computed, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { Plus, Search, VideoPlay, Edit, Delete, Refresh, MoreFilled, 
-         Check, Close, Timer } from '@element-plus/icons-vue'
+         Check, Close, Timer, CircleClose } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import { useUserStore } from '@/stores/useUserStore'
 import dayjs from 'dayjs'
+import { useClientMode } from '@/composables/useClientMode'
 
 const router = useRouter()
+const userStore = useUserStore()
+const { isMobileMode } = useClientMode()
 
 // Data
 const scenarios = ref([])
 const loading = ref(false)
 const searchQuery = ref('')
 const filterStatus = ref('all') // all, success, warning, failure
+const currentUser = computed(() => userStore.userInfo || {})
+const isAdmin = computed(() => currentUser.value.role === 'admin')
+const activeScenarioRuns = ref({})
+let activeRunTimer = null
 
 // Pagination
 const currentPage = ref(1)
@@ -47,6 +55,7 @@ const fetchScenarios = async () => {
         }
         
         scenarios.value = data
+        restoreActiveScenarioRuns()
         
     } catch (err) {
         ElMessage.error('获取场景列表失败')
@@ -155,7 +164,13 @@ const fetchRunConfigOptions = async () => {
     }
 }
 
-const handleRunClick = (row) => {
+const isScenarioRunActive = (row) => Boolean(activeScenarioRuns.value[row.id])
+
+const handleRunClick = async (row) => {
+    if (isScenarioRunActive(row)) {
+        await terminateScenarioRun(row)
+        return
+    }
     runningScenarioId.value = row.id
     runDialogVisible.value = true
     fetchRunConfigOptions()
@@ -196,13 +211,99 @@ const confirmRun = async () => {
         // Optimistic update
         const item = scenarios.value.find(s => s.id === runningScenarioId.value)
         if (item) item.last_run_status = 'RUNNING'
+        activeScenarioRuns.value = {
+            ...activeScenarioRuns.value,
+            [runningScenarioId.value]: {
+                batch_id: data?.batch_id,
+                execution_ids: data?.execution_ids || [],
+                device_serials: runnable
+            }
+        }
+        startActiveRunPolling()
         fetchScenarios() 
     } catch (err) {
         ElMessage.error('启动失败: ' + summarizeHttpDetail(err))
     }
 }
 
+const terminateScenarioRun = async (row) => {
+    const active = activeScenarioRuns.value[row.id]
+    if (!active) return
+    try {
+        await api.cancelRun({
+            kind: 'scenario',
+            target_id: row.id,
+            batch_id: active.batch_id || null,
+            execution_ids: active.execution_ids || [],
+            device_serials: active.device_serials || []
+        })
+        ElMessage.warning('已发送终止请求')
+        row.last_run_status = 'ABORTED'
+        const next = { ...activeScenarioRuns.value }
+        delete next[row.id]
+        activeScenarioRuns.value = next
+    } catch (err) {
+        ElMessage.error('终止失败: ' + summarizeHttpDetail(err))
+    }
+}
+
+const restoreActiveScenarioRuns = async () => {
+    const runningRows = scenarios.value.filter(row => normalizeRunStatus(row.last_run_status) === 'running')
+    if (runningRows.length === 0) return
+    const next = { ...activeScenarioRuns.value }
+    for (const row of runningRows) {
+        try {
+            const { data } = await api.getActiveRuns('scenario', row.id)
+            const items = data?.items || []
+            if (items.length > 0) {
+                next[row.id] = {
+                    batch_id: items[0]?.batch_id,
+                    execution_ids: items.map(item => item.execution_id).filter(Boolean),
+                    device_serials: items.map(item => item.device_serial).filter(Boolean)
+                }
+            }
+        } catch {}
+    }
+    activeScenarioRuns.value = next
+    if (Object.keys(next).length > 0) startActiveRunPolling()
+}
+
+const startActiveRunPolling = () => {
+    stopActiveRunPolling()
+    activeRunTimer = setInterval(async () => {
+        const entries = Object.entries(activeScenarioRuns.value)
+        if (entries.length === 0) {
+            stopActiveRunPolling()
+            return
+        }
+        const next = { ...activeScenarioRuns.value }
+        let changed = false
+        for (const [scenarioId] of entries) {
+            try {
+                const { data } = await api.getActiveRuns('scenario', Number(scenarioId))
+                if ((data?.items || []).length === 0) {
+                    delete next[scenarioId]
+                    changed = true
+                }
+            } catch {}
+        }
+        activeScenarioRuns.value = next
+        if (changed) fetchScenarios()
+    }, 3000)
+}
+
+const stopActiveRunPolling = () => {
+    if (activeRunTimer) {
+        clearInterval(activeRunTimer)
+        activeRunTimer = null
+    }
+}
+
 const handleDelete = async (row) => {
+    if (!canDeleteScenario(row)) {
+        ElMessage.warning('仅创建人或管理员可以删除')
+        return
+    }
     try {
         await ElMessageBox.confirm(`确定删除场景 "${row.name}"?`, '警告', {
             type: 'warning',
@@ -215,10 +316,20 @@ const handleDelete = async (row) => {
         ElMessage.success('删除成功')
         fetchScenarios()
     } catch (err) {
-        if (err !== 'cancel') ElMessage.error('删除失败')
+        if (err !== 'cancel') ElMessage.error('删除失败: ' + summarizeHttpDetail(err))
     } finally {
         loading.value = false
     }
+}
+
+const canDeleteScenario = (row) => {
+    if (!row) return false
+    if (isAdmin.value) return true
+    return row.user_id !== null && row.user_id !== undefined && row.user_id === currentUser.value.id
+}
+
+const deletePermissionTip = (row) => {
+    return canDeleteScenario(row) ? '删除' : '仅创建人或管理员可以删除'
 }
 
 /** 状态标签类型映射 */
@@ -278,6 +389,7 @@ const getStatusColor = (status) => {
     if (s === 'fail' || s === 'failed') return '#F56C6C' // Red
     if (s === 'warning') return '#E6A23C' // Orange
     if (s === 'running') return '#409EFF' // Blue
+    if (s === 'aborted' || s === 'cancelled') return '#909399'
     return '#E6A23C' // Warning
 }
 
@@ -295,10 +407,78 @@ const getDuration = (row) => {
 onActivated(() => {
     fetchScenarios()
 })
+
+onDeactivated(stopActiveRunPolling)
+onUnmounted(stopActiveRunPolling)
 </script>
 
 <template>
-    <div class="scenario-list-container">
+    <div v-if="isMobileMode" class="mobile-scenario-page">
+        <div class="mobile-scenario-toolbar">
+            <el-input
+                v-model="searchQuery"
+                placeholder="搜索场景..."
+                :prefix-icon="Search"
+                clearable
+                class="mobile-search-input"
+                @keyup.enter="handleSearch"
+                @clear="handleSearch"
+            />
+            <el-button :icon="Refresh" circle @click="fetchScenarios" />
+        </div>
+
+        <el-radio-group v-model="filterStatus" class="mobile-status-filter" @change="handleSearch">
+            <el-radio-button value="all">全部</el-radio-button>
+            <el-radio-button value="success">成功</el-radio-button>
+            <el-radio-button value="warning">告警</el-radio-button>
+            <el-radio-button value="failure">失败</el-radio-button>
+        </el-radio-group>
+
+        <div class="mobile-scenario-list" v-loading="loading">
+            <article
+                v-for="item in scenarios"
+                :key="item.id"
+                class="mobile-scenario-card"
+            >
+                <div class="mobile-scenario-strip" :style="{ backgroundColor: getStatusColor(item.last_run_status) }"></div>
+                <div class="mobile-scenario-body">
+                    <div class="mobile-scenario-header">
+                        <div class="mobile-scenario-title">
+                            <strong>{{ item.name }}</strong>
+                        </div>
+                        <el-tag size="small" effect="plain">
+                            {{ normalizeRunStatus(item.last_run_status) || 'not_run' }}
+                        </el-tag>
+                    </div>
+                    <div class="mobile-scenario-info-line">
+                        <span>{{ item.step_count || 0 }} 步</span>
+                        <span>{{ getDuration(item) }}</span>
+                        <span>更新 {{ formatDate(item.updated_at) }}</span>
+                        <span v-if="item.last_run_time">执行 {{ formatDate(item.last_run_time) }}</span>
+                        <span v-else>未执行</span>
+                    </div>
+                    <div class="mobile-scenario-actions">
+                        <el-button type="primary" :icon="VideoPlay" @click="handleRunClick(item)">执行场景</el-button>
+                        <el-button :disabled="!item.last_execution_id && !item.last_report_id" @click="handleReport(item)">查看报告</el-button>
+                    </div>
+                </div>
+            </article>
+            <el-empty v-if="!loading && scenarios.length === 0" description="暂无场景" :image-size="90" />
+        </div>
+
+        <div class="mobile-pagination" v-if="total > 0">
+            <el-pagination
+                v-model:current-page="currentPage"
+                :page-size="pageSize"
+                :background="true"
+                layout="prev, pager, next"
+                :total="total"
+                @current-change="handleCurrentChange"
+            />
+        </div>
+    </div>
+
+    <div v-else class="scenario-list-container">
         <div class="content-wrapper">
             <!-- Header -->
             <div class="list-header">
@@ -370,6 +550,11 @@ onActivated(() => {
                                         <el-icon class="is-loading"><Refresh /></el-icon> 执行中...
                                     </span>
                                 </template>
+                                <template v-else-if="normalizeRunStatus(item.last_run_status) === 'aborted' || normalizeRunStatus(item.last_run_status) === 'cancelled'">
+                                    <span class="status-text neutral">
+                                        已终止
+                                    </span>
+                                </template>
                                 <template v-else>
                                     <span class="status-text neutral">尚未执行</span>
                                 </template>
@@ -408,7 +593,13 @@ onActivated(() => {
                             
                             <div class="btn-group">
                                  <el-tooltip content="运行" placement="top">
-                                    <el-button type="primary" :icon="VideoPlay" circle class="action-btn-run" @click="handleRunClick(item)" />
+                                    <el-button
+                                      :type="isScenarioRunActive(item) ? 'danger' : 'primary'"
+                                      :icon="isScenarioRunActive(item) ? CircleClose : VideoPlay"
+                                      circle
+                                      class="action-btn-run"
+                                      @click="handleRunClick(item)"
+                                    />
                                  </el-tooltip>
                                  
                                  <el-tooltip content="编辑" placement="top">
@@ -422,7 +613,15 @@ onActivated(() => {
                                     <template #dropdown>
                                       <el-dropdown-menu>
                                         <el-dropdown-item @click="handleReport(item)">查看报告</el-dropdown-item>
-                                        <el-dropdown-item divided style="color: #F56C6C" @click="handleDelete(item)">删除</el-dropdown-item>
+                                        <el-dropdown-item
+                                            divided
+                                            :disabled="!canDeleteScenario(item)"
+                                            :style="{ color: canDeleteScenario(item) ? '#F56C6C' : '#C0C4CC' }"
+                                            :title="deletePermissionTip(item)"
+                                            @click="handleDelete(item)"
+                                        >
+                                            删除
+                                        </el-dropdown-item>
                                       </el-dropdown-menu>
                                     </template>
                                   </el-dropdown>
@@ -494,6 +693,53 @@ onActivated(() => {
             </template>
         </el-dialog>
     </div>
+
+    <el-drawer
+        v-if="isMobileMode"
+        v-model="runDialogVisible"
+        title="运行配置"
+        placement="bottom"
+        size="82%"
+    >
+        <div class="mobile-run-form">
+            <label class="mobile-run-label">目标设备</label>
+            <el-checkbox-group v-model="runForm.deviceSerials" class="mobile-device-checks">
+                <el-checkbox
+                    v-for="dev in devices"
+                    :key="dev.serial"
+                    :label="dev.serial"
+                    :disabled="!isDeviceSelectable(dev)"
+                    class="mobile-device-check"
+                >
+                    <div class="mobile-device-check-content">
+                        <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
+                        <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                    </div>
+                    <small v-if="deviceUnavailableReason(dev)">{{ deviceUnavailableReason(dev) }}</small>
+                </el-checkbox>
+            </el-checkbox-group>
+            <div v-if="hasWdaDownDevice" class="run-warning-hint">
+                检测到 iOS 设备 WDA 异常，需在设备中心先执行“检测WDA”。
+            </div>
+
+            <label class="mobile-run-label">运行环境</label>
+            <el-select v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
+                <el-option
+                    v-for="env in environments"
+                    :key="env.id"
+                    :label="env.name"
+                    :value="env.id"
+                />
+            </el-select>
+        </div>
+
+        <template #footer>
+            <div class="mobile-drawer-footer">
+                <el-button @click="runDialogVisible = false">取消</el-button>
+                <el-button type="primary" @click="confirmRun">开始执行</el-button>
+            </div>
+        </template>
+    </el-drawer>
 </template>
 
 <style scoped>
@@ -723,5 +969,205 @@ onActivated(() => {
   display: flex;
   justify-content: flex-end;
   padding-right: 10px;
+}
+
+.mobile-scenario-page {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: #f6f7f9;
+    padding: 12px;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+.mobile-scenario-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.mobile-search-input {
+    width: 100%;
+}
+
+.mobile-status-filter {
+    margin-bottom: 10px;
+    overflow-x: auto;
+    flex-shrink: 0;
+}
+
+.mobile-scenario-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mobile-scenario-card {
+    position: relative;
+    display: flex;
+    border: 1px solid #ebeef5;
+    border-radius: 8px;
+    background: #ffffff;
+    overflow: hidden;
+}
+
+.mobile-scenario-strip {
+    width: 5px;
+    flex-shrink: 0;
+}
+
+.mobile-scenario-body {
+    min-width: 0;
+    flex: 1;
+    padding: 10px 12px;
+}
+
+.mobile-scenario-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.mobile-scenario-title {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mobile-scenario-title strong {
+    font-size: 15px;
+    color: #303133;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-scenario-info-line {
+    margin-top: 6px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    overflow: hidden;
+    font-size: 12px;
+    color: #909399;
+    white-space: nowrap;
+}
+
+.mobile-scenario-info-line span {
+    min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mobile-scenario-info-line span::after {
+    content: "·";
+    margin-left: 7px;
+    color: #c0c4cc;
+}
+
+.mobile-scenario-info-line span:last-child::after {
+    content: "";
+    margin-left: 0;
+}
+
+.mobile-scenario-actions {
+    margin-top: 9px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.mobile-scenario-actions .el-button {
+    margin-left: 0;
+    min-width: 0;
+}
+
+.mobile-pagination {
+    padding-top: 10px;
+    display: flex;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.mobile-run-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mobile-run-form :deep(.el-select__wrapper),
+.mobile-run-form :deep(.el-input__wrapper) {
+    min-height: 44px;
+    font-size: 16px;
+}
+
+.mobile-run-form :deep(.el-select__placeholder),
+.mobile-run-form :deep(.el-input__inner) {
+    font-size: 16px;
+}
+
+.mobile-run-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: #303133;
+}
+
+.mobile-device-checks {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mobile-device-check {
+    margin-right: 0;
+    border: 1px solid #ebeef5;
+    border-radius: 8px;
+    padding: 10px;
+    background: #fff;
+}
+
+.mobile-device-check :deep(.el-checkbox__label) {
+    flex: 1;
+    min-width: 0;
+}
+
+.mobile-device-check-content {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+}
+
+.mobile-device-check-content span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-device-check small {
+    display: block;
+    margin-top: 4px;
+    color: #e6a23c;
+}
+
+.mobile-drawer-footer {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.mobile-drawer-footer .el-button {
+    margin-left: 0;
 }
 </style>

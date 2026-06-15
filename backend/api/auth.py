@@ -1,5 +1,5 @@
 from datetime import timedelta
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -9,6 +9,8 @@ from backend.database import get_session
 from backend.models import User
 from backend.core.security import verify_password, create_access_token, get_password_hash, ACCESS_TOKEN_EXPIRE_MINUTES
 from backend.api import deps
+from backend.api.settings_helpers import is_registration_allowed
+from backend.schemas import CurrentUserRead, PasswordChange, RegistrationStatus, UserRead, UserRegister
 
 router = APIRouter()
 
@@ -39,7 +41,17 @@ def login_access_token(
     }
 
 
-@router.get("/users/me", response_model=User)
+@router.get("/registration-status", response_model=RegistrationStatus)
+def read_registration_status(
+    session: Session = Depends(get_session),
+) -> Any:
+    """
+    Public registration switch used by login/register pages.
+    """
+    return RegistrationStatus(allow_registration=is_registration_allowed(session))
+
+
+@router.get("/users/me", response_model=CurrentUserRead)
 def read_users_me(
     current_user: User = Depends(deps.get_current_active_user),
 ) -> Any:
@@ -49,16 +61,35 @@ def read_users_me(
     return current_user
 
 
-# Optional: Register endpoint for admin
-@router.post("/users", response_model=User)
+@router.put("/password")
+def change_password(
+    *,
+    password_in: PasswordChange,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_active_user),
+) -> Any:
+    """
+    Change password for the current user after verifying the current password.
+    """
+    if not verify_password(password_in.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    current_user.hashed_password = get_password_hash(password_in.new_password)
+    session.add(current_user)
+    session.commit()
+    return {"message": "Password updated successfully"}
+
+
+# Legacy admin-create endpoint kept for compatibility. New UI uses /admin/users.
+@router.post("/users", response_model=UserRead)
 def create_user(
     *,
     session: Session = Depends(get_session),
     username: str,
     password: str,
-    full_name: str = None,
-    email: str = None,
-    current_user: User = Depends(deps.get_current_active_user), # Only allowing logged in users to create? No, standard register usually open or admin only.
+    full_name: Optional[str] = None,
+    email: Optional[str] = None,
+    current_user: User = Depends(deps.get_current_admin_user),
 ) -> Any:
     """
     Create new user (only for admin or open registration).
@@ -66,9 +97,6 @@ def create_user(
     or just open it up if needed. The Requirement said "admin only or open".
     Let's check current_user role.
     """
-    if current_user.role != "admin":
-         raise HTTPException(status_code=403, detail="Not enough permissions")
-
     statement = select(User).where(User.username == username)
     user = session.exec(statement).first()
     if user:
@@ -82,15 +110,15 @@ def create_user(
         hashed_password=get_password_hash(password),
         full_name=full_name,
         email=email,
+        role="user",
     )
     session.add(user)
     session.commit()
     session.refresh(user)
     return user
 
-from backend.schemas import UserRegister
 
-@router.post("/register", response_model=User)
+@router.post("/register", response_model=UserRead)
 def register_user(
     *,
     session: Session = Depends(get_session),
@@ -99,6 +127,9 @@ def register_user(
     """
     Open registration for new users.
     """
+    if not is_registration_allowed(session):
+        raise HTTPException(status_code=403, detail="Registration is disabled. Please contact administrator.")
+
     user = session.exec(select(User).where(User.username == user_in.username)).first()
     if user:
         raise HTTPException(

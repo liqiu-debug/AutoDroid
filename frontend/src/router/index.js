@@ -5,7 +5,7 @@ import { useUserStore } from '../stores/useUserStore'
 // Element Plus Icons
 import {
   Monitor, Files, Collection, DataAnalysis,
-  Timer, Setting, Odometer, Box
+  Timer, Setting, Odometer, Box, UserFilled
 } from '@element-plus/icons-vue'
 
 /**
@@ -19,12 +19,14 @@ const routes = [
   {
     path: '/login',
     name: 'login',
-    component: LoginView
+    component: LoginView,
+    meta: { mobileAvailable: true, mobileTitle: '登录' }
   },
   {
     path: '/register',
     name: 'register',
-    component: () => import('../views/login/Register.vue')
+    component: () => import('../views/login/Register.vue'),
+    meta: { mobileAvailable: true, mobileTitle: '注册' }
   },
 
   // ========== 主布局 ==========
@@ -41,7 +43,7 @@ const routes = [
           {
             path: '',
             name: 'dashboard',
-            meta: { keepAlive: true },
+            meta: { keepAlive: true, mobileAvailable: true, mobileTitle: '运行概览' },
             component: () => import('../views/dashboard/DashboardView.vue')
           }
         ]
@@ -56,7 +58,7 @@ const routes = [
           {
             path: 'devices',
             name: 'device-center',
-            meta: { title: '设备管理中心', keepAlive: true },
+            meta: { title: '设备管理中心', keepAlive: true, mobileAvailable: true, mobileTitle: '设备状态' },
             component: () => import('../views/devices/DeviceCenter.vue')
           },
           {
@@ -83,7 +85,7 @@ const routes = [
           {
             path: 'cases',
             name: 'case-list',
-            meta: { title: '用例管理', keepAlive: true },
+            meta: { title: '用例管理', keepAlive: true, mobileAvailable: true, mobileTitle: '用例执行' },
             component: () => import('../views/cases/CaseList.vue')
           },
           {
@@ -101,7 +103,7 @@ const routes = [
           {
             path: 'scenarios',
             name: 'scenario-list',
-            meta: { title: '场景编排', keepAlive: true },
+            meta: { title: '场景编排', keepAlive: true, mobileAvailable: true, mobileTitle: '场景执行' },
             component: () => import('../views/scenarios/ScenarioList.vue')
           },
           {
@@ -168,13 +170,13 @@ const routes = [
           {
             path: 'reports',
             name: 'report-list',
-            meta: { title: '报告中心', keepAlive: true },
+            meta: { title: '报告中心', keepAlive: true, mobileAvailable: true, mobileTitle: '报告' },
             component: () => import('../views/reports/ReportList.vue')
           },
           {
             path: 'reports/:id',
             name: 'report-detail',
-            meta: { title: '报告详情', hidden: true },
+            meta: { title: '报告详情', hidden: true, mobileAvailable: true, mobileTitle: '报告详情' },
             component: () => import('../views/reports/ReportDetail.vue')
           }
         ]
@@ -186,10 +188,30 @@ const routes = [
         meta: { title: '系统配置', icon: Setting },
         children: [
           {
+            path: 'users',
+            name: 'admin-users',
+            meta: { title: '用户管理', keepAlive: true, requiresAdmin: true },
+            component: () => import('../views/admin/UserManagement.vue')
+          },
+          {
             path: 'notifications',
             name: 'notification-settings',
             meta: { title: '通知设置', keepAlive: true },
             component: () => import('../views/settings/NotificationSettings.vue')
+          }
+        ]
+      },
+
+      // ────── 账号设置 ──────
+      {
+        path: 'account',
+        meta: { title: '账号设置', icon: UserFilled, hidden: true },
+        children: [
+          {
+            path: 'password',
+            name: 'account-password',
+            meta: { title: '修改密码', hidden: true },
+            component: () => import('../views/account/ChangePassword.vue')
           }
         ]
       }
@@ -205,6 +227,7 @@ const router = createRouter({
 router.beforeEach(async (to, from, next) => {
   const userStore = useUserStore()
   const token = localStorage.getItem('token')
+  const requiresAdmin = to.matched.some(record => record.meta?.requiresAdmin)
 
   if (token && !userStore.token) {
     userStore.token = token
@@ -221,13 +244,21 @@ router.beforeEach(async (to, from, next) => {
       if (!userStore.userInfo) {
         try {
           await userStore.fetchUserInfo()
-          next()
+          if (requiresAdmin && !userStore.isAdmin) {
+            next('/')
+          } else {
+            next()
+          }
         } catch (e) {
           userStore.logout()
           next('/login')
         }
       } else {
-        next()
+        if (requiresAdmin && !userStore.isAdmin) {
+          next('/')
+        } else {
+          next()
+        }
       }
     } else {
       next('/login')

@@ -1,10 +1,19 @@
 <!DOCTYPE html>
-<html lang="">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8">
-    <link rel="icon" href="/favicon.ico">
+    <link id="favicon" rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link id="shortcut-icon" rel="shortcut icon" href="/favicon.ico">
+    <script>
+      if (location.protocol === 'file:') {
+        const iconBase = location.pathname.includes('/dist/') ? './' : './public/'
+        document.getElementById('favicon').href = `${iconBase}favicon.svg`
+        document.getElementById('shortcut-icon').href = `${iconBase}favicon.ico`
+      }
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vite App</title>
+    <meta name="theme-color" content="#303133">
+    <title>AutoDroid | 移动端自动化测试平台</title>
   </head>
   <body>
     <div id="app"></div>

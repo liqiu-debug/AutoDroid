@@ -44,7 +44,7 @@ class CaseImageCleanupTests(unittest.TestCase):
         return file_path
 
     def _create_case(self, name: str, steps=None) -> CaseModel:
-        case = CaseModel(name=name, steps=steps or [], variables=[])
+        case = CaseModel(name=name, steps=steps or [], variables=[], user_id=self.user.id)
         self.session.add(case)
         self.session.commit()
         self.session.refresh(case)
@@ -74,7 +74,7 @@ class CaseImageCleanupTests(unittest.TestCase):
             steps=[Step(action="click_image", selector=image_path, selector_type="image", description="img")],
         )
 
-        case_api.delete_test_case(case.id, session=self.session)
+        case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
 
         self.assertFalse(image_file.exists())
 
@@ -88,7 +88,7 @@ class CaseImageCleanupTests(unittest.TestCase):
         other_case = self._create_case("case-standard", steps=[])
         self._add_standard_image_step(other_case.id, image_path)
 
-        case_api.delete_test_case(case.id, session=self.session)
+        case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
 
         self.assertTrue(image_file.exists())
 
@@ -158,7 +158,7 @@ class CaseImageCleanupTests(unittest.TestCase):
             steps=[Step(action="click_image", selector=used_path, selector_type="image", description="used")],
         )
 
-        case_api.delete_test_case(case.id, session=self.session)
+        case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
 
         self.assertFalse(used_file.exists())
         self.assertFalse(orphan_file.exists())
@@ -171,7 +171,7 @@ class CaseImageCleanupTests(unittest.TestCase):
             steps=[Step(action="click_image", selector=custom_path, selector_type="image", description="custom")],
         )
 
-        case_api.delete_test_case(case.id, session=self.session)
+        case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
 
         self.assertTrue(custom_file.exists())
 

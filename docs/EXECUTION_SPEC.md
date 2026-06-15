@@ -1,8 +1,8 @@
-# 执行规范（Android 录制 + Android/iOS 执行）
+# 执行规范（Android/iOS 录制与执行）
 
 ## 1. 边界定义
 
-- 录制：仅 Android 设备支持（`/device/*` 录制接口为 Android-only）。
+- 录制：Android 支持实时投屏和静态截图录制；iOS 支持基于 WDA 的静态截图、层级解析、坐标交互与步骤录制，暂不支持实时投屏。
 - 执行：Android 与 iOS 统一走标准步骤模型。
 - 兼容：`case.steps`（legacy）保留，用于灰度期间兼容；执行优先读取 `TestCaseStep` 标准步骤表。
 
@@ -111,18 +111,17 @@
 
 - `S1001_SCENARIO_PRECHECK_FAILED`: 场景在选定设备上全部预检失败。
 
-### 6.3 录制/平台边界码
+### 6.3 平台边界码
 
-- `P2001_RECORDING_ANDROID_ONLY`: 录制能力仅支持 Android。
-- `P2002_ADB_ANDROID_ONLY`: Android-only 录制能力被 iOS 调用。
+- `P2002_ADB_ANDROID_ONLY`: APK 安装、ADB 等 Android 专属能力被 iOS 调用。
 - `P3001_FASTBOT_ANDROID_ONLY`: Fastbot 仅支持 Android。
 - `P3002_WDA_IOS_ONLY`: WDA 健康检查仅支持 iOS。
 
 ## 7. 结果状态语义
 
 - 步骤级：`PASS/SKIP/WARNING/FAIL`。
-- 用例级：`PASS/WARNING/FAIL`（全 `SKIP` 归类为 `WARNING`）。
-- 场景级：`PASS/WARNING/FAIL`（全 `SKIP` 归类为 `WARNING`）。
+- 用例级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。
+- 场景级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。
 
 ## 8. 推荐执行顺序
 

@@ -1,5 +1,5 @@
 <template>
-  <div class="split-container">
+  <div class="split-container" :class="{ 'is-mobile-mode': isMobileMode }">
     <!-- 左侧：黑白灰几何拼接 (Geometric Splicing) -->
     <div class="left-panel abstract-grid">
       <div class="grid-item bg-black">
@@ -16,13 +16,26 @@
 
     <!-- 右侧：注册表单 -->
     <div class="right-panel">
+      <div class="mode-switch-wrap">
+        <ClientModeSwitch />
+      </div>
       <div class="form-wrapper">
         <div class="form-header">
           <h2 class="title">AutoDroid</h2>
           <p class="subtitle">UI自动化测试平台</p>
         </div>
+
+        <el-alert
+          v-if="!registrationAllowed"
+          title="当前已关闭公开注册，请联系管理员创建账号。"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="registration-alert"
+        />
         
         <el-form 
+          v-if="registrationAllowed"
           ref="formRef"
           :model="form"
           :rules="rules"
@@ -93,15 +106,19 @@
 </template>
 
 <script setup>
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { User, Lock, Avatar } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import ClientModeSwitch from '@/components/ClientModeSwitch.vue'
+import { useClientMode } from '@/composables/useClientMode'
 
 const router = useRouter()
+const { isMobileMode } = useClientMode()
 const formRef = ref(null)
 const loading = ref(false)
+const registrationAllowed = ref(true)
 
 const form = reactive({
   username: '',
@@ -123,11 +140,27 @@ const validatePass2 = (rule, value, callback) => {
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
   name: [{ required: true, message: '请输入真实姓名', trigger: 'blur' }],
-  password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
+  password: [
+    { required: true, message: '请输入密码', trigger: 'blur' },
+    { min: 6, message: '密码至少 6 位', trigger: 'blur' }
+  ],
   confirmPassword: [{ validator: validatePass2, trigger: 'blur' }]
 }
 
+const loadRegistrationStatus = async () => {
+  try {
+    const res = await api.getRegistrationStatus()
+    registrationAllowed.value = res.data?.allow_registration !== false
+  } catch (error) {
+    registrationAllowed.value = true
+  }
+}
+
 const handleRegister = async () => {
+  if (!registrationAllowed.value) {
+    ElMessage.warning('当前已关闭公开注册，请联系管理员创建账号')
+    return
+  }
   if (!formRef.value) return
   
   await formRef.value.validate(async (valid) => {
@@ -149,6 +182,8 @@ const handleRegister = async () => {
     }
   })
 }
+
+onMounted(loadRegistrationStatus)
 </script>
 
 <style scoped>
@@ -164,12 +199,7 @@ const handleRegister = async () => {
 /* --- 左侧拼接设计 --- */
 .left-panel {
   flex: 1;
-  display: none; /* 移动端隐藏 */
-}
-@media (min-width: 900px) {
-  .left-panel {
-    display: block;
-  }
+  display: block;
 }
 
 .abstract-grid {
@@ -209,7 +239,6 @@ const handleRegister = async () => {
   position: relative;
 }
 
-/* 装饰元素 */
 .circle-accent {
   width: 64px;
   height: 64px;
@@ -224,7 +253,7 @@ const handleRegister = async () => {
   color: #ffffff;
   font-size: 64px;
   font-weight: 800;
-  letter-spacing: -2px;
+  letter-spacing: 0;
   transform: rotate(-90deg);
   transform-origin: bottom right;
   opacity: 0.1;
@@ -250,6 +279,14 @@ const handleRegister = async () => {
   justify-content: center;
   background-color: #ffffff;
   padding: 40px;
+  position: relative;
+}
+
+.mode-switch-wrap {
+  display: none;
+  position: absolute;
+  top: 20px;
+  right: 20px;
 }
 
 .form-wrapper {
@@ -291,12 +328,16 @@ const handleRegister = async () => {
   margin-bottom: 32px;
 }
 
+.registration-alert {
+  margin-bottom: 20px;
+}
+
 .title {
   font-size: 32px;
   font-weight: 700;
   color: #000000;
   margin: 0 0 8px 0;
-  letter-spacing: -0.5px;
+  letter-spacing: 0;
 }
 
 .subtitle {
@@ -380,5 +421,133 @@ const handleRegister = async () => {
 .register-link:hover {
   color: #52525b;
   text-decoration: underline;
+}
+
+.split-container.is-mobile-mode {
+  align-items: center;
+  justify-content: center;
+  min-height: 100dvh;
+  height: auto;
+  width: 100%;
+  padding: 16px;
+  background:
+    linear-gradient(90deg, rgba(9, 9, 11, 0.035) 1px, transparent 1px),
+    linear-gradient(0deg, rgba(9, 9, 11, 0.035) 1px, transparent 1px),
+    #f5f7fa;
+  background-size: 28px 28px;
+  overflow-y: auto;
+}
+
+.split-container.is-mobile-mode .left-panel {
+  display: none;
+}
+
+.split-container.is-mobile-mode .right-panel {
+  width: 100%;
+  min-height: calc(100dvh - 32px);
+  max-width: none;
+  padding: 0;
+  background-color: transparent;
+  flex: none;
+}
+
+.split-container.is-mobile-mode .mode-switch-wrap {
+  display: block;
+}
+
+.split-container.is-mobile-mode .form-wrapper {
+  background-color: #ffffff;
+  padding: 28px 22px;
+  border-radius: 8px;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.12);
+  overflow: hidden;
+}
+
+.split-container.is-mobile-mode .form-wrapper::before {
+  background-color: #09090b;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+
+.split-container.is-mobile-mode .form-wrapper:hover {
+  transform: none;
+  box-shadow: 0 22px 56px rgba(15, 23, 42, 0.15);
+}
+
+.split-container.is-mobile-mode .form-header {
+  text-align: center;
+}
+
+.split-container.is-mobile-mode :deep(.minimal-input .el-input__wrapper) {
+  font-size: 16px;
+}
+
+.split-container.is-mobile-mode :deep(.minimal-input .el-input__inner) {
+  font-size: 16px;
+}
+
+@media (max-width: 899px) {
+  .split-container {
+    align-items: center;
+    justify-content: center;
+    min-height: 100dvh;
+    height: auto;
+    width: 100%;
+    padding: 16px;
+    background:
+      linear-gradient(90deg, rgba(9, 9, 11, 0.035) 1px, transparent 1px),
+      linear-gradient(0deg, rgba(9, 9, 11, 0.035) 1px, transparent 1px),
+      #f5f7fa;
+    background-size: 28px 28px;
+    overflow-y: auto;
+  }
+
+  .left-panel {
+    display: none;
+  }
+
+  .right-panel {
+    width: 100%;
+    min-height: calc(100dvh - 32px);
+    max-width: none;
+    padding: 0;
+    background-color: transparent;
+    flex: none;
+  }
+
+  .mode-switch-wrap {
+    display: block;
+  }
+
+  .form-wrapper {
+    background-color: #ffffff;
+    padding: 28px 22px;
+    border-radius: 8px;
+    box-shadow: 0 18px 48px rgba(15, 23, 42, 0.12);
+    overflow: hidden;
+  }
+
+  .form-wrapper::before {
+    background-color: #09090b;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+  }
+
+  .form-wrapper:hover {
+    transform: none;
+    box-shadow: 0 22px 56px rgba(15, 23, 42, 0.15);
+  }
+
+  .form-header {
+    text-align: center;
+  }
+
+  :deep(.minimal-input .el-input__wrapper) {
+    font-size: 16px;
+  }
+
+  :deep(.minimal-input .el-input__inner) {
+    font-size: 16px;
+  }
 }
 </style>

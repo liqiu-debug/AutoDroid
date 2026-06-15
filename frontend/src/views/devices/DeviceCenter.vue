@@ -1,8 +1,11 @@
 <script setup>
 import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete } from '@element-plus/icons-vue'
+import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose } from '@element-plus/icons-vue'
 import api from '@/api'
+import { useClientMode } from '@/composables/useClientMode'
+
+const { isMobileMode } = useClientMode()
 
 // ==================== 状态 ====================
 const devices = ref([])
@@ -10,6 +13,7 @@ const loading = ref(false)
 const syncLoading = ref(false)
 const wdaCheckingSerial = ref('')
 const deleteLoadingSerial = ref('')
+const stopLoadingSerial = ref('')
 
 // 快照弹窗
 const screenshotVisible = ref(false)
@@ -89,6 +93,28 @@ const handleUnlock = async (device) => {
     await fetchDevices()
   } catch (e) {
     ElMessage.error('释放失败：' + (e.response?.data?.detail || e.message))
+  }
+}
+
+/** 停止当前设备上的执行 */
+const handleStopExecution = async (device) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定要停止 ${device.custom_name || device.market_name || device.model || device.serial} 当前执行吗？`,
+      '停止当前设备执行',
+      { type: 'warning', confirmButtonText: '停止执行', cancelButtonText: '取消' }
+    )
+    stopLoadingSerial.value = device.serial
+    const { data } = await api.stopDeviceExecution(device.serial)
+    const count = Number(data?.recovered_executions || 0)
+    ElMessage.success(count > 0 ? `已停止 ${count} 条运行中执行` : '已发送停止指令')
+    await fetchDevices({ refreshIosWda: true })
+  } catch (e) {
+    if (!['cancel', 'close'].includes(e)) {
+      ElMessage.error('停止失败：' + (e.response?.data?.detail || e.message))
+    }
+  } finally {
+    stopLoadingSerial.value = ''
   }
 }
 
@@ -229,7 +255,114 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="device-center" v-loading.fullscreen.lock="syncLoading" element-loading-text="正在同步设备，请稍候...">
+  <div v-if="isMobileMode" class="mobile-device-center" v-loading.fullscreen.lock="syncLoading" element-loading-text="正在同步设备，请稍候...">
+    <div class="mobile-toolbar">
+      <div>
+        <h2>设备状态</h2>
+        <span>{{ devices.length }} 台设备</span>
+      </div>
+      <el-button type="primary" :icon="Refresh" circle @click="handleSync" :loading="syncLoading" />
+    </div>
+
+    <el-empty
+      v-if="!loading && devices.length === 0"
+      description="暂无设备"
+      :image-size="100"
+    />
+
+    <div v-else class="mobile-device-list" v-loading="loading">
+      <article
+        v-for="device in devices"
+        :key="device.serial"
+        class="mobile-device-card"
+      >
+        <header class="mobile-device-card-header">
+          <div class="mobile-device-title-wrap">
+            <strong>{{ device.custom_name || device.market_name || device.model || device.serial }}</strong>
+            <span>{{ device.platform === 'ios' ? 'iOS' : 'Android' }} {{ device.os_version || device.android_version || '—' }}</span>
+          </div>
+          <el-tag :type="statusTagType(device.status)" size="small" effect="dark" round>
+            {{ statusLabel(device.status) }}
+          </el-tag>
+        </header>
+
+        <div class="mobile-device-facts">
+          <div>
+            <span>厂商</span>
+            <strong>{{ device.brand || '—' }}</strong>
+          </div>
+          <div>
+            <span>分辨率</span>
+            <strong>{{ device.resolution || '—' }}</strong>
+          </div>
+          <div class="span-2">
+            <span>设备编号</span>
+            <strong class="serial">{{ device.serial }}</strong>
+          </div>
+        </div>
+
+        <div v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" class="mobile-ios-hint">
+          WDA 未就绪，请先启动 WDA 后再执行。
+        </div>
+
+        <div class="mobile-device-actions">
+          <el-button
+            :icon="Picture"
+            @click="handleScreenshot(device)"
+            :disabled="device.status === 'OFFLINE'"
+          >
+            快照
+          </el-button>
+          <el-button
+            v-if="device.platform === 'ios'"
+            type="primary"
+            plain
+            :icon="Refresh"
+            @click="handleCheckWda(device)"
+            :loading="wdaCheckingSerial === device.serial"
+            :disabled="device.status === 'OFFLINE' || device.status === 'BUSY'"
+          >
+            启动WDA
+          </el-button>
+          <el-button
+            type="danger"
+            plain
+            :icon="CircleClose"
+            @click="handleStopExecution(device)"
+            :loading="stopLoadingSerial === device.serial"
+            :disabled="device.status !== 'BUSY'"
+          >
+            停止执行
+          </el-button>
+        </div>
+      </article>
+    </div>
+
+    <el-dialog
+      v-model="screenshotVisible"
+      :title="`实时屏幕快照 — ${screenshotDevice?.model || ''}`"
+      width="92%"
+      align-center
+      destroy-on-close
+    >
+      <div class="screenshot-container" v-loading="screenshotLoading">
+        <img
+          v-if="screenshotData"
+          :src="`data:image/png;base64,${screenshotData}`"
+          class="screenshot-img"
+          alt="设备截图"
+        />
+        <el-empty v-else description="暂无截图" :image-size="80" />
+      </div>
+      <template #footer>
+        <el-button :icon="Refresh" @click="refreshScreenshot(screenshotDevice?.serial)" :loading="screenshotLoading">
+          刷新屏幕
+        </el-button>
+      </template>
+    </el-dialog>
+  </div>
+
+  <div v-else class="device-center" v-loading.fullscreen.lock="syncLoading" element-loading-text="正在同步设备，请稍候...">
 
     <!-- 顶部工具栏 -->
     <div class="toolbar">
@@ -649,5 +782,132 @@ onBeforeUnmount(() => {
   max-height: 560px;
   object-fit: contain;
   border-radius: 4px;
+}
+
+.mobile-device-center {
+  height: 100%;
+  overflow-y: auto;
+  padding: 12px;
+  box-sizing: border-box;
+  background: #f6f7f9;
+}
+
+.mobile-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.mobile-toolbar h2 {
+  margin: 0 0 3px;
+  font-size: 18px;
+  color: #303133;
+}
+
+.mobile-toolbar span {
+  font-size: 12px;
+  color: #909399;
+}
+
+.mobile-device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mobile-device-card {
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.mobile-device-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mobile-device-title-wrap {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mobile-device-title-wrap strong {
+  font-size: 15px;
+  color: #303133;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-device-title-wrap span {
+  font-size: 12px;
+  color: #909399;
+}
+
+.mobile-device-facts {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mobile-device-facts div {
+  border-radius: 6px;
+  background: #f6f7f9;
+  padding: 8px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mobile-device-facts .span-2 {
+  grid-column: 1 / -1;
+}
+
+.mobile-device-facts span {
+  font-size: 11px;
+  color: #909399;
+}
+
+.mobile-device-facts strong {
+  font-size: 13px;
+  color: #303133;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-device-facts .serial {
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+}
+
+.mobile-ios-hint {
+  margin-top: 10px;
+  border-radius: 6px;
+  background: #fdf6ec;
+  color: #b88230;
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.mobile-device-actions {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.mobile-device-actions .el-button {
+  margin-left: 0;
+  min-width: 0;
 }
 </style>

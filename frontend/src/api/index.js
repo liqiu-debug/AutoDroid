@@ -47,8 +47,14 @@ export default {
     register(data) {
         return api.post('/auth/register', data)
     },
+    getRegistrationStatus() {
+        return api.get('/auth/registration-status')
+    },
     getUserInfo() {
         return api.get('/auth/users/me')
+    },
+    changePassword(data) {
+        return api.put('/auth/password', data)
     },
 
     // Cases
@@ -71,6 +77,12 @@ export default {
         if (deviceSerial) qs.push(`device_serial=${deviceSerial}`)
         const qsStr = qs.length ? `?${qs.join('&')}` : ''
         return api.post(`/cases/${id}/run${qsStr}`)
+    },
+    runTestCaseBatch(id, envId, deviceSerials) {
+        return api.post(`/cases/${id}/run-batch`, {
+            env_id: envId || null,
+            device_serials: Array.isArray(deviceSerials) ? deviceSerials : (deviceSerials ? [deviceSerials] : [])
+        })
     },
     precheckTestCase(id, envId, deviceSerial) {
         let qs = []
@@ -224,6 +236,12 @@ export default {
     deleteBatch(batchId) {
         return api.delete(`/reports/batch/${batchId}`)
     },
+    cancelRun(data) {
+        return api.post('/runs/cancel', data)
+    },
+    getActiveRuns(kind, targetId) {
+        return api.get('/runs/active', { params: { kind, target_id: targetId } })
+    },
 
     // Tasks (定时任务)
     getTasks() {
@@ -251,6 +269,23 @@ export default {
     },
     sendTestNotification(webhookUrl) {
         return api.post('/settings/test-notification', { webhook_url: webhookUrl })
+    },
+
+    // Admin (用户管理)
+    getAdminRegistrationSettings() {
+        return api.get('/admin/registration-settings')
+    },
+    updateAdminRegistrationSettings(allowRegistration) {
+        return api.put('/admin/registration-settings', { allow_registration: allowRegistration })
+    },
+    getAdminUsers(params) {
+        return api.get('/admin/users', { params })
+    },
+    createAdminUser(data) {
+        return api.post('/admin/users', data)
+    },
+    updateAdminUserStatus(id, isActive) {
+        return api.patch(`/admin/users/${id}/status`, { is_active: isActive })
     },
 
     // Fastbot (性能测试)
@@ -320,6 +355,9 @@ export default {
         return api.get(`/devices/${serial}/screenshot`, { timeout: 30000 })
     },
     unlockDevice(serial) {
+        return api.post(`/devices/${serial}/unlock`)
+    },
+    stopDeviceExecution(serial) {
         return api.post(`/devices/${serial}/unlock`)
     },
     rebootDevice(serial) {

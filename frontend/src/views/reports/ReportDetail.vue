@@ -6,10 +6,12 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
+import { useClientMode } from '@/composables/useClientMode'
 
 const route = useRoute()
 const router = useRouter()
 const id = route.params.id
+const { isMobileMode } = useClientMode()
 
 // Data
 const loading = ref(false)
@@ -67,6 +69,7 @@ const getStatusTagType = (status) => {
     if (s === 'WARNING') return 'warning'
     if (s === 'SKIP') return 'info'
     if (s === 'RUNNING') return ''
+    if (s === 'ABORTED') return 'info'
     return 'danger'
 }
 
@@ -168,27 +171,11 @@ const fetchDetail = async () => {
                 }
             })
             
-            cases.value = Array.from(caseMap.values())
-            
-            // Auto expand failing cases
-            const failingCases = cases.value.filter(c => c.hasError).map(c => c.name)
-            if (failingCases.length > 0) {
-                activeCaseNames.value = failingCases
-                
-                // Scroll to the first error after DOM update
-                setTimeout(() => {
-                    const firstErrorEl = document.querySelector('.error-row')
-                    const container = document.querySelector('.detail-content')
-                    if (firstErrorEl && container) {
-                        const containerRect = container.getBoundingClientRect()
-                        const elRect = firstErrorEl.getBoundingClientRect()
-                        container.scrollTo({
-                            top: container.scrollTop + (elRect.top - containerRect.top) - 80,
-                            behavior: 'smooth'
-                        })
-                    }
-                }, 300)
-            }
+            cases.value = Array.from(caseMap.values()).map((item, index) => ({
+                ...item,
+                collapseKey: `${index}-${item.name}`,
+            }))
+            activeCaseNames.value = []
         }
     } catch (err) {
         ElMessage.error('获取报告详情失败')
@@ -247,7 +234,93 @@ onMounted(() => {
 </script>
 
 <template>
-    <div class="detail-container" v-loading="loading">
+    <div v-if="isMobileMode" class="mobile-detail-container" v-loading="loading">
+        <div class="mobile-detail-header">
+            <el-button link :icon="ArrowLeft" @click="handleBack">返回</el-button>
+            <div v-if="execution" class="mobile-detail-title">
+                <strong>{{ execution.scenario_name }}</strong>
+                <span>{{ formatDeviceName(execution.device_serial, execution.device_info) }}</span>
+            </div>
+            <el-tag v-if="execution" :type="getStatusTagType(execution.status)">
+                {{ execution.status }}
+            </el-tag>
+        </div>
+
+        <div v-if="execution" class="mobile-detail-meta">
+            <span><el-icon><User /></el-icon>{{ execution.executor_name || 'System' }}</span>
+            <span><el-icon><Timer /></el-icon>{{ formatDate(execution.start_time) }}</span>
+        </div>
+
+        <div class="mobile-case-flow">
+            <el-collapse v-model="activeCaseNames" v-if="cases.length > 0" class="mobile-case-collapse">
+                <el-collapse-item
+                    v-for="(caseItem, caseIndex) in cases"
+                    :key="caseItem.collapseKey"
+                    :name="caseItem.collapseKey"
+                >
+                    <template #title>
+                        <div class="mobile-detail-case-header">
+                            <div>
+                                <span>Case {{ caseIndex + 1 }} · {{ caseItem.steps.length }} 步</span>
+                                <strong>{{ caseItem.name }}</strong>
+                            </div>
+                            <el-tag :type="getStatusTagType(caseItem.status)" size="small">{{ caseItem.status }}</el-tag>
+                        </div>
+                    </template>
+
+                    <div class="mobile-step-scroll">
+                        <div class="mobile-step-list">
+                            <div
+                                v-for="row in caseItem.steps"
+                                :key="row.id || `${caseItem.name}-${row.local_step_order}`"
+                                class="mobile-step-item"
+                                :class="tableRowClassName({ row })"
+                            >
+                                <div class="mobile-step-index">#{{ row.local_step_order || row.step_order }}</div>
+                                <div class="mobile-step-main">
+                                    <div class="mobile-step-title">
+                                        <strong>{{ row.display_name || row.step_name }}</strong>
+                                        <el-tag :type="getStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                                    </div>
+                                    <p v-if="row.error_message" :class="getMessageClass(row.status)">{{ formatStepMessage(row) }}</p>
+                                    <div class="mobile-step-meta">
+                                        <span>{{ getDuration(row.duration) }}</span>
+                                        <el-button
+                                            v-if="hasStepPreview(row)"
+                                            type="primary"
+                                            link
+                                            :icon="View"
+                                            @click.stop="viewStepPreview(row)"
+                                        >
+                                            {{ getStepPreviewLabel(row) }}
+                                        </el-button>
+                                        <el-button
+                                            v-if="hasFailureScreenshot(row)"
+                                            type="danger"
+                                            link
+                                            :icon="Picture"
+                                            @click.stop="viewFailureScreenshot(row)"
+                                        >
+                                            失败截图
+                                        </el-button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </el-collapse-item>
+            </el-collapse>
+            <el-empty v-else-if="!loading" description="暂无用例执行数据" />
+        </div>
+
+        <el-dialog v-model="showScreenshot" :title="currentPreviewTitle" :fullscreen="true">
+            <div class="screenshot-wrapper mobile-screenshot-wrapper">
+                <img :src="currentScreenshot" alt="步骤预览" />
+            </div>
+        </el-dialog>
+    </div>
+
+    <div v-else class="detail-container" v-loading="loading">
         <!-- Header -->
         <div class="detail-header">
             <div class="header-left">
@@ -269,8 +342,8 @@ onMounted(() => {
              <el-collapse v-model="activeCaseNames" v-if="cases.length > 0">
                  <el-collapse-item 
                     v-for="(caseItem, index) in cases" 
-                    :key="caseItem.name" 
-                    :name="caseItem.name"
+                    :key="caseItem.collapseKey"
+                    :name="caseItem.collapseKey"
                  >
                      <template #title>
                          <div class="case-header">
@@ -501,6 +574,7 @@ onMounted(() => {
     display: flex;
     align-items: center;
     width: 100%;
+    min-height: 56px;
 }
 
 .case-index {
@@ -529,8 +603,14 @@ onMounted(() => {
     color: #6c757d;
     display: flex;
     align-items: center;
+    align-self: center;
     gap: 8px;
     margin-right: 16px;
+}
+
+.case-meta :deep(.el-tag) {
+    display: inline-flex;
+    align-items: center;
 }
 
 .case-body {
@@ -564,5 +644,245 @@ onMounted(() => {
 
 :deep(.el-table .skip-row:hover > td.el-table__cell) {
     background-color: #ebedef !important;
+}
+
+.mobile-detail-container {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: #f6f7f9;
+    overflow: hidden;
+}
+
+.mobile-detail-header {
+    padding: 10px 12px;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    background: #ffffff;
+    border-bottom: 1px solid #ebeef5;
+    flex-shrink: 0;
+}
+
+.mobile-detail-title {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.mobile-detail-title strong {
+    font-size: 15px;
+    color: #303133;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-detail-title span {
+    font-size: 12px;
+    color: #909399;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-detail-meta {
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    color: #606266;
+    font-size: 12px;
+    background: #ffffff;
+    border-bottom: 1px solid #ebeef5;
+    flex-shrink: 0;
+}
+
+.mobile-detail-meta span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.mobile-case-flow {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mobile-case-collapse {
+    border-top: none;
+    border-bottom: none;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mobile-case-collapse :deep(.el-collapse-item) {
+    border: 1px solid #ebeef5;
+    border-radius: 8px;
+    background: #ffffff;
+    overflow: hidden;
+}
+
+.mobile-case-collapse :deep(.el-collapse-item__header) {
+    height: auto;
+    min-height: 66px;
+    margin-bottom: 0;
+    padding: 0 12px;
+    border-radius: 0;
+    border-bottom: none;
+    background: #ffffff;
+}
+
+.mobile-case-collapse :deep(.el-collapse-item.is-active .el-collapse-item__header) {
+    border-bottom: 1px solid #ebeef5;
+}
+
+.mobile-case-collapse :deep(.el-collapse-item__wrap) {
+    border-bottom: none;
+    background: #ffffff;
+}
+
+.mobile-case-collapse :deep(.el-collapse-item__content) {
+    padding: 0;
+}
+
+.mobile-detail-case {
+    border: 1px solid #ebeef5;
+    border-radius: 8px;
+    background: #ffffff;
+    overflow: hidden;
+}
+
+.mobile-detail-case-header {
+    padding: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border-bottom: 1px solid #ebeef5;
+}
+
+.mobile-detail-case-header :deep(.el-tag) {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.mobile-case-collapse .mobile-detail-case-header {
+    width: 100%;
+    padding: 0;
+    border-bottom: none;
+}
+
+.mobile-detail-case-header div {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.mobile-detail-case-header span {
+    font-size: 11px;
+    color: #909399;
+}
+
+.mobile-detail-case-header strong {
+    font-size: 14px;
+    color: #303133;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-step-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.mobile-step-scroll {
+    overflow: visible;
+}
+
+.mobile-step-item {
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr);
+    gap: 8px;
+    padding: 12px;
+    border-bottom: 1px solid #f0f2f5;
+}
+
+.mobile-step-item:last-child {
+    border-bottom: none;
+}
+
+.mobile-step-index {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: #f4f4f5;
+    color: #606266;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.mobile-step-main {
+    min-width: 0;
+}
+
+.mobile-step-title {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.mobile-step-title strong {
+    min-width: 0;
+    font-size: 13px;
+    color: #303133;
+    line-height: 1.4;
+}
+
+.mobile-step-main p {
+    margin: 6px 0 0;
+    line-height: 1.5;
+}
+
+.mobile-step-meta {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    color: #909399;
+    font-size: 12px;
+}
+
+.mobile-step-item.error-row {
+    background: #fef0f0;
+}
+
+.mobile-step-item.warning-row {
+    background: #fdf6ec;
+}
+
+.mobile-step-item.skip-row {
+    background: #f4f4f5;
+}
+
+.mobile-screenshot-wrapper {
+    min-height: calc(100dvh - 96px);
+    align-items: center;
 }
 </style>

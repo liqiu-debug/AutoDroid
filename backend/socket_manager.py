@@ -96,15 +96,18 @@ class ConnectionManager:
             
         await self.send_message(case_id, message)
     
-    async def broadcast_run_start(self, case_id: int, case_name: str, total_steps: int):
+    async def broadcast_run_start(self, case_id: int, case_name: str, total_steps: int, **run_meta):
         """广播开始执行"""
-        await self.send_message(case_id, {
+        payload = {
             "type": "run_start",
             "case_id": case_id,
             "case_name": case_name,
             "total_steps": total_steps,
+            "status": "RUNNING",
             "timestamp": datetime.now().isoformat()
-        })
+        }
+        payload.update({key: value for key, value in run_meta.items() if value is not None})
+        await self.send_message(case_id, payload)
     
     async def broadcast_run_complete(
         self, 
@@ -113,19 +116,23 @@ class ConnectionManager:
         total_duration: float,
         passed: int,
         failed: int,
-        report_id: str = None
+        report_id: str = None,
+        **run_meta
     ):
         """广播执行完成"""
-        await self.send_message(case_id, {
+        payload = {
             "type": "run_complete",
             "case_id": case_id,
             "success": success,
+            "status": "PASS" if success else "FAIL",
             "total_duration": round(total_duration, 2),
             "passed": passed,
             "failed": failed,
             "report_id": report_id,
             "timestamp": datetime.now().isoformat()
-        })
+        }
+        payload.update({key: value for key, value in run_meta.items() if value is not None})
+        await self.send_message(case_id, payload)
 
 
 # 全局连接管理器实例
