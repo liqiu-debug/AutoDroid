@@ -313,6 +313,138 @@ class FluencySessionRead(BaseModel):
     class Config:
         from_attributes = True
 
+
+class StartupReadyCheck(BaseModel):
+    enabled: bool = False
+    locator_type: str = "text"
+    locator_value: str = ""
+    timeout_sec: int = 10
+
+    @field_validator("locator_type", mode="before")
+    @classmethod
+    def normalize_locator_type(cls, value):
+        normalized = str(value or "text").strip().lower()
+        alias_map = {
+            "resourceid": "resource_id",
+            "resourceId": "resource_id",
+            "id": "resource_id",
+            "desc": "description",
+            "content-desc": "description",
+        }
+        normalized = alias_map.get(normalized, normalized)
+        if normalized not in {"text", "resource_id", "description", "xpath"}:
+            raise ValueError("locator_type must be text/resource_id/description/xpath")
+        return normalized
+
+    @field_validator("timeout_sec", mode="before")
+    @classmethod
+    def normalize_timeout_sec(cls, value):
+        try:
+            timeout = int(value)
+        except (TypeError, ValueError):
+            timeout = 10
+        return max(1, min(timeout, 60))
+
+
+class StartupPerfettoSlowTrace(BaseModel):
+    enabled: bool = True
+    cold_threshold_ms: int = 5000
+    hot_threshold_ms: int = 1500
+
+    @field_validator("cold_threshold_ms", "hot_threshold_ms", mode="before")
+    @classmethod
+    def normalize_threshold(cls, value):
+        try:
+            threshold = int(value)
+        except (TypeError, ValueError):
+            threshold = 0
+        return max(1, min(threshold, 120000))
+
+
+class StartupRunRequest(BaseModel):
+    package_name: str
+    activity_name: Optional[str] = None
+    device_serials: List[str]
+    startup_modes: List[str] = Field(default_factory=lambda: ["cold", "hot"])
+    iterations: int = 3
+    cooldown_sec: int = 3
+    capture_log: bool = True
+    ready_check: StartupReadyCheck = Field(default_factory=StartupReadyCheck)
+    perfetto_slow_trace: StartupPerfettoSlowTrace = Field(default_factory=StartupPerfettoSlowTrace)
+
+    @field_validator("device_serials", mode="before")
+    @classmethod
+    def normalize_device_serials(cls, value):
+        if isinstance(value, str):
+            values = [value]
+        else:
+            values = list(value or [])
+        serials = []
+        seen = set()
+        for item in values:
+            serial = str(item or "").strip()
+            if serial and serial not in seen:
+                serials.append(serial)
+                seen.add(serial)
+        if not serials:
+            raise ValueError("device_serials must not be empty")
+        return serials
+
+    @field_validator("startup_modes", mode="before")
+    @classmethod
+    def normalize_startup_modes(cls, value):
+        values = list(value or ["cold", "hot"])
+        modes = []
+        for item in values:
+            mode = str(item or "").strip().lower()
+            if mode not in {"cold", "hot"}:
+                raise ValueError("startup_modes only supports cold/hot")
+            if mode not in modes:
+                modes.append(mode)
+        if not modes:
+            raise ValueError("startup_modes must not be empty")
+        return modes
+
+    @field_validator("iterations", mode="before")
+    @classmethod
+    def normalize_iterations(cls, value):
+        try:
+            iterations = int(value)
+        except (TypeError, ValueError):
+            iterations = 3
+        return max(1, min(iterations, 100))
+
+    @field_validator("cooldown_sec", mode="before")
+    @classmethod
+    def normalize_cooldown_sec(cls, value):
+        try:
+            cooldown = int(value)
+        except (TypeError, ValueError):
+            cooldown = 3
+        return max(0, min(cooldown, 60))
+
+
+class StartupTaskRead(BaseModel):
+    id: int
+    package_name: str
+    duration: int
+    throttle: int
+    ignore_crashes: bool
+    capture_log: bool
+    device_serial: str
+    status: str
+    total_crashes: int = 0
+    total_anrs: int = 0
+    executor_name: Optional[str] = None
+    created_at: Any
+    started_at: Any = None
+    finished_at: Any = None
+    report_ready: bool = False
+    summary: Optional[Dict[str, Any]] = None
+
+    class Config:
+        from_attributes = True
+
 class DeviceStatusRead(BaseModel):
     serial: str
     device_name: str = ""

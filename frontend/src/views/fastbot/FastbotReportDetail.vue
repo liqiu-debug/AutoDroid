@@ -127,6 +127,7 @@ const jankEvents = computed(() => report.value?.jank_events || [])
 const traceArtifacts = computed(() => report.value?.trace_artifacts || [])
 const crashEvents = computed(() => report.value?.crash_events || [])
 const summary = computed(() => report.value?.summary || {})
+const isStartupSession = computed(() => summary.value?.session_type === 'startup')
 const isManualFluencySession = computed(() => summary.value?.session_type === 'fluency_manual')
 const manualMarkers = computed(() => Array.isArray(summary.value?.manual_markers) ? summary.value.manual_markers : [])
 const markerSegments = computed(() => Array.isArray(summary.value?.marker_segments) ? summary.value.marker_segments : [])
@@ -134,7 +135,10 @@ const verdict = computed(() => summary.value?.verdict || null)
 const performanceMonitorEnabled = computed(() => summary.value?.performance_monitor_enabled !== false)
 const jankFrameMonitorEnabled = computed(() => summary.value?.jank_frame_monitor_enabled === true)
 const localReplayEnabled = computed(() => summary.value?.local_replay_enabled === true)
-const reportTitle = computed(() => `${performanceMonitorEnabled.value ? '性能报告' : '智能探索报告'} — ${task.value?.package_name || ''}`)
+const reportTitle = computed(() => {
+    if (isStartupSession.value) return `冷热启动报告 — ${task.value?.package_name || ''}`
+    return `${performanceMonitorEnabled.value ? '性能报告' : '智能探索报告'} — ${task.value?.package_name || ''}`
+})
 const currentReplayTitle = computed(() => {
     const event = currentReplayEvent.value
     if (!event) return '本地复现回放'
@@ -153,6 +157,17 @@ const jankMonitoringModeLabel = computed(() => {
     if (mode === 'gfxinfo') return '系统帧统计'
     return mode
 })
+
+const startupConfig = computed(() => summary.value?.startup_config || {})
+const startupRuns = computed(() => Array.isArray(summary.value?.startup_runs) ? summary.value.startup_runs : [])
+const startupAggregate = computed(() => summary.value?.startup_aggregate || {})
+const slowEvents = computed(() => Array.isArray(summary.value?.slow_events) ? summary.value.slow_events : [])
+const startupModesLabel = computed(() => {
+    const modes = startupConfig.value?.startup_modes || []
+    if (!Array.isArray(modes) || modes.length === 0) return '-'
+    return modes.map(mode => mode === 'cold' ? '冷启动' : '热启动').join(' / ')
+})
+const startupSuccessRate = computed(() => `${((Number(summary.value?.success_rate) || 0) * 100).toFixed(1)}%`)
 
 const reportBaseDate = computed(() => {
     const startedAt = dayjs(task.value?.started_at)
@@ -302,6 +317,21 @@ const formatMetric = (value, digits = 1) => {
     if (value === null || value === undefined || value === '') return '-'
     const num = Number(value)
     return Number.isFinite(num) ? num.toFixed(digits) : '-'
+}
+const formatMs = (value) => {
+    const num = Number(value)
+    return Number.isFinite(num) ? `${num} ms` : '-'
+}
+const formatStartupMode = (value) => value === 'cold' ? '冷启动' : (value === 'hot' ? '热启动' : value || '-')
+const formatReadyStatus = (value) => {
+    const map = {
+        DISABLED: '未开启',
+        SKIPPED: '未配置',
+        FOUND: '已就绪',
+        TIMEOUT: '超时',
+        ERROR: '异常',
+    }
+    return map[value] || value || '-'
 }
 const pickMedianMetric = (values) => {
     const numbers = values
@@ -932,7 +962,7 @@ const formatDurationSeconds = (value) => {
 }
 
 const goBack = () => {
-    router.push({ path: '/execution/reports', query: { tab: 'fastbot' } })
+    router.push({ path: '/execution/reports', query: { tab: isStartupSession.value ? 'startup' : 'fastbot' } })
 }
 
 onMounted(() => {
@@ -962,6 +992,192 @@ watch(
         </div>
 
         <div class="detail-body" v-if="task && report">
+            <template v-if="isStartupSession">
+                <div class="summary-cards">
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">状态</div>
+                        <div class="stat-value">
+                            <el-tag :type="task.status === 'COMPLETED' ? 'success' : (task.status === 'FAILED' ? 'danger' : 'warning')" effect="plain">
+                                {{ task.status }}
+                            </el-tag>
+                        </div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">冷启动就绪 P90</div>
+                        <div class="stat-value primary">{{ formatMs(startupAggregate.cold?.ready_p90_ms) }}</div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">热启动就绪 P90</div>
+                        <div class="stat-value success">{{ formatMs(startupAggregate.hot?.ready_p90_ms) }}</div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">冷启动 Total P90</div>
+                        <div class="stat-value">{{ formatMs(startupAggregate.cold?.p90_ms) }}</div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">热启动 Total P90</div>
+                        <div class="stat-value">{{ formatMs(startupAggregate.hot?.p90_ms) }}</div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">成功率</div>
+                        <div class="stat-value success">{{ startupSuccessRate }}</div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">慢启动次数</div>
+                        <div class="stat-value danger">{{ summary.slow_count || 0 }}</div>
+                    </el-card>
+                    <el-card shadow="never" class="stat-card">
+                        <div class="stat-label">Trace 数</div>
+                        <div class="stat-value warning">{{ traceArtifacts.length }}</div>
+                    </el-card>
+                </div>
+
+                <el-card shadow="never" class="info-card">
+                    <template #header>
+                        <span class="card-title">启动测试配置</span>
+                    </template>
+                    <el-descriptions :column="3" border size="small">
+                        <el-descriptions-item label="包名">{{ task.package_name }}</el-descriptions-item>
+                        <el-descriptions-item label="Activity">{{ startupConfig.resolved_component || startupConfig.activity_name || '-' }}</el-descriptions-item>
+                        <el-descriptions-item label="设备">{{ formatDeviceName(task.device_serial) }}</el-descriptions-item>
+                        <el-descriptions-item label="启动模式">{{ startupModesLabel }}</el-descriptions-item>
+                        <el-descriptions-item label="启动次数">{{ startupConfig.iterations || task.duration }}</el-descriptions-item>
+                        <el-descriptions-item label="轮次间隔">{{ startupConfig.cooldown_sec ?? '-' }}s</el-descriptions-item>
+                        <el-descriptions-item label="冷启动阈值">{{ formatMs(startupConfig.perfetto_slow_trace?.cold_threshold_ms) }}</el-descriptions-item>
+                        <el-descriptions-item label="热启动阈值">{{ formatMs(startupConfig.perfetto_slow_trace?.hot_threshold_ms) }}</el-descriptions-item>
+                        <el-descriptions-item label="首页就绪检查">{{ startupConfig.ready_check?.enabled ? '已开启' : '未开启' }}</el-descriptions-item>
+                        <el-descriptions-item label="开始时间">{{ formatTime(task.started_at) }}</el-descriptions-item>
+                        <el-descriptions-item label="结束时间">{{ formatTime(task.finished_at) }}</el-descriptions-item>
+                        <el-descriptions-item label="执行人">{{ task.executor_name || '-' }}</el-descriptions-item>
+                    </el-descriptions>
+                </el-card>
+
+                <el-card shadow="never" class="events-card">
+                    <template #header>
+                        <span class="card-title">启动轮次明细 ({{ startupRuns.length }})</span>
+                    </template>
+                    <el-table
+                        v-if="startupRuns.length > 0"
+                        :data="startupRuns"
+                        :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                    >
+                        <el-table-column label="模式" width="90" align="center">
+                            <template #default="{ row }">{{ formatStartupMode(row.mode) }}</template>
+                        </el-table-column>
+                        <el-table-column label="轮次" prop="iteration" width="70" align="center" />
+                        <el-table-column label="状态" width="90" align="center">
+                            <template #default="{ row }">
+                                <el-tag :type="row.success ? 'success' : 'danger'" size="small" effect="plain">{{ row.status }}</el-tag>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="Activity" min-width="190" show-overflow-tooltip>
+                            <template #default="{ row }">{{ row.activity || '-' }}</template>
+                        </el-table-column>
+                        <el-table-column label="首页就绪" width="120" align="center">
+                            <template #default="{ row }">
+                                {{ row.ready_ms ? formatMs(row.ready_ms) : formatReadyStatus(row.ready_status) }}
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="TotalTime" width="110" align="center">
+                            <template #default="{ row }">{{ formatMs(row.total_time_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="ThisTime" width="110" align="center">
+                            <template #default="{ row }">{{ formatMs(row.this_time_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="WaitTime" width="110" align="center">
+                            <template #default="{ row }">{{ formatMs(row.wait_time_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="Displayed" width="120" align="center">
+                            <template #default="{ row }">{{ formatMs(row.displayed?.time_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="Fully drawn" width="120" align="center">
+                            <template #default="{ row }">{{ formatMs(row.fully_drawn?.time_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="错误原因" min-width="220" show-overflow-tooltip>
+                            <template #default="{ row }">{{ row.error || row.ready_error || '-' }}</template>
+                        </el-table-column>
+                    </el-table>
+                    <el-empty v-else description="暂无启动轮次数据" />
+                </el-card>
+
+                <el-card shadow="never" class="events-card">
+                    <template #header>
+                        <span class="card-title">慢启动事件 ({{ slowEvents.length }})</span>
+                    </template>
+                    <el-table
+                        v-if="slowEvents.length > 0"
+                        :data="slowEvents"
+                        :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                    >
+                        <el-table-column label="模式" width="90" align="center">
+                            <template #default="{ row }">{{ formatStartupMode(row.mode) }}</template>
+                        </el-table-column>
+                        <el-table-column label="轮次" prop="iteration" width="70" align="center" />
+                        <el-table-column label="耗时" width="110" align="center">
+                            <template #default="{ row }">{{ formatMs(row.total_time_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="阈值" width="110" align="center">
+                            <template #default="{ row }">{{ formatMs(row.threshold_ms) }}</template>
+                        </el-table-column>
+                        <el-table-column label="Trace" min-width="260" show-overflow-tooltip>
+                            <template #default="{ row }">{{ row.trace_path || row.trace_error || '未导出' }}</template>
+                        </el-table-column>
+                        <el-table-column label="诊断状态" width="120" align="center">
+                            <template #default="{ row }">{{ formatDiagnosisStatus(row.diagnosis_status) }}</template>
+                        </el-table-column>
+                    </el-table>
+                    <el-empty v-else description="没有触发慢启动阈值" />
+                </el-card>
+
+                <el-card shadow="never" class="events-card">
+                    <template #header>
+                        <div class="trace-header">
+                            <span class="card-title">Perfetto Trace ({{ traceArtifacts.length }})</span>
+                            <el-button
+                                type="primary"
+                                link
+                                :loading="batchTraceAiLoading"
+                                :disabled="analyzedTraceArtifacts.length === 0"
+                                @click="generateAllTraceSummaries"
+                            >
+                                全部生成 AI 总结
+                            </el-button>
+                        </div>
+                    </template>
+                    <el-table
+                        v-if="traceArtifacts.length > 0"
+                        :data="traceArtifacts"
+                        :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                    >
+                        <el-table-column label="触发时间" prop="trigger_time" width="120" align="center" />
+                        <el-table-column label="模式" width="90" align="center">
+                            <template #default="{ row }">{{ formatStartupMode(row.startup_mode) }}</template>
+                        </el-table-column>
+                        <el-table-column label="诊断状态" width="120" align="center">
+                            <template #default="{ row }">{{ formatTraceAnalysisStatus(row.analysis_status) }}</template>
+                        </el-table-column>
+                        <el-table-column label="一句话结论" min-width="260" show-overflow-tooltip>
+                            <template #default="{ row }">{{ getPrimaryTraceCause(row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="Trace 路径" min-width="260" prop="path" show-overflow-tooltip />
+                        <el-table-column label="AI 总结" width="120" align="center">
+                            <template #default="{ row }">
+                                <el-button
+                                    link
+                                    type="primary"
+                                    :disabled="row.analysis_status !== 'ANALYZED'"
+                                    @click="openTraceAiDialog(row)"
+                                >
+                                    {{ row.ai_summary ? '查看' : '生成' }}
+                                </el-button>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                    <el-empty v-else description="暂无慢启动 Perfetto Trace" />
+                </el-card>
+            </template>
+
+            <template v-else>
             <el-card
                 v-if="jankFrameMonitorEnabled && verdict"
                 shadow="never"
@@ -1317,6 +1533,7 @@ watch(
                     <el-descriptions-item label="结束时间">{{ formatTime(task.finished_at) }}</el-descriptions-item>
                 </el-descriptions>
             </el-card>
+            </template>
         </div>
 
         <!-- 日志查看弹窗 (含 AI 分析) -->

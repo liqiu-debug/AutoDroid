@@ -60,7 +60,7 @@ AutoDroid/
 ### 当前版本补充
 
 - 后端已经扩展为模块化 API 结构，核心目录包括 `backend/api/`、`backend/drivers/`、`backend/device_stream/`、`backend/tests/`。
-- 前端页面已覆盖 `cases / scenarios / devices / reports / fastbot / dashboard / tasks / settings` 等业务域。
+- 前端页面已覆盖 `cases / scenarios / devices / reports / fastbot / fluency / startup / dashboard / tasks / settings` 等业务域。
 - `backend/templates/` 当前同时包含 `report.html` 和 `scenario_report.html` 两类报告模板。
 - `docs/` 当前除执行规范与 WDA 运维外，还包含技术版/业务版项目介绍文档。
 - `scripts/`、`resources/`、`assets/` 为运行与部署相关目录，已是当前项目结构的一部分。
@@ -162,6 +162,17 @@ AutoDroid/
    - 底层使用 OpenCV 模板匹配算法
    - 超时时间 5 秒
 
+#### 4. 冷热启动专项（Startup）
+
+专项测试中的“冷热启动”用于 Android App 启动体验巡检：
+
+1. 前端选择 Android 设备、包名、可选 Activity、冷/热启动模式与启动次数。
+2. 后端为每台设备创建独立任务；多设备会按所选设备并行执行，单台设备内部按模式和轮次串行执行。
+3. 启动计时以 `adb shell am start -W` 为基础，记录 `ThisTime`、`TotalTime`、`WaitTime`。
+4. 可选开启“首页就绪检查”，通过 uiautomator2 等待首页关键元素出现，并记录首页就绪耗时；配置项“首页就绪超时”表示最长等待时间，默认 10 秒。
+5. 报告优先展示首页就绪 P90，用于衡量用户真实可用体验；`TotalTime P90` 作为首帧启动辅助指标。
+6. 当启动耗时超过阈值时，可额外触发一次 Perfetto 诊断复跑；诊断复跑不计入主指标，只作为慢启动 trace 证据。
+
 ### API 接口
 
 | 方法 | 路径 | 说明 |
@@ -180,6 +191,8 @@ AutoDroid/
 | `WS` | `/ws/run/{id}` | WebSocket 实时执行（Case） |
 | `GET` | `/executions` | 执行报告列表 |
 | `GET` | `/executions/{id}` | 执行报告详情 |
+| `POST` | `/fastbot/startup/run` | 提交冷热启动专项任务（Android） |
+| `GET` | `/fastbot/startup/tasks` | 获取冷热启动任务列表 |
 
 ## 快速启动
 
@@ -241,3 +254,4 @@ npm run dev -- --host
 5. **保存用例**：输入用例名称并保存
 6. **执行回放**：点击运行按钮，实时观看执行日志
 7. **查看报告**：执行完成后查看 HTML 测试报告
+8. **专项测试**：进入“专项测试 → 冷热启动”，配置首页就绪 locator 后查看首页就绪 P90 与慢启动 Trace

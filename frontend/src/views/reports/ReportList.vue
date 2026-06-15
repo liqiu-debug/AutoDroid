@@ -10,7 +10,8 @@ const router = useRouter()
 const route = useRoute()
 
 // ========== 顶层 Tab ==========
-const activeTab = ref(route.query.tab === 'fastbot' ? 'fastbot' : 'ui')
+const resolveTab = (tab) => (tab === 'fastbot' || tab === 'startup' ? tab : 'ui')
+const activeTab = ref(resolveTab(route.query.tab))
 
 // ========== UI 场景报告 ==========
 const loading = ref(false)
@@ -192,6 +193,9 @@ const getDuration = (seconds) => {
 const fbLoading = ref(false)
 const fbTasks = ref([])
 const fbSearch = ref('')
+const startupLoading = ref(false)
+const startupTasks = ref([])
+const startupSearch = ref('')
 let fbPollTimer = null
 let pageActive = false
 
@@ -207,11 +211,44 @@ const fetchFbTasks = async () => {
     }
 }
 
+const fetchStartupTasks = async () => {
+    startupLoading.value = true
+    try {
+        const res = await api.getStartupTasks({ limit: 100 })
+        startupTasks.value = res.data || []
+    } catch (err) {
+        console.error('获取冷热启动任务失败', err)
+    } finally {
+        startupLoading.value = false
+    }
+}
+
 const filteredFbTasks = computed(() => {
     const map = devicesMap.value
     let list = fbTasks.value
     if (fbSearch.value) {
         const q = fbSearch.value.toLowerCase()
+        list = list.filter(item => item.package_name.toLowerCase().includes(q) || item.device_serial.toLowerCase().includes(q))
+    }
+    return list.map(item => {
+        let name = item.device_serial
+        const dev = map[item.device_serial]
+        if (dev) {
+            const p = dev.custom_name || dev.market_name || dev.model
+            if (p) name = p
+        }
+        return {
+            ...item,
+            _resolved_device: name
+        }
+    })
+})
+
+const filteredStartupTasks = computed(() => {
+    const map = devicesMap.value
+    let list = startupTasks.value
+    if (startupSearch.value) {
+        const q = startupSearch.value.toLowerCase()
         list = list.filter(item => item.package_name.toLowerCase().includes(q) || item.device_serial.toLowerCase().includes(q))
     }
     return list.map(item => {
@@ -258,10 +295,28 @@ const getFbDuration = (task) => {
     return `${m}m ${s}s`
 }
 
+const formatMs = (value) => {
+    const num = Number(value)
+    return Number.isFinite(num) ? `${num} ms` : '-'
+}
+
+const getStartupAggregateValue = (task, mode, key) => task.summary?.startup_aggregate?.[mode]?.[key]
+const getStartupSlowCount = (task) => Number(task.summary?.slow_count || 0)
+const getStartupModes = (task) => {
+    const modes = task.summary?.startup_config?.startup_modes || []
+    if (!Array.isArray(modes) || modes.length === 0) return '-'
+    return modes.map(mode => mode === 'cold' ? '冷启动' : '热启动').join(' / ')
+}
+const getStartupIterations = (task) => task.summary?.startup_config?.iterations || task.duration || '-'
+
 const handleTabChange = (tab) => {
     fetchDevices()
     if (tab === 'fastbot') {
         fetchFbTasks()
+        return
+    }
+    if (tab === 'startup') {
+        fetchStartupTasks()
         return
     }
     fetchData()
@@ -271,6 +326,7 @@ const startFbPolling = () => {
     if (fbPollTimer) return
     fbPollTimer = setInterval(() => {
         if (activeTab.value === 'fastbot') fetchFbTasks()
+        if (activeTab.value === 'startup') fetchStartupTasks()
     }, 15000)
 }
 
@@ -296,14 +352,18 @@ const refreshReportCenter = () => {
     fetchDevices()
     fetchData()
     fetchFbTasks()
+    fetchStartupTasks()
 }
 
 watch(
     () => route.query.tab,
     (tab) => {
-        activeTab.value = tab === 'fastbot' ? 'fastbot' : 'ui'
+        activeTab.value = resolveTab(tab)
         if (pageActive && activeTab.value === 'fastbot' && fbTasks.value.length === 0) {
             fetchFbTasks()
+        }
+        if (pageActive && activeTab.value === 'startup' && startupTasks.value.length === 0) {
+            fetchStartupTasks()
         }
     }
 )
@@ -518,6 +578,85 @@ onUnmounted(() => {
                         <el-table-column label="操作" width="140" align="center" fixed="right">
                             <template #default="{ row }">
                                 <el-tooltip v-if="row.status === 'COMPLETED'" content="查看报告" placement="top">
+                                    <el-button :icon="View" link type="primary" @click="handleFbView(row.id)" />
+                                </el-tooltip>
+                                <el-tooltip content="删除" placement="top">
+                                    <el-button :icon="Delete" link type="danger" @click="handleFbDelete(row)" />
+                                </el-tooltip>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                </el-tab-pane>
+
+                <el-tab-pane label="冷热启动报告" name="startup">
+                    <div class="list-header">
+                        <div class="left-filters">
+                            <el-input
+                                v-model="startupSearch"
+                                placeholder="搜索包名或设备..."
+                                :prefix-icon="Search"
+                                clearable
+                                class="search-input"
+                            />
+                        </div>
+                        <div class="right-actions">
+                            <el-button :icon="Refresh" circle @click="fetchStartupTasks" />
+                        </div>
+                    </div>
+
+                    <el-table
+                        :data="filteredStartupTasks"
+                        v-loading="startupLoading"
+                        style="width: 100%"
+                        :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                        max-height="calc(100vh - 240px)"
+                    >
+                        <el-table-column prop="id" label="ID" width="60" align="center" />
+                        <el-table-column label="目标包名" min-width="190">
+                            <template #default="{ row }">
+                                <span class="pkg-name">{{ row.package_name }}</span>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="运行设备" width="170">
+                            <template #default="{ row }">{{ row._resolved_device }}</template>
+                        </el-table-column>
+                        <el-table-column label="启动模式" width="130" align="center">
+                            <template #default="{ row }">{{ getStartupModes(row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="启动次数" width="90" align="center">
+                            <template #default="{ row }">{{ getStartupIterations(row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="冷启动就绪 P90" width="140" align="center">
+                            <template #default="{ row }">{{ formatMs(getStartupAggregateValue(row, 'cold', 'ready_p90_ms')) }}</template>
+                        </el-table-column>
+                        <el-table-column label="热启动就绪 P90" width="140" align="center">
+                            <template #default="{ row }">{{ formatMs(getStartupAggregateValue(row, 'hot', 'ready_p90_ms')) }}</template>
+                        </el-table-column>
+                        <el-table-column label="冷启动 Total P90" width="140" align="center">
+                            <template #default="{ row }">{{ formatMs(getStartupAggregateValue(row, 'cold', 'p90_ms')) }}</template>
+                        </el-table-column>
+                        <el-table-column label="热启动 Total P90" width="140" align="center">
+                            <template #default="{ row }">{{ formatMs(getStartupAggregateValue(row, 'hot', 'p90_ms')) }}</template>
+                        </el-table-column>
+                        <el-table-column label="慢启动" width="90" align="center">
+                            <template #default="{ row }">
+                                <span :class="{ 'text-danger': getStartupSlowCount(row) > 0 }">{{ getStartupSlowCount(row) }}</span>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="开始时间" width="140" align="center">
+                            <template #default="{ row }">{{ formatDate(row.started_at || row.created_at) }}</template>
+                        </el-table-column>
+                        <el-table-column label="执行人" width="120" align="center">
+                            <template #default="{ row }">{{ row.executor_name || '-' }}</template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="100" align="center">
+                            <template #default="{ row }">
+                                <el-tag :type="getFbStatusType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="操作" width="120" align="center" fixed="right">
+                            <template #default="{ row }">
+                                <el-tooltip v-if="row.status === 'COMPLETED' || row.report_ready" content="查看报告" placement="top">
                                     <el-button :icon="View" link type="primary" @click="handleFbView(row.id)" />
                                 </el-tooltip>
                                 <el-tooltip content="删除" placement="top">

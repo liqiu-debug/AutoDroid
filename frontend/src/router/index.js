@@ -143,6 +143,12 @@ const routes = [
             name: 'FluencyAnalysis',
             meta: { title: '流畅度分析', keepAlive: true },
             component: () => import('@/views/special/Fluency.vue')
+          },
+          {
+            path: 'startup',
+            name: 'StartupAnalysis',
+            meta: { title: '冷热启动', keepAlive: true },
+            component: () => import('@/views/special/Startup.vue')
           }
         ]
       },
