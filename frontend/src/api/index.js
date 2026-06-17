@@ -335,6 +335,35 @@ export default {
         return api.get('/fastbot/devices')
     },
 
+    // Compatibility (视觉兼容性)
+    getCompatPageSets() {
+        return api.get('/compatibility/page-sets')
+    },
+    createCompatPageSet(data) {
+        return api.post('/compatibility/page-sets', data)
+    },
+    updateCompatPageSet(id, data) {
+        return api.put(`/compatibility/page-sets/${id}`, data)
+    },
+    deleteCompatPageSet(id) {
+        return api.delete(`/compatibility/page-sets/${id}`)
+    },
+    getCompatibilityRuns(params) {
+        return api.get('/compatibility/runs', { params })
+    },
+    createCompatibilityRun(data) {
+        return api.post('/compatibility/runs', data)
+    },
+    getCompatibilityRun(id) {
+        return api.get(`/compatibility/runs/${id}`)
+    },
+    deleteCompatibilityRun(id) {
+        return api.delete(`/compatibility/runs/${id}`)
+    },
+    cancelCompatibilityRun(id) {
+        return api.post(`/compatibility/runs/${id}/cancel`)
+    },
+
     // Log Analysis (AI 智能分析)
     analyzeLog(data) {
         return api.post('/fastbot/analyze_log', data, { timeout: 120000 })

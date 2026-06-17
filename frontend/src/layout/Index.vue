@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import Navbar from './components/Navbar.vue'
+import SidebarMenuItem from './components/SidebarMenuItem.vue'
 import ClientModeSwitch from '@/components/ClientModeSwitch.vue'
 import MobileUnavailable from '@/components/MobileUnavailable.vue'
 import { useClientMode } from '@/composables/useClientMode'
@@ -27,14 +28,6 @@ const menuRoutes = computed(() => {
   if (!layoutRoute || !layoutRoute.children) return []
   return layoutRoute.children.filter(r => r.meta && !r.meta.hidden && canShowRoute(r))
 })
-
-/**
- * 判断一级菜单是否应该直接显示为 menu-item（仅有一个可见子路由时）
- */
-const getVisibleChildren = (route) => {
-  if (!route.children) return []
-  return route.children.filter(child => !child.meta?.hidden && canShowRoute(child))
-}
 
 const mobileNavItems = computed(() => [
   { path: '/dashboard', label: '概览', icon: Odometer },
@@ -88,42 +81,12 @@ const handleMobileLogout = () => {
           text-color="#cfcfcf"
           active-text-color="#409eff"
         >
-          <template v-for="menu in menuRoutes" :key="menu.path">
-            <!--
-              情况1：没有 children 或只有一个可见 child → 直接渲染 el-menu-item
-              (如"运行大盘"只有一个子路由)
-            -->
-            <el-menu-item
-              v-if="!menu.children || getVisibleChildren(menu).length <= 1"
-              :index="menu.children && getVisibleChildren(menu).length === 1
-                ? '/' + menu.path + '/' + getVisibleChildren(menu)[0].path
-                : '/' + menu.path"
-            >
-              <el-icon>
-                <component :is="menu.meta.icon" />
-              </el-icon>
-              <template #title>{{ menu.meta.title }}</template>
-            </el-menu-item>
-
-            <!--
-              情况2：有多个可见 children → 渲染 el-sub-menu + 子 el-menu-item
-            -->
-            <el-sub-menu v-else :index="'/' + menu.path">
-              <template #title>
-                <el-icon>
-                  <component :is="menu.meta.icon" />
-                </el-icon>
-                <span>{{ menu.meta.title }}</span>
-              </template>
-              <el-menu-item
-                v-for="child in getVisibleChildren(menu)"
-                :key="child.path"
-                :index="'/' + menu.path + '/' + child.path"
-              >
-                {{ child.meta?.title }}
-              </el-menu-item>
-            </el-sub-menu>
-          </template>
+          <SidebarMenuItem
+            v-for="menu in menuRoutes"
+            :key="menu.path"
+            :item="menu"
+            :can-show-route="canShowRoute"
+          />
         </el-menu>
       </el-aside>
 
