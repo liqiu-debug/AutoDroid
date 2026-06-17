@@ -406,6 +406,25 @@ export default {
     getPackages(params) {
         return api.get('/packages/', { params })
     },
+    createPackageUploadSession(data) {
+        return api.post('/packages/upload-sessions', data)
+    },
+    uploadPackageChunk(uploadId, index, formData, config = {}) {
+        return api.post(`/packages/upload-sessions/${uploadId}/chunks/${index}`, formData, {
+            timeout: 300000,
+            ...config,
+            headers: {
+                ...(config.headers || {}),
+                'Content-Type': 'multipart/form-data'
+            }
+        })
+    },
+    completePackageUpload(uploadId) {
+        return api.post(`/packages/upload-sessions/${uploadId}/complete`, null, { timeout: 300000 })
+    },
+    cancelPackageUpload(uploadId) {
+        return api.delete(`/packages/upload-sessions/${uploadId}`)
+    },
     deletePackage(id) {
         return api.delete(`/packages/${id}`)
     },

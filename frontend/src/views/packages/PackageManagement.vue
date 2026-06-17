@@ -4,6 +4,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled, Download, Delete, Box, Cellphone } from '@element-plus/icons-vue'
 import api from '@/api'
 
+const CHUNK_SIZE = 20 * 1024 * 1024
+const MAX_CHUNK_RETRIES = 2
+
 // ==================== 状态 ====================
 const packages = ref([])
 const loading = ref(false)
@@ -20,10 +23,38 @@ const deviceList = ref([])
 const deviceLoading = ref(false)
 
 // 上传相关
-const uploadHeaders = computed(() => ({
-  Authorization: `Bearer ${localStorage.getItem('token') || ''}`
-}))
-const uploadAction = '/api/packages/upload'
+const uploadDialogVisible = ref(false)
+const uploadInProgress = ref(false)
+const uploadCancelling = ref(false)
+const uploadStatus = ref('idle')
+const uploadStatusText = ref('')
+const uploadFileName = ref('')
+const uploadFileSize = ref(0)
+const uploadUploadedBytes = ref(0)
+const uploadCurrentChunkLoaded = ref(0)
+const uploadCurrentChunk = ref(0)
+const uploadTotalChunks = ref(0)
+const activeUploadId = ref('')
+
+let uploadCancelRequested = false
+let activeUploadController = null
+
+const uploadProgress = computed(() => {
+  if (!uploadFileSize.value) return 0
+  const uploaded = uploadUploadedBytes.value + uploadCurrentChunkLoaded.value
+  return Math.min(100, Math.max(0, Math.round((uploaded / uploadFileSize.value) * 100)))
+})
+
+const uploadProgressStatus = computed(() => {
+  if (uploadStatus.value === 'error') return 'exception'
+  if (uploadStatus.value === 'success') return 'success'
+  return undefined
+})
+
+const uploadDialogCanClose = computed(() => !uploadInProgress.value && !uploadCancelling.value)
+const uploadChunkLabel = computed(() => (
+  uploadTotalChunks.value ? `${uploadCurrentChunk.value} / ${uploadTotalChunks.value}` : '—'
+))
 
 // ==================== 方法 ====================
 
@@ -44,29 +75,167 @@ const fetchPackages = async () => {
   }
 }
 
-/** 上传成功回调 */
-const handleUploadSuccess = (response) => {
-  ElMessage.success(`上传成功：${response.app_name} v${response.version_name}`)
-  fetchPackages()
-}
-
-/** 上传失败回调 */
-const handleUploadError = (error) => {
-  let msg = '上传失败'
-  try {
-    const parsed = JSON.parse(error.message)
-    msg = parsed.detail || msg
-  } catch { /* ignore */ }
-  ElMessage.error(msg)
-}
-
 /** 上传前校验 */
 const beforeUpload = (file) => {
+  if (uploadInProgress.value) {
+    ElMessage.warning('已有上传任务进行中')
+    return false
+  }
   const isAPK = file.name.toLowerCase().endsWith('.apk')
   if (!isAPK) {
     ElMessage.warning('仅支持 .apk 文件')
   }
   return isAPK
+}
+
+const getErrorMessage = (error, fallback = '上传失败') => (
+  error?.response?.data?.detail || error?.message || fallback
+)
+
+const isCancelError = (error) => (
+  uploadCancelRequested || error?.code === 'ERR_CANCELED' || error?.name === 'CanceledError'
+)
+
+const resetUploadProgress = () => {
+  uploadStatus.value = 'idle'
+  uploadStatusText.value = ''
+  uploadFileName.value = ''
+  uploadFileSize.value = 0
+  uploadUploadedBytes.value = 0
+  uploadCurrentChunkLoaded.value = 0
+  uploadCurrentChunk.value = 0
+  uploadTotalChunks.value = 0
+  activeUploadId.value = ''
+  uploadCancelRequested = false
+  activeUploadController = null
+}
+
+const formatBytes = (bytes) => {
+  if (!bytes) return '0 KB'
+  const mb = bytes / (1024 * 1024)
+  if (mb >= 1) return `${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)} MB`
+  return `${(bytes / 1024).toFixed(0)} KB`
+}
+
+const cleanupActiveUploadSession = async () => {
+  if (!activeUploadId.value) return
+  try {
+    await api.cancelPackageUpload(activeUploadId.value)
+  } catch (error) {
+    if (!error?.response || error.response.status !== 404) {
+      ElMessage.warning(getErrorMessage(error, '取消上传失败，临时文件会在 24 小时后自动清理'))
+    }
+  }
+}
+
+const cancelActiveUpload = async () => {
+  uploadCancelRequested = true
+  uploadCancelling.value = true
+  uploadStatusText.value = '正在取消上传'
+  if (activeUploadController) {
+    activeUploadController.abort()
+  }
+  await cleanupActiveUploadSession()
+}
+
+const uploadChunkWithRetry = async (uploadId, index, chunk, fileName) => {
+  let attempt = 0
+  while (attempt <= MAX_CHUNK_RETRIES) {
+    if (uploadCancelRequested) {
+      throw new Error('上传已取消')
+    }
+
+    const formData = new FormData()
+    formData.append('file', chunk, fileName)
+    activeUploadController = new AbortController()
+
+    try {
+      await api.uploadPackageChunk(uploadId, index, formData, {
+        signal: activeUploadController.signal,
+        onUploadProgress: (event) => {
+          uploadCurrentChunkLoaded.value = Math.min(event.loaded || 0, chunk.size)
+        }
+      })
+      return
+    } catch (error) {
+      if (isCancelError(error)) {
+        throw error
+      }
+      if (attempt >= MAX_CHUNK_RETRIES) {
+        throw error
+      }
+      attempt += 1
+      uploadCurrentChunkLoaded.value = 0
+      uploadStatusText.value = `分片 ${index + 1} 上传失败，正在重试 ${attempt} / ${MAX_CHUNK_RETRIES}`
+    } finally {
+      activeUploadController = null
+    }
+  }
+}
+
+const uploadApkInChunks = async ({ file, onSuccess, onError }) => {
+  resetUploadProgress()
+  uploadDialogVisible.value = true
+  uploadInProgress.value = true
+  uploadStatus.value = 'uploading'
+  uploadFileName.value = file.name
+  uploadFileSize.value = file.size
+  uploadTotalChunks.value = Math.ceil(file.size / CHUNK_SIZE)
+  uploadStatusText.value = '正在创建上传会话'
+
+  try {
+    const { data: session } = await api.createPackageUploadSession({
+      filename: file.name,
+      file_size: file.size,
+      chunk_size: CHUNK_SIZE,
+      total_chunks: uploadTotalChunks.value
+    })
+    activeUploadId.value = session.upload_id
+
+    for (let index = 0; index < uploadTotalChunks.value; index += 1) {
+      if (uploadCancelRequested) {
+        throw new Error('上传已取消')
+      }
+      const start = index * CHUNK_SIZE
+      const end = Math.min(file.size, start + CHUNK_SIZE)
+      const chunk = file.slice(start, end)
+      uploadCurrentChunk.value = index + 1
+      uploadCurrentChunkLoaded.value = 0
+      uploadStatusText.value = `正在上传分片 ${index + 1} / ${uploadTotalChunks.value}`
+
+      await uploadChunkWithRetry(session.upload_id, index, chunk, file.name)
+      uploadUploadedBytes.value += chunk.size
+      uploadCurrentChunkLoaded.value = 0
+    }
+
+    uploadStatus.value = 'merging'
+    uploadStatusText.value = '正在合并解析 APK'
+    const { data: result } = await api.completePackageUpload(session.upload_id)
+
+    uploadStatus.value = 'success'
+    uploadUploadedBytes.value = file.size
+    uploadStatusText.value = '上传完成'
+    ElMessage.success(`上传成功：${result.app_name} v${result.version_name}`)
+    onSuccess?.(result)
+    await fetchPackages()
+    uploadDialogVisible.value = false
+  } catch (error) {
+    if (isCancelError(error)) {
+      await cleanupActiveUploadSession()
+      uploadStatus.value = 'cancelled'
+      uploadStatusText.value = '上传已取消'
+      ElMessage.info('上传已取消')
+    } else {
+      uploadStatus.value = 'error'
+      uploadStatusText.value = getErrorMessage(error)
+      ElMessage.error(uploadStatusText.value)
+    }
+    onError?.(error)
+  } finally {
+    uploadInProgress.value = false
+    uploadCancelling.value = false
+    activeUploadController = null
+  }
 }
 
 /** 下载安装包 */
@@ -185,12 +354,11 @@ onMounted(() => {
     <!-- 拖拽上传区 -->
     <el-card class="upload-card" shadow="never">
       <el-upload
-        :action="uploadAction"
-        :headers="uploadHeaders"
-        :on-success="handleUploadSuccess"
-        :on-error="handleUploadError"
+        action="/api/packages/upload-sessions"
+        :http-request="uploadApkInChunks"
         :before-upload="beforeUpload"
         :show-file-list="false"
+        :disabled="uploadInProgress"
         accept=".apk"
         drag
         name="file"
@@ -200,6 +368,46 @@ onMounted(() => {
         <div class="upload-tip">仅支持 .apk 格式文件</div>
       </el-upload>
     </el-card>
+
+    <el-dialog
+      v-model="uploadDialogVisible"
+      title="APK 上传"
+      width="460px"
+      :show-close="uploadDialogCanClose"
+      :close-on-click-modal="uploadDialogCanClose"
+      :close-on-press-escape="uploadDialogCanClose"
+      @closed="resetUploadProgress"
+    >
+      <div class="upload-progress-dialog">
+        <div class="upload-file-name">{{ uploadFileName || '—' }}</div>
+        <div class="upload-meta-grid">
+          <span>大小</span>
+          <strong>{{ formatBytes(uploadFileSize) }}</strong>
+          <span>分片</span>
+          <strong>{{ uploadChunkLabel }}</strong>
+        </div>
+        <el-progress
+          :percentage="uploadProgress"
+          :status="uploadProgressStatus"
+          :stroke-width="10"
+          striped
+          striped-flow
+        />
+        <div class="upload-status-text">{{ uploadStatusText }}</div>
+      </div>
+      <template #footer>
+        <el-button
+          v-if="uploadInProgress && uploadStatus === 'uploading'"
+          :loading="uploadCancelling"
+          @click="cancelActiveUpload"
+        >
+          取消上传
+        </el-button>
+        <el-button v-else :disabled="!uploadDialogCanClose" @click="uploadDialogVisible = false">
+          关闭
+        </el-button>
+      </template>
+    </el-dialog>
 
     <!-- 版本库表格 -->
     <el-card class="table-card" shadow="never">
@@ -410,6 +618,40 @@ onMounted(() => {
   font-size: 12px;
   color: #909399;
   margin-top: 8px;
+}
+
+.upload-progress-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.upload-file-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: #303133;
+  word-break: break-all;
+}
+
+.upload-meta-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 14px;
+  font-size: 13px;
+}
+
+.upload-meta-grid span {
+  color: #909399;
+}
+
+.upload-meta-grid strong {
+  color: #303133;
+  font-weight: 600;
+}
+
+.upload-status-text {
+  min-height: 20px;
+  font-size: 13px;
+  color: #606266;
 }
 
 /* 表格区 */
