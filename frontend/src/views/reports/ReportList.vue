@@ -12,7 +12,7 @@ const route = useRoute()
 const { isMobileMode } = useClientMode()
 
 // ========== 顶层 Tab ==========
-const resolveTab = (tab) => (tab === 'fastbot' || tab === 'startup' ? tab : 'ui')
+const resolveTab = (tab) => (['fastbot', 'startup', 'compatibility'].includes(tab) ? tab : 'ui')
 const activeTab = ref(resolveTab(route.query.tab))
 
 // ========== UI 场景报告 ==========
@@ -232,6 +232,10 @@ const fbSearch = ref('')
 const startupLoading = ref(false)
 const startupTasks = ref([])
 const startupSearch = ref('')
+const compatibilityLoading = ref(false)
+const compatibilityRuns = ref([])
+const compatibilitySearch = ref('')
+const compatibilityStatus = ref('all')
 let fbPollTimer = null
 let pageActive = false
 
@@ -256,6 +260,18 @@ const fetchStartupTasks = async () => {
         console.error('获取冷热启动任务失败', err)
     } finally {
         startupLoading.value = false
+    }
+}
+
+const fetchCompatibilityRuns = async () => {
+    compatibilityLoading.value = true
+    try {
+        const { data } = await api.getCompatibilityRuns({ skip: 0, limit: 100 })
+        compatibilityRuns.value = data.items || []
+    } catch (err) {
+        console.error('获取兼容性报告失败', err)
+    } finally {
+        compatibilityLoading.value = false
     }
 }
 
@@ -301,7 +317,30 @@ const filteredStartupTasks = computed(() => {
     })
 })
 
+const filteredCompatibilityRuns = computed(() => {
+    let list = compatibilityRuns.value || []
+    if (compatibilityStatus.value !== 'all') {
+        const status = compatibilityStatus.value.toUpperCase()
+        list = list.filter(item => {
+            const itemStatus = String(item.status || '').toUpperCase()
+            if (status === 'RUNNING') return itemStatus === 'RUNNING' || itemStatus === 'PENDING'
+            if (status === 'FAIL') return itemStatus === 'FAIL' || itemStatus === 'ERROR'
+            return itemStatus === status
+        })
+    }
+    if (compatibilitySearch.value) {
+        const q = compatibilitySearch.value.toLowerCase()
+        list = list.filter(item => (
+            String(item.name || '').toLowerCase().includes(q)
+            || String(item.package_name || '').toLowerCase().includes(q)
+        ))
+    }
+    return list
+})
+
 const handleFbView = (taskId) => { router.push(`/special/fastbot/report/${taskId}`) }
+const handleCompatibilityView = (runId) => { router.push(`/execution/reports/compatibility/${runId}`) }
+const isCompatibilityRunning = (status) => ['PENDING', 'RUNNING'].includes(String(status || '').toUpperCase())
 
 const handleFbDelete = async (row) => {
     try {
@@ -316,10 +355,42 @@ const handleFbDelete = async (row) => {
     }
 }
 
+const handleCompatibilityDelete = async (row) => {
+    try {
+        await ElMessageBox.confirm(
+            `确定删除兼容性报告「${row.name}」？相关截图、XML 和差异图文件也将被删除。`,
+            '警告',
+            { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+        )
+        await api.deleteCompatibilityRun(row.id)
+        ElMessage.success('已删除')
+        await fetchCompatibilityRuns()
+    } catch (err) {
+        if (!['cancel', 'close'].includes(err)) {
+            ElMessage.error(err.response?.data?.detail || '删除失败')
+        }
+    }
+}
+
 const getFbStatusType = (status) => {
     const map = { RUNNING: '', COMPLETED: 'success', FAILED: 'danger', PENDING: 'info' }
     return map[status] || 'info'
 }
+
+const getCompatibilityStatusType = (status) => {
+    const normalized = String(status || '').toUpperCase()
+    if (normalized === 'PASS') return 'success'
+    if (normalized === 'WARNING' || normalized === 'RUNNING') return 'warning'
+    if (['FAIL', 'ERROR', 'ABORTED'].includes(normalized)) return 'danger'
+    return 'info'
+}
+
+const getCompatibilityStatusText = (status) => String(status || 'PENDING').toUpperCase()
+const getCompatibilityMode = (mode) => mode === 'clean' ? '干净对比' : '升级兼容'
+const getCompatibilityPageCount = (run) => run.page_set?.pages?.length || run.total_pages || 0
+const hasRunningCompatibilityRuns = computed(() => (
+    compatibilityRuns.value.some(item => isCompatibilityRunning(item.status))
+))
 
 const getFbDuration = (task) => {
     if (!task.started_at) return '-'
@@ -355,6 +426,10 @@ const handleTabChange = (tab) => {
         fetchStartupTasks()
         return
     }
+    if (tab === 'compatibility') {
+        fetchCompatibilityRuns()
+        return
+    }
     fetchData()
 }
 
@@ -363,6 +438,7 @@ const startFbPolling = () => {
     fbPollTimer = setInterval(() => {
         if (activeTab.value === 'fastbot') fetchFbTasks()
         if (activeTab.value === 'startup') fetchStartupTasks()
+        if (activeTab.value === 'compatibility' && hasRunningCompatibilityRuns.value) fetchCompatibilityRuns()
     }, 15000)
 }
 
@@ -389,6 +465,7 @@ const refreshReportCenter = () => {
     fetchData()
     fetchFbTasks()
     fetchStartupTasks()
+    fetchCompatibilityRuns()
 }
 
 watch(
@@ -400,6 +477,9 @@ watch(
         }
         if (pageActive && activeTab.value === 'startup' && startupTasks.value.length === 0) {
             fetchStartupTasks()
+        }
+        if (pageActive && activeTab.value === 'compatibility' && compatibilityRuns.value.length === 0) {
+            fetchCompatibilityRuns()
         }
     }
 )
@@ -783,6 +863,91 @@ onUnmounted(() => {
                         </el-table-column>
                     </el-table>
                 </el-tab-pane>
+
+                <el-tab-pane label="兼容性报告" name="compatibility">
+                    <div class="list-header">
+                        <div class="left-filters">
+                            <el-input
+                                v-model="compatibilitySearch"
+                                placeholder="搜索任务或包名..."
+                                :prefix-icon="Search"
+                                clearable
+                                class="search-input"
+                            />
+                            <el-radio-group v-model="compatibilityStatus">
+                                <el-radio-button value="all">全部</el-radio-button>
+                                <el-radio-button value="pass">通过</el-radio-button>
+                                <el-radio-button value="warning">警告</el-radio-button>
+                                <el-radio-button value="fail">失败</el-radio-button>
+                                <el-radio-button value="running">运行中</el-radio-button>
+                            </el-radio-group>
+                        </div>
+                        <div class="right-actions">
+                            <el-button :icon="Refresh" circle @click="fetchCompatibilityRuns" />
+                        </div>
+                    </div>
+
+                    <el-table
+                        :data="filteredCompatibilityRuns"
+                        v-loading="compatibilityLoading"
+                        style="width: 100%"
+                        :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                        max-height="calc(100vh - 240px)"
+                    >
+                        <el-table-column prop="id" label="ID" width="64" align="center" />
+                        <el-table-column label="任务" min-width="220">
+                            <template #default="{ row }">
+                                <div class="run-name">{{ row.name }}</div>
+                                <div class="muted-text">{{ row.package_name }}</div>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="页面合集" min-width="150">
+                            <template #default="{ row }">{{ row.page_set?.name || '-' }}</template>
+                        </el-table-column>
+                        <el-table-column label="模式" width="100" align="center">
+                            <template #default="{ row }">{{ getCompatibilityMode(row.mode) }}</template>
+                        </el-table-column>
+                        <el-table-column label="设备/页面" width="100" align="center">
+                            <template #default="{ row }">{{ row.total_cells }} / {{ getCompatibilityPageCount(row) }}</template>
+                        </el-table-column>
+                        <el-table-column label="结果" width="120" align="center">
+                            <template #default="{ row }">
+                                <span class="summary-count pass">{{ row.pass_count }}</span>
+                                <span class="summary-count warn">{{ row.warning_count }}</span>
+                                <span class="summary-count fail">{{ row.fail_count }}</span>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="110" align="center">
+                            <template #default="{ row }">
+                                <el-tag :type="getCompatibilityStatusType(row.status)" size="small" effect="plain">
+                                    {{ getCompatibilityStatusText(row.status) }}
+                                </el-tag>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="开始时间" width="150" align="center">
+                            <template #default="{ row }">{{ formatDate(row.started_at || row.created_at) }}</template>
+                        </el-table-column>
+                        <el-table-column label="执行人" width="120" align="center">
+                            <template #default="{ row }">{{ row.executor_name || '-' }}</template>
+                        </el-table-column>
+                        <el-table-column label="操作" width="120" align="center" fixed="right">
+                            <template #default="{ row }">
+                                <el-tooltip content="查看报告" placement="top">
+                                    <el-button :icon="View" link type="primary" @click="handleCompatibilityView(row.id)" />
+                                </el-tooltip>
+                                <el-tooltip content="删除" placement="top">
+                                    <el-button
+                                        :icon="Delete"
+                                        link
+                                        type="danger"
+                                        :disabled="isCompatibilityRunning(row.status)"
+                                        @click="handleCompatibilityDelete(row)"
+                                    />
+                                </el-tooltip>
+                            </template>
+                        </el-table-column>
+                    </el-table>
+                </el-tab-pane>
             </el-tabs>
         </div>
     </div>
@@ -927,6 +1092,25 @@ onUnmounted(() => {
     font-size: 13px;
     color: #303133;
 }
+
+.run-name {
+    font-weight: 600;
+    color: #303133;
+}
+
+.muted-text {
+    color: #909399;
+    font-size: 12px;
+}
+
+.summary-count {
+    margin: 0 4px;
+    font-weight: 700;
+}
+
+.pass { color: #67C23A; }
+.warn { color: #E6A23C; }
+.fail { color: #F56C6C; }
 
 .text-danger { color: #F56C6C; font-weight: 600; }
 .text-warning { color: #E6A23C; font-weight: 600; }

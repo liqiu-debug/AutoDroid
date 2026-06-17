@@ -7,6 +7,8 @@ import os
 import shlex
 import uuid
 import logging
+import asyncio
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +44,110 @@ def _ensure_android_install_device(device: Device) -> None:
             status_code=400,
             detail="P2002_ADB_ANDROID_ONLY: APK 安装仅支持 Android 设备，iOS 设备仅支持执行。",
         )
+
+
+async def _run_adb_command(cmd: str, timeout: int = 120) -> str:
+    try:
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=timeout
+        )
+        return stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError("与设备通信超时（可能设备已断开）") from exc
+    except Exception as exc:
+        raise RuntimeError(f"执行命令失败: {exc}") from exc
+
+
+def _parse_adb_install_error(output: str) -> str:
+    failure_match = re.search(r"Failure\s*\[([^\]]+)\]", output or "")
+    return failure_match.group(1) if failure_match else str(output or "").strip()[-200:]
+
+
+async def install_app_package_to_device(
+    *,
+    session: Session,
+    package_id: int,
+    serial: str,
+    require_idle: bool = True,
+    uninstall_first: bool = False,
+    allow_uninstall_retry: bool = True,
+    allow_downgrade: bool = True,
+) -> dict:
+    """Install an uploaded APK onto an Android device and return install metadata."""
+    pkg = session.get(AppPackage, package_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail="安装包不存在")
+
+    file_path = _resolve_package_file_path(pkg.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="APK 文件已被删除")
+
+    device = session.exec(select(Device).where(Device.serial == serial)).first()
+    if not device:
+        raise HTTPException(status_code=404, detail=f"设备 {serial} 不存在")
+
+    _ensure_android_install_device(device)
+
+    if require_idle and device.status != "IDLE":
+        raise HTTPException(
+            status_code=400,
+            detail=f"设备 {device.model} 当前状态为 {device.status}，无法安装"
+        )
+
+    quoted_serial = shlex.quote(serial)
+    if uninstall_first and pkg.package_name:
+        uninstall_cmd = f"adb -s {quoted_serial} uninstall {shlex.quote(pkg.package_name)}"
+        logger.info("兼容性/包管理执行卸载命令: %s", uninstall_cmd)
+        try:
+            await _run_adb_command(uninstall_cmd, timeout=45)
+        except RuntimeError as exc:
+            logger.warning("卸载旧包失败但继续安装: serial=%s package=%s error=%s", serial, pkg.package_name, exc)
+
+    install_flags = "-r -t"
+    if allow_downgrade:
+        install_flags += " -d"
+    cmd = f"adb -s {quoted_serial} install {install_flags} {shlex.quote(str(file_path))}"
+    logger.info("执行安装命令: %s", cmd)
+    output = await _run_adb_command(cmd)
+    logger.info("ADB 安装输出: %s", output.strip())
+
+    retried_after_uninstall = False
+    if (
+        allow_uninstall_retry
+        and "INSTALL_FAILED_VERSION_DOWNGRADE" in output
+        and pkg.package_name
+    ):
+        retried_after_uninstall = True
+        logger.warning("检测到系统拦截降级安装，准备自动卸载旧版本并重试 (%s)", pkg.package_name)
+        uninstall_cmd = f"adb -s {quoted_serial} uninstall {shlex.quote(pkg.package_name)}"
+        uninstall_output = await _run_adb_command(uninstall_cmd, timeout=30)
+        logger.info("ADB 卸载输出: %s", uninstall_output.strip())
+
+        logger.info("重新执行安装: %s", cmd)
+        output = await _run_adb_command(cmd)
+        logger.info("重试安装输出: %s", output.strip())
+
+    if "Success" not in output:
+        raise HTTPException(
+            status_code=500,
+            detail=f"安装失败: {_parse_adb_install_error(output)}"
+        )
+
+    return {
+        "success": True,
+        "msg": f"{pkg.app_name} v{pkg.version_name} 安装成功",
+        "package_id": pkg.id,
+        "package_name": pkg.package_name,
+        "version_name": pkg.version_name,
+        "version_code": pkg.version_code,
+        "output": output,
+        "retried_after_uninstall": retried_after_uninstall,
+    }
 
 
 @router.post("/upload", response_model=AppPackageRead, summary="上传 APK 文件")
@@ -219,80 +325,15 @@ async def install_package(
     通过 ADB 将 APK 推送安装到指定设备。
     使用 -r (覆盖安装) -t (允许测试包) 参数。
     """
-    import asyncio
-
-    # 1. 查询安装包
-    pkg = session.get(AppPackage, package_id)
-    if not pkg:
-        raise HTTPException(status_code=404, detail="安装包不存在")
-
-    file_path = _resolve_package_file_path(pkg.file_path)
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="APK 文件已被删除")
-
-    # 2. 校验设备状态
-    device = session.exec(
-        select(Device).where(Device.serial == req.serial)
-    ).first()
-
-    if not device:
-        raise HTTPException(status_code=404, detail=f"设备 {req.serial} 不存在")
-
-    _ensure_android_install_device(device)
-
-    if device.status != "IDLE":
-        raise HTTPException(
-            status_code=400,
-            detail=f"设备 {device.model} 当前状态为 {device.status}，无法安装"
+    try:
+        return await install_app_package_to_device(
+            session=session,
+            package_id=package_id,
+            serial=req.serial,
+            require_idle=True,
+            uninstall_first=False,
+            allow_uninstall_retry=True,
+            allow_downgrade=True,
         )
-
-    # 3. 定义 ADB 执行辅助函数
-    async def _run_adb(c, timeout=120):
-        try:
-            process = await asyncio.create_subprocess_shell(
-                c,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
-            return stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=500, detail=f"与设备通信超时（可能设备已断开）")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"执行命令失败: {e}")
-
-    # 4. 执行 ADB 安装
-    cmd = f"adb -s {shlex.quote(req.serial)} install -r -t -d {shlex.quote(str(file_path))}"
-    logger.info(f"执行安装命令: {cmd}")
-    output = await _run_adb(cmd)
-    logger.info(f"ADB 安装输出: {output.strip()}")
-
-    # 5. 降级失败备选方案：自动卸载并重试
-    if "INSTALL_FAILED_VERSION_DOWNGRADE" in output and pkg.package_name:
-        logger.warning(f"检测到系统拦截降级安装，准备自动卸载旧版本并重试 ({pkg.package_name})")
-        uninstall_cmd = f'adb -s {req.serial} uninstall {pkg.package_name}'
-        uninstall_output = await _run_adb(uninstall_cmd, timeout=30)
-        logger.info(f"ADB 卸载输出: {uninstall_output.strip()}")
-        
-        logger.info(f"重新执行安装: {cmd}")
-        output = await _run_adb(cmd)
-        logger.info(f"重试安装输出: {output.strip()}")
-
-    # 6. 解析最终结果 — adb install 即使失败也可能返回 exit code 0
-
-    if "Success" in output:
-        return {
-            "success": True,
-            "msg": f"{pkg.app_name} v{pkg.version_name} 安装成功"
-        }
-    else:
-        # 提取 Failure [REASON] 格式的错误
-        import re
-        failure_match = re.search(r"Failure\s*\[([^\]]+)\]", output)
-        error_reason = failure_match.group(1) if failure_match else output.strip()[-200:]
-        raise HTTPException(
-            status_code=500,
-            detail=f"安装失败: {error_reason}"
-        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

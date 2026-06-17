@@ -567,6 +567,182 @@ class PaginatedAppPackageRead(BaseModel):
     items: List[AppPackageRead]
 
 
+# ---- Compatibility Test Schemas ----
+
+
+class CompatPageDefinition(BaseModel):
+    name: str
+    case_id: int
+    settle_seconds: int = Field(default=2, ge=0, le=60)
+    required_text: Optional[str] = None
+    key: Optional[str] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("page name must not be empty")
+        return text
+
+
+class CompatPageSetCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    pages: List[CompatPageDefinition] = Field(default_factory=list)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("page set name must not be empty")
+        return text
+
+
+class CompatPageSetUpdate(CompatPageSetCreate):
+    pass
+
+
+class CompatPageSetRead(CompatPageSetCreate):
+    id: int
+    user_id: Optional[int] = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class CompatibilityThresholds(BaseModel):
+    pixel_diff_ratio_warn: float = Field(default=0.03, ge=0, le=1)
+    ssim_warn: float = Field(default=0.96, ge=0, le=1)
+    xml_diff_ratio_warn: float = Field(default=0.35, ge=0, le=1)
+
+
+class CompatibilityRunCreate(BaseModel):
+    name: str
+    old_package_id: Optional[int] = None
+    new_package_id: int
+    page_set_id: int
+    device_serials: List[str]
+    mode: str = "upgrade"
+    env_id: Optional[int] = None
+    thresholds: CompatibilityThresholds = Field(default_factory=CompatibilityThresholds)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("run name must not be empty")
+        return text
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def normalize_mode(cls, value):
+        mode = str(value or "upgrade").strip().lower()
+        if mode not in {"upgrade", "clean"}:
+            raise ValueError("mode must be upgrade or clean")
+        return mode
+
+    @field_validator("device_serials", mode="before")
+    @classmethod
+    def normalize_serials(cls, value):
+        values = [value] if isinstance(value, str) else list(value or [])
+        serials = []
+        seen = set()
+        for item in values:
+            serial = str(item or "").strip()
+            if serial and serial not in seen:
+                serials.append(serial)
+                seen.add(serial)
+        if not serials:
+            raise ValueError("device_serials must not be empty")
+        return serials
+
+
+class CompatibilityPageResultRead(BaseModel):
+    id: int
+    run_id: int
+    cell_id: int
+    page_key: str = ""
+    page_name: str = ""
+    case_id: Optional[int] = None
+    status: str = "PENDING"
+    reason: Optional[str] = None
+    required_text: Optional[str] = None
+    baseline_screenshot_path: Optional[str] = None
+    candidate_screenshot_path: Optional[str] = None
+    diff_screenshot_path: Optional[str] = None
+    baseline_xml_path: Optional[str] = None
+    candidate_xml_path: Optional[str] = None
+    baseline_activity: Optional[str] = None
+    candidate_activity: Optional[str] = None
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class CompatibilityCellRead(BaseModel):
+    id: int
+    run_id: int
+    device_serial: str
+    device_info: Optional[str] = None
+    os_version: Optional[str] = None
+    resolution: Optional[str] = None
+    status: str = "PENDING"
+    current_stage: Optional[str] = None
+    old_install_status: Optional[str] = None
+    new_install_status: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Any = None
+    finished_at: Any = None
+    pages: List[CompatibilityPageResultRead] = Field(default_factory=list)
+
+    class Config:
+        from_attributes = True
+
+
+class CompatibilityRunRead(BaseModel):
+    id: int
+    name: str
+    page_set_id: Optional[int] = None
+    page_set_name: Optional[str] = None
+    page_set_snapshot: List[CompatPageDefinition] = Field(default_factory=list)
+    old_package_id: Optional[int] = None
+    new_package_id: int
+    package_name: str = ""
+    mode: str = "upgrade"
+    env_id: Optional[int] = None
+    device_serials: List[str] = Field(default_factory=list)
+    thresholds: Dict[str, Any] = Field(default_factory=dict)
+    status: str = "PENDING"
+    total_cells: int = 0
+    total_pages: int = 0
+    pass_count: int = 0
+    warning_count: int = 0
+    fail_count: int = 0
+    error_message: Optional[str] = None
+    executor_name: Optional[str] = None
+    created_at: Any
+    started_at: Any = None
+    finished_at: Any = None
+    page_set: Optional[CompatPageSetRead] = None
+    cells: List[CompatibilityCellRead] = Field(default_factory=list)
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedCompatibilityRunRead(BaseModel):
+    total: int
+    items: List[CompatibilityRunRead]
+
+
 # ---- Global Variable / Environment Schemas ----
 
 class EnvironmentCreate(BaseModel):

@@ -206,6 +206,88 @@ class AppPackage(SQLModel, table=True):
     uploader_name: Optional[str] = None
 
 
+class CompatPageSet(SQLModel, table=True):
+    """兼容性测试页面集合：用已有用例进入预设页面并采集快照。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    description: Optional[str] = None
+    pages: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    updater_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class CompatibilityRun(SQLModel, table=True):
+    """生产包视觉兼容性测试任务。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    page_set_id: Optional[int] = Field(default=None, foreign_key="compatpageset.id", index=True)
+    page_set_name: Optional[str] = None
+    page_set_snapshot: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    old_package_id: Optional[int] = Field(default=None, foreign_key="apppackage.id", index=True)
+    new_package_id: int = Field(foreign_key="apppackage.id", index=True)
+    package_name: str = Field(default="", index=True)
+    mode: str = Field(default="upgrade")  # upgrade | clean
+    env_id: Optional[int] = Field(default=None, foreign_key="environment.id")
+    device_serials: List[str] = Field(default=[], sa_column=Column(PydanticListType(str)))
+    thresholds: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    status: str = Field(default="PENDING", index=True)
+    total_cells: int = Field(default=0)
+    total_pages: int = Field(default=0)
+    pass_count: int = Field(default=0)
+    warning_count: int = Field(default=0)
+    fail_count: int = Field(default=0)
+    error_message: Optional[str] = None
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    executor_name: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class CompatibilityCell(SQLModel, table=True):
+    """兼容性任务中单台设备的执行单元。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="compatibilityrun.id", index=True)
+    device_serial: str = Field(index=True)
+    device_info: Optional[str] = None
+    os_version: Optional[str] = None
+    resolution: Optional[str] = None
+    status: str = Field(default="PENDING", index=True)
+    current_stage: Optional[str] = None
+    old_install_status: Optional[str] = None
+    new_install_status: Optional[str] = None
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class CompatibilityPageResult(SQLModel, table=True):
+    """兼容性任务中单页面的旧/新版对比结果。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="compatibilityrun.id", index=True)
+    cell_id: int = Field(foreign_key="compatibilitycell.id", index=True)
+    page_key: str = Field(default="")
+    page_name: str = Field(default="")
+    case_id: Optional[int] = Field(default=None, foreign_key="testcase.id")
+    status: str = Field(default="PENDING", index=True)
+    reason: Optional[str] = None
+    required_text: Optional[str] = None
+    baseline_screenshot_path: Optional[str] = None
+    candidate_screenshot_path: Optional[str] = None
+    diff_screenshot_path: Optional[str] = None
+    baseline_xml_path: Optional[str] = None
+    candidate_xml_path: Optional[str] = None
+    baseline_ocr_text: Optional[str] = None
+    candidate_ocr_text: Optional[str] = None
+    baseline_activity: Optional[str] = None
+    candidate_activity: Optional[str] = None
+    metrics: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
 class TestCaseStep(SQLModel, table=True):
     """
     跨端测试步骤表

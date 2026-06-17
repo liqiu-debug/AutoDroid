@@ -187,6 +187,273 @@ def _migrate_testresult_report_display(cursor) -> None:
         logger.info("Migration: ALTER TABLE testresult ADD COLUMN report_display")
 
 
+def _migrate_compatibility_tables(cursor) -> None:
+    """Create compatibility-test tables for existing SQLite databases."""
+    if not _table_exists(cursor, "compatpageset"):
+        cursor.execute(
+            """
+            CREATE TABLE compatpageset (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                description VARCHAR,
+                pages JSON,
+                user_id INTEGER REFERENCES user(id),
+                updater_id INTEGER REFERENCES user(id),
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP
+            )
+            """
+        )
+        logger.info("Migration: CREATE TABLE compatpageset")
+
+    if not _table_exists(cursor, "compatibilityrun"):
+        cursor.execute(
+            """
+            CREATE TABLE compatibilityrun (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                page_set_id INTEGER REFERENCES compatpageset(id),
+                page_set_name VARCHAR,
+                page_set_snapshot JSON,
+                old_package_id INTEGER REFERENCES apppackage(id),
+                new_package_id INTEGER NOT NULL REFERENCES apppackage(id),
+                package_name VARCHAR DEFAULT '',
+                mode VARCHAR DEFAULT 'upgrade',
+                env_id INTEGER REFERENCES environment(id),
+                device_serials TEXT,
+                thresholds JSON,
+                status VARCHAR DEFAULT 'PENDING',
+                total_cells INTEGER DEFAULT 0,
+                total_pages INTEGER DEFAULT 0,
+                pass_count INTEGER DEFAULT 0,
+                warning_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                error_message VARCHAR,
+                user_id INTEGER REFERENCES user(id),
+                executor_name VARCHAR,
+                created_at TIMESTAMP NOT NULL,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+            """
+        )
+        logger.info("Migration: CREATE TABLE compatibilityrun")
+
+    if not _table_exists(cursor, "compatibilitycell"):
+        cursor.execute(
+            """
+            CREATE TABLE compatibilitycell (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES compatibilityrun(id),
+                device_serial VARCHAR NOT NULL,
+                device_info VARCHAR,
+                os_version VARCHAR,
+                resolution VARCHAR,
+                status VARCHAR DEFAULT 'PENDING',
+                current_stage VARCHAR,
+                old_install_status VARCHAR,
+                new_install_status VARCHAR,
+                error_message VARCHAR,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+            """
+        )
+        logger.info("Migration: CREATE TABLE compatibilitycell")
+
+    if not _table_exists(cursor, "compatibilitypageresult"):
+        cursor.execute(
+            """
+            CREATE TABLE compatibilitypageresult (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES compatibilityrun(id),
+                cell_id INTEGER NOT NULL REFERENCES compatibilitycell(id),
+                page_key VARCHAR DEFAULT '',
+                page_name VARCHAR DEFAULT '',
+                case_id INTEGER REFERENCES testcase(id),
+                status VARCHAR DEFAULT 'PENDING',
+                reason VARCHAR,
+                required_text VARCHAR,
+                baseline_screenshot_path VARCHAR,
+                candidate_screenshot_path VARCHAR,
+                diff_screenshot_path VARCHAR,
+                baseline_xml_path VARCHAR,
+                candidate_xml_path VARCHAR,
+                baseline_ocr_text VARCHAR,
+                candidate_ocr_text VARCHAR,
+                baseline_activity VARCHAR,
+                candidate_activity VARCHAR,
+                metrics JSON,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP
+            )
+            """
+        )
+        logger.info("Migration: CREATE TABLE compatibilitypageresult")
+
+
+def _migrate_compatibility_old_package_nullable(cursor) -> None:
+    """Allow compatibility runs to use the currently installed app as baseline."""
+    if not _table_exists(cursor, "compatibilityrun"):
+        return
+
+    cursor.execute("PRAGMA table_info(compatibilityrun)")
+    cols = cursor.fetchall()
+    old_package_col = next((col for col in cols if col[1] == "old_package_id"), None)
+    if old_package_col is None or old_package_col[3] == 0:
+        return
+
+    logger.info("Migration: making compatibilityrun.old_package_id nullable")
+    cursor.execute("DROP TABLE IF EXISTS compatibilityrun_new")
+    cursor.execute(
+        """
+        CREATE TABLE compatibilityrun_new (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            page_set_id INTEGER REFERENCES compatpageset(id),
+            page_set_name VARCHAR,
+            page_set_snapshot JSON,
+            old_package_id INTEGER REFERENCES apppackage(id),
+            new_package_id INTEGER NOT NULL REFERENCES apppackage(id),
+            package_name VARCHAR DEFAULT '',
+            mode VARCHAR DEFAULT 'upgrade',
+            env_id INTEGER REFERENCES environment(id),
+            device_serials TEXT,
+            thresholds JSON,
+            status VARCHAR DEFAULT 'PENDING',
+            total_cells INTEGER DEFAULT 0,
+            total_pages INTEGER DEFAULT 0,
+            pass_count INTEGER DEFAULT 0,
+            warning_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            error_message VARCHAR,
+            user_id INTEGER REFERENCES user(id),
+            executor_name VARCHAR,
+            created_at TIMESTAMP NOT NULL,
+            started_at TIMESTAMP,
+            finished_at TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        INSERT INTO compatibilityrun_new (
+            id, name, page_set_id, page_set_name, page_set_snapshot, old_package_id,
+            new_package_id, package_name, mode, env_id, device_serials, thresholds,
+            status, total_cells, total_pages, pass_count, warning_count, fail_count,
+            error_message, user_id, executor_name, created_at, started_at, finished_at
+        )
+        SELECT
+            id, name, page_set_id,
+            (SELECT name FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id),
+            COALESCE((SELECT pages FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id), '[]'),
+            old_package_id, new_package_id, package_name, mode, env_id, device_serials,
+            thresholds, status, total_cells, total_pages, pass_count, warning_count,
+            fail_count, error_message, user_id, executor_name, created_at, started_at,
+            finished_at
+        FROM compatibilityrun
+        """
+    )
+    cursor.execute("DROP TABLE compatibilityrun")
+    cursor.execute("ALTER TABLE compatibilityrun_new RENAME TO compatibilityrun")
+
+
+def _migrate_compatibility_run_page_set_snapshot(cursor) -> None:
+    """Store page-set data on each compatibility run and allow deleting source page sets."""
+    if not _table_exists(cursor, "compatibilityrun"):
+        return
+
+    cursor.execute("PRAGMA table_info(compatibilityrun)")
+    cols = cursor.fetchall()
+    existing_cols = {col[1] for col in cols}
+    page_set_col = next((col for col in cols if col[1] == "page_set_id"), None)
+    needs_rebuild = (
+        "page_set_name" not in existing_cols
+        or "page_set_snapshot" not in existing_cols
+        or (page_set_col is not None and page_set_col[3] == 1)
+    )
+    if not needs_rebuild:
+        cursor.execute(
+            """
+            UPDATE compatibilityrun
+            SET
+                page_set_name = COALESCE(page_set_name, (
+                    SELECT name FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id
+                )),
+                page_set_snapshot = COALESCE(page_set_snapshot, (
+                    SELECT pages FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id
+                ), '[]')
+            WHERE page_set_id IS NOT NULL
+            """
+        )
+        return
+
+    logger.info("Migration: snapshot compatibilityrun page-set data and make page_set_id nullable")
+    page_set_name_expr = (
+        "COALESCE(page_set_name, "
+        "(SELECT name FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id))"
+        if "page_set_name" in existing_cols
+        else "(SELECT name FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id)"
+    )
+    page_set_snapshot_expr = (
+        "COALESCE(page_set_snapshot, "
+        "(SELECT pages FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id), '[]')"
+        if "page_set_snapshot" in existing_cols
+        else "COALESCE((SELECT pages FROM compatpageset WHERE compatpageset.id = compatibilityrun.page_set_id), '[]')"
+    )
+
+    cursor.execute("DROP TABLE IF EXISTS compatibilityrun_new")
+    cursor.execute(
+        """
+        CREATE TABLE compatibilityrun_new (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            page_set_id INTEGER REFERENCES compatpageset(id),
+            page_set_name VARCHAR,
+            page_set_snapshot JSON,
+            old_package_id INTEGER REFERENCES apppackage(id),
+            new_package_id INTEGER NOT NULL REFERENCES apppackage(id),
+            package_name VARCHAR DEFAULT '',
+            mode VARCHAR DEFAULT 'upgrade',
+            env_id INTEGER REFERENCES environment(id),
+            device_serials TEXT,
+            thresholds JSON,
+            status VARCHAR DEFAULT 'PENDING',
+            total_cells INTEGER DEFAULT 0,
+            total_pages INTEGER DEFAULT 0,
+            pass_count INTEGER DEFAULT 0,
+            warning_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            error_message VARCHAR,
+            user_id INTEGER REFERENCES user(id),
+            executor_name VARCHAR,
+            created_at TIMESTAMP NOT NULL,
+            started_at TIMESTAMP,
+            finished_at TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        f"""
+        INSERT INTO compatibilityrun_new (
+            id, name, page_set_id, page_set_name, page_set_snapshot, old_package_id,
+            new_package_id, package_name, mode, env_id, device_serials, thresholds,
+            status, total_cells, total_pages, pass_count, warning_count, fail_count,
+            error_message, user_id, executor_name, created_at, started_at, finished_at
+        )
+        SELECT
+            id, name, page_set_id, {page_set_name_expr}, {page_set_snapshot_expr},
+            old_package_id, new_package_id, package_name, mode, env_id, device_serials,
+            thresholds, status, total_cells, total_pages, pass_count, warning_count,
+            fail_count, error_message, user_id, executor_name, created_at, started_at,
+            finished_at
+        FROM compatibilityrun
+        """
+    )
+    cursor.execute("DROP TABLE compatibilityrun")
+    cursor.execute("ALTER TABLE compatibilityrun_new RENAME TO compatibilityrun")
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     _ensure_schema_migration_table(cursor)
@@ -197,6 +464,9 @@ def _run_migrations_with_conn(conn) -> None:
         ("20260305_003_scheduledtask_scenario_nullable", _migrate_scheduledtask_scenario_id_nullable),
         ("20260312_004_fastbotreport_jank_fields", _migrate_fastbotreport_jank_fields),
         ("20260519_005_testresult_report_display", _migrate_testresult_report_display),
+        ("20260616_006_compatibility_tables", _migrate_compatibility_tables),
+        ("20260616_007_compatibility_current_baseline", _migrate_compatibility_old_package_nullable),
+        ("20260616_008_compatibility_page_set_snapshot", _migrate_compatibility_run_page_set_snapshot),
     ]
 
     for version, migration_func in migration_plan:

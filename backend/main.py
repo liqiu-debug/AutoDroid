@@ -254,6 +254,7 @@ from backend.api import fastbot
 from backend.api import log_analysis
 from backend.api import devices
 from backend.api import packages
+from backend.api import compatibility
 from backend.api import environments
 from backend.api import ai
 
@@ -280,6 +281,7 @@ def _register_http_routers(
     target.include_router(log_analysis.router, prefix="/fastbot", tags=["log_analysis"], include_in_schema=include_in_schema)
     target.include_router(devices.router, prefix="/devices", tags=["devices"], include_in_schema=include_in_schema)
     target.include_router(packages.router, prefix="/packages", tags=["packages"], include_in_schema=include_in_schema)
+    target.include_router(compatibility.router, prefix="/compatibility", tags=["compatibility"], include_in_schema=include_in_schema)
     target.include_router(environments.router, prefix="/environments", tags=["environments"], include_in_schema=include_in_schema)
     if ai_prefix:
         target.include_router(ai.router, prefix=ai_prefix, tags=["ai"], include_in_schema=include_in_schema)

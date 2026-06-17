@@ -151,6 +151,26 @@ const routes = [
             name: 'StartupAnalysis',
             meta: { title: '冷热启动', keepAlive: true },
             component: () => import('@/views/special/Startup.vue')
+          },
+          {
+            path: 'compatibility',
+            name: 'CompatibilityTest',
+            meta: { title: '兼容性测试', alwaysShow: true },
+            redirect: '/special/compatibility/run',
+            children: [
+              {
+                path: 'run',
+                name: 'CompatibilityRun',
+                meta: { title: '测试配置', keepAlive: true },
+                component: () => import('@/views/special/Compatibility.vue')
+              },
+              {
+                path: 'page-sets',
+                name: 'CompatibilityPageSets',
+                meta: { title: '页面合集', keepAlive: true },
+                component: () => import('@/views/special/CompatibilityPageSets.vue')
+              }
+            ]
           }
         ]
       },
@@ -172,6 +192,12 @@ const routes = [
             name: 'report-list',
             meta: { title: '报告中心', keepAlive: true, mobileAvailable: true, mobileTitle: '报告' },
             component: () => import('../views/reports/ReportList.vue')
+          },
+          {
+            path: 'reports/compatibility/:id',
+            name: 'compatibility-report-detail',
+            meta: { title: '兼容性报告详情', hidden: true },
+            component: () => import('../views/reports/CompatibilityReportDetail.vue')
           },
           {
             path: 'reports/:id',
