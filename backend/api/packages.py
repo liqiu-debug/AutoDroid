@@ -9,12 +9,15 @@ import uuid
 import logging
 import asyncio
 import re
+import json
+import shutil
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select, col, func
 
 from backend.database import get_session
@@ -31,10 +34,184 @@ router = APIRouter()
 # 存储目录
 UPLOAD_DIR = project_path("uploads", "apps")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CHUNK_UPLOAD_DIR = UPLOAD_DIR / ".chunks"
+CHUNK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+PACKAGE_UPLOAD_CHUNK_SIZE = 20 * 1024 * 1024
+UPLOAD_SESSION_TTL_SECONDS = 24 * 60 * 60
+UPLOAD_READ_SIZE = 1024 * 1024
+
+
+class PackageUploadSessionCreate(BaseModel):
+    filename: str
+    file_size: int
+    chunk_size: int
+    total_chunks: int
+
+
+class PackageUploadSessionRead(BaseModel):
+    upload_id: str
+    chunk_size: int
+    total_chunks: int
+    uploaded_chunks: List[int] = Field(default_factory=list)
+
+
+class PackageChunkUploadRead(BaseModel):
+    upload_id: str
+    index: int
+    received_bytes: int
+    uploaded_chunks_count: int
+    total_chunks: int
 
 
 def _resolve_package_file_path(stored_path: str) -> Path:
     return resolve_project_path(stored_path, anchors=("uploads/apps",))
+
+
+def _is_admin(user: User) -> bool:
+    return (getattr(user, "role", "") or "").strip().lower() == "admin"
+
+
+def _validate_upload_id(upload_id: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", upload_id or ""):
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+
+
+def _upload_session_dir(upload_id: str) -> Path:
+    _validate_upload_id(upload_id)
+    return CHUNK_UPLOAD_DIR / upload_id
+
+
+def _upload_session_meta_path(upload_id: str) -> Path:
+    return _upload_session_dir(upload_id) / "meta.json"
+
+
+def _uploaded_chunk_indexes(session_dir: Path) -> List[int]:
+    indexes: List[int] = []
+    for path in session_dir.glob("*.part"):
+        try:
+            indexes.append(int(path.stem))
+        except ValueError:
+            continue
+    return sorted(indexes)
+
+
+def _remove_path(path: Path) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    except Exception as exc:
+        logger.warning("清理路径失败 %s: %s", path, exc)
+
+
+def _cleanup_stale_upload_sessions() -> None:
+    if not CHUNK_UPLOAD_DIR.exists():
+        return
+
+    now = time.time()
+    for session_dir in CHUNK_UPLOAD_DIR.iterdir():
+        if not session_dir.is_dir():
+            continue
+        try:
+            if now - session_dir.stat().st_mtime > UPLOAD_SESSION_TTL_SECONDS:
+                _remove_path(session_dir)
+        except Exception as exc:
+            logger.warning("检查过期上传会话失败 %s: %s", session_dir, exc)
+
+
+def _load_upload_session(upload_id: str, current_user: User) -> Dict[str, Any]:
+    session_dir = _upload_session_dir(upload_id)
+    meta_path = session_dir / "meta.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"上传会话损坏: {exc}") from exc
+
+    owner_id = meta.get("user_id")
+    if not _is_admin(current_user) and owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问该上传会话")
+    return meta
+
+
+def _expected_total_chunks(file_size: int, chunk_size: int) -> int:
+    return (file_size + chunk_size - 1) // chunk_size
+
+
+def _validate_upload_session_payload(payload: PackageUploadSessionCreate) -> str:
+    filename = os.path.basename((payload.filename or "").strip())
+    if not filename.lower().endswith(".apk"):
+        raise HTTPException(status_code=400, detail="仅支持 .apk 文件")
+    if payload.file_size <= 0:
+        raise HTTPException(status_code=400, detail="文件大小必须大于 0")
+    if payload.chunk_size != PACKAGE_UPLOAD_CHUNK_SIZE:
+        raise HTTPException(status_code=400, detail="分片大小必须为 20 MiB")
+
+    expected_chunks = _expected_total_chunks(payload.file_size, payload.chunk_size)
+    if payload.total_chunks != expected_chunks:
+        raise HTTPException(status_code=400, detail="分片数量与文件大小不匹配")
+    return filename
+
+
+async def _write_upload_file(file: UploadFile, saved_path: Path) -> int:
+    total_bytes = 0
+    try:
+        with open(saved_path, "wb") as handle:
+            while True:
+                chunk = await file.read(UPLOAD_READ_SIZE)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                handle.write(chunk)
+    except Exception as exc:
+        _remove_path(saved_path)
+        raise HTTPException(status_code=500, detail=f"文件保存失败: {exc}") from exc
+    return total_bytes
+
+
+def _record_uploaded_package(
+    *,
+    saved_path: Path,
+    file_size_bytes: int,
+    session: Session,
+    current_user: User,
+) -> AppPackage:
+    apk_info = parse_apk_info(str(saved_path))
+
+    if apk_info.get("package_name"):
+        stmt = select(AppPackage).where(
+            AppPackage.package_name == apk_info["package_name"],
+            AppPackage.is_latest == True  # noqa: E712
+        )
+        old_packages = session.exec(stmt).all()
+        for pkg in old_packages:
+            pkg.is_latest = False
+            session.add(pkg)
+
+    new_package = AppPackage(
+        app_name=apk_info.get("app_name", "Unknown"),
+        package_name=apk_info.get("package_name", ""),
+        version_name=apk_info.get("version_name", ""),
+        version_code=apk_info.get("version_code", ""),
+        file_path=project_relative_path(saved_path, anchors=("uploads/apps",)),
+        file_size=round(file_size_bytes / (1024 * 1024), 2),
+        is_latest=True,
+        uploader_id=current_user.id,
+        uploader_name=current_user.full_name or current_user.username,
+    )
+    session.add(new_package)
+    session.commit()
+    session.refresh(new_package)
+
+    logger.info(
+        f"APK 上传成功: {apk_info.get('app_name')} "
+        f"({apk_info.get('package_name')}) v{apk_info.get('version_name')}"
+    )
+    return new_package
 
 
 def _ensure_android_install_device(device: Device) -> None:
@@ -169,50 +346,185 @@ async def upload_package(
     saved_name = f"{uuid.uuid4().hex}{ext}"
     saved_path = UPLOAD_DIR / saved_name
 
+    file_size_bytes = await _write_upload_file(file, saved_path)
+    return _record_uploaded_package(
+        saved_path=saved_path,
+        file_size_bytes=file_size_bytes,
+        session=session,
+        current_user=current_user,
+    )
+
+
+@router.post(
+    "/upload-sessions",
+    response_model=PackageUploadSessionRead,
+    summary="创建 APK 分片上传会话",
+)
+def create_package_upload_session(
+    payload: PackageUploadSessionCreate,
+    current_user: User = Depends(get_current_user),
+):
+    filename = _validate_upload_session_payload(payload)
+    _cleanup_stale_upload_sessions()
+
+    upload_id = uuid.uuid4().hex
+    session_dir = _upload_session_dir(upload_id)
+    session_dir.mkdir(parents=True, exist_ok=False)
+
+    meta = {
+        "upload_id": upload_id,
+        "filename": filename,
+        "file_size": payload.file_size,
+        "chunk_size": payload.chunk_size,
+        "total_chunks": payload.total_chunks,
+        "user_id": current_user.id,
+        "created_at": time.time(),
+    }
+
     try:
-        content = await file.read()
-        with open(saved_path, "wb") as f:
-            f.write(content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件保存失败: {e}")
+        with open(_upload_session_meta_path(upload_id), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        _remove_path(session_dir)
+        raise HTTPException(status_code=500, detail=f"创建上传会话失败: {exc}") from exc
 
-    file_size_mb = round(len(content) / (1024 * 1024), 2)
+    return PackageUploadSessionRead(
+        upload_id=upload_id,
+        chunk_size=payload.chunk_size,
+        total_chunks=payload.total_chunks,
+        uploaded_chunks=[],
+    )
 
-    # 3. 解析 APK 信息
-    apk_info = parse_apk_info(str(saved_path))
 
-    # 4. 将相同包名的旧包标记为 非最新
-    if apk_info.get("package_name"):
-        stmt = select(AppPackage).where(
-            AppPackage.package_name == apk_info["package_name"],
-            AppPackage.is_latest == True  # noqa: E712
+@router.post(
+    "/upload-sessions/{upload_id}/chunks/{index}",
+    response_model=PackageChunkUploadRead,
+    summary="上传 APK 分片",
+)
+async def upload_package_chunk(
+    upload_id: str,
+    index: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    meta = _load_upload_session(upload_id, current_user)
+    total_chunks = int(meta["total_chunks"])
+    if index < 0 or index >= total_chunks:
+        raise HTTPException(status_code=400, detail="分片索引越界")
+
+    file_size = int(meta["file_size"])
+    chunk_size = int(meta["chunk_size"])
+    expected_max_size = min(chunk_size, file_size - index * chunk_size)
+    if expected_max_size <= 0:
+        raise HTTPException(status_code=400, detail="分片索引越界")
+
+    session_dir = _upload_session_dir(upload_id)
+    part_path = session_dir / f"{index}.part"
+    temp_path = session_dir / f"{index}.part.tmp"
+    received_bytes = 0
+
+    try:
+        with open(temp_path, "wb") as handle:
+            while True:
+                chunk = await file.read(UPLOAD_READ_SIZE)
+                if not chunk:
+                    break
+                received_bytes += len(chunk)
+                if received_bytes > expected_max_size:
+                    raise HTTPException(status_code=400, detail="分片大小超过限制")
+                handle.write(chunk)
+        if received_bytes <= 0:
+            raise HTTPException(status_code=400, detail="分片内容不能为空")
+        os.replace(temp_path, part_path)
+    except HTTPException:
+        _remove_path(temp_path)
+        raise
+    except Exception as exc:
+        _remove_path(temp_path)
+        raise HTTPException(status_code=500, detail=f"分片保存失败: {exc}") from exc
+
+    uploaded_chunks = _uploaded_chunk_indexes(session_dir)
+    return PackageChunkUploadRead(
+        upload_id=upload_id,
+        index=index,
+        received_bytes=received_bytes,
+        uploaded_chunks_count=len(uploaded_chunks),
+        total_chunks=total_chunks,
+    )
+
+
+@router.post(
+    "/upload-sessions/{upload_id}/complete",
+    response_model=AppPackageRead,
+    summary="完成 APK 分片上传",
+)
+def complete_package_upload(
+    upload_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    meta = _load_upload_session(upload_id, current_user)
+    session_dir = _upload_session_dir(upload_id)
+    file_size = int(meta["file_size"])
+    total_chunks = int(meta["total_chunks"])
+    chunk_size = int(meta["chunk_size"])
+
+    part_paths: List[Path] = []
+    total_bytes = 0
+    missing_indexes: List[int] = []
+    for index in range(total_chunks):
+        part_path = session_dir / f"{index}.part"
+        if not part_path.exists():
+            missing_indexes.append(index)
+            continue
+        part_size = part_path.stat().st_size
+        expected_max_size = min(chunk_size, file_size - index * chunk_size)
+        if part_size <= 0 or part_size > expected_max_size:
+            raise HTTPException(status_code=400, detail=f"分片 {index} 大小不匹配")
+        total_bytes += part_size
+        part_paths.append(part_path)
+
+    if missing_indexes:
+        preview = ", ".join(str(i) for i in missing_indexes[:5])
+        raise HTTPException(status_code=400, detail=f"缺少分片: {preview}")
+    if total_bytes != file_size:
+        raise HTTPException(status_code=400, detail="分片总大小与文件大小不匹配")
+
+    saved_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.apk"
+    try:
+        with open(saved_path, "wb") as output:
+            for part_path in part_paths:
+                with open(part_path, "rb") as source:
+                    shutil.copyfileobj(source, output, length=UPLOAD_READ_SIZE)
+        if saved_path.stat().st_size != file_size:
+            _remove_path(saved_path)
+            raise HTTPException(status_code=400, detail="合并后的文件大小不匹配")
+
+        new_package = _record_uploaded_package(
+            saved_path=saved_path,
+            file_size_bytes=file_size,
+            session=session,
+            current_user=current_user,
         )
-        old_packages = session.exec(stmt).all()
-        for pkg in old_packages:
-            pkg.is_latest = False
-            session.add(pkg)
+    except HTTPException:
+        _remove_path(saved_path)
+        raise
+    except Exception as exc:
+        _remove_path(saved_path)
+        raise HTTPException(status_code=500, detail=f"完成上传失败: {exc}") from exc
 
-    # 5. 创建新记录
-    new_package = AppPackage(
-        app_name=apk_info.get("app_name", "Unknown"),
-        package_name=apk_info.get("package_name", ""),
-        version_name=apk_info.get("version_name", ""),
-        version_code=apk_info.get("version_code", ""),
-        file_path=project_relative_path(saved_path, anchors=("uploads/apps",)),
-        file_size=file_size_mb,
-        is_latest=True,
-        uploader_id=current_user.id,
-        uploader_name=current_user.full_name or current_user.username,
-    )
-    session.add(new_package)
-    session.commit()
-    session.refresh(new_package)
-
-    logger.info(
-        f"APK 上传成功: {apk_info.get('app_name')} "
-        f"({apk_info.get('package_name')}) v{apk_info.get('version_name')}"
-    )
+    _remove_path(session_dir)
     return new_package
+
+
+@router.delete("/upload-sessions/{upload_id}", summary="取消 APK 分片上传")
+def cancel_package_upload(
+    upload_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    _load_upload_session(upload_id, current_user)
+    _remove_path(_upload_session_dir(upload_id))
+    return {"message": "已取消上传"}
 
 
 @router.get("/", response_model=PaginatedAppPackageRead, summary="获取安装包列表")
