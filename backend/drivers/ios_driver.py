@@ -19,7 +19,8 @@ import wda
 
 from .base_driver import BaseDriver
 from backend.utils import evaluate_page_text_assertion
-from backend.utils.ocr_compat import create_paddle_ocr_engine, extract_ocr_text, iter_ocr_text_items, run_paddle_ocr
+from backend.utils.ocr_compat import extract_ocr_text, iter_ocr_text_items, run_paddle_ocr
+from backend.ocr_service import get_ocr_engine, start_ocr_prewarm
 
 logger = logging.getLogger(__name__)
 
@@ -100,32 +101,13 @@ class IOSDriver(BaseDriver):
 
     @classmethod
     def _ensure_ocr_prewarm_started(cls) -> None:
-        with cls._ocr_prewarm_lock:
-            if cls._ocr_prewarm_started:
-                return
-            cls._ocr_prewarm_started = True
-        thread = threading.Thread(
-            target=cls._prewarm_ocr_engine_worker,
-            name="ios-ocr-prewarm",
-            daemon=True,
-        )
-        thread.start()
+        """启动 OCR 预热（使用全局服务）"""
+        start_ocr_prewarm(use_angle_cls=False, lang="ch")
 
     @classmethod
     def _prewarm_ocr_engine_worker(cls) -> None:
-        try:
-            ocr_engine = cls._get_ocr_engine()
-        except Exception as exc:
-            logger.warning("iOS OCR engine prewarm skipped: %s", exc)
-            return
-
-        try:
-            _, np = cls._load_opencv_numpy()
-            blank = np.zeros((48, 192, 3), dtype=np.uint8)
-            run_paddle_ocr(ocr_engine, blank, use_cls=False)
-            logger.debug("iOS OCR engine warmup done")
-        except Exception as exc:
-            logger.warning("iOS OCR engine warmup partial failure: %s", exc)
+        """预热工作线程（已由 OCRService 处理，保留空实现以兼容）"""
+        pass
 
 
     def _diag_common(self) -> Dict[str, Any]:
@@ -2209,23 +2191,8 @@ class IOSDriver(BaseDriver):
 
     @classmethod
     def _get_ocr_engine(cls) -> Any:
-        if cls._ocr_engine is None:
-            last_exc: Optional[Exception] = None
-            for _ in range(2):
-                try:
-                    logger.debug("iOS OCR engine loading")
-                    cls._ocr_engine = create_paddle_ocr_engine(use_angle_cls=False, lang="ch")
-                    logger.debug("iOS OCR engine ready")
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    time.sleep(0.15)
-            if cls._ocr_engine is None:
-                detail = str(last_exc or "").strip().splitlines()[0] if last_exc else "unknown"
-                raise RuntimeError(
-                    f"extract_by_ocr 初始化失败: {detail}"
-                ) from last_exc
-        return cls._ocr_engine
+        """获取 OCR 引擎（使用全局单例服务）"""
+        return get_ocr_engine(use_angle_cls=False, lang="ch")
 
     def _decode_png_to_bgr(self, png_bytes: bytes, source: str) -> Any:
         cv2, np = self._load_opencv_numpy()

@@ -257,6 +257,8 @@ from backend.api import packages
 from backend.api import compatibility
 from backend.api import environments
 from backend.api import ai
+from backend.api import limiter
+from backend.api import deps
 
 
 def _register_http_routers(
@@ -283,6 +285,7 @@ def _register_http_routers(
     target.include_router(packages.router, prefix="/packages", tags=["packages"], include_in_schema=include_in_schema)
     target.include_router(compatibility.router, prefix="/compatibility", tags=["compatibility"], include_in_schema=include_in_schema)
     target.include_router(environments.router, prefix="/environments", tags=["environments"], include_in_schema=include_in_schema)
+    target.include_router(limiter.router, prefix="/limiter", tags=["limiter"], include_in_schema=include_in_schema)
     if ai_prefix:
         target.include_router(ai.router, prefix=ai_prefix, tags=["ai"], include_in_schema=include_in_schema)
 
@@ -418,6 +421,7 @@ def run_test_case_legacy_alias(
     env_id: Optional[int] = None,
     device_serial: Optional[str] = None,
     session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
 ):
     """
     Legacy compatibility endpoint.
@@ -430,6 +434,7 @@ def run_test_case_legacy_alias(
         env_id=env_id,
         device_serial=device_serial,
         session=session,
+        current_user=current_user,
     )
     if isinstance(response, dict):
         payload = dict(response)
