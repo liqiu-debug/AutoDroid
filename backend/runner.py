@@ -18,8 +18,9 @@ import cv2
 
 from .schemas import Step, ActionType, SelectorType, Variable
 from .utils import evaluate_page_text_assertion
-from .utils.ocr_compat import create_paddle_ocr_engine, extract_ocr_text, run_paddle_ocr
+from .utils.ocr_compat import extract_ocr_text, run_paddle_ocr
 from .utils.template_match import find_template_match, image_to_bgr, load_image_bgr
+from backend.ocr_service import get_ocr_engine
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +88,7 @@ def _sleep_or_abort(seconds: float, abort_event: Optional[threading.Event]) -> b
 
 
 def _get_ocr_engine() -> Any:
-    global _ocr_engine
-    if _ocr_engine is not None:
-        return _ocr_engine
-
-    with _ocr_lock:
-        if _ocr_engine is None:
-            logger.debug("Legacy runner OCR engine loading")
-            _ocr_engine = create_paddle_ocr_engine(use_angle_cls=False, lang="ch")
-            logger.debug("Legacy runner OCR engine ready")
-    return _ocr_engine
+    return get_ocr_engine(use_angle_cls=False, lang="ch")
 
 
 def _dump_model(value: Any) -> Any:

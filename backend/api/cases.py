@@ -2,6 +2,7 @@ import logging
 import re
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -41,6 +42,7 @@ from backend.step_contract import (
     normalize_execute_on,
     normalize_platform_overrides,
 )
+from backend.execution_limiter import get_execution_limiter
 from backend.utils.pydantic_compat import dump_model
 
 router = APIRouter()
@@ -278,6 +280,7 @@ def _make_case_run_record(
     case_id: int,
     batch_id: Optional[str],
     device_serial: Optional[str],
+    run_id: Optional[str] = None,
 ):
     abort_event = _new_abort_event_for_device(device_serial)
     return registry.register(
@@ -286,7 +289,32 @@ def _make_case_run_record(
         batch_id=batch_id,
         device_serial=device_serial,
         abort_event=abort_event,
+        run_id=run_id,
     )
+
+
+@contextmanager
+def _case_execution_slot(
+    *,
+    user_id: Optional[int],
+    device_serial: Optional[str],
+    run_id: Optional[str],
+    execution_lease=None,
+    timeout: float = 30.0,
+):
+    if execution_lease is not None:
+        with execution_lease:
+            yield
+        return
+
+    limiter = get_execution_limiter()
+    with limiter.acquire(
+        user_id=user_id or 0,
+        device_serial=device_serial,
+        task_id=run_id,
+        timeout=timeout,
+    ):
+        yield
 
 
 def _step_ui_status(step_result: Any) -> str:
@@ -498,12 +526,19 @@ def _enrich_case_read(
     session: Session,
     creator_info: Optional[tuple] = None,
     updater_info: Optional[tuple] = None,
+    folder_name: Optional[str] = None,  # 新增参数，避免重复查询
+    use_new_step_model: Optional[bool] = None,
+    standard_steps: Optional[List[TestCaseStep]] = None,
 ) -> TestCaseRead:
     """为 TestCaseRead 补充 folder_name/用户信息，并按开关决定 steps 来源。"""
     case_read = TestCaseRead.from_orm(case)
 
-    if case.id and is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False):
-        standard_steps = _list_standard_steps(session, case.id)
+    if use_new_step_model is None:
+        use_new_step_model = is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False)
+
+    if case.id and use_new_step_model:
+        if standard_steps is None:
+            standard_steps = _list_standard_steps(session, case.id)
         if standard_steps:
             case_read.steps = _to_legacy_step_models(standard_steps)
 
@@ -511,7 +546,12 @@ def _enrich_case_read(
         case_read.creator_name = creator_info[0] or creator_info[1] or "Unknown"
     if updater_info:
         case_read.updater_name = updater_info[0] or updater_info[1] or "Unknown"
-    if case.folder_id:
+
+    # 优先使用传入的 folder_name（列表查询时已预加载）
+    if folder_name:
+        case_read.folder_name = folder_name
+    elif case.folder_id:
+        # 回退到单独查询（仅用于单个 case 查询）
         folder = session.get(CaseFolder, case.folder_id)
         if folder:
             case_read.folder_name = folder.name
@@ -569,9 +609,11 @@ def list_test_cases(
             creator.username,
             updater.full_name,
             updater.username,
+            CaseFolder.name,  # 预加载 folder name，避免 N+1
         )
         .outerjoin(creator, TestCase.user_id == creator.id)
         .outerjoin(updater, TestCase.updater_id == updater.id)
+        .outerjoin(CaseFolder, TestCase.folder_id == CaseFolder.id)  # 预加载 folder
     )
 
     if keyword:
@@ -590,9 +632,21 @@ def list_test_cases(
     total = count_query.scalar()
 
     results = query.offset(skip).limit(limit).all()
+    use_new_step_model = is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False)
+    standard_steps_by_case: Dict[int, List[TestCaseStep]] = {}
+    if use_new_step_model and results:
+        case_ids = [case.id for case, *_ in results if case.id is not None]
+        if case_ids:
+            standard_steps = session.exec(
+                select(TestCaseStep)
+                .where(TestCaseStep.case_id.in_(case_ids))
+                .order_by(TestCaseStep.case_id, TestCaseStep.order, TestCaseStep.id)
+            ).all()
+            for step in standard_steps:
+                standard_steps_by_case.setdefault(step.case_id, []).append(step)
 
     case_list: List[TestCaseRead] = []
-    for case, c_full, c_user, u_full, u_user in results:
+    for case, c_full, c_user, u_full, u_user, folder_name in results:
         if tag and (not case.tags or tag not in case.tags):
             continue
         case_list.append(
@@ -601,6 +655,9 @@ def list_test_cases(
                 session,
                 creator_info=(c_full, c_user),
                 updater_info=(u_full, u_user),
+                folder_name=folder_name,  # 传入已查询的 folder_name
+                use_new_step_model=use_new_step_model,
+                standard_steps=standard_steps_by_case.get(case.id or 0, []),
             )
         )
 
@@ -776,45 +833,63 @@ def _run_case_background(
     device_serial: Optional[str] = None,
     run_id: Optional[str] = None,
     abort_event=None,
+    user_id: Optional[int] = None,
+    execution_lease=None,
 ):
-    # We need a new session for the background thread.
-    with session_factory() as session:
-        case = session.get(TestCase, case_id)
-        if not case:
-            return
-        case_snapshot = _build_case_snapshot(case)
+    try:
+        with _case_execution_slot(
+            user_id=user_id,
+            device_serial=device_serial,
+            run_id=run_id,
+            execution_lease=execution_lease,
+        ):
+            # We need a new session for the background thread.
+            with session_factory() as session:
+                case = session.get(TestCase, case_id)
+                if not case:
+                    if device_serial:
+                        unregister_device_abort(device_serial)
+                    registry.complete(run_id, "ERROR")
+                    return
+                case_snapshot = _build_case_snapshot(case)
 
-        from backend.runner import TestRunner
+                from backend.runner import TestRunner
 
-        if abort_event is None:
-            abort_event = _new_abort_event_for_device(device_serial)
+                if abort_event is None:
+                    abort_event = _new_abort_event_for_device(device_serial)
 
-        runner = TestRunner(device_serial=device_serial)
-        runner.abort_event = abort_event
-        try:
-            runner.connect()
+                runner = TestRunner(device_serial=device_serial)
+                runner.abort_event = abort_event
+                try:
+                    runner.connect()
 
-            # Prepare optional variables map.
-            variables_map = {}
-            if env_id:
-                from backend.models import GlobalVariable
+                    # Prepare optional variables map.
+                    variables_map = {}
+                    if env_id:
+                        from backend.models import GlobalVariable
 
-                global_vars = session.exec(
-                    select(GlobalVariable).where(GlobalVariable.env_id == env_id)
-                ).all()
-                for gv in global_vars:
-                    variables_map[gv.key] = gv.value
+                        global_vars = session.exec(
+                            select(GlobalVariable).where(GlobalVariable.env_id == env_id)
+                        ).all()
+                        for gv in global_vars:
+                            variables_map[gv.key] = gv.value
 
-            result = runner.run_case(case_snapshot, extra_variables=variables_map)
+                    result = runner.run_case(case_snapshot, extra_variables=variables_map)
 
-            # Update case status.
-            _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
-        except Exception:
-            _update_case_run_status(session, case_id, ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL")
-        finally:
-            if device_serial:
-                unregister_device_abort(device_serial)
-            registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
+                    # Update case status.
+                    _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
+                except Exception:
+                    _update_case_run_status(session, case_id, ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL")
+                finally:
+                    if device_serial:
+                        unregister_device_abort(device_serial)
+                    registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
+    except RuntimeError as e:
+        # 限流失败，记录日志
+        logger.warning("执行任务限流失败: case_id=%s, user_id=%s, error=%s", case_id, user_id, e)
+        with session_factory() as session:
+            _update_case_run_status(session, case_id, "FAIL")
+        registry.complete(run_id, "RATE_LIMITED")
 
 
 def _run_case_background_cross_platform(
@@ -824,6 +899,8 @@ def _run_case_background_cross_platform(
     device_serial: Optional[str] = None,
     run_id: Optional[str] = None,
     abort_event=None,
+    user_id: Optional[int] = None,
+    execution_lease=None,
 ):
     # Cross-platform path currently requires explicit target device.
     if not device_serial:
@@ -833,56 +910,75 @@ def _run_case_background_cross_platform(
             session_factory=session_factory,
             env_id=env_id,
             device_serial=device_serial,
+            run_id=run_id,
+            abort_event=abort_event,
+            user_id=user_id,
+            execution_lease=execution_lease,
         )
 
-    with session_factory() as session:
-        case = session.get(TestCase, case_id)
-        if not case:
-            return
-        case_snapshot = _build_case_snapshot(case)
+    try:
+        with _case_execution_slot(
+            user_id=user_id,
+            device_serial=device_serial,
+            run_id=run_id,
+            execution_lease=execution_lease,
+        ):
+            with session_factory() as session:
+                case = session.get(TestCase, case_id)
+                if not case:
+                    unregister_device_abort(device_serial)
+                    registry.complete(run_id, "ERROR")
+                    return
+                case_snapshot = _build_case_snapshot(case)
 
-        if abort_event is None:
-            abort_event = register_device_abort(device_serial)
+                if abort_event is None:
+                    abort_event = register_device_abort(device_serial)
 
-        try:
-            device = session.exec(select(Device).where(Device.serial == device_serial)).first()
-            if device:
-                device.status = "BUSY"
-                device.updated_at = datetime.now()
-                session.add(device)
-                session.commit()
+                try:
+                    device = session.exec(select(Device).where(Device.serial == device_serial)).first()
+                    if device:
+                        device.status = "BUSY"
+                        device.updated_at = datetime.now()
+                        session.add(device)
+                    session.commit()
 
-            result = run_case_with_standard_runner(
-                session=session,
-                case=case_snapshot,
-                device_serial=device_serial,
-                env_id=env_id,
-                abort_event=abort_event,
-            )
+                    result = run_case_with_standard_runner(
+                        session=session,
+                        case=case_snapshot,
+                        device_serial=device_serial,
+                        env_id=env_id,
+                        abort_event=abort_event,
+                    )
 
-            _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
-        except Exception as exc:
-            logger.exception(
-                "cross-platform case execution failed: case_id=%s device=%s error=%s",
-                case_id,
-                device_serial,
-                exc,
-            )
-            _update_case_run_status(
-                session,
-                case_id,
-                ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL",
-            )
-        finally:
-            try:
-                restore_device_status_after_execution(session, device_serial)
-            except Exception:
-                logger.exception(
-                    "failed to restore device status after case execution: device=%s",
-                    device_serial,
-                )
-            unregister_device_abort(device_serial)
-            registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
+                    _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
+                except Exception as exc:
+                    logger.exception(
+                        "cross-platform case execution failed: case_id=%s device=%s error=%s",
+                        case_id,
+                        device_serial,
+                        exc,
+                    )
+                    _update_case_run_status(
+                        session,
+                        case_id,
+                        ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL",
+                    )
+                finally:
+                    try:
+                        restore_device_status_after_execution(session, device_serial)
+                    except Exception:
+                        logger.exception(
+                            "failed to restore device status after case execution: device=%s",
+                            device_serial,
+                        )
+                    unregister_device_abort(device_serial)
+                    registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
+    except RuntimeError as e:
+        # 限流失败
+        logger.warning("执行任务限流失败: case_id=%s, user_id=%s, error=%s", case_id, user_id, e)
+        with session_factory() as session:
+            _update_case_run_status(session, case_id, "FAIL")
+        registry.complete(run_id, "RATE_LIMITED")
 
 
 @router.post("/{case_id}/run")
@@ -892,6 +988,7 @@ def run_test_case(
     env_id: Optional[int] = None,
     device_serial: Optional[str] = None,
     session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
 ):
     """Quick run a test case in background."""
     case = session.get(TestCase, case_id)
@@ -911,21 +1008,42 @@ def run_test_case(
     )
     run_func = _run_case_background_cross_platform if use_cross_platform_runner else _run_case_background
     batch_id = str(uuid.uuid4())
-    run_record = _make_case_run_record(
-        case_id=case_id,
-        batch_id=batch_id,
-        device_serial=device_serial,
-    )
-    _update_case_run_status(session, case_id, "RUNNING")
-    background_tasks.add_task(
-        run_func,
-        case_id,
-        session_factory,
-        env_id,
-        device_serial,
-        run_record.run_id,
-        run_record.abort_event,
-    )
+    run_id = str(uuid.uuid4())
+    try:
+        execution_lease = get_execution_limiter().acquire_lease(
+            user_id=current_user.id,
+            device_serial=device_serial,
+            task_id=run_id,
+            timeout=0.0,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+
+    try:
+        run_record = _make_case_run_record(
+            case_id=case_id,
+            batch_id=batch_id,
+            device_serial=device_serial,
+            run_id=run_id,
+        )
+        _update_case_run_status(session, case_id, "RUNNING")
+        background_tasks.add_task(
+            run_func,
+            case_id,
+            session_factory,
+            env_id,
+            device_serial,
+            run_record.run_id,
+            run_record.abort_event,
+            current_user.id,  # 传递 user_id 用于限流
+            execution_lease,
+        )
+    except Exception:
+        execution_lease.release()
+        if device_serial:
+            unregister_device_abort(device_serial)
+        registry.complete(run_id, "ERROR")
+        raise
 
     return {
         "message": "Execution started",
@@ -942,6 +1060,7 @@ def run_test_case_batch(
     case_id: int,
     request: CaseRunBatchRequest,
     session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
 ):
     """Run one case on multiple devices as one cancellable batch."""
     case = session.get(TestCase, case_id)
@@ -995,17 +1114,73 @@ def run_test_case_batch(
         )
 
     batch_id = str(uuid.uuid4())
-    run_ids: List[str] = []
+    run_items = []
+    rate_limited = False
     use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
 
-    _update_case_run_status(session, case_id, "RUNNING")
-
     for serial in runnable_serials:
-        run_record = _make_case_run_record(
-            case_id=case_id,
-            batch_id=batch_id,
-            device_serial=serial,
+        run_id = str(uuid.uuid4())
+        try:
+            execution_lease = get_execution_limiter().acquire_lease(
+                user_id=current_user.id,
+                device_serial=serial,
+                task_id=run_id,
+                timeout=0.0,
+            )
+        except RuntimeError as exc:
+            rate_limited = True
+            blocked_prechecks.append(
+                {
+                    "device_serial": serial,
+                    "reason": str(exc),
+                    "code": "RATE_LIMITED",
+                }
+            )
+            continue
+
+        try:
+            run_record = _make_case_run_record(
+                case_id=case_id,
+                batch_id=batch_id,
+                device_serial=serial,
+                run_id=run_id,
+            )
+        except Exception:
+            execution_lease.release()
+            if serial:
+                unregister_device_abort(serial)
+            for prev_serial, prev_record, prev_lease in run_items:
+                prev_lease.release()
+                if prev_serial:
+                    unregister_device_abort(prev_serial)
+                registry.complete(prev_record.run_id, "ERROR")
+            raise
+        run_items.append((serial, run_record, execution_lease))
+
+    if not run_items:
+        raise HTTPException(
+            status_code=429 if rate_limited else 400,
+            detail={
+                "code": "C1002_CASE_RATE_LIMITED" if rate_limited else "C1001_CASE_PRECHECK_FAILED",
+                "message": "case execution blocked by concurrency limits"
+                if rate_limited
+                else "case precheck failed for all selected devices",
+                "items": blocked_prechecks,
+            },
         )
+
+    try:
+        _update_case_run_status(session, case_id, "RUNNING")
+    except Exception:
+        for serial, run_record, execution_lease in run_items:
+            execution_lease.release()
+            if serial:
+                unregister_device_abort(serial)
+            registry.complete(run_record.run_id, "ERROR")
+        raise
+
+    run_ids: List[str] = []
+    for serial, run_record, execution_lease in run_items:
         run_ids.append(run_record.run_id)
         run_func = _run_case_background_cross_platform if use_cross_platform_runner and serial else _run_case_background
         threading.Thread(
@@ -1017,6 +1192,8 @@ def run_test_case_batch(
                 serial,
                 run_record.run_id,
                 run_record.abort_event,
+                current_user.id,
+                execution_lease,
             ),
             daemon=True,
         ).start()

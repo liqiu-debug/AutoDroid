@@ -17,7 +17,8 @@ import uiautomator2 as u2
 
 from .base_driver import BaseDriver
 from backend.utils import evaluate_page_text_assertion
-from backend.utils.ocr_compat import create_paddle_ocr_engine, extract_ocr_text, run_paddle_ocr
+from backend.utils.ocr_compat import extract_ocr_text, run_paddle_ocr
+from backend.ocr_service import get_ocr_engine
 from backend.utils.template_match import find_template_match, image_to_bgr, load_image_bgr
 
 logger = logging.getLogger(__name__)
@@ -1193,16 +1194,8 @@ class AndroidDriver(BaseDriver):
 
     @classmethod
     def _get_ocr_engine(cls) -> Any:
-        if cls._ocr_engine is None:
-            try:
-                logger.debug("Android OCR engine loading")
-                cls._ocr_engine = create_paddle_ocr_engine(use_angle_cls=False, lang="ch")
-                logger.debug("Android OCR engine ready")
-            except Exception as exc:
-                raise RuntimeError(
-                    "extract_by_ocr 依赖缺失: 请安装 paddleocr 及其依赖"
-                ) from exc
-        return cls._ocr_engine
+        """获取 OCR 引擎（使用全局单例服务）"""
+        return get_ocr_engine(use_angle_cls=False, lang="ch")
 
     def _extract_text_from_screenshot(
         self,

@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from backend import runner as legacy_runner
 from backend.utils.ocr_compat import extract_ocr_text, iter_ocr_text_items, run_paddle_ocr
 
 
@@ -66,6 +68,18 @@ class OCRCompatTests(unittest.TestCase):
         result = run_paddle_ocr(engine, image="dummy", use_cls=False)
         text = extract_ocr_text(result)
         self.assertEqual(text, "确定")
+
+    def test_legacy_runner_uses_global_ocr_service(self):
+        expected_engine = object()
+        legacy_runner._ocr_engine = None
+
+        with patch(
+            "backend.runner.get_ocr_engine",
+            return_value=expected_engine,
+        ) as get_engine_mock:
+            self.assertIs(legacy_runner._get_ocr_engine(), expected_engine)
+
+        get_engine_mock.assert_called_once_with(use_angle_cls=False, lang="ch")
 
 
 if __name__ == "__main__":

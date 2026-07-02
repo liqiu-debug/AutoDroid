@@ -16,6 +16,7 @@ from backend.cross_platform_execution import (
 from backend.feature_flags import FLAG_CROSS_PLATFORM_RUNNER, is_flag_enabled
 from backend.models import TestScenario, ScenarioStep, User, TestCase, Step, TestExecution, TestResult, Device
 from backend.run_control import ABORTED_STATUS, registry
+from backend.execution_limiter import get_execution_limiter
 from backend.schemas import (
     PaginatedTestScenarioRead,
     ScenarioRunRequest,
@@ -1402,7 +1403,50 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
                 ABORTED_STATUS if abort_event and abort_event.is_set() else None,
             )
 
-async def _schedule_concurrent_runs(execution_ids: List[int], scenario_id: int, device_serials: List[str], env_id: Optional[int] = None):
+def _run_single_device_sync_with_lease(
+    execution_id: int,
+    scenario_id: int,
+    device_serial: Optional[str] = None,
+    env_id: Optional[int] = None,
+    execution_lease=None,
+):
+    try:
+        return _run_single_device_sync(
+            execution_id=execution_id,
+            scenario_id=scenario_id,
+            device_serial=device_serial,
+            env_id=env_id,
+        )
+    finally:
+        if execution_lease is not None:
+            execution_lease.release()
+
+
+def _mark_scenario_execution_rate_limited(execution_id: int, reason: str) -> None:
+    from sqlmodel import Session as SQLSession
+
+    with SQLSession(engine) as session:
+        execution = session.get(TestExecution, execution_id)
+        if not execution:
+            return
+        execution.status = "ERROR"
+        execution.end_time = datetime.now()
+        session.add(execution)
+        session.commit()
+        logger.warning(
+            "scenario execution rate limited: execution_id=%s reason=%s",
+            execution_id,
+            reason,
+        )
+
+
+async def _schedule_concurrent_runs(
+    execution_ids: List[int],
+    scenario_id: int,
+    device_serials: List[str],
+    env_id: Optional[int] = None,
+    execution_leases: Optional[List[Any]] = None,
+):
     """使用 ThreadPoolExecutor 并发执行每个设备的测试"""
     loop = asyncio.get_running_loop()
     
@@ -1410,15 +1454,33 @@ async def _schedule_concurrent_runs(execution_ids: List[int], scenario_id: int, 
     max_workers = len(device_serials) if device_serials else 1
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         tasks = []
-        for exec_id, serial in zip(execution_ids, device_serials):
+        for index, (exec_id, serial) in enumerate(zip(execution_ids, device_serials)):
+            execution_lease = (
+                execution_leases[index]
+                if execution_leases is not None and index < len(execution_leases)
+                else None
+            )
+            if execution_lease is None:
+                try:
+                    execution_lease = get_execution_limiter().acquire_lease(
+                        user_id=0,
+                        device_serial=serial,
+                        task_id=f"scenario:{exec_id}",
+                        timeout=0.0,
+                    )
+                except RuntimeError as exc:
+                    _mark_scenario_execution_rate_limited(exec_id, str(exc))
+                    continue
+
             # run_in_executor 将同步阻塞的 Runner 任务放入线程池调度
             task = loop.run_in_executor(
                 executor, 
-                _run_single_device_sync,  # 传入同步目标函数
+                _run_single_device_sync_with_lease,  # 传入同步目标函数
                 exec_id, 
                 scenario_id, 
                 serial, 
-                env_id
+                env_id,
+                execution_lease,
             )
             tasks.append(task)
             
@@ -1533,36 +1595,83 @@ async def run_scenario_api(
             },
         )
 
+    limiter = get_execution_limiter()
+    run_items = []
+    rate_limited = False
     for serial in runnable_serials:
-        meta = _resolve_device_meta(
-            session,
-            serial,
-            fallback_display=(serial or "Default Runner"),
+        try:
+            execution_lease = limiter.acquire_lease(
+                user_id=current_user.id,
+                device_serial=serial,
+                task_id=f"scenario:{batch_id}:{serial or 'default'}",
+                timeout=0.0,
+            )
+        except RuntimeError as exc:
+            rate_limited = True
+            blocked_prechecks.append(
+                {
+                    "device_serial": serial,
+                    "reason": str(exc),
+                    "code": "RATE_LIMITED",
+                }
+            )
+            continue
+        run_items.append((serial, execution_lease))
+
+    if not run_items:
+        raise HTTPException(
+            status_code=429 if rate_limited else 400,
+            detail={
+                "code": "S1002_SCENARIO_RATE_LIMITED"
+                if rate_limited
+                else "S1001_SCENARIO_PRECHECK_FAILED",
+                "message": "scenario execution blocked by concurrency limits"
+                if rate_limited
+                else "scenario precheck failed for all selected devices",
+                "items": blocked_prechecks,
+            },
         )
 
-        execution = TestExecution(
+    execution_leases = []
+    scheduled_serials = []
+    try:
+        for serial, execution_lease in run_items:
+            meta = _resolve_device_meta(
+                session,
+                serial,
+                fallback_display=(serial or "Default Runner"),
+            )
+
+            execution = TestExecution(
+                scenario_id=scenario_id,
+                scenario_name=scenario.name,
+                status="PENDING",
+                executor_id=current_user.id,
+                executor_name=executor_name,
+                device_serial=meta.get("device_serial"),
+                platform=meta.get("platform"),
+                device_info=meta.get("device_info"),
+                batch_id=batch_id,
+                batch_name=f"{scenario.name} 并发运行"
+            )
+            session.add(execution)
+            session.commit()
+            session.refresh(execution)
+            execution_ids.append(execution.id)
+            execution_leases.append(execution_lease)
+            scheduled_serials.append(serial)
+
+        asyncio.create_task(_schedule_concurrent_runs(
+            execution_ids=execution_ids,
             scenario_id=scenario_id,
-            scenario_name=scenario.name,
-            status="PENDING", 
-            executor_id=current_user.id,
-            executor_name=executor_name,
-            device_serial=meta.get("device_serial"),
-            platform=meta.get("platform"),
-            device_info=meta.get("device_info"),
-            batch_id=batch_id,
-            batch_name=f"{scenario.name} 并发运行"
-        )
-        session.add(execution)
-        session.commit()
-        session.refresh(execution)
-        execution_ids.append(execution.id)
-        
-    asyncio.create_task(_schedule_concurrent_runs(
-        execution_ids=execution_ids,
-        scenario_id=scenario_id,
-        device_serials=runnable_serials,
-        env_id=request.env_id
-    ))
+            device_serials=scheduled_serials,
+            env_id=request.env_id,
+            execution_leases=execution_leases,
+        ))
+    except Exception:
+        for _serial, execution_lease in run_items:
+            execution_lease.release()
+        raise
     
     return {
         "message": "Batch execution started", 
