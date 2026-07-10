@@ -350,6 +350,9 @@ def _broadcast_video_packet(dev_info: DeviceInfo, data: bytes) -> None:
 
     nal_types = _update_h264_init_cache(dev_info, data)
 
+    # 崩溃复现录制取流点：录制器在这里直接消费 reader 线程解析出的原始
+    # 码流，位于所有观看端队列与丢帧路径（ClientStreamQueue.offer）之前。
+    # 观看端拥塞丢帧（含等待关键帧状态下的丢弃）不会影响回放素材完整性。
     recorder = dev_info.recorder
     if recorder:
         try:

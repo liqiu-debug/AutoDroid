@@ -335,6 +335,49 @@ class ClientStreamQueueTests(unittest.TestCase):
         self.assertEqual(_drain(client_queue), [SPS, PPS, fresh_idr])
 
 
+class _RecorderProbe:
+    """记录 ingest 调用的假录制器，用于验证录制取流点。"""
+
+    def __init__(self):
+        self.packets = []
+
+    def ingest(self, data: bytes) -> None:
+        self.packets.append(data)
+
+
+class CrashReplayTapPointTests(unittest.TestCase):
+    """崩溃复现录制器必须消费丢帧路径之前的原始码流。"""
+
+    def test_recorder_receives_raw_stream_before_client_drop_path(self):
+        dev_info = DeviceInfo("serial-recorder", 27183)
+        recorder = _RecorderProbe()
+        dev_info.recorder = recorder
+        client_queue = ClientStreamQueue(maxsize=2)
+        dev_info.input_queues.append(client_queue)
+        p1 = b"\x00\x00\x00\x01\x41\x9a\x01"
+        p2 = b"\x00\x00\x00\x01\x41\x9a\x02"
+
+        _broadcast_video_packet(dev_info, SPS)
+        _broadcast_video_packet(dev_info, PPS)  # 队列满 2/2
+        _broadcast_video_packet(dev_info, p1)   # 观看端丢弃 → 等待关键帧
+        _broadcast_video_packet(dev_info, p2)   # 观看端继续丢弃
+
+        self.assertTrue(client_queue.awaiting_keyframe)
+        # 观看端丢掉的 P 帧原样进入录制器，顺序完整
+        self.assertEqual(recorder.packets, [SPS, PPS, p1, p2])
+
+    def test_recorder_receives_stream_without_any_viewer(self):
+        dev_info = DeviceInfo("serial-no-viewer", 27184)
+        recorder = _RecorderProbe()
+        dev_info.recorder = recorder
+        p1 = b"\x00\x00\x00\x01\x41\x9a\x01"
+
+        _broadcast_video_packet(dev_info, IDR)
+        _broadcast_video_packet(dev_info, p1)
+
+        self.assertEqual(recorder.packets, [IDR, p1])
+
+
 class DeviceStreamManagerInitializationTests(unittest.TestCase):
     def test_connection_exception_is_visible_in_device_status(self):
         manager = ScrcpyDeviceManager()
