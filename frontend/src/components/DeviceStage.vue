@@ -13,6 +13,7 @@ import { useStageCanvas } from '@/composables/useStageCanvas'
 import { useScreenCrop, isQuickImageSuggestedError } from '@/composables/useScreenCrop'
 import { useLivePreviewPolling } from '@/composables/useLivePreviewPolling'
 import ScrcpyPlayer from './ScrcpyPlayer.vue'
+import IosMjpegPlayer from './IosMjpegPlayer.vue'
 
 const caseStore = useCaseStore()
 
@@ -549,7 +550,7 @@ defineExpose({
       </div>
       <div class="toolbar-right">
         <slot name="before-refresh"></slot>
-        <el-button v-if="liveMode" :icon="Refresh" @click="fetchLiveHierarchy({ showLoading: true, forceHierarchy: true })" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">刷新层级</el-button>
+        <el-button v-if="liveMode" :icon="Refresh" @click="fetchLiveHierarchy({ showLoading: true, forceHierarchy: true })" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">{{ isIosLivePreview ? '刷新截图/层级' : '刷新层级' }}</el-button>
         <el-button v-if="!liveMode" :icon="Refresh" @click="fetchDump" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">刷新</el-button>
       </div>
     </div>
@@ -642,6 +643,19 @@ defineExpose({
       <div v-else class="no-device">
         <el-empty description="点击刷新获取设备状态" :image-size="80" />
       </div>
+
+      <!--
+        iOS 实时画面层（WDA MJPEG）：只读预览，鼠标事件穿透到底层静态画布。
+        点击 / 悬停 / 框选仍基于"静态截图 + 层级"坐标系，保证录制正确性；
+        框选或快捷图像提示期间隐藏实时层，露出真实的截取源画面（静态截图）。
+      -->
+      <IosMjpegPlayer
+        v-if="isIosLivePreview"
+        v-show="!isAnyCropMode && !quickImagePrompt"
+        class="ios-live-layer"
+        :serial="selectedSerial"
+        @wda-unavailable="fetchDevices()"
+      />
 
       <!-- Hover Overlay -->
       <div class="hover-overlay" :style="getOverlayStyle()"></div>
@@ -945,6 +959,15 @@ defineExpose({
   border-radius: 8px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
   cursor: crosshair;
+}
+
+/*
+ * iOS 实时画面层：与 .canvas-container 保持相同的内边距，
+ * 使实时帧的 contain 适配约束盒与底层静态截图完全一致，
+ * 悬停高亮 / 框选遮罩（按静态截图坐标计算）在视觉上自然对齐。
+ */
+.ios-live-layer {
+  padding: 20px;
 }
 
 .no-device {
