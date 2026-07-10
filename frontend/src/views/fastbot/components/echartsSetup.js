@@ -7,6 +7,7 @@ import {
     LegendComponent,
     GridComponent,
     MarkPointComponent,
+    MarkLineComponent,
     ToolboxComponent,
     DataZoomComponent,
 } from 'echarts/components'
@@ -19,6 +20,7 @@ use([
     LegendComponent,
     GridComponent,
     MarkPointComponent,
+    MarkLineComponent,
     ToolboxComponent,
     DataZoomComponent,
 ])
