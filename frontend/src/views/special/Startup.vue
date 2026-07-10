@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { VideoPlay, Refresh, View } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
 
 const router = useRouter()
 
@@ -30,6 +31,9 @@ const selectedDevices = ref([])
 const devicesLoading = ref(false)
 const tasks = ref([])
 const tasksLoading = ref(false)
+const tasksPage = ref(1)
+const tasksPageSize = ref(20)
+const tasksTotal = ref(0)
 const submitting = ref(false)
 let pollTimer = null
 let pageActive = false
@@ -66,13 +70,28 @@ const fetchDevices = async () => {
 const fetchTasks = async () => {
     tasksLoading.value = true
     try {
-        const res = await api.getStartupTasks({ limit: 30 })
-        tasks.value = res.data || []
+        const res = await api.getStartupTasks({
+            skip: (tasksPage.value - 1) * tasksPageSize.value,
+            limit: tasksPageSize.value,
+        })
+        tasks.value = res.data.items || []
+        tasksTotal.value = res.data.total || 0
     } catch (err) {
         ElMessage.error('获取启动测试任务失败')
     } finally {
         tasksLoading.value = false
     }
+}
+
+const handleTasksPageChange = (val) => {
+    tasksPage.value = val
+    fetchTasks()
+}
+
+const handleTasksSizeChange = (val) => {
+    tasksPageSize.value = val
+    tasksPage.value = 1
+    fetchTasks()
 }
 
 const refreshAll = async () => {
@@ -122,6 +141,7 @@ const submit = async () => {
     try {
         await api.runStartupTest(buildPayload())
         ElMessage.success(`已提交 ${selectedDevices.value.length} 台设备的冷热启动测试`)
+        tasksPage.value = 1
         await fetchTasks()
     } catch (err) {
         ElMessage.error(err.response?.data?.detail || err.message || '提交启动测试失败')
@@ -138,12 +158,6 @@ const formatMs = (value) => {
 const formatDeviceName = (serial) => {
     const device = devices.value.find(item => item.serial === serial)
     return device?.custom_name || device?.market_name || device?.model || serial || '未知设备'
-}
-const statusTagType = (status) => {
-    if (status === 'COMPLETED') return 'success'
-    if (status === 'FAILED') return 'danger'
-    if (status === 'RUNNING') return 'warning'
-    return 'info'
 }
 const formatModes = (task) => {
     const modes = task.summary?.startup_config?.startup_modes || []
@@ -322,6 +336,7 @@ onUnmounted(() => {
                         <el-button link type="primary" @click="goReportCenter">查看报告中心</el-button>
                     </div>
                 </template>
+                <div class="tasks-table-area">
                 <el-table
                     :data="tasks"
                     v-loading="tasksLoading"
@@ -373,6 +388,20 @@ onUnmounted(() => {
                         </template>
                     </el-table-column>
                 </el-table>
+                </div>
+
+                <div class="pagination-footer" v-if="tasksTotal > 0">
+                    <el-pagination
+                        v-model:current-page="tasksPage"
+                        v-model:page-size="tasksPageSize"
+                        :page-sizes="[10, 20, 50]"
+                        :background="true"
+                        layout="total, sizes, prev, pager, next"
+                        :total="tasksTotal"
+                        @size-change="handleTasksSizeChange"
+                        @current-change="handleTasksPageChange"
+                    />
+                </div>
             </el-card>
         </div>
     </div>
@@ -409,6 +438,20 @@ onUnmounted(() => {
 .tasks-card :deep(.el-card__body) {
     flex: 1;
     min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.tasks-table-area {
+    flex: 1;
+    min-height: 0;
+}
+
+.pagination-footer {
+    flex-shrink: 0;
+    padding-top: 10px;
+    display: flex;
+    justify-content: flex-end;
 }
 
 .card-header,

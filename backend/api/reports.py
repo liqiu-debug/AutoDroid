@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select, func, desc
+from sqlalchemy import or_
+from sqlmodel import Session, col, select, func, desc
 from ..database import get_session
 from ..models import Device, ScheduledTask, TestExecution, TestResult, TestScenario, User
 from pydantic import BaseModel
@@ -555,40 +556,44 @@ def get_reports(
     status: Optional[str] = None,
     platform: Optional[str] = None,
     device_serial: Optional[str] = None,
+    keyword: Optional[str] = None,
     session: Session = Depends(get_session)
 ):
     query = select(TestExecution, User.full_name, User.username).outerjoin(User, TestExecution.executor_id == User.id)
-    
-    if scenario_id:
-        query = query.where(TestExecution.scenario_id == scenario_id)
-    if status and status != 'all':
-        query = query.where(TestExecution.status == status)
-    if platform and platform != "all":
-        query = query.where(TestExecution.platform == platform.lower())
-    if device_serial:
-        query = query.where(TestExecution.device_serial == device_serial)
-        
     count_query = select(func.count(TestExecution.id))
+
+    conditions = []
     if scenario_id:
-        count_query = count_query.where(TestExecution.scenario_id == scenario_id)
+        conditions.append(TestExecution.scenario_id == scenario_id)
     if status and status != 'all':
-        count_query = count_query.where(TestExecution.status == status)
+        conditions.append(TestExecution.status == status)
     if platform and platform != "all":
-        count_query = count_query.where(TestExecution.platform == platform.lower())
+        conditions.append(TestExecution.platform == platform.lower())
     if device_serial:
-        count_query = count_query.where(TestExecution.device_serial == device_serial)
-    
+        conditions.append(TestExecution.device_serial == device_serial)
+    if keyword:
+        conditions.append(
+            or_(
+                col(TestExecution.scenario_name).contains(keyword),
+                col(TestExecution.batch_name).contains(keyword),
+            )
+        )
+
+    for condition in conditions:
+        query = query.where(condition)
+        count_query = count_query.where(condition)
+
     total = session.exec(count_query).one()
-    
+
     query = query.order_by(desc(TestExecution.start_time))
     results = session.exec(query.offset(skip).limit(limit)).all()
-    
+
     response = []
     for execution, f_name, u_name in results:
         data = dump_model(execution)
         data['executor_name'] = f_name or u_name or "System"
         response.append(TestExecutionRead(**data))
-        
+
     return PaginatedTestExecutionRead(total=total, items=response)
 
 

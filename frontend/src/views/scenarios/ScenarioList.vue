@@ -1,10 +1,12 @@
 <script setup>
 import { ref, onActivated, onDeactivated, onUnmounted, computed, reactive } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus, Search, VideoPlay, Edit, Delete, Refresh, MoreFilled, 
+import { Plus, Search, VideoPlay, Edit, Delete, Refresh, MoreFilled,
          Check, Close, Timer, CircleClose } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import FolderTreePanel from '@/components/FolderTreePanel.vue'
+import { deviceStatusLabel, deviceStatusTagType, runStatusColor } from '@/utils/statusMeta'
 import { useUserStore } from '@/stores/useUserStore'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
@@ -12,6 +14,27 @@ import { useClientMode } from '@/composables/useClientMode'
 const router = useRouter()
 const userStore = useUserStore()
 const { isMobileMode } = useClientMode()
+
+// ==================== Folder Tree ====================
+const selectedFolderId = ref(null)
+const treePanelRef = ref(null)
+
+const refreshFolderTree = () => treePanelRef.value?.refresh()
+
+const fetchScenarioFolderTree = async () => {
+    const res = await api.getScenarioFolderTree()
+    return { tree: res.data.tree || [], items: res.data.all_scenarios || [] }
+}
+
+const handleFolderSelect = (folderId) => {
+    selectedFolderId.value = folderId
+    currentPage.value = 1
+    fetchScenarios()
+}
+
+const handleOpenScenario = (node) => {
+    router.push(`/ui/scenarios/${node.scenario_id}/edit`)
+}
 
 // Data
 const scenarios = ref([])
@@ -37,6 +60,9 @@ const fetchScenarios = async () => {
             skip: (currentPage.value - 1) * pageSize.value,
             limit: pageSize.value,
             keyword: searchQuery.value || undefined
+        }
+        if (selectedFolderId.value !== null) {
+            params.folder_id = selectedFolderId.value
         }
         const res = await api.getScenarios(params)
         
@@ -81,7 +107,11 @@ const handleCurrentChange = (val) => {
 }
 
 const handleCreate = () => {
-    router.push('/ui/scenarios/create')
+    const query = {}
+    if (selectedFolderId.value !== null) {
+        query.folder_id = selectedFolderId.value
+    }
+    router.push({ path: '/ui/scenarios/create', query })
 }
 
 const handleEdit = (id) => {
@@ -315,6 +345,7 @@ const handleDelete = async (row) => {
         await api.deleteScenario(row.id)
         ElMessage.success('删除成功')
         fetchScenarios()
+        refreshFolderTree()
     } catch (err) {
         if (err !== 'cancel') ElMessage.error('删除失败: ' + summarizeHttpDetail(err))
     } finally {
@@ -330,18 +361,6 @@ const canDeleteScenario = (row) => {
 
 const deletePermissionTip = (row) => {
     return canDeleteScenario(row) ? '删除' : '仅创建人或管理员可以删除'
-}
-
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
 }
 
 const isDeviceSelectable = (device) => device?.status === 'IDLE'
@@ -382,17 +401,6 @@ const formatDate = (date) => {
     return d.format('MM-DD HH:mm')
 }
 
-const getStatusColor = (status) => {
-    if (!status) return '#909399' // Gray
-    const s = normalizeRunStatus(status)
-    if (s === 'pass' || s === 'success') return '#67C23A' // Green
-    if (s === 'fail' || s === 'failed') return '#F56C6C' // Red
-    if (s === 'warning') return '#E6A23C' // Orange
-    if (s === 'running') return '#409EFF' // Blue
-    if (s === 'aborted' || s === 'cancelled') return '#909399'
-    return '#E6A23C' // Warning
-}
-
 const normalizeRunStatus = (status) => (status || '').toString().toLowerCase()
 
 const getDuration = (row) => {
@@ -406,6 +414,7 @@ const getDuration = (row) => {
 
 onActivated(() => {
     fetchScenarios()
+    refreshFolderTree()
 })
 
 onDeactivated(stopActiveRunPolling)
@@ -440,7 +449,7 @@ onUnmounted(stopActiveRunPolling)
                 :key="item.id"
                 class="mobile-scenario-card"
             >
-                <div class="mobile-scenario-strip" :style="{ backgroundColor: getStatusColor(item.last_run_status) }"></div>
+                <div class="mobile-scenario-strip" :style="{ backgroundColor: runStatusColor(item.last_run_status) }"></div>
                 <div class="mobile-scenario-body">
                     <div class="mobile-scenario-header">
                         <div class="mobile-scenario-title">
@@ -479,7 +488,27 @@ onUnmounted(stopActiveRunPolling)
     </div>
 
     <div v-else class="scenario-list-container">
-        <div class="content-wrapper">
+        <el-container class="main-layout">
+            <!-- Left: Folder Tree -->
+            <el-aside width="200px" class="folder-aside">
+                <FolderTreePanel
+                    ref="treePanelRef"
+                    title="场景目录"
+                    all-label="所有场景"
+                    item-id-key="scenario_id"
+                    :fetch-tree="fetchScenarioFolderTree"
+                    :create-folder="api.createScenarioFolder"
+                    :rename-folder="api.renameScenarioFolder"
+                    :delete-folder="api.deleteScenarioFolder"
+                    :move-item="api.moveScenario"
+                    @select-folder="handleFolderSelect"
+                    @open-item="handleOpenScenario"
+                    @item-moved="fetchScenarios"
+                />
+            </el-aside>
+
+            <el-main class="list-main">
+                <div class="content-wrapper">
             <!-- Header -->
             <div class="list-header">
                 <div class="left-filters">
@@ -516,7 +545,7 @@ onUnmounted(stopActiveRunPolling)
                         class="scenario-item"
                     >
                         <!-- 1. Status Strip (Left) -->
-                        <div class="status-strip" :style="{ backgroundColor: getStatusColor(item.last_run_status) }"></div>
+                        <div class="status-strip" :style="{ backgroundColor: runStatusColor(item.last_run_status) }"></div>
                         
                         <!-- 2. Main Content (Middle) -->
                         <div class="main-content">
@@ -646,6 +675,8 @@ onUnmounted(stopActiveRunPolling)
                 />
             </div>
         </div>
+            </el-main>
+        </el-container>
 
         <!-- Run Configuration Dialog -->
         <el-dialog v-model="runDialogVisible" title="运行配置" width="400px">
@@ -662,7 +693,7 @@ onUnmounted(stopActiveRunPolling)
                             <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                                 <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
                                 <div style="display: flex; align-items: center; gap: 6px;">
-                                    <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                    <el-tag :type="deviceStatusTagType(dev.status)" size="small">{{ deviceStatusLabel(dev.status) }}</el-tag>
                                     <span v-if="deviceUnavailableReason(dev)" style="font-size: 12px; color: #e6a23c;">
                                         {{ deviceUnavailableReason(dev) }}
                                     </span>
@@ -713,7 +744,7 @@ onUnmounted(stopActiveRunPolling)
                 >
                     <div class="mobile-device-check-content">
                         <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
-                        <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                        <el-tag :type="deviceStatusTagType(dev.status)" size="small">{{ deviceStatusLabel(dev.status) }}</el-tag>
                     </div>
                     <small v-if="deviceUnavailableReason(dev)">{{ deviceUnavailableReason(dev) }}</small>
                 </el-checkbox>
@@ -750,13 +781,35 @@ onUnmounted(stopActiveRunPolling)
     background: #f2f3f5;
 }
 
-.content-wrapper {
+.main-layout {
     flex: 1;
+    overflow: hidden;
+    margin: 10px;
+    gap: 10px;
+}
+
+.folder-aside {
     background: #fff;
     border-radius: 4px;
     display: flex;
     flex-direction: column;
-    margin: 10px;
+    overflow: hidden;
+}
+
+.list-main {
+    padding: 0 !important;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.content-wrapper {
+    flex: 1;
+    min-height: 0;
+    background: #fff;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
     padding: 20px;
     overflow: hidden;
 }

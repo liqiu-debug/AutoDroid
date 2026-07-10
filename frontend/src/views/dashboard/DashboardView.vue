@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useClientMode } from '@/composables/useClientMode'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
@@ -266,16 +267,6 @@ const formatDuration = (seconds) => {
   const m = Math.floor(duration / 60)
   const s = Math.round(duration % 60)
   return `${m}m ${s}s`
-}
-
-const statusTagType = (status) => {
-  const normalized = (status || '').toUpperCase()
-  if (normalized === 'PASS') return 'success'
-  if (normalized === 'WARNING') return 'warning'
-  if (normalized === 'FAIL' || normalized === 'ERROR') return 'danger'
-  if (normalized === 'ABORTED') return 'info'
-  if (normalized === 'RUNNING') return 'info'
-  return 'info'
 }
 
 const alertType = (level) => {

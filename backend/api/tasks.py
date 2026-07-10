@@ -7,12 +7,18 @@ import json
 import logging
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select
+from sqlalchemy import or_
+from sqlmodel import Session, col, func, select
 from datetime import datetime
 
 from backend.database import get_session
 from backend.models import ScheduledTask, TestScenario, User
-from backend.schemas import ScheduledTaskCreate, ScheduledTaskRead, ScheduledTaskUpdate
+from backend.schemas import (
+    PaginatedScheduledTaskRead,
+    ScheduledTaskCreate,
+    ScheduledTaskRead,
+    ScheduledTaskUpdate,
+)
 from backend.api import deps
 from backend.scheduler_service import get_scheduler, SchedulerService
 
@@ -317,10 +323,33 @@ def _task_to_read(task: ScheduledTask, scenario_name: str = "") -> dict:
     }
 
 
-@router.get("/", response_model=List[ScheduledTaskRead])
-def list_tasks(session: Session = Depends(get_session)):
-    """获取所有定时任务"""
-    tasks = session.exec(select(ScheduledTask).order_by(ScheduledTask.id.desc())).all()
+@router.get("/", response_model=PaginatedScheduledTaskRead)
+def list_tasks(
+    skip: int = 0,
+    limit: int = 20,
+    keyword: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    """分页获取定时任务，keyword 匹配任务名称或场景名称"""
+    query = select(ScheduledTask).outerjoin(
+        TestScenario, ScheduledTask.scenario_id == TestScenario.id
+    )
+    count_query = select(func.count(ScheduledTask.id)).outerjoin(
+        TestScenario, ScheduledTask.scenario_id == TestScenario.id
+    )
+    if keyword:
+        condition = or_(
+            col(ScheduledTask.name).contains(keyword),
+            col(TestScenario.name).contains(keyword),
+        )
+        query = query.where(condition)
+        count_query = count_query.where(condition)
+
+    total = session.exec(count_query).one()
+    tasks = session.exec(
+        query.order_by(ScheduledTask.id.desc()).offset(skip).limit(limit)
+    ).all()
+
     result = []
     for task in tasks:
         scenario_name = "智能探索"
@@ -328,7 +357,7 @@ def list_tasks(session: Session = Depends(get_session)):
             scenario = session.get(TestScenario, task.scenario_id)
             scenario_name = scenario.name if scenario else "未知场景"
         result.append(_task_to_read(task, scenario_name))
-    return result
+    return PaginatedScheduledTaskRead(total=total, items=result)
 
 
 @router.post("/", response_model=ScheduledTaskRead)

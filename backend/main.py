@@ -64,6 +64,7 @@ SPA_EXCLUDED_PREFIXES = (
     "auth",
     "cases",
     "folders",
+    "scenario-folders",
     "scenarios",
     "reports",
     "tasks",
@@ -277,6 +278,7 @@ def _register_http_routers(
     target.include_router(admin.router, prefix="/admin", tags=["admin"], include_in_schema=include_in_schema)
     target.include_router(cases.router, prefix="/cases", tags=["cases"], include_in_schema=include_in_schema)
     target.include_router(folders.router, prefix="/folders", tags=["folders"], include_in_schema=include_in_schema)
+    target.include_router(folders.scenario_router, prefix="/scenario-folders", tags=["scenario-folders"], include_in_schema=include_in_schema)
     target.include_router(scenarios.router, prefix="/scenarios", tags=["scenarios"], include_in_schema=include_in_schema)
     target.include_router(reports.router, prefix=reports_prefix, tags=["reports"], include_in_schema=include_in_schema)
     target.include_router(runs.router, prefix="/runs", tags=["runs"], include_in_schema=include_in_schema)

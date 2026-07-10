@@ -3,13 +3,25 @@ import { computed, onActivated, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CopyDocument, Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
 import api from '@/api'
+import { useRemoteSearch } from '@/composables/useRemoteSearch'
 
 const pageSets = ref([])
-const cases = ref([])
 const activeSetId = ref(null)
 const loading = reactive({
   page: false,
   saving: false,
+})
+
+// 进入用例选择器：远程搜索，避免用例超量（原一次拉 500 条）时静默截断
+const {
+    options: caseOptions,
+    loading: casesLoading,
+    search: searchCases,
+    ensureOption: ensureCaseOption,
+} = useRemoteSearch({
+    fetcher: (keyword) => api.getTestCases({ skip: 0, limit: 50, keyword: keyword || undefined })
+        .then(({ data }) => data.items || []),
+    resolver: (id) => api.getTestCase(id).then(({ data }) => data).catch(() => null),
 })
 
 const form = reactive({
@@ -45,11 +57,10 @@ const loadForm = (item) => {
     description: item.description || '',
     pages: clonePagesForForm(item.pages || []),
   })
-}
-
-const fetchCases = async () => {
-  const { data } = await api.getTestCases({ skip: 0, limit: 500 })
-  cases.value = data.items || []
+  // 编辑回显：把已引用的用例固定进候选，避免只显示裸 ID
+  form.pages.forEach(page => {
+    if (page.case_id) ensureCaseOption(page.case_id)
+  })
 }
 
 const fetchPageSets = async () => {
@@ -67,7 +78,7 @@ const fetchPageSets = async () => {
 const refreshAll = async () => {
   loading.page = true
   try {
-    await Promise.all([fetchCases(), fetchPageSets()])
+    await Promise.all([searchCases(''), fetchPageSets()])
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || err.message || '加载页面合集失败')
   } finally {
@@ -221,8 +232,16 @@ onActivated(refreshAll)
           </el-table-column>
           <el-table-column label="进入用例" min-width="240">
             <template #default="{ row }">
-              <el-select v-model="row.case_id" filterable class="full-control">
-                <el-option v-for="item in cases" :key="item.id" :label="item.name" :value="item.id" />
+              <el-select
+                v-model="row.case_id"
+                filterable
+                remote
+                :remote-method="searchCases"
+                :loading="casesLoading"
+                placeholder="搜索并选择用例"
+                class="full-control"
+              >
+                <el-option v-for="item in caseOptions" :key="item.id" :label="item.name" :value="item.id" />
               </el-select>
             </template>
           </el-table-column>
