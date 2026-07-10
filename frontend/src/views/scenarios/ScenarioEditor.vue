@@ -189,7 +189,12 @@ const saveSteps = async () => {
 
     // Create if new
     if (!targetId) {
-         const res = await api.createScenario({ name: currentScenario.value.name })
+         const createPayload = { name: currentScenario.value.name }
+         const folderId = route.query.folder_id ? Number(route.query.folder_id) : null
+         if (folderId) {
+             createPayload.folder_id = folderId
+         }
+         const res = await api.createScenario(createPayload)
          targetId = res.data.id
          await router.replace(`/ui/scenarios/${targetId}/edit`)
          ElMessage.success('场景创建成功')

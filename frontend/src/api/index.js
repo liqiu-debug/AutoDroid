@@ -124,6 +124,23 @@ export default {
         return api.patch(`/folders/move-case/${caseId}`, { folder_id: folderId })
     },
 
+    // Scenario Folders
+    getScenarioFolderTree() {
+        return api.get('/scenario-folders/tree')
+    },
+    createScenarioFolder(data) {
+        return api.post('/scenario-folders/', data)
+    },
+    renameScenarioFolder(id, data) {
+        return api.put(`/scenario-folders/${id}`, data)
+    },
+    deleteScenarioFolder(id) {
+        return api.delete(`/scenario-folders/${id}`)
+    },
+    moveScenario(scenarioId, folderId) {
+        return api.patch(`/scenario-folders/move-scenario/${scenarioId}`, { folder_id: folderId })
+    },
+
     // Device
     getDeviceDump(serial, options = {}) {
         const signal = options?.signal
