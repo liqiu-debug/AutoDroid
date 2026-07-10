@@ -2,7 +2,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from backend.fastbot_runner import _monitor_logcat, run_fastbot_task
+from backend.fastbot.logcat import _monitor_logcat
+from backend.fastbot.runner import run_fastbot_task
 
 
 class _FakeStream:
@@ -63,10 +64,10 @@ class FastbotLogcatReplayTests(unittest.IsolatedAsyncioTestCase):
         })
 
         with patch(
-            "backend.fastbot_runner.asyncio.create_subprocess_shell",
+            "backend.fastbot.logcat.asyncio.create_subprocess_shell",
             new=AsyncMock(return_value=proc),
         ), patch(
-            "backend.fastbot_runner._capture_logcat_snapshot",
+            "backend.fastbot.logcat._capture_logcat_snapshot",
             new=AsyncMock(return_value="log snapshot"),
         ):
             await _monitor_logcat(
@@ -95,7 +96,7 @@ class FastbotLogcatReplayTests(unittest.IsolatedAsyncioTestCase):
         replay_callback = AsyncMock(side_effect=RuntimeError("replay export failed"))
 
         with patch(
-            "backend.fastbot_runner.asyncio.create_subprocess_shell",
+            "backend.fastbot.logcat.asyncio.create_subprocess_shell",
             new=AsyncMock(return_value=proc),
         ):
             await _monitor_logcat(
@@ -135,22 +136,22 @@ class FastbotLogcatReplayTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         with patch(
-            "backend.fastbot_runner.push_fastbot_assets",
+            "backend.fastbot.runner.push_fastbot_assets",
             new=AsyncMock(),
         ), patch(
-            "backend.fastbot_runner._adb_shell",
+            "backend.fastbot.runner._adb_shell",
             new=AsyncMock(return_value=""),
         ), patch(
-            "backend.fastbot_runner._monitor_logcat",
+            "backend.fastbot.runner._monitor_logcat",
             new=AsyncMock(side_effect=fake_logcat),
         ), patch(
-            "backend.fastbot_runner._monitor_performance",
+            "backend.fastbot.runner._monitor_performance",
             new=stuck_monitor,
         ), patch(
-            "backend.fastbot_runner.asyncio.create_subprocess_shell",
+            "backend.fastbot.runner.asyncio.create_subprocess_shell",
             new=AsyncMock(return_value=monkey_proc),
         ), patch(
-            "backend.fastbot_runner.MONITOR_TASK_SHUTDOWN_TIMEOUT_SECONDS",
+            "backend.fastbot.runner.MONITOR_TASK_SHUTDOWN_TIMEOUT_SECONDS",
             0.05,
         ):
             result = await asyncio.wait_for(

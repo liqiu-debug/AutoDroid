@@ -126,7 +126,7 @@ def _ensure_report_trace_analysis(
         task = session.get(FastbotTask, task_id)
         if task and task.package_name:
             try:
-                from backend.fastbot_runner import _analyze_exported_traces
+                from backend.fastbot.perfetto import _analyze_exported_traces
 
                 _analyze_exported_traces(task.package_name, trace_artifacts, jank_events)
                 summary["analyzed_trace_count"] = sum(
@@ -894,7 +894,7 @@ async def _execute_fastbot_async(
     monitor_options: Dict = None,
 ):
     """异步执行 Fastbot，使用 try...finally 确保设备锁释放"""
-    from backend.fastbot_runner import run_fastbot_task
+    from backend.fastbot.runner import run_fastbot_task
     from sqlmodel import Session as SQLSession
 
     with SQLSession(engine) as session:
@@ -1013,7 +1013,7 @@ async def _execute_startup_task_async(
     task_id: int,
     config: Dict[str, Any],
 ):
-    from backend.fastbot_runner import run_startup_task
+    from backend.fastbot.startup import run_startup_task
     from sqlmodel import Session as SQLSession
 
     serial = ""
@@ -1142,7 +1142,7 @@ def _execute_fluency_background(task_id: int):
 
 
 async def _execute_fluency_async(task_id: int):
-    from backend.fastbot_runner import run_manual_fluency_session
+    from backend.fastbot.runner import run_manual_fluency_session
     from sqlmodel import Session as SQLSession
 
     runtime = _fluency_runtimes.get(task_id)
