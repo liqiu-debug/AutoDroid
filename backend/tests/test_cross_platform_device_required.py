@@ -6,7 +6,7 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from backend.api import ws_run
 from backend.api import cases as cases_api
-from backend.api import scenarios as scenarios_api
+from backend import scenario_execution
 from backend.models import (
     ScenarioStep,
     TestCase,
@@ -139,9 +139,9 @@ class ScenarioDeviceRequiredTests(unittest.TestCase):
             self.execution_id = execution.id
 
     def test_run_single_device_sync_without_device_marks_execution_error(self):
-        with patch.object(scenarios_api, "engine", self.engine), \
-             self.assertLogs("backend.api.scenarios", level="ERROR") as logs:
-            scenarios_api._run_single_device_sync(
+        with patch.object(scenario_execution, "engine", self.engine), \
+             self.assertLogs("backend.scenario_execution", level="ERROR") as logs:
+            scenario_execution._run_single_device_sync(
                 execution_id=self.execution_id,
                 scenario_id=self.scenario_id,
                 device_serial=None,
