@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import SQLModel, Session, create_engine, select
 
-from backend.api.compatibility import compare_page_snapshots, create_run, delete_page_set, delete_run, get_run, _execute_cell
+from backend.api.compatibility import compare_page_snapshots, create_run, delete_page_set, delete_run, get_run, list_runs, _execute_cell
 from backend.api.packages import install_app_package_to_device
 from backend.models import AppPackage, CompatPageSet, CompatibilityCell, CompatibilityPageResult, CompatibilityRun, Device, TestCase, User
 from backend.paths import project_path
@@ -478,6 +478,57 @@ class CompatibilityCompareTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "PASS")
         self.assertFalse(result["metrics"]["required_text_missing"])
+
+
+class CompatibilityListRunsFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        SQLModel.metadata.create_all(self.engine)
+        self.session = Session(self.engine)
+        self.user = User(username="viewer", hashed_password="x")
+        self.session.add(self.user)
+
+        package = AppPackage(app_name="Demo", package_name="com.demo.app", file_path="/tmp/demo.apk")
+        self.session.add(package)
+        self.session.commit()
+        self.session.refresh(package)
+
+        runs = [
+            CompatibilityRun(name="升级验证-A", package_name="com.demo.app", new_package_id=package.id, status="PASS"),
+            CompatibilityRun(name="升级验证-B", package_name="com.demo.app", new_package_id=package.id, status="WARNING"),
+            CompatibilityRun(name="夜间巡检", package_name="com.other.app", new_package_id=package.id, status="RUNNING"),
+            CompatibilityRun(name="失败任务", package_name="com.other.app", new_package_id=package.id, status="ERROR"),
+        ]
+        self.session.add_all(runs)
+        self.session.commit()
+
+    def tearDown(self) -> None:
+        self.session.close()
+
+    def test_keyword_matches_name_or_package(self):
+        by_name = list_runs(keyword="升级验证", session=self.session, current_user=self.user)
+        self.assertEqual(by_name.total, 2)
+
+        by_package = list_runs(keyword="com.other", session=self.session, current_user=self.user)
+        self.assertEqual(by_package.total, 2)
+        self.assertEqual({item.package_name for item in by_package.items}, {"com.other.app"})
+
+    def test_status_filter_groups_running_and_fail(self):
+        running = list_runs(status="running", session=self.session, current_user=self.user)
+        self.assertEqual(running.total, 1)
+        self.assertEqual(running.items[0].status, "RUNNING")
+
+        failed = list_runs(status="fail", session=self.session, current_user=self.user)
+        self.assertEqual(failed.total, 1)
+        self.assertEqual(failed.items[0].status, "ERROR")
+
+        everything = list_runs(status="all", session=self.session, current_user=self.user)
+        self.assertEqual(everything.total, 4)
+
+    def test_pagination_keeps_filtered_total(self):
+        result = list_runs(keyword="升级验证", skip=1, limit=1, session=self.session, current_user=self.user)
+        self.assertEqual(result.total, 2)
+        self.assertEqual(len(result.items), 1)
 
 
 if __name__ == "__main__":

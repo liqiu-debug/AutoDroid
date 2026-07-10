@@ -31,6 +31,8 @@ from backend.schemas import (
     FluencySessionRead,
     FluencySessionStartRequest,
     FluencyMarkerCreate,
+    PaginatedFastbotTaskRead,
+    PaginatedStartupTaskRead,
     StartupRunRequest,
     StartupTaskRead,
     DeviceRead,
@@ -350,8 +352,14 @@ def _build_fluency_session_read(
 def _safe_load_summary(report: Optional[FastbotReport]) -> Dict[str, Any]:
     if not report or not report.summary:
         return {}
+    return _safe_load_summary_text(report.summary)
+
+
+def _safe_load_summary_text(summary_text: Optional[str]) -> Dict[str, Any]:
+    if not summary_text:
+        return {}
     try:
-        loaded = json.loads(report.summary)
+        loaded = json.loads(summary_text)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
         return {}
@@ -361,11 +369,32 @@ def _is_startup_report(report: Optional[FastbotReport]) -> bool:
     return _safe_load_summary(report).get("session_type") == "startup"
 
 
+def _is_startup_summary_text(summary_text: Optional[str]) -> bool:
+    return _safe_load_summary_text(summary_text).get("session_type") == "startup"
+
+
+def _load_report_summary_map(session: Session) -> Dict[int, Optional[str]]:
+    """加载 task_id -> report summary 文本映射（只取 summary 列，避免加载大字段）。"""
+    rows = session.exec(
+        select(FastbotReport.task_id, FastbotReport.summary)
+    ).all()
+    return {task_id: summary for task_id, summary in rows}
+
+
+def _task_matches_keyword(task: FastbotTask, keyword: str) -> bool:
+    lowered = keyword.lower()
+    return (
+        lowered in str(task.package_name or "").lower()
+        or lowered in str(task.device_serial or "").lower()
+    )
+
+
 def _build_startup_task_read(
     task: FastbotTask,
-    report: Optional[FastbotReport] = None,
+    summary: Optional[Dict[str, Any]] = None,
+    report_ready: bool = False,
 ) -> Dict[str, Any]:
-    summary = _safe_load_summary(report)
+    summary = summary or {}
     return {
         "id": task.id,
         "package_name": task.package_name,
@@ -381,33 +410,32 @@ def _build_startup_task_read(
         "created_at": task.created_at,
         "started_at": task.started_at,
         "finished_at": task.finished_at,
-        "report_ready": bool(report),
+        "report_ready": report_ready,
         "summary": summary if summary else None,
     }
 
 
-@router.get("/tasks", response_model=List[FastbotTaskRead])
+@router.get("/tasks", response_model=PaginatedFastbotTaskRead)
 def list_tasks(
     skip: int = 0,
     limit: int = 50,
+    keyword: Optional[str] = None,
     session: Session = Depends(get_session),
 ):
-    """获取任务历史列表"""
-    candidate_limit = max((skip + limit) * 4, limit, 50)
-    tasks = session.exec(
-        select(FastbotTask).order_by(FastbotTask.id.desc()).limit(candidate_limit)
-    ).all()
-    task_ids = [task.id for task in tasks if task.id is not None]
-    reports = session.exec(
-        select(FastbotReport).where(FastbotReport.task_id.in_(task_ids))
-    ).all() if task_ids else []
-    report_by_task = {report.task_id: report for report in reports}
+    """分页获取智能探索任务历史（排除冷热启动任务），keyword 匹配包名或设备序列号"""
+    tasks = session.exec(select(FastbotTask).order_by(FastbotTask.id.desc())).all()
+    summary_by_task = _load_report_summary_map(session)
 
     filtered = [
         task for task in tasks
-        if task.id not in _startup_task_ids and not _is_startup_report(report_by_task.get(task.id))
+        if task.id not in _startup_task_ids
+        and not _is_startup_summary_text(summary_by_task.get(task.id))
+        and (not keyword or _task_matches_keyword(task, keyword))
     ]
-    return filtered[skip:skip + limit]
+    return PaginatedFastbotTaskRead(
+        total=len(filtered),
+        items=filtered[skip:skip + limit],
+    )
 
 
 @router.get("/tasks/{task_id}", response_model=FastbotTaskRead)
@@ -731,30 +759,37 @@ async def list_devices_with_status(session: Session = Depends(get_session)):
     return sort_devices_for_display(result)
 
 
-@router.get("/startup/tasks", response_model=List[StartupTaskRead])
+@router.get("/startup/tasks", response_model=PaginatedStartupTaskRead)
 def list_startup_tasks(
+    skip: int = 0,
     limit: int = 20,
+    keyword: Optional[str] = None,
     session: Session = Depends(get_session),
 ):
-    candidate_limit = max(limit * 6, 50)
-    tasks = session.exec(
-        select(FastbotTask).order_by(FastbotTask.id.desc()).limit(candidate_limit)
-    ).all()
-    task_ids = [task.id for task in tasks if task.id is not None]
-    reports = session.exec(
-        select(FastbotReport).where(FastbotReport.task_id.in_(task_ids))
-    ).all() if task_ids else []
-    report_by_task = {report.task_id: report for report in reports}
+    """分页获取冷热启动任务，keyword 匹配包名或设备序列号"""
+    tasks = session.exec(select(FastbotTask).order_by(FastbotTask.id.desc())).all()
+    summary_by_task = _load_report_summary_map(session)
 
-    results: List[Dict[str, Any]] = []
+    matched: List[FastbotTask] = []
     for task in tasks:
-        report = report_by_task.get(task.id)
-        if task.id not in _startup_task_ids and not _is_startup_report(report):
+        is_startup = task.id in _startup_task_ids or _is_startup_summary_text(
+            summary_by_task.get(task.id)
+        )
+        if not is_startup:
             continue
-        results.append(_build_startup_task_read(task, report=report))
-        if len(results) >= limit:
-            break
-    return results
+        if keyword and not _task_matches_keyword(task, keyword):
+            continue
+        matched.append(task)
+
+    items = [
+        _build_startup_task_read(
+            task,
+            summary=_safe_load_summary_text(summary_by_task.get(task.id)),
+            report_ready=task.id in summary_by_task,
+        )
+        for task in matched[skip:skip + limit]
+    ]
+    return PaginatedStartupTaskRead(total=len(matched), items=items)
 
 
 @router.post("/startup/run", response_model=List[StartupTaskRead])

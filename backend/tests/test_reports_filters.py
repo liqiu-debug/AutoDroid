@@ -52,6 +52,16 @@ class ReportFiltersTests(unittest.TestCase):
                 platform=None,
                 device_info="Legacy Device (legacy-001)",
             ),
+            TestExecution(
+                scenario_id=scenario.id,
+                scenario_name="登录冒烟",
+                batch_name="夜间批次-01",
+                status="FAIL",
+                start_time=base_time + timedelta(minutes=3),
+                device_serial="android-002",
+                platform="android",
+                device_info="Pixel 9 (android-002)",
+            ),
         ]
         self.session.add_all(executions)
         self.session.commit()
@@ -72,11 +82,32 @@ class ReportFiltersTests(unittest.TestCase):
 
     def test_legacy_execution_is_kept_without_structured_filters(self):
         result = get_reports(session=self.session)
-        self.assertEqual(result.total, 3)
-        self.assertEqual(len(result.items), 3)
+        self.assertEqual(result.total, 4)
+        self.assertEqual(len(result.items), 4)
         legacy_items = [item for item in result.items if item.platform is None and item.device_serial is None]
         self.assertEqual(len(legacy_items), 1)
         self.assertEqual(legacy_items[0].device_info, "Legacy Device (legacy-001)")
+
+    def test_keyword_matches_scenario_name(self):
+        result = get_reports(keyword="scenario-report", session=self.session)
+        self.assertEqual(result.total, 3)
+        self.assertEqual({item.scenario_name for item in result.items}, {"scenario-report-filter"})
+
+    def test_keyword_matches_batch_name(self):
+        result = get_reports(keyword="夜间批次", session=self.session)
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.items[0].batch_name, "夜间批次-01")
+        self.assertEqual(result.items[0].scenario_name, "登录冒烟")
+
+    def test_keyword_without_match_returns_empty(self):
+        result = get_reports(keyword="不存在的关键字", session=self.session)
+        self.assertEqual(result.total, 0)
+        self.assertEqual(result.items, [])
+
+    def test_keyword_combines_with_status_filter(self):
+        result = get_reports(keyword="登录冒烟", status="FAIL", session=self.session)
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.items[0].status, "FAIL")
 
 
 if __name__ == "__main__":

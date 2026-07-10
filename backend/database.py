@@ -479,6 +479,34 @@ def _migrate_compatibility_run_page_set_snapshot(cursor) -> None:
     cursor.execute("ALTER TABLE compatibilityrun_new RENAME TO compatibilityrun")
 
 
+def _migrate_scenario_folders(cursor) -> None:
+    """创建场景目录表并为 testscenario 补充 folder_id 外键列。"""
+    if not _table_exists(cursor, "scenariofolder"):
+        cursor.execute(
+            """
+            CREATE TABLE scenariofolder (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                parent_id INTEGER REFERENCES scenariofolder(id),
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        logger.info("Migration: CREATE TABLE scenariofolder")
+
+    if not _table_exists(cursor, "testscenario"):
+        logger.warning("Migration skip: table testscenario not found when adding column folder_id")
+        return
+
+    cursor.execute("PRAGMA table_info(testscenario)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "folder_id" not in existing_cols:
+        cursor.execute(
+            "ALTER TABLE testscenario ADD COLUMN folder_id INTEGER REFERENCES scenariofolder(id)"
+        )
+        logger.info("Migration: ALTER TABLE testscenario ADD COLUMN folder_id")
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     _ensure_schema_migration_table(cursor)
@@ -492,6 +520,7 @@ def _run_migrations_with_conn(conn) -> None:
         ("20260616_006_compatibility_tables", _migrate_compatibility_tables),
         ("20260616_007_compatibility_current_baseline", _migrate_compatibility_old_package_nullable),
         ("20260616_008_compatibility_page_set_snapshot", _migrate_compatibility_run_page_set_snapshot),
+        ("20260710_009_scenario_folders", _migrate_scenario_folders),
     ]
 
     for version, migration_func in migration_plan:

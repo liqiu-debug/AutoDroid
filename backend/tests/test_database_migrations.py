@@ -137,8 +137,15 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("page_set_name", compatibilityrun_col_names)
         self.assertIn("page_set_snapshot", compatibilityrun_col_names)
 
+        scenario_folder_table = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = 'scenariofolder'"
+        ).fetchone()
+        self.assertIsNotNone(scenario_folder_table)
+        testscenario_cols = {c[1] for c in self._table_columns("testscenario")}
+        self.assertIn("folder_id", testscenario_cols)
+
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 8)
+        self.assertEqual(len(rows), 9)
 
         # Re-run should be no-op and keep same version records.
         _run_migrations_with_conn(self.conn)

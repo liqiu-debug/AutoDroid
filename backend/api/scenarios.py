@@ -701,23 +701,28 @@ def list_scenarios(
     skip: int = 0,
     limit: int = 100,
     keyword: Optional[str] = None,
+    folder_id: Optional[int] = None,
     session: Session = Depends(get_session)
 ):
-    """List scenarios with pagination and filtering"""
+    """List scenarios with pagination and filtering (keyword / folder_id)"""
     from sqlalchemy.orm import aliased
     Creator = aliased(User)
     Updater = aliased(User)
-    
+
     query = session.query(TestScenario, Creator.full_name, Creator.username, Updater.full_name, Updater.username)\
         .outerjoin(Creator, TestScenario.user_id == Creator.id)\
         .outerjoin(Updater, TestScenario.updater_id == Updater.id)
-    
+
     if keyword:
         query = query.filter(TestScenario.name.contains(keyword))
-        
+    if folder_id is not None:
+        query = query.filter(TestScenario.folder_id == folder_id)
+
     count_query = session.query(func.count(TestScenario.id))
     if keyword:
         count_query = count_query.filter(TestScenario.name.contains(keyword))
+    if folder_id is not None:
+        count_query = count_query.filter(TestScenario.folder_id == folder_id)
     total = count_query.scalar()
         
     query = query.order_by(TestScenario.created_at.desc())
