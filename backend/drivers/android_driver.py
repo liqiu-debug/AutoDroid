@@ -16,6 +16,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import uiautomator2 as u2
 
 from .base_driver import BaseDriver
+from backend.execution_errors import (
+    E2001_ELEMENT_NOT_FOUND,
+    E2002_WAIT_TIMEOUT,
+    E2003_ASSERT_TEXT_FAILED,
+    E2004_ASSERT_IMAGE_FAILED,
+    E2005_IMAGE_NOT_MATCHED,
+    E2006_OCR_NO_RESULT,
+    E2007_INPUT_FAILED,
+    ExecutionStepAssertionError,
+    ExecutionStepRuntimeError,
+)
 from backend.utils import evaluate_page_text_assertion
 from backend.utils.ocr_compat import extract_ocr_text, run_paddle_ocr
 from backend.ocr_service import get_ocr_engine
@@ -343,7 +354,11 @@ class AndroidDriver(BaseDriver):
         try:
             el = self._find_element(selector, by)
             if not el.exists(timeout=5):
-                raise RuntimeError(f"元素未找到: selector={selector!r}, by={by!r}")
+                raise ExecutionStepRuntimeError(
+                    E2001_ELEMENT_NOT_FOUND,
+                    f"元素未找到: selector={selector!r}, by={by!r}",
+                    context={"selector": selector, "by": by},
+                )
             el.click()
             self._log_action_success(
                 "click",
@@ -609,7 +624,11 @@ class AndroidDriver(BaseDriver):
         try:
             el = self._find_element(selector, by)
             if not el.exists(timeout=5):
-                raise RuntimeError(f"元素未找到: selector={selector!r}, by={by!r}")
+                raise ExecutionStepRuntimeError(
+                    E2001_ELEMENT_NOT_FOUND,
+                    f"元素未找到: selector={selector!r}, by={by!r}",
+                    context={"selector": selector, "by": by},
+                )
 
             target = self._resolve_input_target(el)
             is_password_intent = self._is_password_intent(selector=selector, target=target)
@@ -710,8 +729,10 @@ class AndroidDriver(BaseDriver):
                     errors.append(f"{strategy_name}: {exc}")
 
             detail = "; ".join(errors) if errors else "unknown"
-            raise RuntimeError(
-                f"Android.input 执行失败: selector={selector!r}, by={by!r}, text_len={text_len}, detail={detail}"
+            raise ExecutionStepRuntimeError(
+                E2007_INPUT_FAILED,
+                f"Android.input 执行失败: selector={selector!r}, by={by!r}, text_len={text_len}, detail={detail}",
+                context={"selector": selector, "by": by, "text_len": text_len},
             )
         except Exception as exc:
             self._log_action_failure(
@@ -786,7 +807,11 @@ class AndroidDriver(BaseDriver):
                 errors.append(f"send_keys failed: {exc}")
 
             detail = "; ".join(errors) if errors else "unknown"
-            raise RuntimeError(f"Android.input_focused 执行失败: {detail}")
+            raise ExecutionStepRuntimeError(
+                E2007_INPUT_FAILED,
+                f"Android.input_focused 执行失败: {detail}",
+                context={"text_len": text_len},
+            )
         except Exception as exc:
             self._log_action_failure(
                 "input_focused",
@@ -847,8 +872,10 @@ class AndroidDriver(BaseDriver):
         try:
             el = self._find_element(selector, by)
             if not el.exists(timeout=timeout):
-                raise RuntimeError(
-                    f"等待超时，元素未出现: selector={selector!r}, by={by!r}, timeout={timeout}"
+                raise ExecutionStepRuntimeError(
+                    E2002_WAIT_TIMEOUT,
+                    f"等待超时，元素未出现: selector={selector!r}, by={by!r}, timeout={timeout}",
+                    context={"selector": selector, "by": by, "timeout": timeout},
                 )
             self._log_action_success(
                 "wait_until_exists",
@@ -914,11 +941,15 @@ class AndroidDriver(BaseDriver):
                 return
 
             if normalized_mode == "not_contains":
-                raise AssertionError(
-                    f"断言失败: 期望页面不包含 {expected!r}, 实际命中={preview!r}"
+                raise ExecutionStepAssertionError(
+                    E2003_ASSERT_TEXT_FAILED,
+                    f"断言失败: 期望页面不包含 {expected!r}, 实际命中={preview!r}",
+                    context={"expected_text": expected, "match_mode": normalized_mode},
                 )
-            raise AssertionError(
-                f"断言失败: 期望页面包含 {expected!r}, 实际候选={preview!r}"
+            raise ExecutionStepAssertionError(
+                E2003_ASSERT_TEXT_FAILED,
+                f"断言失败: 期望页面包含 {expected!r}, 实际候选={preview!r}",
+                context={"expected_text": expected, "match_mode": normalized_mode},
             )
         except Exception as exc:
             self._log_action_failure(
@@ -1016,10 +1047,18 @@ class AndroidDriver(BaseDriver):
             )
             match_elapsed = time.time() - wait_started
             if not isinstance(match, dict):
-                raise RuntimeError(f"图像模板匹配失败: 未在屏幕上找到匹配的图像区域 ({target})")
+                raise ExecutionStepRuntimeError(
+                    E2005_IMAGE_NOT_MATCHED,
+                    f"图像模板匹配失败: 未在屏幕上找到匹配的图像区域 ({target})",
+                    context={"image_path": target},
+                )
             point = match.get("point")
             if not isinstance(point, (list, tuple)) or len(point) < 2:
-                raise RuntimeError(f"图像模板匹配失败: 匹配结果缺少坐标 point ({target})")
+                raise ExecutionStepRuntimeError(
+                    E2005_IMAGE_NOT_MATCHED,
+                    f"图像模板匹配失败: 匹配结果缺少坐标 point ({target})",
+                    context={"image_path": target},
+                )
             x = float(point[0])
             y = float(point[1])
             similarity = float(match.get("similarity") or 0.0)
@@ -1081,7 +1120,11 @@ class AndroidDriver(BaseDriver):
             if normalized_mode == "exists":
                 match = self._find_image_match_strict(target)
                 if not isinstance(match, dict):
-                    raise AssertionError(f"断言失败: 期望页面存在图像 {target!r}，但未匹配到")
+                    raise ExecutionStepAssertionError(
+                        E2004_ASSERT_IMAGE_FAILED,
+                        f"断言失败: 期望页面存在图像 {target!r}，但未匹配到",
+                        context={"image_path": target, "match_mode": normalized_mode},
+                    )
                 self._log_action_success(
                     "assert_image",
                     started_at,
@@ -1103,12 +1146,14 @@ class AndroidDriver(BaseDriver):
 
             if self._is_strong_image_match(first_match):
                 meta = self._extract_image_match_meta(first_match)
-                raise AssertionError(
+                raise ExecutionStepAssertionError(
+                    E2004_ASSERT_IMAGE_FAILED,
                     f"断言失败: 期望页面不存在图像 {target!r}，但已高置信度匹配到目标"
                     + (
                         f" (similarity={meta.get('similarity')}, ssim={meta.get('ssim')}, x={meta.get('x')}, y={meta.get('y')})"
                         if meta else ""
-                    )
+                    ),
+                    context={"image_path": target, "match_mode": normalized_mode},
                 )
 
             time.sleep(self._IMAGE_ASSERT_RECHECK_DELAY_SECONDS)
@@ -1116,9 +1161,11 @@ class AndroidDriver(BaseDriver):
             confirmed_match = second_match if second_match is not None else None
             if confirmed_match is not None:
                 meta = self._extract_image_match_meta(confirmed_match)
-                raise AssertionError(
+                raise ExecutionStepAssertionError(
+                    E2004_ASSERT_IMAGE_FAILED,
                     f"断言失败: 期望页面不存在图像 {target!r}，但仍匹配到目标"
-                    + (f" (similarity={meta.get('similarity')}, x={meta.get('x')}, y={meta.get('y')})" if meta else "")
+                    + (f" (similarity={meta.get('similarity')}, x={meta.get('x')}, y={meta.get('y')})" if meta else ""),
+                    context={"image_path": target, "match_mode": normalized_mode},
                 )
 
             self._log_action_success(
@@ -1163,7 +1210,11 @@ class AndroidDriver(BaseDriver):
             crop_desc = f"[{rx1},{ry1},{rx2},{ry2}]"
             raw_text = self._extract_text_from_screenshot(image, rx1, ry1, rx2, ry2)
             if not raw_text:
-                raise RuntimeError("extract_by_ocr 未识别到文本")
+                raise ExecutionStepRuntimeError(
+                    E2006_OCR_NO_RESULT,
+                    "extract_by_ocr 未识别到文本",
+                    context={"region": region, "crop": crop_desc},
+                )
             extracted = self._apply_extract_rule(raw_text, extract_rule or {})
             self._log_action_success(
                 "extract_by_ocr",
