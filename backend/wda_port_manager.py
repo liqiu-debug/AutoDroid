@@ -3,6 +3,9 @@ iOS WDA 端口转发管理器。
 
 基于 `tidevice relay` 维护 UDID -> localhost 端口映射，
 用于多 iOS 设备并发执行时的本地 WDA 访问。
+
+同时提供 WDA MJPEG server（实时画面流）的独立 relay 实例，
+端口段与 WDA HTTP relay 隔离，互不影响。
 """
 from __future__ import annotations
 
@@ -20,6 +23,11 @@ logger = logging.getLogger(__name__)
 WDA_REMOTE_PORT = 8100
 WDA_PORT_RANGE_START = 8200
 WDA_PORT_RANGE_END = 8299
+
+# WDA 内置 MJPEG server 的设备端默认端口（mjpegServerPort）
+MJPEG_REMOTE_PORT = 9100
+MJPEG_PORT_RANGE_START = 9300
+MJPEG_PORT_RANGE_END = 9399
 
 
 @dataclass
@@ -44,28 +52,49 @@ class WDARelayManager:
         self._entries: Dict[str, RelayEntry] = {}
         self._lock = threading.Lock()
 
-    def ensure_relay(self, udid: str, preferred_port: Optional[int] = None) -> int:
+    def ensure_relay(
+        self,
+        udid: str,
+        preferred_port: Optional[int] = None,
+        remote_port: Optional[int] = None,
+    ) -> int:
         """
         确保指定设备存在可用 relay，返回本地端口。
+
+        remote_port 可覆盖默认设备端端口；若已有 relay 指向不同的
+        设备端端口，会先停掉旧 relay 再重建。
         """
         device_id = str(udid or "").strip()
         if not device_id:
             raise RuntimeError("invalid udid")
+
+        target_remote = self._remote_port
+        if remote_port is not None:
+            try:
+                target_remote = int(remote_port)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"invalid remote port: {remote_port!r}") from exc
+            if not (0 < target_remote < 65536):
+                raise RuntimeError(f"invalid remote port: {remote_port!r}")
 
         with self._lock:
             self._cleanup_dead_locked()
 
             existing = self._entries.get(device_id)
             if existing and existing.process.poll() is None:
-                return existing.local_port
+                if existing.remote_port == target_remote:
+                    return existing.local_port
+                # 设备端端口变更：停掉旧 relay 后重建
+                self._entries.pop(device_id, None)
+                self._terminate_process(existing.process)
 
             chosen_port = self._select_port_locked(device_id, preferred_port)
-            process = self._spawn_relay(device_id, chosen_port, self._remote_port)
+            process = self._spawn_relay(device_id, chosen_port, target_remote)
 
             entry = RelayEntry(
                 udid=device_id,
                 local_port=chosen_port,
-                remote_port=self._remote_port,
+                remote_port=target_remote,
                 process=process,
                 started_at=time.time(),
             )
@@ -188,3 +217,11 @@ class WDARelayManager:
 
 
 wda_relay_manager = WDARelayManager()
+
+# iOS MJPEG（WDA mjpegServer）专用 relay：与 WDA HTTP relay 相互独立、端口段隔离，
+# 供 backend/device_stream/ios_mjpeg.py 建立近实时画面流使用。
+ios_mjpeg_relay_manager = WDARelayManager(
+    start_port=MJPEG_PORT_RANGE_START,
+    end_port=MJPEG_PORT_RANGE_END,
+    remote_port=MJPEG_REMOTE_PORT,
+)
