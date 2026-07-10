@@ -17,7 +17,7 @@ import queue
 from typing import Dict, Optional, Generator, List, Set
 
 import adbutils
-from backend.paths import project_path
+from backend.paths import PROJECT_ROOT, project_path
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
 
 # 配置日志
