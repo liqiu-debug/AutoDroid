@@ -51,6 +51,15 @@ ANDROID_MOTION_EVENT_ACTION_DOWN = 0
 ANDROID_MOTION_EVENT_ACTION_UP = 1
 ANDROID_MOTION_EVENT_ACTION_MOVE = 2
 
+# H.264 同步包 NAL 类型：IDR(5) / SPS(7) / PPS(8)。
+# 它们是解码器可以重建状态的锚点；其余（P/B 帧等）都依赖前序帧。
+SYNC_NAL_TYPES = frozenset({5, 7, 8})
+
+# 观看端队列容量（包数）。30 包在 60fps 下约 0.5s：容量越小，拥塞客户端
+# 追赶实时画面越快；配合"丢帧后等待关键帧"策略，追赶总是以干净的
+# init 序列（SPS/PPS/IDR）重新开始，不会产生花屏。
+CLIENT_QUEUE_MAXSIZE = 30
+
 
 class DeviceInfo:
     """已连接设备的运行时状态"""
@@ -69,7 +78,7 @@ class DeviceInfo:
         self.error: Optional[str] = None
         
         # 广播机制
-        self.input_queues: List[queue.Queue] = []
+        self.input_queues: List["ClientStreamQueue"] = []
         self.reader_thread: Optional[threading.Thread] = None
         self.running: bool = True
         self.sps_pps_packets: List[bytes] = [] # 缓存 SPS/PPS 用于新连接初始化
@@ -201,53 +210,173 @@ def _get_h264_init_packets(dev_info: DeviceInfo) -> List[bytes]:
     return packets
 
 
-def _offer_video_packet(
-    client_queue: queue.Queue,
-    data: bytes,
-    nal_types: Set[int],
-    init_packets: Optional[List[bytes]] = None,
-) -> bool:
+class ClientStreamQueue:
     """
-    将视频包放入客户端队列。
+    单个观看端的视频包队列，实现"丢帧后等待关键帧"（drop-until-keyframe）策略。
 
-    队列拥塞时：
-    - 非同步包（普通 P/B 帧）直接丢弃，避免把半截 GOP 塞给解码器导致花屏
-    - SPS/PPS/IDR 到来时，清空旧队列，仅保留最新的解码初始化序列
+    背景：H.264 的 P 帧依赖前序帧解码。一旦因队列拥塞对某客户端丢弃过
+    任何一包，该客户端的解码参考链即已断裂；此时继续投递后续 P 帧只会
+    让画面持续花屏（直到下一个 IDR 才能自愈）。因此首次丢帧后进入
+    awaiting_keyframe 状态：一律丢弃非同步包，直到同步包（SPS/PPS/IDR）
+    到来时清空积压、原子播种 init 序列 + 当前包，并在确认 IDR 已投递后
+    恢复正常投递。
+
+    线程模型：offer() 仅由设备 reader 线程调用（单生产者），get() 由该
+    客户端的消费协程/线程调用；seed() 必须在实例对 reader 线程可见
+    （加入 DeviceInfo.input_queues）之前调用。因此内部状态无需加锁，
+    广播路径保持无锁低开销。
     """
-    if not data:
-        return False
 
-    try:
-        client_queue.put_nowait(data)
-        return True
-    except queue.Full:
-        pass
+    def __init__(self, maxsize: int = CLIENT_QUEUE_MAXSIZE):
+        self._maxsize = int(maxsize or 0)
+        self._queue: queue.Queue = queue.Queue(maxsize=self._maxsize)
+        # True 表示已对该客户端丢过包（解码参考链断裂），等待关键帧恢复。
+        self._awaiting_keyframe = False
 
-    is_sync_packet = any(nal_type in nal_types for nal_type in (5, 7, 8))
-    if not is_sync_packet:
-        return False
+    @property
+    def awaiting_keyframe(self) -> bool:
+        return self._awaiting_keyframe
 
-    try:
-        while True:
-            client_queue.get_nowait()
-    except queue.Empty:
-        pass
+    def qsize(self) -> int:
+        return self._queue.qsize()
 
-    packets = [packet for packet in (init_packets or []) if packet]
-    if data not in packets:
-        packets.append(data)
+    def get(self, timeout: Optional[float] = None) -> bytes:
+        """供观看端消费，语义与 queue.Queue.get(timeout=...) 一致。"""
+        return self._queue.get(timeout=timeout)
 
-    maxsize = int(getattr(client_queue, "maxsize", 0) or 0)
-    if maxsize > 0 and len(packets) > maxsize:
-        packets = packets[-maxsize:]
+    def get_nowait(self) -> bytes:
+        return self._queue.get_nowait()
 
-    for packet in packets:
-        try:
-            client_queue.put_nowait(packet)
-        except queue.Full:
+    def seed(self, init_packets: Optional[List[bytes]]) -> None:
+        """
+        客户端接入时播种解码初始化序列（SPS/PPS + 最近 IDR）。
+
+        必须在实例加入 DeviceInfo.input_queues 之前调用，保证 init 序列
+        一定排在所有实时包之前（避免解码器先收到 P 帧）。
+        """
+        for packet in init_packets or []:
+            if not packet:
+                continue
+            try:
+                self._queue.put_nowait(packet)
+            except queue.Full:
+                return
+
+    def offer(
+        self,
+        data: bytes,
+        nal_types: Set[int],
+        init_packets: Optional[List[bytes]] = None,
+    ) -> bool:
+        """
+        投递一个视频包（仅 reader 线程调用），返回 False 表示该包被丢弃。
+
+        - 未丢帧 + 队列有空位：直接入队（与历史行为一致的快路径）。
+        - 非同步包遇到队列满：丢弃并进入 awaiting_keyframe；此后即使队列
+          有空位，非同步包也一律丢弃，防止断裂的参考链导致持续花屏。
+        - 同步包遇到拥塞或处于 awaiting_keyframe：清空积压，把 init 序列 +
+          当前包按序一次性入队（单生产者模型下顺序原子成立），确认投递过
+          IDR 后解除等待状态；仅投递 SPS/PPS（无 IDR）时继续等待。
+        """
+        if not data:
             return False
 
-    return True
+        if not (nal_types & SYNC_NAL_TYPES):
+            # 普通 P/B 帧：等待关键帧期间一律丢弃
+            if self._awaiting_keyframe:
+                return False
+            try:
+                self._queue.put_nowait(data)
+                return True
+            except queue.Full:
+                self._awaiting_keyframe = True
+                return False
+
+        # 同步包（SPS/PPS/IDR）
+        if not self._awaiting_keyframe:
+            try:
+                self._queue.put_nowait(data)
+                return True
+            except queue.Full:
+                pass  # 拥塞：走清空重播路径
+
+        return self._reseed(data, nal_types, init_packets)
+
+    def _reseed(
+        self,
+        data: bytes,
+        nal_types: Set[int],
+        init_packets: Optional[List[bytes]],
+    ) -> bool:
+        """清空积压并原子播种 init 序列 + 当前同步包，重建客户端解码状态。"""
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        packets = [packet for packet in (init_packets or []) if packet]
+        if data not in packets:
+            packets.append(data)
+        if self._maxsize > 0 and len(packets) > self._maxsize:
+            packets = packets[-self._maxsize:]
+
+        delivered_idr = False
+        for packet in packets:
+            try:
+                self._queue.put_nowait(packet)
+            except queue.Full:
+                # 单生产者模型下清空后不应发生；万一发生则保持等待，下个同步包重试
+                self._awaiting_keyframe = True
+                return False
+            packet_nal_types = nal_types if packet == data else _collect_h264_nal_types(packet)
+            if 5 in packet_nal_types:
+                delivered_idr = True
+
+        # 只有真正投递过 IDR 才算参考链重建完成；config-only 时继续等待 IDR
+        self._awaiting_keyframe = not delivered_idr
+        return True
+
+
+def _broadcast_video_packet(dev_info: DeviceInfo, data: bytes) -> None:
+    """
+    将 reader 线程读到的一个视频包分发给录制器与所有观看端队列。
+
+    由设备 reader 线程串行调用（单生产者）；观看端队列的丢帧策略见
+    ClientStreamQueue.offer。
+    """
+    if not data:
+        return
+
+    nal_types = _update_h264_init_cache(dev_info, data)
+
+    recorder = dev_info.recorder
+    if recorder:
+        try:
+            recorder.ingest(data)
+        except Exception as e:
+            logger.warning("写入本地复现录制失败（忽略）: serial=%s error=%s", dev_info.serial, e)
+
+    is_sync_packet = bool(nal_types & SYNC_NAL_TYPES)
+    if is_sync_packet:
+        logger.debug(
+            "收到同步包: serial=%s nal_types=%s len=%s",
+            dev_info.serial,
+            sorted(nal_types),
+            len(data),
+        )
+
+    queues = list(dev_info.input_queues)
+    init_packets = _get_h264_init_packets(dev_info) if is_sync_packet else None
+    for client_queue in queues:
+        if not client_queue.offer(data, nal_types, init_packets=init_packets):
+            logger.debug(
+                "丢弃视频包以保护解码链并追赶实时画面: serial=%s nal_types=%s len=%s awaiting_keyframe=%s",
+                dev_info.serial,
+                sorted(nal_types),
+                len(data),
+                client_queue.awaiting_keyframe,
+            )
 
 
 def _build_touch_control_packet(
@@ -694,33 +823,6 @@ class ScrcpyDeviceManager:
 
     def _start_video_reader(self, dev_info: DeviceInfo):
         """启动后台线程，从 socket 读取视频流并广播给所有客户端"""
-        def _broadcast_frame(data: bytes):
-            """广播一帧给所有客户端队列"""
-            if not data:
-                return
-            nal_types = _update_h264_init_cache(dev_info, data)
-            recorder = dev_info.recorder
-            if recorder:
-                try:
-                    recorder.ingest(data)
-                except Exception as e:
-                    logger.warning("写入本地复现录制失败（忽略）: serial=%s error=%s", dev_info.serial, e)
-            if 7 in nal_types or 8 in nal_types:
-                logger.info("收到视频初始化包: serial=%s nal_types=%s len=%s", dev_info.serial, sorted(nal_types), len(data))
-            if 5 in nal_types:
-                logger.info("缓存最近关键帧: serial=%s len=%s", dev_info.serial, len(data))
-
-            queues = list(dev_info.input_queues)
-            init_packets = _get_h264_init_packets(dev_info) if any(nal_type in nal_types for nal_type in (5, 7, 8)) else None
-            for q in queues:
-                offered = _offer_video_packet(q, data, nal_types, init_packets=init_packets)
-                if not offered and q.full():
-                    logger.debug(
-                        "丢弃非关键视频包以追赶实时画面: serial=%s nal_types=%s len=%s",
-                        dev_info.serial,
-                        sorted(nal_types),
-                        len(data),
-                    )
 
         def _reader_loop():
             serial = dev_info.serial
@@ -781,7 +883,7 @@ class ScrcpyDeviceManager:
                                 break
                             # 完整的 NAL: buf[0:pos]
                             nal_unit = bytes(buf[:pos])
-                            _broadcast_frame(nal_unit)
+                            _broadcast_video_packet(dev_info, nal_unit)
                             buf = buf[pos:]
 
                     except socket.timeout:
@@ -815,7 +917,7 @@ class ScrcpyDeviceManager:
                         if not h264_data:
                             continue
 
-                        _broadcast_frame(h264_data)
+                        _broadcast_video_packet(dev_info, h264_data)
 
                     except socket.timeout:
                         continue
@@ -842,20 +944,16 @@ class ScrcpyDeviceManager:
         if not dev_info or not dev_info.ready:
             raise ValueError(f"设备 {serial} 未就绪或不存在")
 
-        # 创建客户端队列
-        client_queue = queue.Queue(maxsize=30)
-        dev_info.input_queues.append(client_queue)
-        logger.info(f"客户端加入视频流: {serial} (当前客户端数: {len(dev_info.input_queues)})")
-
-        # 先补发解码初始化包，避免画面静止时新客户端拿不到首帧。
+        # 创建客户端队列：先播种解码初始化包（SPS/PPS + 最近 IDR），再挂入
+        # 广播列表。播种发生在队列对 reader 线程可见之前，保证 init 序列
+        # 一定排在实时包之前，不会与广播包交错。
+        client_queue = ClientStreamQueue(maxsize=CLIENT_QUEUE_MAXSIZE)
         init_packets = _get_h264_init_packets(dev_info)
         if init_packets:
-            logger.info(f"向新客户端发送缓存初始化包: serial={serial} packets={len(init_packets)}")
-            for packet in init_packets:
-                try:
-                    client_queue.put(packet)
-                except queue.Full:
-                    pass
+            logger.info(f"向新客户端播种缓存初始化包: serial={serial} packets={len(init_packets)}")
+            client_queue.seed(init_packets)
+        dev_info.input_queues.append(client_queue)
+        logger.info(f"客户端加入视频流: {serial} (当前客户端数: {len(dev_info.input_queues)})")
 
         try:
             while self._running and serial in self._devices and dev_info.ready:
