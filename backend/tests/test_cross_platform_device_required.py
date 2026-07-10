@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import Session, SQLModel, create_engine
 
-from backend import main
+from backend.api import ws_run
 from backend.api import cases as cases_api
 from backend.api import scenarios as scenarios_api
 from backend.models import (
@@ -85,11 +85,11 @@ class CaseWebSocketDeviceRequiredTests(unittest.IsolatedAsyncioTestCase):
     async def test_websocket_run_case_without_device_sends_error(self):
         websocket = _FakeWebSocket()
 
-        with patch.object(main, "engine", self.engine), \
-             patch.object(main.manager, "connect", new=AsyncMock()), \
-             patch.object(main.manager, "broadcast_run_start", new=AsyncMock()) as run_start_mock, \
-             patch.object(main.manager, "disconnect"):
-            await main.websocket_run_case(
+        with patch.object(ws_run, "engine", self.engine), \
+             patch.object(ws_run.manager, "connect", new=AsyncMock()), \
+             patch.object(ws_run.manager, "broadcast_run_start", new=AsyncMock()) as run_start_mock, \
+             patch.object(ws_run.manager, "disconnect"):
+            await ws_run.websocket_run_case(
                 websocket,
                 self.case_id,
                 env_id=None,
