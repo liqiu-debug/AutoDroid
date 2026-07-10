@@ -19,13 +19,16 @@ from backend.cross_platform_execution import (
 )
 from backend.database import get_session
 from backend.feature_flags import (
-    FLAG_CROSS_PLATFORM_RUNNER,
     FLAG_NEW_STEP_MODEL,
     is_flag_enabled,
 )
 from backend.models import CaseFolder, Device, TestCase, TestCaseStep, User
-from backend.run_control import ABORTED_STATUS, registry
-from backend.runner import register_device_abort, unregister_device_abort
+from backend.run_control import (
+    ABORTED_STATUS,
+    register_device_abort,
+    registry,
+    unregister_device_abort,
+)
 from backend.schemas import (
     PaginatedTestCaseRead,
     Step,
@@ -826,72 +829,6 @@ def sync_case_standard_steps_from_legacy(
     return [_row_to_standard_step_read(item) for item in saved_steps]
 
 
-def _run_case_background(
-    case_id: int,
-    session_factory,
-    env_id: Optional[int] = None,
-    device_serial: Optional[str] = None,
-    run_id: Optional[str] = None,
-    abort_event=None,
-    user_id: Optional[int] = None,
-    execution_lease=None,
-):
-    try:
-        with _case_execution_slot(
-            user_id=user_id,
-            device_serial=device_serial,
-            run_id=run_id,
-            execution_lease=execution_lease,
-        ):
-            # We need a new session for the background thread.
-            with session_factory() as session:
-                case = session.get(TestCase, case_id)
-                if not case:
-                    if device_serial:
-                        unregister_device_abort(device_serial)
-                    registry.complete(run_id, "ERROR")
-                    return
-                case_snapshot = _build_case_snapshot(case)
-
-                from backend.runner import TestRunner
-
-                if abort_event is None:
-                    abort_event = _new_abort_event_for_device(device_serial)
-
-                runner = TestRunner(device_serial=device_serial)
-                runner.abort_event = abort_event
-                try:
-                    runner.connect()
-
-                    # Prepare optional variables map.
-                    variables_map = {}
-                    if env_id:
-                        from backend.models import GlobalVariable
-
-                        global_vars = session.exec(
-                            select(GlobalVariable).where(GlobalVariable.env_id == env_id)
-                        ).all()
-                        for gv in global_vars:
-                            variables_map[gv.key] = gv.value
-
-                    result = runner.run_case(case_snapshot, extra_variables=variables_map)
-
-                    # Update case status.
-                    _update_case_run_status(session, case_id, _status_for_case_result(result, abort_event))
-                except Exception:
-                    _update_case_run_status(session, case_id, ABORTED_STATUS if abort_event and abort_event.is_set() else "FAIL")
-                finally:
-                    if device_serial:
-                        unregister_device_abort(device_serial)
-                    registry.complete(run_id, ABORTED_STATUS if abort_event and abort_event.is_set() else None)
-    except RuntimeError as e:
-        # 限流失败，记录日志
-        logger.warning("执行任务限流失败: case_id=%s, user_id=%s, error=%s", case_id, user_id, e)
-        with session_factory() as session:
-            _update_case_run_status(session, case_id, "FAIL")
-        registry.complete(run_id, "RATE_LIMITED")
-
-
 def _run_case_background_cross_platform(
     case_id: int,
     session_factory,
@@ -1005,11 +942,9 @@ def run_test_case(
     def session_factory():
         return SQLSession(engine)
 
-    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
-    if use_cross_platform_runner and not device_serial:
-        # 跨端链路必须显式指定设备，不再静默回落 legacy。
+    if not device_serial:
+        # 跨端链路必须显式指定设备。
         raise HTTPException(status_code=400, detail="请选择执行设备")
-    run_func = _run_case_background_cross_platform if use_cross_platform_runner else _run_case_background
     batch_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
     try:
@@ -1031,7 +966,7 @@ def run_test_case(
         )
         _update_case_run_status(session, case_id, "RUNNING")
         background_tasks.add_task(
-            run_func,
+            _run_case_background_cross_platform,
             case_id,
             session_factory,
             env_id,
@@ -1054,7 +989,7 @@ def run_test_case(
         "batch_id": batch_id,
         "run_id": run_record.run_id,
         "device_serial": device_serial,
-        "runner": "cross_platform" if use_cross_platform_runner else "legacy",
+        "runner": "cross_platform",
     }
 
 
@@ -1079,17 +1014,13 @@ def run_test_case_batch(
     requested_serials = request.device_serials or [None]
     runnable_serials: List[Optional[str]] = []
     blocked_prechecks: List[Dict[str, Any]] = []
-    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
 
     for serial in requested_serials:
         if not serial:
-            if use_cross_platform_runner:
-                # 跨端链路必须显式指定设备，不再静默回落 legacy。
-                blocked_prechecks.append(
-                    {"device_serial": serial, "reason": "请选择执行设备"}
-                )
-            else:
-                runnable_serials.append(serial)
+            # 跨端链路必须显式指定设备。
+            blocked_prechecks.append(
+                {"device_serial": serial, "reason": "请选择执行设备"}
+            )
             continue
         try:
             precheck = precheck_case_execution(
@@ -1191,9 +1122,8 @@ def run_test_case_batch(
     run_ids: List[str] = []
     for serial, run_record, execution_lease in run_items:
         run_ids.append(run_record.run_id)
-        run_func = _run_case_background_cross_platform if use_cross_platform_runner else _run_case_background
         threading.Thread(
-            target=run_func,
+            target=_run_case_background_cross_platform,
             args=(
                 case_id,
                 session_factory,

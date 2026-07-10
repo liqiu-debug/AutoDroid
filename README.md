@@ -95,7 +95,6 @@ AutoDroid/
 │   ├── tests/                  # 后端自动化测试
 │   ├── main.py                 # FastAPI 入口、录制接口、WebSocket、SPA 托管
 │   ├── models.py               # SQLModel 数据模型
-│   ├── runner.py               # Legacy 执行链路
 │   ├── step_contract.py        # 标准步骤与 Legacy 步骤转换
 │   ├── scheduler_service.py    # APScheduler 定时调度
 │   └── fastbot_runner.py       # Fastbot、冷热启动与性能监控执行引擎
@@ -235,7 +234,7 @@ npm run dev -- --host
 
 ## 执行模型
 
-项目同时保留 Legacy Android 执行链路和标准跨端执行链路，以兼容历史数据并支持灰度迁移。
+执行统一走标准跨端执行链路（Android/iOS）。历史 `case.steps` JSON 保留用于数据兼容，启动时会自动回填为标准步骤表。
 
 标准步骤主要包含：
 
@@ -253,11 +252,10 @@ npm run dev -- --host
 | 配置项 | 默认值 | 作用 |
 |---|---|---|
 | `new_step_model` | 开启 | 启用标准步骤表的读写与兼容迁移 |
-| `cross_platform_runner` | 开启 | 执行入口统一走跨端 Runner（执行必须显式指定设备） |
 | `ios_execution` | 关闭 | 允许 iOS 执行 |
 | `ws_disconnect_abort` | 关闭 | 实时执行的 WebSocket 断开后立即中止对应执行 |
 
-标准步骤模型与跨端 Runner 已默认启用；在 `SystemSetting` 中显式写入 `false` 可临时回退。iOS 执行仍需手动开启。
+跨端 Runner 已成为唯一执行链路（原 `cross_platform_runner` 开关已移除），执行必须显式指定设备。标准步骤模型默认启用，在 `SystemSetting` 中显式写入 `false` 可临时回退；iOS 执行仍需手动开启。
 
 ## 配置说明
 

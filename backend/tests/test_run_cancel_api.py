@@ -7,8 +7,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 
 from backend.api.runs import CancelRunRequest, active_runs, cancel_runs
 from backend.models import TestCase, TestExecution, TestScenario
-from backend.run_control import ABORTED_STATUS, registry
-from backend.runner import _sleep_or_abort
+from backend.run_control import ABORTED_STATUS, _sleep_or_abort, registry
 
 
 class RunCancelApiTests(unittest.TestCase):
@@ -37,7 +36,7 @@ class RunCancelApiTests(unittest.TestCase):
             abort_event=abort_event,
         )
 
-        with patch("backend.runner.trigger_device_abort") as trigger_mock:
+        with patch("backend.run_control.trigger_device_abort") as trigger_mock:
             payload = cancel_runs(
                 CancelRunRequest(
                     kind="case",

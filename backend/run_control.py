@@ -2,16 +2,59 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
+logger = logging.getLogger(__name__)
+
 RUNNING_STATUSES = {"RUNNING", "PENDING"}
 TERMINAL_STATUSES = {"PASS", "WARNING", "FAIL", "ERROR", "ABORTED"}
 ABORTED_STATUS = "ABORTED"
+
+
+# ============ 全局设备中止注册表 ============
+# 用于从 unlock/cancel 接口中止正在执行测试的 Python 线程
+_device_abort_events: Dict[str, threading.Event] = {}
+_abort_lock = threading.Lock()
+
+
+def register_device_abort(serial: str) -> threading.Event:
+    """注册设备中止事件，返回 Event 给 runner 监听"""
+    with _abort_lock:
+        event = threading.Event()
+        _device_abort_events[serial] = event
+        return event
+
+
+def trigger_device_abort(serial: str):
+    """触发设备中止信号（由 unlock/cancel 接口调用）"""
+    with _abort_lock:
+        event = _device_abort_events.get(serial)
+        if event:
+            event.set()
+            logger.warning(f"已发送中止信号到设备 {serial}")
+
+
+def unregister_device_abort(serial: str):
+    """清除设备中止事件"""
+    with _abort_lock:
+        _device_abort_events.pop(serial, None)
+
+
+def _sleep_or_abort(seconds: float, abort_event: Optional[threading.Event]) -> bool:
+    """可中断休眠：返回 True 表示因中止信号提前返回。"""
+    if seconds <= 0:
+        return bool(abort_event and abort_event.is_set())
+    if abort_event:
+        return abort_event.wait(seconds)
+    time.sleep(seconds)
+    return False
 
 
 @dataclass
@@ -135,14 +178,11 @@ class RunRegistry:
             record.abort_event.set()
 
         serials = sorted({record.device_serial for record in records if record.device_serial})
-        if serials:
+        for serial in serials:
             try:
-                from backend.runner import trigger_device_abort
-
-                for serial in serials:
-                    trigger_device_abort(serial)
+                trigger_device_abort(serial)
             except Exception:
-                pass
+                logger.exception("failed to trigger device abort: serial=%s", serial)
 
         return records
 

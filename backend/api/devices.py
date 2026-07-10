@@ -1399,7 +1399,7 @@ async def unlock_device(
 
     # ★ 触发 Python 端中止信号（中断正在执行的 runner 线程）
     try:
-        from backend.runner import trigger_device_abort
+        from backend.run_control import trigger_device_abort
 
         trigger_device_abort(serial)
     except Exception:

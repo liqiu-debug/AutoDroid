@@ -13,9 +13,13 @@ from backend.cross_platform_execution import (
     restore_device_status_after_execution,
     run_case_with_standard_runner,
 )
-from backend.feature_flags import FLAG_CROSS_PLATFORM_RUNNER, is_flag_enabled
-from backend.models import TestScenario, ScenarioStep, User, TestCase, Step, TestExecution, TestResult, Device
-from backend.run_control import ABORTED_STATUS, registry
+from backend.models import TestScenario, ScenarioStep, User, TestCase, TestExecution, TestResult, Device
+from backend.run_control import (
+    ABORTED_STATUS,
+    register_device_abort,
+    registry,
+    unregister_device_abort,
+)
 from backend.execution_limiter import get_execution_limiter
 from backend.schemas import (
     PaginatedTestScenarioRead,
@@ -36,7 +40,6 @@ import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from backend.runner import ScenarioRunner, register_device_abort, trigger_device_abort, unregister_device_abort
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -627,68 +630,6 @@ def _prepare_cross_platform_device_execution(
     session.add(execution)
     session.commit()
     return abort_event
-
-
-def _prepare_legacy_scenario_device_execution(
-    *,
-    session: Session,
-    execution: TestExecution,
-    runner: ScenarioRunner,
-) -> Tuple[Optional[str], Any]:
-    runner.runner.connect()
-    driver = runner.runner.d
-    device_serial = getattr(driver, "serial", None)
-    if not device_serial:
-        return None, None
-
-    abort_event = register_device_abort(device_serial)
-    runner.abort_event = abort_event
-    runner.runner.abort_event = abort_event
-    run_record = registry.register(
-        kind="scenario",
-        target_id=execution.scenario_id,
-        batch_id=execution.batch_id,
-        device_serial=device_serial,
-        abort_event=abort_event,
-        execution_id=execution.id,
-    )
-    setattr(abort_event, "_autodroid_run_id", run_record.run_id)
-
-    resolved_meta = _resolve_device_meta(
-        session,
-        device_serial,
-        fallback_display=execution.device_info,
-    )
-    execution.device_serial = resolved_meta.get("device_serial")
-    execution.platform = "android"
-
-    dev = session.exec(select(Device).where(Device.serial == device_serial)).first()
-    if dev:
-        dev.status = "BUSY"
-        dev.updated_at = datetime.now()
-        execution.platform = str(dev.platform or "").strip().lower() or execution.platform
-        name_part = dev.custom_name or dev.market_name or dev.model
-        if name_part:
-            execution.device_info = name_part
-        session.add(dev)
-    else:
-        runner_info = getattr(driver, "info", None) or {}
-        if runner_info:
-            execution.device_info = (
-                f"{runner_info.get('manufacturer')} {runner_info.get('model')} "
-                f"(Android {runner_info.get('version')})"
-            )
-        elif resolved_meta.get("device_info"):
-            execution.device_info = resolved_meta.get("device_info")
-
-    if resolved_meta.get("platform"):
-        execution.platform = resolved_meta.get("platform")
-    if resolved_meta.get("device_info") and not execution.device_info:
-        execution.device_info = resolved_meta.get("device_info")
-
-    session.add(execution)
-    session.commit()
-    return device_serial, abort_event
 
 
 def _execute_cross_platform_scenario_core(
@@ -1309,10 +1250,8 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
         try:
             start_time = execution.start_time
 
-            use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
-
-            if use_cross_platform_runner and not device_serial:
-                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+            if not device_serial:
+                # 跨端链路必须显式指定设备。
                 logger.error(
                     "cross-platform scenario execution requires device_serial: scenario_id=%s execution_id=%s",
                     scenario_id,
@@ -1325,65 +1264,21 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
                 session.commit()
                 return
 
-            if use_cross_platform_runner:
-                abort_event = _prepare_cross_platform_device_execution(
-                    session=session,
-                    execution=execution,
-                    device_serial=device_serial,
-                )
-                _execute_cross_platform_scenario_core(
-                    session=session,
-                    scenario=scenario,
-                    execution=execution,
-                    scenario_id=scenario_id,
-                    device_serial=device_serial,
-                    start_time=start_time,
-                    env_id=env_id,
-                    abort_event=abort_event,
-                )
-            else:
-                # Legacy Android path
-                runner = ScenarioRunner(device_serial=device_serial)
-                try:
-                    prepared_serial, abort_event = _prepare_legacy_scenario_device_execution(
-                        session=session,
-                        execution=execution,
-                        runner=runner,
-                    )
-                    if prepared_serial:
-                        device_serial = prepared_serial
-                except Exception as e:
-                    logger.warning("legacy scenario device connect failed: execution_id=%s scenario_id=%s error=%s", execution_id, scenario_id, e)
-                    execution.status = "ERROR"
-                    execution.end_time = datetime.now()
-                    session.add(execution)
-                    session.commit()
-                    return
-
-                event_iter = _iter_legacy_scenario_event_infos(
-                    session=session,
-                    execution_id=execution.id,
-                    runner=runner,
-                    scenario_id=scenario_id,
-                    env_id=env_id,
-                    commit_per_step=False,
-                )
-                while True:
-                    try:
-                        next(event_iter)
-                    except StopIteration as stop:
-                        legacy_state = stop.value or _build_legacy_scenario_state()
-                        break
-
-                session.commit()
-                _finalize_scenario_execution(
-                    session=session,
-                    scenario=scenario,
-                    execution=execution,
-                    cases_results=legacy_state["cases_results"],
-                    start_time=start_time,
-                    status_override=ABORTED_STATUS if abort_event and abort_event.is_set() else None,
-                )
+            abort_event = _prepare_cross_platform_device_execution(
+                session=session,
+                execution=execution,
+                device_serial=device_serial,
+            )
+            _execute_cross_platform_scenario_core(
+                session=session,
+                scenario=scenario,
+                execution=execution,
+                scenario_id=scenario_id,
+                device_serial=device_serial,
+                start_time=start_time,
+                env_id=env_id,
+                abort_event=abort_event,
+            )
         except Exception as e:
             logger.exception("background scenario execution failed: scenario_id=%s execution_id=%s", scenario_id, execution.id if execution else None)
             was_aborted = bool(abort_event and abort_event.is_set())
@@ -1564,17 +1459,13 @@ async def run_scenario_api(
     requested_serials = request.device_serials or [None]
     runnable_serials: List[Optional[str]] = []
     blocked_prechecks: List[Dict[str, Any]] = []
-    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
 
     for serial in requested_serials:
         if not serial:
-            if use_cross_platform_runner:
-                # 跨端链路必须显式指定设备，不再静默回落 legacy。
-                blocked_prechecks.append(
-                    {"device_serial": serial, "reason": "请选择执行设备"}
-                )
-            else:
-                runnable_serials.append(serial)
+            # 跨端链路必须显式指定设备。
+            blocked_prechecks.append(
+                {"device_serial": serial, "reason": "请选择执行设备"}
+            )
             continue
         try:
             precheck = precheck_scenario_execution(
@@ -1721,21 +1612,6 @@ def precheck_scenario_api(
 
 from fastapi import WebSocket, WebSocketDisconnect
 from backend.socket_manager import manager
-import time
-
-
-def _build_ws_active_case_state(scenario_event: Dict[str, Any]) -> Dict[str, Any]:
-    scenario_step = scenario_event.get("scenario_step")
-    case_obj = scenario_event.get("case")
-    return {
-        "case_id": getattr(case_obj, "id", None),
-        "case_name": scenario_event.get("case_name") or "Unknown",
-        "alias": getattr(scenario_step, "alias", None),
-        "step_name": scenario_event.get("step_name") or "Unknown",
-        "started_at": time.time(),
-        "steps": [],
-        "last_screenshot_base64": None,
-    }
 
 
 async def _broadcast_ws_case_outcome(
@@ -1788,337 +1664,6 @@ async def _broadcast_ws_execution_complete(
             "execution_id": execution_id,
         },
     )
-
-
-def _capture_legacy_ws_failure_screenshot_base64(
-    runner: ScenarioRunner,
-    *,
-    execution_id: int,
-    step_order: int,
-) -> Optional[str]:
-    driver = getattr(getattr(runner, "runner", None), "d", None)
-    if not driver:
-        return None
-
-    try:
-        image = driver.screenshot()
-        return _encode_case_error_screenshot_base64(
-            image,
-            execution_id=execution_id,
-            step_order=step_order,
-        )
-    except Exception as exc:
-        logger.warning(
-            "websocket scenario screenshot failed: execution_id=%s step_order=%s error=%s",
-            execution_id,
-            step_order,
-            exc,
-        )
-        return None
-
-
-def _build_ws_case_entry(
-    active_case: Dict[str, Any],
-    *,
-    case_result: Optional[Dict[str, Any]] = None,
-    force_status: Optional[str] = None,
-) -> Tuple[Dict[str, Any], float]:
-    now = time.time()
-    started_at = float(active_case.get("started_at") or now)
-    duration = max(0.0, now - started_at)
-    resolved_result = case_result or {}
-    case_status = force_status or _determine_case_status(
-        active_case.get("steps") or [],
-        case_success=bool(resolved_result.get("success")),
-        case_is_warning=bool(resolved_result.get("is_warning")),
-    )
-    case_entry = {
-        "case_id": resolved_result.get("case_id") or active_case.get("case_id"),
-        "case_name": active_case.get("case_name"),
-        "alias": active_case.get("alias"),
-        "status": case_status,
-        "duration": round(duration, 2),
-        "steps": list(active_case.get("steps") or []),
-    }
-    return case_entry, duration
-
-
-def _build_legacy_scenario_state() -> Dict[str, Any]:
-    return {
-        "cases_results": [],
-        "global_step_order": 1,
-        "active_case": None,
-    }
-
-
-
-def _handle_legacy_scenario_step_result(
-    *,
-    session: Session,
-    execution_id: int,
-    runner: ScenarioRunner,
-    scenario_event: Dict[str, Any],
-    active_case: Optional[Dict[str, Any]],
-    global_step_order: int,
-    commit_per_step: bool,
-) -> Tuple[Dict[str, Any], int, Dict[str, Any]]:
-    if active_case is None:
-        active_case = _build_ws_active_case_state(scenario_event)
-
-    case_step = scenario_event.get("step")
-    step_res = scenario_event.get("step_result") or {}
-    step_payload = normalize_step_payload_for_report(step_res.get("step") or {})
-    case_step_payload = normalize_step_payload_for_report(case_step) if case_step is not None else {}
-    step_source = dict(case_step_payload)
-    for key, value in step_payload.items():
-        if value not in (None, ""):
-            step_source[key] = value
-    step_duration = float(step_res.get("duration") or 0)
-    action_value = step_source.get("action")
-    selector_value = step_source.get("selector")
-    description_value = step_source.get("description")
-    selector_type_value = step_source.get("selector_type")
-    strategy = step_source.get("error_strategy") or "ABORT"
-    action_desc = f"{action_value} {selector_value or ''}".strip()
-    step_log_entry = {
-        **step_source,
-        "action": action_value,
-        "description": description_value,
-        "selector": selector_value,
-        "selector_type": selector_type_value,
-        "duration": round(step_duration, 2),
-    }
-    if isinstance(step_res.get("output"), dict):
-        step_log_entry["output"] = step_res.get("output")
-
-    screenshot_base64 = str(step_res.get("screenshot") or "").strip() or None
-
-    if step_res.get("is_skipped"):
-        step_log_entry["status"] = "skipped"
-    elif not step_res.get("success"):
-        error_msg = step_res.get("error")
-        if step_res.get("is_warning"):
-            step_log_entry["status"] = "warning"
-        else:
-            step_log_entry["status"] = "failed"
-            step_log_entry["strategy"] = strategy
-        step_log_entry["error"] = error_msg
-
-        if not screenshot_base64:
-            screenshot_base64 = _capture_legacy_ws_failure_screenshot_base64(
-                runner,
-                execution_id=execution_id,
-                step_order=global_step_order,
-            )
-    else:
-        step_log_entry["status"] = "success"
-
-    screenshot_path = _persist_step_screenshot(
-        execution_id=execution_id,
-        step_order=global_step_order,
-        screenshot_b64=screenshot_base64,
-    )
-    if screenshot_base64:
-        step_log_entry["screenshot"] = screenshot_base64
-        active_case["last_screenshot_base64"] = screenshot_base64
-
-    report_display = build_report_display(
-        step_log_entry,
-        screenshot_base64=screenshot_base64,
-        screenshot_path=screenshot_path,
-        include_preview_base64=True,
-    )
-    step_log_entry["report_display"] = report_display
-    display_text = report_display.get("display_text") or description_value or action_value or "未知操作"
-
-    active_case["steps"].append(step_log_entry)
-
-    test_result = TestResult(
-        execution_id=execution_id,
-        step_name=f"[{active_case['step_name']}] {display_text}",
-        step_order=global_step_order,
-        status=_ui_status_to_db_status(step_log_entry["status"]),
-        duration=step_duration * 1000,
-        error_message=step_res.get("error"),
-        screenshot_path=screenshot_path,
-        report_display=storage_report_display(report_display),
-    )
-    session.add(test_result)
-    if commit_per_step:
-        session.commit()
-
-    event_info = {
-        "type": "step_result",
-        "status": step_log_entry["status"],
-        "action_desc": display_text or action_desc or action_value,
-        "error": step_res.get("error"),
-        "strategy": strategy,
-        "step_log_entry": step_log_entry,
-    }
-    return active_case, global_step_order + 1, event_info
-
-
-
-def _consume_legacy_scenario_event(
-    *,
-    session: Session,
-    execution_id: int,
-    runner: ScenarioRunner,
-    scenario_event: Dict[str, Any],
-    state: Dict[str, Any],
-    commit_per_step: bool,
-) -> Dict[str, Any]:
-    event_type = scenario_event.get("type")
-
-    if event_type == "scenario_abort":
-        return {"type": event_type}
-
-    if event_type == "case_start":
-        state["active_case"] = _build_ws_active_case_state(scenario_event)
-        return {
-            "type": "case_start",
-            "case_index": int(scenario_event.get("case_index") or 0),
-            "total_cases": int(scenario_event.get("total_cases") or 0),
-            "step_name": scenario_event.get("step_name") or "Unknown",
-            "case_name": scenario_event.get("case_name") or "Unknown",
-        }
-
-    if event_type == "step_result":
-        active_case, next_order, event_info = _handle_legacy_scenario_step_result(
-            session=session,
-            execution_id=execution_id,
-            runner=runner,
-            scenario_event=scenario_event,
-            active_case=state.get("active_case"),
-            global_step_order=int(state.get("global_step_order") or 1),
-            commit_per_step=commit_per_step,
-        )
-        state["active_case"] = active_case
-        state["global_step_order"] = next_order
-        return event_info
-
-    if event_type == "case_missing":
-        case_index = int(scenario_event.get("case_index") or 0)
-        step_name = scenario_event.get("step_name") or f"Step {case_index + 1}"
-        case_id = scenario_event.get("case_id")
-        missing_case_result = _build_synthetic_case_result(
-            case_id=case_id,
-            error_message=f"Case not found: {case_id}",
-            description="case not found",
-        )
-        raw_item = dict(scenario_event.get("raw_result") or {})
-        raw_item["alias"] = raw_item.get("alias") or getattr(scenario_event.get("scenario_step"), "alias", None)
-        raw_item["case_name"] = raw_item.get("case_name") or scenario_event.get("case_name") or "Unknown"
-        case_entry, next_order, _ = _persist_case_result_and_build_case_report(
-            session=session,
-            execution_id=execution_id,
-            item=raw_item,
-            case_result=missing_case_result,
-            global_step_order=int(state.get("global_step_order") or 1),
-            step_name_prefix=step_name,
-            include_case_duration=True,
-            commit_per_step=commit_per_step,
-        )
-        state["global_step_order"] = next_order
-        state["cases_results"].append(case_entry)
-        state["active_case"] = None
-        return {
-            "type": "case_missing",
-            "case_index": case_index,
-            "step_name": step_name,
-            "case_id": case_id,
-            "case_entry": case_entry,
-        }
-
-    if event_type == "case_exception":
-        active_case = state.get("active_case")
-        if active_case is None:
-            active_case = _build_ws_active_case_state(scenario_event)
-            active_case["case_id"] = scenario_event.get("case_id") or active_case.get("case_id")
-
-        error_message = str(scenario_event.get("error") or "legacy scenario execution failed")
-        active_case["steps"].append(
-            {
-                "status": "failed",
-                "action": "system",
-                "description": error_message,
-                "selector": None,
-                "selector_type": None,
-                "duration": 0,
-                "error": error_message,
-            }
-        )
-        session.add(
-            TestResult(
-                execution_id=execution_id,
-                step_name=f"[{active_case['step_name']}] {error_message}",
-                step_order=int(state.get("global_step_order") or 1),
-                status="FAIL",
-                duration=0,
-                error_message=error_message,
-                screenshot_path=None,
-            )
-        )
-        if commit_per_step:
-            session.commit()
-        state["global_step_order"] = int(state.get("global_step_order") or 1) + 1
-
-        case_entry, duration = _build_ws_case_entry(active_case, force_status="failed")
-        state["cases_results"].append(case_entry)
-        state["active_case"] = None
-        return {
-            "type": "case_exception",
-            "error": error_message,
-            "case_entry": case_entry,
-            "duration": duration,
-            "attachment": active_case.get("last_screenshot_base64"),
-        }
-
-    if event_type == "case_complete":
-        case_result = scenario_event.get("case_result") or {}
-        active_case = state.get("active_case")
-        if active_case is None:
-            active_case = _build_ws_active_case_state(scenario_event)
-            active_case["case_id"] = case_result.get("case_id") or active_case.get("case_id")
-
-        case_entry, duration = _build_ws_case_entry(active_case, case_result=case_result)
-        state["cases_results"].append(case_entry)
-        state["active_case"] = None
-        return {
-            "type": "case_complete",
-            "case_entry": case_entry,
-            "duration": duration,
-            "attachment": active_case.get("last_screenshot_base64"),
-        }
-
-    return {"type": str(event_type or "unknown")}
-
-
-def _iter_legacy_scenario_event_infos(
-    *,
-    session: Session,
-    execution_id: int,
-    runner: ScenarioRunner,
-    scenario_id: int,
-    env_id: Optional[int],
-    commit_per_step: bool,
-):
-    state = _build_legacy_scenario_state()
-    scenario_iter = runner.iter_scenario_execution(scenario_id, session, env_id=env_id)
-    while True:
-        try:
-            scenario_event = next(scenario_iter)
-        except StopIteration:
-            return state
-        event_info = _consume_legacy_scenario_event(
-            session=session,
-            execution_id=execution_id,
-            runner=runner,
-            scenario_event=scenario_event,
-            state=state,
-            commit_per_step=commit_per_step,
-        )
-        yield event_info
 
 
 def _iter_cross_platform_event_infos(
@@ -2288,71 +1833,6 @@ def _execute_cross_platform_scenario_ws(
         )
 
 
-class _LegacyScenarioWsExecutionState:
-    def __init__(
-        self,
-        *,
-        scenario_id: int,
-        execution_id: int,
-        env_id: Optional[int],
-        device_serial: Optional[str],
-    ) -> None:
-        from sqlmodel import Session as SQLSession
-
-        self.session = SQLSession(engine)
-        self.scenario_id = scenario_id
-        self.env_id = env_id
-        self.device_serial = device_serial
-        self.execution = self.session.get(TestExecution, execution_id)
-        if not self.execution:
-            self.session.close()
-            raise RuntimeError(f"Execution not found: {execution_id}")
-        self.runner = ScenarioRunner(device_serial=device_serial)
-        self.start_time = self.execution.start_time or datetime.now()
-        self._event_iter = None
-
-    def prepare(self) -> Optional[str]:
-        prepared_serial, _abort_event = _prepare_legacy_scenario_device_execution(
-            session=self.session,
-            execution=self.execution,
-            runner=self.runner,
-        )
-        if prepared_serial:
-            self.device_serial = prepared_serial
-        self._event_iter = _iter_legacy_scenario_event_infos(
-            session=self.session,
-            execution_id=self.execution.id,
-            runner=self.runner,
-            scenario_id=self.scenario_id,
-            env_id=self.env_id,
-            commit_per_step=True,
-        )
-        return self.device_serial
-
-    def next_event(self) -> Dict[str, Any]:
-        if self._event_iter is None:
-            raise RuntimeError("legacy websocket execution is not prepared")
-
-        try:
-            return {"done": False, "event": next(self._event_iter)}
-        except StopIteration as stop:
-            legacy_state = stop.value or _build_legacy_scenario_state()
-            scenario = self.session.get(TestScenario, self.scenario_id)
-            if not scenario:
-                raise RuntimeError(f"Scenario not found: {self.scenario_id}")
-            final_summary = _finalize_scenario_execution(
-                session=self.session,
-                scenario=scenario,
-                execution=self.execution,
-                cases_results=legacy_state["cases_results"],
-                start_time=self.start_time,
-            )
-            return {"done": True, "summary": final_summary}
-
-    def close(self) -> None:
-        self.session.close()
-
-
 @router.websocket("/ws/run/{scenario_id}")
 async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id: Optional[int] = None, device_serial: Optional[str] = None):
     """WebSocket endpoint: Run scenario with real-time logs"""
@@ -2360,7 +1840,6 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
     await manager.connect(websocket, ws_key)
 
     blocking_executor = ThreadPoolExecutor(max_workers=1)
-    legacy_ws_state = None
     device_serial_ws = device_serial
     execution_id_ws = None
     try:
@@ -2425,10 +1904,8 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
                 },
             )
 
-            use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
-
-            if use_cross_platform_runner and not device_serial:
-                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+            if not device_serial:
+                # 跨端链路必须显式指定设备。
                 execution.status = "ERROR"
                 execution.end_time = datetime.now()
                 execution.duration = 0
@@ -2447,105 +1924,67 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
                 )
                 return
 
-            if use_cross_platform_runner:
-                await manager.broadcast_log(ws_key, "info", "🧠 使用跨端执行引擎")
-                device_serial_ws = device_serial
+            await manager.broadcast_log(ws_key, "info", "🧠 使用跨端执行引擎")
+            device_serial_ws = device_serial
 
-                try:
-                    scenario_precheck = precheck_scenario_execution(
-                        session=session,
-                        scenario_id=scenario_id,
-                        device_serial=device_serial_ws,
-                        env_id=env_id,
-                    )
-                except Exception as exc:
-                    execution.status = "ERROR"
-                    execution.end_time = datetime.now()
-                    execution.duration = 0
-                    session.add(execution)
-                    session.commit()
-                    await manager.broadcast_log(ws_key, "error", f"❌ 运行前预检异常: {exc}")
-                    return
-
-                if not scenario_precheck.get("ok"):
-                    reason = _summarize_precheck_failure(scenario_precheck)
-                    execution.status = "ERROR"
-                    execution.end_time = datetime.now()
-                    execution.duration = 0
-                    session.add(execution)
-                    session.commit()
-                    await manager.broadcast_log(ws_key, "error", f"❌ 运行前预检未通过: {reason}")
-                    await manager.send_message(
-                        ws_key,
-                        {
-                            "type": "run_complete",
-                            "success": False,
-                            "status": "ERROR",
-                            "summary": f"运行前预检未通过: {reason}",
-                            "execution_id": execution.id,
-                        },
-                    )
-                    return
-
-                cross_summary = await _run_in_blocking_executor(
-                    blocking_executor,
-                    _execute_cross_platform_scenario_ws,
-                    scenario_id=scenario_id,
-                    execution_id=execution.id,
-                    device_serial=device_serial_ws,
-                    start_time=start_time,
-                    env_id=env_id,
-                )
-
-                event_iter = _iter_cross_platform_event_infos(
-                    raw_results=cross_summary.get("raw_results", []),
-                    cases_results=cross_summary.get("cases_results", []),
-                )
-                while True:
-                    try:
-                        event_info = next(event_iter)
-                    except StopIteration:
-                        break
-                    await _broadcast_ws_scenario_event(ws_key, event_info)
-
-                await _broadcast_ws_execution_complete(ws_key, execution.id, cross_summary)
-                return
-
-            # 2. Prepare Runner
             try:
-                legacy_ws_state = await _run_in_blocking_executor(
-                    blocking_executor,
-                    _LegacyScenarioWsExecutionState,
+                scenario_precheck = precheck_scenario_execution(
+                    session=session,
                     scenario_id=scenario_id,
-                    execution_id=execution.id,
+                    device_serial=device_serial_ws,
                     env_id=env_id,
-                    device_serial=device_serial,
                 )
-                device_serial_ws = await _run_in_blocking_executor(
-                    blocking_executor,
-                    legacy_ws_state.prepare,
-                )
-                await manager.broadcast_log(ws_key, "info", "✅ 设备连接成功")
-            except Exception as e:
-                await manager.broadcast_log(ws_key, "error", f"❌ 设备连接失败: {e}")
+            except Exception as exc:
                 execution.status = "ERROR"
                 execution.end_time = datetime.now()
+                execution.duration = 0
                 session.add(execution)
                 session.commit()
+                await manager.broadcast_log(ws_key, "error", f"❌ 运行前预检异常: {exc}")
                 return
 
-            while True:
-                next_result = await _run_in_blocking_executor(
-                    blocking_executor,
-                    legacy_ws_state.next_event,
+            if not scenario_precheck.get("ok"):
+                reason = _summarize_precheck_failure(scenario_precheck)
+                execution.status = "ERROR"
+                execution.end_time = datetime.now()
+                execution.duration = 0
+                session.add(execution)
+                session.commit()
+                await manager.broadcast_log(ws_key, "error", f"❌ 运行前预检未通过: {reason}")
+                await manager.send_message(
+                    ws_key,
+                    {
+                        "type": "run_complete",
+                        "success": False,
+                        "status": "ERROR",
+                        "summary": f"运行前预检未通过: {reason}",
+                        "execution_id": execution.id,
+                    },
                 )
-                if next_result.get("done"):
-                    final_summary = next_result.get("summary")
+                return
+
+            cross_summary = await _run_in_blocking_executor(
+                blocking_executor,
+                _execute_cross_platform_scenario_ws,
+                scenario_id=scenario_id,
+                execution_id=execution.id,
+                device_serial=device_serial_ws,
+                start_time=start_time,
+                env_id=env_id,
+            )
+
+            event_iter = _iter_cross_platform_event_infos(
+                raw_results=cross_summary.get("raw_results", []),
+                cases_results=cross_summary.get("cases_results", []),
+            )
+            while True:
+                try:
+                    event_info = next(event_iter)
+                except StopIteration:
                     break
-                event_info = next_result.get("event")
                 await _broadcast_ws_scenario_event(ws_key, event_info)
 
-            await _broadcast_ws_execution_complete(ws_key, execution.id, final_summary)
+            await _broadcast_ws_execution_complete(ws_key, execution.id, cross_summary)
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {ws_key}")
@@ -2553,14 +1992,6 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
         logger.exception("场景 WebSocket 执行异常: ws_key=%s scenario_id=%s", ws_key, scenario_id)
         await manager.broadcast_log(ws_key, "error", f"❌ 系统异常: {str(e)}")
     finally:
-        try:
-            if legacy_ws_state is not None:
-                await _run_in_blocking_executor(
-                    blocking_executor,
-                    legacy_ws_state.close,
-                )
-        except Exception as e:
-            logger.warning("关闭场景 WebSocket 后台执行上下文失败: ws_key=%s error=%s", ws_key, e)
         # ★ 恢复设备状态 并 清除中止事件
         try:
             from sqlmodel import Session as SQLSession

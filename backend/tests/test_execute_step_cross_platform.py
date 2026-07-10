@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from fastapi import HTTPException
+
 from backend.main import (
     SingleStepPayload,
     _cross_platform_result_to_legacy_payload,
@@ -78,28 +80,41 @@ class SingleStepCrossPlatformTests(unittest.TestCase):
         self.assertEqual(payload["platform"], "ios")
         self.assertEqual(payload["step"]["action"], "click")
 
-    @patch("backend.main.time.sleep", return_value=None)
-    @patch("backend.main._take_screenshot_base64", return_value="abc")
+    @patch("backend.main._wait_ui_stable", return_value=None)
+    @patch("backend.main._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})
     @patch("backend.main._resolve_recording_platform", return_value="android")
-    @patch("backend.main.TestRunner")
-    def test_execute_single_step_android_accepts_blank_selector_type_for_assert_text(
+    @patch("backend.main.CrossPlatformRunner")
+    def test_execute_single_step_android_uses_cross_platform_runner(
         self,
         runner_cls,
         resolve_platform_mock,
-        screenshot_mock,
-        sleep_mock,
+        build_dump_mock,
+        wait_ui_mock,
     ):
         session = Mock()
 
         runner = Mock()
-        runner.d = Mock()
-        runner.d.info = {}
-        runner.d.dump_hierarchy.return_value = "<xml />"
-        runner.execute_step.return_value = {
-            "step": {"action": "assert_text", "selector_type": None},
-            "success": True,
-            "error": None,
+        runner.driver = Mock()
+        runner.run_step.return_value = {
+            "action": "assert_text",
+            "status": "PASS",
+            "platform": "android",
+            "device_id": "android-1",
+            "error_strategy": "ABORT",
             "duration": 0.2,
+            "error": None,
+            "output": None,
+            "artifacts": None,
+            "step": {
+                "action": "assert_text",
+                "args": {"expected_text": "登录成功", "match_mode": "contains"},
+                "value": "登录成功",
+                "execute_on": ["android"],
+                "platform_overrides": {},
+                "timeout": 10,
+                "error_strategy": "ABORT",
+                "description": "断言页面包含登录成功",
+            },
         }
         runner_cls.return_value = runner
 
@@ -118,12 +133,26 @@ class SingleStepCrossPlatformTests(unittest.TestCase):
         response = execute_single_step(payload, session=session)
 
         self.assertTrue(response["result"]["success"])
+        self.assertEqual(response["result"]["status"], "PASS")
         self.assertEqual(response["dump"]["screenshot"], "abc")
-        step_model = runner.execute_step.call_args.args[0]
-        self.assertEqual(step_model.action.value, "assert_text")
-        self.assertIsNone(step_model.selector_type)
+        runner_cls.assert_called_once_with(platform="android", device_id="android-1")
+        normalized_step = runner.run_step.call_args.args[0]
+        self.assertEqual(normalized_step["action"], "assert_text")
+        self.assertEqual(normalized_step["args"].get("expected_text"), "登录成功")
         resolve_platform_mock.assert_called_once_with(session, "android-1")
-        runner.connect.assert_called_once()
+        runner.disconnect.assert_called_once()
+
+    def test_execute_single_step_without_device_returns_400(self):
+        payload = SingleStepPayload(
+            step={"action": "click", "selector": "登录", "selector_type": "text"},
+            device_serial=None,
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            execute_single_step(payload, session=Mock())
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("请选择执行设备", str(ctx.exception.detail))
 
     @patch("backend.main.time.sleep", return_value=None)
     @patch("backend.main._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})

@@ -3,7 +3,6 @@ import unittest
 from sqlmodel import Session, SQLModel, create_engine
 
 from backend.feature_flags import (
-    FLAG_CROSS_PLATFORM_RUNNER,
     FLAG_IOS_EXECUTION,
     FLAG_NEW_STEP_MODEL,
     FLAG_WS_DISCONNECT_ABORT,
@@ -21,9 +20,8 @@ class FeatureFlagDefaultsTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.session.close()
 
-    def test_new_execution_flags_default_enabled(self):
+    def test_new_step_model_defaults_enabled(self):
         self.assertTrue(is_flag_enabled(self.session, FLAG_NEW_STEP_MODEL))
-        self.assertTrue(is_flag_enabled(self.session, FLAG_CROSS_PLATFORM_RUNNER))
 
     def test_ios_and_ws_disconnect_flags_default_disabled(self):
         self.assertFalse(is_flag_enabled(self.session, FLAG_IOS_EXECUTION))
@@ -34,14 +32,12 @@ class FeatureFlagDefaultsTests(unittest.TestCase):
 
     def test_explicit_default_argument_still_wins_for_missing_setting(self):
         self.assertTrue(is_flag_enabled(self.session, "unknown_flag", default=True))
-        self.assertFalse(is_flag_enabled(self.session, FLAG_CROSS_PLATFORM_RUNNER, default=False))
+        self.assertFalse(is_flag_enabled(self.session, FLAG_NEW_STEP_MODEL, default=False))
 
     def test_db_false_value_overrides_enabled_default(self):
-        self.session.add(SystemSetting(key=FLAG_CROSS_PLATFORM_RUNNER, value="false"))
         self.session.add(SystemSetting(key=FLAG_NEW_STEP_MODEL, value="0"))
         self.session.commit()
 
-        self.assertFalse(is_flag_enabled(self.session, FLAG_CROSS_PLATFORM_RUNNER))
         self.assertFalse(is_flag_enabled(self.session, FLAG_NEW_STEP_MODEL))
 
     def test_db_true_value_overrides_disabled_default(self):
@@ -51,11 +47,11 @@ class FeatureFlagDefaultsTests(unittest.TestCase):
         self.assertTrue(is_flag_enabled(self.session, FLAG_IOS_EXECUTION))
 
     def test_invalid_db_value_falls_back_to_default(self):
-        self.session.add(SystemSetting(key=FLAG_CROSS_PLATFORM_RUNNER, value="whatever"))
+        self.session.add(SystemSetting(key=FLAG_NEW_STEP_MODEL, value="whatever"))
         self.session.add(SystemSetting(key=FLAG_IOS_EXECUTION, value="whatever"))
         self.session.commit()
 
-        self.assertTrue(is_flag_enabled(self.session, FLAG_CROSS_PLATFORM_RUNNER))
+        self.assertTrue(is_flag_enabled(self.session, FLAG_NEW_STEP_MODEL))
         self.assertFalse(is_flag_enabled(self.session, FLAG_IOS_EXECUTION))
 
 
