@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from backend.api.scenarios import (
+from backend.scenario_results import (
     _build_cases_results_from_raw_results,
     _persist_case_result_and_build_case_report,
     _persist_step_screenshot,
@@ -75,7 +75,7 @@ class ScenarioCaseResultPersistenceTests(unittest.TestCase):
             "is_warning": True,
         }
 
-        with patch("backend.api.scenarios._persist_step_screenshot", return_value="screenshots/fake.png"):
+        with patch("backend.scenario_results._persist_step_screenshot", return_value="screenshots/fake.png"):
             case_entry, next_order, case_duration = _persist_case_result_and_build_case_report(
                 session=self.session,
                 execution_id=self.execution_id,
@@ -173,7 +173,7 @@ class ScenarioCaseResultPersistenceTests(unittest.TestCase):
         }
         image = Image.new("RGB", (1, 1), color=(255, 0, 0))
 
-        with patch("backend.api.scenarios._persist_step_screenshot", return_value="screenshots/fallback.png") as persist_mock:
+        with patch("backend.scenario_results._persist_step_screenshot", return_value="screenshots/fallback.png") as persist_mock:
             case_entry, next_order, _ = _persist_case_result_and_build_case_report(
                 session=self.session,
                 execution_id=self.execution_id,
@@ -225,7 +225,7 @@ class ScenarioCaseResultPersistenceTests(unittest.TestCase):
         png_payload = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode("utf-8")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("backend.api.scenarios._get_reports_root_dir", return_value=tmpdir):
+            with patch("backend.scenario_results._get_reports_root_dir", return_value=tmpdir):
                 stored_path = _persist_step_screenshot(
                     execution_id=42,
                     step_order=7,

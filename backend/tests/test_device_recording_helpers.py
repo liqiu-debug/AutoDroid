@@ -3,7 +3,7 @@ import hashlib
 import unittest
 from unittest.mock import Mock, patch
 
-from backend.main import (
+from backend.api.recording import (
     _RecordingIOSSessionPool,
     _build_device_dump_payload,
     _get_device_hierarchy_xml,
@@ -54,8 +54,8 @@ class DeviceRecordingHelperTests(unittest.TestCase):
         pool = _RecordingIOSSessionPool()
         driver = Mock()
 
-        with patch("backend.main.check_wda_health") as health_check, patch(
-            "backend.main.IOSDriver",
+        with patch("backend.api.recording.check_wda_health") as health_check, patch(
+            "backend.api.recording.IOSDriver",
             return_value=driver,
         ) as driver_cls:
             first = pool.acquire("ios-1", "http://127.0.0.1:8200")

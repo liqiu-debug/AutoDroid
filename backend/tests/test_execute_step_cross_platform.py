@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
 
-from backend.main import (
+from backend.api.recording import (
     SingleStepPayload,
     _cross_platform_result_to_legacy_payload,
     _normalize_single_step_for_runner,
@@ -80,10 +80,10 @@ class SingleStepCrossPlatformTests(unittest.TestCase):
         self.assertEqual(payload["platform"], "ios")
         self.assertEqual(payload["step"]["action"], "click")
 
-    @patch("backend.main._wait_ui_stable", return_value=None)
-    @patch("backend.main._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})
-    @patch("backend.main._resolve_recording_platform", return_value="android")
-    @patch("backend.main.CrossPlatformRunner")
+    @patch("backend.api.recording._wait_ui_stable", return_value=None)
+    @patch("backend.api.recording._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})
+    @patch("backend.api.recording._resolve_recording_platform", return_value="android")
+    @patch("backend.api.recording.CrossPlatformRunner")
     def test_execute_single_step_android_uses_cross_platform_runner(
         self,
         runner_cls,
@@ -154,13 +154,13 @@ class SingleStepCrossPlatformTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("请选择执行设备", str(ctx.exception.detail))
 
-    @patch("backend.main.time.sleep", return_value=None)
-    @patch("backend.main._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})
-    @patch("backend.main.check_wda_health")
-    @patch("backend.main.resolve_ios_wda_url", return_value="http://127.0.0.1:8200")
-    @patch("backend.main.is_flag_enabled", return_value=True)
-    @patch("backend.main.resolve_device_platform", return_value="ios")
-    @patch("backend.main.CrossPlatformRunner")
+    @patch("backend.api.recording.time.sleep", return_value=None)
+    @patch("backend.api.recording._build_device_dump_payload", return_value={"device_info": {}, "hierarchy_xml": "<xml />", "screenshot": "abc"})
+    @patch("backend.api.recording.check_wda_health")
+    @patch("backend.api.recording.resolve_ios_wda_url", return_value="http://127.0.0.1:8200")
+    @patch("backend.api.recording.is_flag_enabled", return_value=True)
+    @patch("backend.api.recording.resolve_device_platform", return_value="ios")
+    @patch("backend.api.recording.CrossPlatformRunner")
     def test_execute_single_step_ios_uses_cross_platform_runner(
         self,
         runner_cls,

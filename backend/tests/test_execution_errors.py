@@ -577,7 +577,7 @@ class IOSDriverStructuredErrorTests(unittest.TestCase):
         self.assertIn("元素未找到", str(exc))
         self.assertEqual(exc.context.get("timeout"), 1)
 
-    @patch("backend.drivers.ios_driver.time.sleep", return_value=None)
+    @patch("backend.drivers.ios.app_control.time.sleep", return_value=None)
     def test_stop_app_failure_raises_e2008(self, _):
         driver = self._new_driver()
         session = Mock()

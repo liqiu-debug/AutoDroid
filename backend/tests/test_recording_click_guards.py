@@ -2,7 +2,7 @@ import unittest
 
 from fastapi import HTTPException
 
-from backend.main import (
+from backend.api.recording import (
     CLICK_IMAGE_REQUIRED_DETAIL,
     CLICK_TARGET_NOT_FOUND_DETAIL,
     _build_click_step_from_inspect_result,

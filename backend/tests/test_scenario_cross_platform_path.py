@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from sqlmodel import Session, SQLModel, create_engine
 
+from backend import scenario_execution
 from backend.api import scenarios
 from backend.models import Device, ScenarioStep, TestCase, TestExecution, TestScenario
 
@@ -84,12 +85,12 @@ class ScenarioCrossPlatformPathTests(unittest.TestCase):
         start_time = datetime.now() - timedelta(seconds=1)
 
         with Session(self.engine) as session, \
-             patch.object(scenarios, "_run_scenario_cross_platform", return_value=fake_result) as cross_run, \
+             patch.object(scenario_execution, "_run_scenario_cross_platform", return_value=fake_result) as cross_run, \
              patch("backend.report_generator.report_generator.generate_scenario_report", return_value="report-1"):
             scenario = session.get(TestScenario, self.scenario_id)
             execution = session.get(TestExecution, self.execution.id)
 
-            summary = scenarios._execute_cross_platform_scenario_core(
+            summary = scenario_execution._execute_cross_platform_scenario_core(
                 session=session,
                 scenario=scenario,
                 execution=execution,
@@ -122,13 +123,13 @@ class ScenarioCrossPlatformPathTests(unittest.TestCase):
         abort_event = threading.Event()
         fake_result = self._fake_cross_result()
 
-        with patch.object(scenarios, "engine", self.engine), \
-             patch.object(scenarios, "register_device_abort", return_value=abort_event) as register_abort, \
-             patch.object(scenarios, "unregister_device_abort") as unregister_abort, \
-             patch.object(scenarios, "restore_device_status_after_execution") as restore_status, \
-             patch.object(scenarios, "_run_scenario_cross_platform", return_value=fake_result) as cross_run, \
+        with patch.object(scenario_execution, "engine", self.engine), \
+             patch.object(scenario_execution, "register_device_abort", return_value=abort_event) as register_abort, \
+             patch.object(scenario_execution, "unregister_device_abort") as unregister_abort, \
+             patch.object(scenario_execution, "restore_device_status_after_execution") as restore_status, \
+             patch.object(scenario_execution, "_run_scenario_cross_platform", return_value=fake_result) as cross_run, \
              patch("backend.report_generator.report_generator.generate_scenario_report", return_value="report-1"):
-            scenarios._run_single_device_sync(
+            scenario_execution._run_single_device_sync(
                 execution_id=self.execution.id,
                 scenario_id=self.scenario_id,
                 device_serial="ios-1",
@@ -163,9 +164,9 @@ class ScenarioCrossPlatformPathTests(unittest.TestCase):
             setup_session.refresh(missing_execution)
             missing_execution_id = missing_execution.id
 
-        with patch.object(scenarios, "engine", self.engine), \
-             self.assertLogs("backend.api.scenarios", level="ERROR") as logs:
-            scenarios._run_single_device_sync(
+        with patch.object(scenario_execution, "engine", self.engine), \
+             self.assertLogs("backend.scenario_execution", level="ERROR") as logs:
+            scenario_execution._run_single_device_sync(
                 execution_id=missing_execution_id,
                 scenario_id=99999,
                 device_serial="ios-1",
@@ -180,15 +181,15 @@ class ScenarioCrossPlatformPathTests(unittest.TestCase):
             self.assertIsNotNone(execution.end_time)
 
     def test_run_single_device_sync_marks_error_when_device_prepare_fails(self):
-        with patch.object(scenarios, "engine", self.engine), \
+        with patch.object(scenario_execution, "engine", self.engine), \
              patch.object(
-                 scenarios,
+                 scenario_execution,
                  "_prepare_cross_platform_device_execution",
                  side_effect=RuntimeError("connect failed"),
              ), \
-             patch.object(scenarios, "restore_device_status_after_execution") as restore_status, \
-             patch.object(scenarios, "unregister_device_abort") as unregister_abort:
-            scenarios._run_single_device_sync(
+             patch.object(scenario_execution, "restore_device_status_after_execution") as restore_status, \
+             patch.object(scenario_execution, "unregister_device_abort") as unregister_abort:
+            scenario_execution._run_single_device_sync(
                 execution_id=self.execution.id,
                 scenario_id=self.scenario_id,
                 device_serial="ios-1",

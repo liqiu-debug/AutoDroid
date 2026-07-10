@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock, patch
 from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import Session, SQLModel, create_engine
 
-from backend import main
+from backend.api import ws_run
 from backend.api import cases as cases_api
-from backend.api import scenarios as scenarios_api
+from backend import scenario_execution
 from backend.models import (
     ScenarioStep,
     TestCase,
@@ -85,11 +85,11 @@ class CaseWebSocketDeviceRequiredTests(unittest.IsolatedAsyncioTestCase):
     async def test_websocket_run_case_without_device_sends_error(self):
         websocket = _FakeWebSocket()
 
-        with patch.object(main, "engine", self.engine), \
-             patch.object(main.manager, "connect", new=AsyncMock()), \
-             patch.object(main.manager, "broadcast_run_start", new=AsyncMock()) as run_start_mock, \
-             patch.object(main.manager, "disconnect"):
-            await main.websocket_run_case(
+        with patch.object(ws_run, "engine", self.engine), \
+             patch.object(ws_run.manager, "connect", new=AsyncMock()), \
+             patch.object(ws_run.manager, "broadcast_run_start", new=AsyncMock()) as run_start_mock, \
+             patch.object(ws_run.manager, "disconnect"):
+            await ws_run.websocket_run_case(
                 websocket,
                 self.case_id,
                 env_id=None,
@@ -139,9 +139,9 @@ class ScenarioDeviceRequiredTests(unittest.TestCase):
             self.execution_id = execution.id
 
     def test_run_single_device_sync_without_device_marks_execution_error(self):
-        with patch.object(scenarios_api, "engine", self.engine), \
-             self.assertLogs("backend.api.scenarios", level="ERROR") as logs:
-            scenarios_api._run_single_device_sync(
+        with patch.object(scenario_execution, "engine", self.engine), \
+             self.assertLogs("backend.scenario_execution", level="ERROR") as logs:
+            scenario_execution._run_single_device_sync(
                 execution_id=self.execution_id,
                 scenario_id=self.scenario_id,
                 device_serial=None,
