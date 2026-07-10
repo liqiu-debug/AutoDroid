@@ -118,13 +118,13 @@
 
 基于 `TestExecution`/`TestResult` 历史统计"最近 N 次通过率"，标记不稳定用例 Top；支持两次执行结果 diff 视图。
 
-### 🚧 P2.4 iOS 实时投屏（后端已落地，前端进行中）
+### ✅ P2.4 iOS 实时投屏
 
-后端：WDA MJPEG relay（9300-9399）+ `WS /ws/ios-mjpeg/{serial}`（二进制 JPEG 帧）与 `GET /api/stream/ios-mjpeg/{serial}`（multipart 透传）双端点，单上游连接多客户端广播，帧率/质量经 WDA settings 可配（`ios_mjpeg_*` SystemSetting）。前端接入 `DeviceStage` 排在进行中的前端会话。
+后端：WDA MJPEG relay（9300-9399）+ `WS /ws/ios-mjpeg/{serial}`（二进制 JPEG 帧）与 `GET /api/stream/ios-mjpeg/{serial}`（multipart 透传）双端点，单上游连接多客户端广播，帧率/质量经 WDA settings 可配（`ios_mjpeg_*` SystemSetting）。前端：`IosMjpegPlayer` 以纯预览层接入 `DeviceStage`（`pointer-events:none`，点击/框选仍走静态截图+层级流程，框选时自动隐藏实时层保证所见即所得）；WDA 不可用（4005）引导检测，异常断开退避自动重连。待真机验证。
 
 ### ✅ 专项：Android Scrcpy 投屏质量（P1 批次新增）
 
-参数配置化（`AUTODROID_SCRCPY_MAX_SIZE/BITRATE/MAX_FPS/GOP`，默认 1920/8Mbps/60fps/1s）；花屏根因修复（客户端级"丢帧后等关键帧"状态机 + init 原子播种）；核查确认崩溃复现录制取原始流、不受观看端丢帧影响。前端 WebCodecs 解码器替换 jmuxer/MSE 排在进行中的前端会话。
+参数配置化（`AUTODROID_SCRCPY_MAX_SIZE/BITRATE/MAX_FPS/GOP`，默认 1920/8Mbps/60fps/1s）；花屏根因修复（客户端级"丢帧后等关键帧"状态机 + init 原子播种）；核查确认崩溃复现录制取原始流、不受观看端丢帧影响。前端 `ScrcpyPlayer` 已接入 WebCodecs 主解码路径（Annex-B 直喂、SPS 变化才重配、连续失败自动降级 jmuxer，`?scrcpyDecoder=jmuxer` 可强制回退），Safari 兼容性待真机验证。
 
 ### ⬜ P2.5 通知渠道扩展
 
