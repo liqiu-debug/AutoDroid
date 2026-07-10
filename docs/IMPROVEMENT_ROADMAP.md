@@ -88,11 +88,11 @@
 
 **已落地方案**：`feature_flags.py` 引入按 key 默认值表（`new_step_model` 默认开、DB 显式 `false` 可回退）；启动时幂等回填 legacy 步骤（`database.py::backfill_case_steps_to_standard`，单条失败跳过）；删除 `runner.py` 与全部 legacy 分支（净 -3100 行），`cross_platform_runner` 开关随链路一起移除；abort 注册表迁入 `run_control.py`；所有执行入口设备必选校验。
 
-### ✅ P1.5 巨型文件拆分（第一批）
+### ✅ P1.5 巨型文件拆分
 
-**已落地方案**：`fastbot_runner.py` 2899→169 行（re-export shim + `backend/fastbot/` 10 模块，AST 验证名称覆盖 100%）；`DeviceStage.vue` 2071→1047 行（6 composables + 2 utils，defineExpose API 不变）；`FastbotReportDetail.vue` 2027→670 行（10 子组件）。
+**已落地方案（第一批）**：`fastbot_runner.py` 2899→169 行（re-export shim + `backend/fastbot/` 10 模块，AST 验证名称覆盖 100%）；`DeviceStage.vue` 2071→1047 行（6 composables + 2 utils，defineExpose API 不变）；`FastbotReportDetail.vue` 2027→670 行（10 子组件）。
 
-**剩余**：`main.py`（1741）、`api/scenarios.py`（2547）、`ios_driver.py`（2592）的拆分排后续批次（main.py/scenarios.py 在 P1.4 删 legacy 后体量已下降）。
+**已落地方案（第二批）**：`main.py` 1741→316 行（录制端点→`api/recording.py`、WS 执行→`api/ws_run.py`、SPA→`spa.py`）；`api/scenarios.py` →929 行路由（执行编排→`scenario_execution.py`、结果持久化→`scenario_results.py`）；`ios_driver.py` →753 行类骨架（`drivers/ios/` mixin 包：locator/vision/app_control/support）。路由表与 OpenAPI JSON 前后逐字节一致，77 个 IOSDriver 方法 AST 逐字比对不变，15 个测试文件 patch 路径同步迁移。
 
 ### ✅ P1.6 SQLite 并发加固
 
