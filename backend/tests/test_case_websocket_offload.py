@@ -1,3 +1,4 @@
+import asyncio
 import threading
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,10 @@ from backend.models import Device, TestCase
 class _FakeWebSocket:
     def __init__(self) -> None:
         self.send_json = AsyncMock()
+
+    async def receive_text(self):
+        # 模拟保持连接的客户端：挂起直至被 disconnect watcher 取消
+        await asyncio.Event().wait()
 
 
 class _FakeCrossPlatformRunner:

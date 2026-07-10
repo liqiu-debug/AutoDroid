@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from sqlmodel import Session, select
 from backend.database import engine
 from backend.models import User, TestCase, TestScenario

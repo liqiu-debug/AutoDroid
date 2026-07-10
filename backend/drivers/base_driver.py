@@ -128,5 +128,9 @@ class BaseDriver(ABC):
         """断开设备连接（默认空实现，子类按需重写）。"""
         logger.info("[%s] 断开设备连接: %s", self.__class__.__name__, self.device_id)
 
+    def health_check(self) -> bool:
+        """快速探测底层连接是否仍可用（连接池复用前调用，子类按需重写）。"""
+        return True
+
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} device_id={self.device_id!r}>"

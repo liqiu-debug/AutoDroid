@@ -1,5 +1,5 @@
-uiautomator2
-adbutils
-opencv-python
-findit
-androguard
+uiautomator2>=3.5
+adbutils>=2.12
+opencv-python>=4.10
+findit>=0.5.9
+androguard>=4.1

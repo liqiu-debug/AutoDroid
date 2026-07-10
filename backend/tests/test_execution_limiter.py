@@ -1,6 +1,14 @@
+import os
 import unittest
+from unittest.mock import patch
 
-from backend.execution_limiter import ExecutionLimiter
+from backend.execution_limiter import (
+    DEFAULT_MAX_GLOBAL,
+    DEFAULT_MAX_PER_USER,
+    ExecutionLimiter,
+    get_execution_limiter,
+    reset_execution_limiter,
+)
 
 
 class ExecutionLimiterTests(unittest.TestCase):
@@ -63,6 +71,46 @@ class ExecutionLimiterTests(unittest.TestCase):
             timeout=0,
         )
         next_lease.release()
+
+
+class ExecutionLimiterEnvConfigTests(unittest.TestCase):
+    def setUp(self):
+        reset_execution_limiter()
+        self.addCleanup(reset_execution_limiter)
+
+    def test_defaults_when_env_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AUTODROID_LIMIT_PER_USER", None)
+            os.environ.pop("AUTODROID_LIMIT_GLOBAL", None)
+            limiter = get_execution_limiter()
+
+        self.assertEqual(limiter.max_concurrent_per_user, DEFAULT_MAX_PER_USER)
+        self.assertEqual(limiter.max_global, DEFAULT_MAX_GLOBAL)
+
+    def test_env_overrides_limits(self):
+        env = {"AUTODROID_LIMIT_PER_USER": "2", "AUTODROID_LIMIT_GLOBAL": "7"}
+        with patch.dict(os.environ, env):
+            limiter = get_execution_limiter()
+
+        self.assertEqual(limiter.max_concurrent_per_user, 2)
+        self.assertEqual(limiter.max_global, 7)
+
+    def test_invalid_env_values_fall_back_to_defaults(self):
+        env = {"AUTODROID_LIMIT_PER_USER": "abc", "AUTODROID_LIMIT_GLOBAL": "0"}
+        with patch.dict(os.environ, env):
+            limiter = get_execution_limiter()
+
+        self.assertEqual(limiter.max_concurrent_per_user, DEFAULT_MAX_PER_USER)
+        self.assertEqual(limiter.max_global, DEFAULT_MAX_GLOBAL)
+
+    def test_singleton_reuses_first_instance(self):
+        with patch.dict(os.environ, {"AUTODROID_LIMIT_GLOBAL": "7"}):
+            first = get_execution_limiter()
+        with patch.dict(os.environ, {"AUTODROID_LIMIT_GLOBAL": "9"}):
+            second = get_execution_limiter()
+
+        self.assertIs(first, second)
+        self.assertEqual(second.max_global, 7)
 
 
 if __name__ == "__main__":

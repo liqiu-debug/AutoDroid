@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -310,10 +311,33 @@ class ExecutionLimiter:
 _global_limiter: Optional[ExecutionLimiter] = None
 _limiter_lock = threading.Lock()
 
+# 默认限流参数（可通过环境变量覆盖）
+DEFAULT_MAX_PER_USER = 5
+DEFAULT_MAX_GLOBAL = 20
+
+
+def _limit_from_env(env_name: str, default: int) -> int:
+    """从环境变量读取限流参数，非法值回退默认并告警。"""
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError(raw)
+        return value
+    except ValueError:
+        logger.warning("环境变量 %s=%r 非法，回退默认值 %s", env_name, raw, default)
+        return default
+
 
 def get_execution_limiter() -> ExecutionLimiter:
     """
     获取全局限流器实例（单例模式）
+
+    限流参数支持环境变量覆盖：
+    - AUTODROID_LIMIT_PER_USER: 每用户最大并发（默认 5）
+    - AUTODROID_LIMIT_GLOBAL: 全局最大并发（默认 20）
 
     Returns:
         ExecutionLimiter 实例
@@ -322,11 +346,17 @@ def get_execution_limiter() -> ExecutionLimiter:
     if _global_limiter is None:
         with _limiter_lock:
             if _global_limiter is None:
+                max_per_user = _limit_from_env("AUTODROID_LIMIT_PER_USER", DEFAULT_MAX_PER_USER)
+                max_global = _limit_from_env("AUTODROID_LIMIT_GLOBAL", DEFAULT_MAX_GLOBAL)
                 _global_limiter = ExecutionLimiter(
-                    max_concurrent_per_user=5,
-                    max_global=20,
+                    max_concurrent_per_user=max_per_user,
+                    max_global=max_global,
                 )
-                logger.info("执行限流器已初始化: max_per_user=5, max_global=20")
+                logger.info(
+                    "执行限流器已初始化: max_per_user=%s, max_global=%s",
+                    max_per_user,
+                    max_global,
+                )
     return _global_limiter
 
 

@@ -1,6 +1,7 @@
 import logging
 import os
 from pathlib import Path
+from sqlalchemy import event
 from sqlmodel import Session, SQLModel, col, create_engine, select
 
 from backend.paths import PROJECT_ROOT
@@ -14,8 +15,32 @@ if not sqlite_path.is_absolute():
 sqlite_path.parent.mkdir(parents=True, exist_ok=True)
 sqlite_url = f"sqlite:///{sqlite_path.as_posix()}"
 
+# 并发写等待锁的时长（毫秒）：团队多人同时执行/操作时避免立刻抛 database is locked
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
+def configure_sqlite_engine(target_engine) -> None:
+    """为 SQLite engine 附加并发加固 PRAGMA。
+
+    - WAL：允许读写并行，显著降低团队并发下的锁冲突（对文件库持久生效）
+    - synchronous=NORMAL：WAL 模式下的推荐档位，安全且更快
+    - busy_timeout：写锁被占时等待而非立即失败
+    """
+
+    @event.listens_for(target_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        finally:
+            cursor.close()
+
+
 # check_same_thread=False is needed for SQLite with multiple threads/FastAPI
 engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
+configure_sqlite_engine(engine)
 
 
 def _table_exists(cursor, table: str) -> bool:

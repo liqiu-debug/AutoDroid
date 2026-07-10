@@ -10,6 +10,8 @@ from backend.models import SystemSetting
 FLAG_NEW_STEP_MODEL = "new_step_model"
 FLAG_CROSS_PLATFORM_RUNNER = "cross_platform_runner"
 FLAG_IOS_EXECUTION = "ios_execution"
+# WebSocket 客户端断开后立即中止对应执行（默认关闭，保持历史行为）
+FLAG_WS_DISCONNECT_ABORT = "ws_disconnect_abort"
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
