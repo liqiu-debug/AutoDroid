@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
+import { runStatusTagType as getStatusTagType } from '@/utils/statusMeta'
 import { useClientMode } from '@/composables/useClientMode'
 
 const route = useRoute()
@@ -61,16 +62,6 @@ const translateStepDesc = (desc) => {
         return `${ACTION_LABELS[match[1]]} ${match[2]}`.trim()
     }
     return desc
-}
-
-const getStatusTagType = (status) => {
-    const s = normalizeStatus(status)
-    if (s === 'PASS') return 'success'
-    if (s === 'WARNING') return 'warning'
-    if (s === 'SKIP') return 'info'
-    if (s === 'RUNNING') return ''
-    if (s === 'ABORTED') return 'info'
-    return 'danger'
 }
 
 const getMessageClass = (status) => {

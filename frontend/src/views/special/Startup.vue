@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { VideoPlay, Refresh, View } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
 
 const router = useRouter()
 
@@ -157,12 +158,6 @@ const formatMs = (value) => {
 const formatDeviceName = (serial) => {
     const device = devices.value.find(item => item.serial === serial)
     return device?.custom_name || device?.market_name || device?.model || serial || '未知设备'
-}
-const statusTagType = (status) => {
-    if (status === 'COMPLETED') return 'success'
-    if (status === 'FAILED') return 'danger'
-    if (status === 'RUNNING') return 'warning'
-    return 'info'
 }
 const formatModes = (task) => {
     const modes = task.summary?.startup_config?.startup_modes || []

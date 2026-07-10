@@ -11,6 +11,7 @@ import {
 import LogConsole from '@/components/LogConsole.vue'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
+import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 
 const route = useRoute()
@@ -522,18 +523,6 @@ const stopActiveRunPolling = () => {
 }
 
 onUnmounted(stopActiveRunPolling)
-
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
-}
 
 const isDeviceSelectable = (device) => device?.status === 'IDLE'
 

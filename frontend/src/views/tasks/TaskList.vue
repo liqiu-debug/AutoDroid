@@ -4,19 +4,29 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Search, Refresh, Edit, Timer, Calendar, Clock } from '@element-plus/icons-vue'
 import api from '@/api'
 import dayjs from 'dayjs'
+import { useRemoteSearch } from '@/composables/useRemoteSearch'
 
 // ---- 数据 ----
 const tasks = ref([])
-const scenarios = ref([])
 const devices = ref([])
 const environments = ref([])
 const loading = ref(false)
-const scenariosLoading = ref(false)
 const searchQuery = ref('')
 const currentPage = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
-let scenariosRequest = null
+
+// 场景选择器：远程搜索，避免场景超量时静默截断
+const {
+    options: scenarioOptions,
+    loading: scenariosLoading,
+    search: searchScenarios,
+    ensureOption: ensureScenarioOption,
+} = useRemoteSearch({
+    fetcher: (keyword) => api.getScenarios({ skip: 0, limit: 50, keyword: keyword || undefined })
+        .then((res) => res.data.items || res.data || []),
+    resolver: (id) => api.getScenario(id).then((res) => res.data).catch(() => null),
+})
 
 // 弹窗
 const dialogVisible = ref(false)
@@ -86,28 +96,8 @@ const handleCurrentChange = (val) => {
     fetchTasks()
 }
 
-const fetchScenarios = () => {
-    if (scenariosRequest) return scenariosRequest
-
-    scenariosLoading.value = true
-    scenariosRequest = api.getScenarios()
-        .then((res) => {
-            scenarios.value = res.data.items || res.data || []
-        })
-        .catch((err) => {
-            console.error('获取场景列表失败', err)
-            ElMessage.error('获取场景列表失败')
-        })
-        .finally(() => {
-            scenariosLoading.value = false
-            scenariosRequest = null
-        })
-
-    return scenariosRequest
-}
-
 const handleScenarioDropdownVisible = (visible) => {
-    if (visible) fetchScenarios()
+    if (visible && scenarioOptions.value.length === 0) searchScenarios('')
 }
 
 const fetchDevices = async () => {
@@ -160,6 +150,7 @@ const handleEdit = (row) => {
     dialogTitle.value = '编辑定时任务'
     form.name = row.name
     form.scenario_id = row.scenario_id
+    if (row.scenario_id) ensureScenarioOption(row.scenario_id)
     form.device_serials = row.device_serials || []
     form.strategy = row.strategy
 
@@ -443,13 +434,16 @@ onMounted(() => {
                 <el-form-item v-if="form.task_type === 'ui'" label="执行场景">
                     <el-select
                         v-model="form.scenario_id"
-                        placeholder="选择场景"
+                        placeholder="选择场景（可输入关键字搜索）"
                         style="width: 100%"
+                        filterable
+                        remote
+                        :remote-method="searchScenarios"
                         :loading="scenariosLoading"
                         @visible-change="handleScenarioDropdownVisible"
                     >
                         <el-option
-                            v-for="s in scenarios"
+                            v-for="s in scenarioOptions"
                             :key="s.id"
                             :label="s.name"
                             :value="s.id"

@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, VideoPlay, CopyDocument, Delete, Search, Refresh, Edit, ArrowDown, CircleClose } from '@element-plus/icons-vue'
 import api from '@/api'
 import FolderTreePanel from '@/components/FolderTreePanel.vue'
+import { deviceStatusLabel, deviceStatusTagType, normalizeRunStatus, runStatusTagType } from '@/utils/statusMeta'
 import { useUserStore } from '@/stores/useUserStore'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
@@ -189,18 +190,6 @@ const fetchRunConfigOptions = async () => {
     }
 }
 
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
-}
-
 const isDeviceSelectable = (device) => device?.status === 'IDLE'
 
 const deviceUnavailableReason = (device) => {
@@ -211,26 +200,6 @@ const deviceUnavailableReason = (device) => {
 }
 
 const hasWdaDownDevice = () => devices.value.some(d => d.status === 'WDA_DOWN')
-
-const normalizeCaseRunStatus = (status) => {
-    const normalized = (status || '').toString().trim().toLowerCase()
-    if (normalized === 'pass' || normalized === 'success') return 'PASS'
-    if (normalized === 'fail' || normalized === 'failed' || normalized === 'error') return 'FAIL'
-    if (normalized === 'warning') return 'WARNING'
-    if (normalized === 'running' || normalized === 'running...') return 'RUNNING'
-    if (normalized === 'aborted' || normalized === 'cancelled') return 'ABORTED'
-    return ''
-}
-
-const caseRunStatusTagType = (status) => {
-    const normalized = normalizeCaseRunStatus(status)
-    if (normalized === 'PASS') return 'success'
-    if (normalized === 'WARNING') return 'warning'
-    if (normalized === 'FAIL') return 'danger'
-    if (normalized === 'RUNNING') return 'info'
-    if (normalized === 'ABORTED') return 'info'
-    return 'info'
-}
 
 const isCaseRunActive = (row) => Boolean(activeCaseRuns.value[row.id])
 
@@ -315,7 +284,7 @@ const terminateCaseRun = async (row) => {
 }
 
 const restoreActiveCaseRuns = async () => {
-    const runningRows = cases.value.filter(row => normalizeCaseRunStatus(row.last_run_status) === 'RUNNING')
+    const runningRows = cases.value.filter(row => normalizeRunStatus(row.last_run_status) === 'RUNNING')
     if (runningRows.length === 0) return
     const next = { ...activeCaseRuns.value }
     for (const row of runningRows) {
@@ -496,11 +465,11 @@ onUnmounted(stopActiveRunPolling)
                         <span>ID #{{ item.id }}</span>
                     </div>
                     <el-tag
-                        v-if="normalizeCaseRunStatus(item.last_run_status)"
-                        :type="caseRunStatusTagType(item.last_run_status)"
+                        v-if="normalizeRunStatus(item.last_run_status)"
+                        :type="runStatusTagType(item.last_run_status)"
                         size="small"
                     >
-                        {{ normalizeCaseRunStatus(item.last_run_status) }}
+                        {{ normalizeRunStatus(item.last_run_status) }}
                     </el-tag>
                 </div>
 
@@ -623,11 +592,11 @@ onUnmounted(stopActiveRunPolling)
                             <el-table-column label="状态" width="100" align="center">
                                 <template #default="{ row }">
                                     <el-tag
-                                        v-if="normalizeCaseRunStatus(row.last_run_status)"
-                                        :type="caseRunStatusTagType(row.last_run_status)"
+                                        v-if="normalizeRunStatus(row.last_run_status)"
+                                        :type="runStatusTagType(row.last_run_status)"
                                         size="small"
                                     >
-                                        {{ normalizeCaseRunStatus(row.last_run_status) }}
+                                        {{ normalizeRunStatus(row.last_run_status) }}
                                     </el-tag>
                                     <span v-else class="text-gray">-</span>
                                 </template>
@@ -716,7 +685,7 @@ onUnmounted(stopActiveRunPolling)
                             <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                                 <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
                                 <div style="display: flex; align-items: center; gap: 6px;">
-                                    <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                    <el-tag :type="deviceStatusTagType(dev.status)" size="small">{{ deviceStatusLabel(dev.status) }}</el-tag>
                                     <span v-if="deviceUnavailableReason(dev)" style="font-size: 12px; color: #e6a23c;">
                                         {{ deviceUnavailableReason(dev) }}
                                     </span>
@@ -768,7 +737,7 @@ onUnmounted(stopActiveRunPolling)
                 >
                     <div class="mobile-device-check-content">
                         <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
-                        <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                        <el-tag :type="deviceStatusTagType(dev.status)" size="small">{{ deviceStatusLabel(dev.status) }}</el-tag>
                     </div>
                     <small v-if="deviceUnavailableReason(dev)">{{ deviceUnavailableReason(dev) }}</small>
                 </el-checkbox>

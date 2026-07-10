@@ -6,6 +6,7 @@ import { Plus, Search, VideoPlay, Edit, Delete, Refresh, MoreFilled,
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import FolderTreePanel from '@/components/FolderTreePanel.vue'
+import { deviceStatusLabel, deviceStatusTagType, runStatusColor } from '@/utils/statusMeta'
 import { useUserStore } from '@/stores/useUserStore'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
@@ -362,18 +363,6 @@ const deletePermissionTip = (row) => {
     return canDeleteScenario(row) ? '删除' : '仅创建人或管理员可以删除'
 }
 
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
-}
-
 const isDeviceSelectable = (device) => device?.status === 'IDLE'
 
 const deviceUnavailableReason = (device) => {
@@ -410,17 +399,6 @@ const formatDate = (date) => {
         return '今天 ' + d.format('HH:mm')
     }
     return d.format('MM-DD HH:mm')
-}
-
-const getStatusColor = (status) => {
-    if (!status) return '#909399' // Gray
-    const s = normalizeRunStatus(status)
-    if (s === 'pass' || s === 'success') return '#67C23A' // Green
-    if (s === 'fail' || s === 'failed') return '#F56C6C' // Red
-    if (s === 'warning') return '#E6A23C' // Orange
-    if (s === 'running') return '#409EFF' // Blue
-    if (s === 'aborted' || s === 'cancelled') return '#909399'
-    return '#E6A23C' // Warning
 }
 
 const normalizeRunStatus = (status) => (status || '').toString().toLowerCase()
@@ -471,7 +449,7 @@ onUnmounted(stopActiveRunPolling)
                 :key="item.id"
                 class="mobile-scenario-card"
             >
-                <div class="mobile-scenario-strip" :style="{ backgroundColor: getStatusColor(item.last_run_status) }"></div>
+                <div class="mobile-scenario-strip" :style="{ backgroundColor: runStatusColor(item.last_run_status) }"></div>
                 <div class="mobile-scenario-body">
                     <div class="mobile-scenario-header">
                         <div class="mobile-scenario-title">
@@ -567,7 +545,7 @@ onUnmounted(stopActiveRunPolling)
                         class="scenario-item"
                     >
                         <!-- 1. Status Strip (Left) -->
-                        <div class="status-strip" :style="{ backgroundColor: getStatusColor(item.last_run_status) }"></div>
+                        <div class="status-strip" :style="{ backgroundColor: runStatusColor(item.last_run_status) }"></div>
                         
                         <!-- 2. Main Content (Middle) -->
                         <div class="main-content">
@@ -715,7 +693,7 @@ onUnmounted(stopActiveRunPolling)
                             <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                                 <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
                                 <div style="display: flex; align-items: center; gap: 6px;">
-                                    <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                                    <el-tag :type="deviceStatusTagType(dev.status)" size="small">{{ deviceStatusLabel(dev.status) }}</el-tag>
                                     <span v-if="deviceUnavailableReason(dev)" style="font-size: 12px; color: #e6a23c;">
                                         {{ deviceUnavailableReason(dev) }}
                                     </span>
@@ -766,7 +744,7 @@ onUnmounted(stopActiveRunPolling)
                 >
                     <div class="mobile-device-check-content">
                         <span>{{ dev.custom_name || dev.market_name || dev.model || dev.serial }}</span>
-                        <el-tag :type="statusTagType(dev.status)" size="small">{{ statusLabel(dev.status) }}</el-tag>
+                        <el-tag :type="deviceStatusTagType(dev.status)" size="small">{{ deviceStatusLabel(dev.status) }}</el-tag>
                     </div>
                     <small v-if="deviceUnavailableReason(dev)">{{ deviceUnavailableReason(dev) }}</small>
                 </el-checkbox>

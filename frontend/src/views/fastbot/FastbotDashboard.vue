@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CaretRight } from '@element-plus/icons-vue'
 import api from '@/api'
+import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 
 const router = useRouter()
 
@@ -106,18 +107,6 @@ const handleConfirmRun = async () => {
     } finally {
         submitting.value = false
     }
-}
-
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', FASTBOT_RUNNING: 'danger', BUSY: 'danger', OFFLINE: 'info' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', FASTBOT_RUNNING: '🔴 跑测中', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线' }
-  return map[status] || status
 }
 
 const goToReports = () => {

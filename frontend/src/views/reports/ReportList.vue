@@ -6,6 +6,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
+import { runStatusTagType } from '@/utils/statusMeta'
 
 const router = useRouter()
 const route = useRoute()
@@ -203,16 +204,6 @@ const formatDate = (date) => {
     if (!date) return '-'
     return dayjs(date).format('MM-DD HH:mm:ss')
 }
-const getStatusColor = (status) => {
-    if (!status) return '#909399'
-    const s = status.toLowerCase()
-    if (s === 'pass') return '#67C23A'
-    if (s === 'warning') return '#E6A23C'
-    if (s === 'fail') return '#F56C6C'
-    if (s === 'error') return '#E6A23C'
-    if (s === 'running') return '#409EFF'
-    return '#909399'
-}
 const getDuration = (seconds) => {
     if (!seconds) return '0s'
     if (seconds < 60) return `${Math.round(seconds)}s`
@@ -360,19 +351,6 @@ const handleCompatibilityDelete = async (row) => {
             ElMessage.error(err.response?.data?.detail || '删除失败')
         }
     }
-}
-
-const getFbStatusType = (status) => {
-    const map = { RUNNING: '', COMPLETED: 'success', FAILED: 'danger', PENDING: 'info' }
-    return map[status] || 'info'
-}
-
-const getCompatibilityStatusType = (status) => {
-    const normalized = String(status || '').toUpperCase()
-    if (normalized === 'PASS') return 'success'
-    if (normalized === 'WARNING' || normalized === 'RUNNING') return 'warning'
-    if (['FAIL', 'ERROR', 'ABORTED'].includes(normalized)) return 'danger'
-    return 'info'
 }
 
 const getCompatibilityStatusText = (status) => String(status || 'PENDING').toUpperCase()
@@ -526,7 +504,7 @@ onUnmounted(() => {
                         <strong>{{ group.batch_name }}</strong>
                         <span>{{ formatDate(group.start_time) }} · {{ group.executions.length }} 台设备</span>
                     </div>
-                    <el-tag :type="group.status === 'PASS' ? 'success' : (group.status === 'WARNING' ? 'warning' : (group.status === 'RUNNING' ? '' : 'danger'))" size="small">
+                    <el-tag :type="runStatusTagType(group.status)" size="small">
                         {{ group.status === 'RUNNING' ? '运行中' : group.status }}
                     </el-tag>
                 </header>
@@ -542,7 +520,7 @@ onUnmounted(() => {
                             <span>{{ getDuration(item.duration) }} · {{ item.executor_name || group.executor_name || '-' }}</span>
                         </div>
                         <div class="mobile-report-execution-actions">
-                            <el-tag size="small" :type="item.status === 'PASS' ? 'success' : (item.status === 'WARNING' ? 'warning' : (isExecutionRunning(item.status) ? '' : 'danger'))">
+                            <el-tag size="small" :type="runStatusTagType(item.status)">
                                 {{ item.status }}
                             </el-tag>
                             <el-button
@@ -620,7 +598,7 @@ onUnmounted(() => {
                                             </el-table-column>
                                             <el-table-column label="状态" width="100">
                                                 <template #default="{ row: subRow }">
-                                                    <el-tag :type="subRow.status === 'PASS' ? 'success' : (subRow.status === 'WARNING' ? 'warning' : (subRow.status === 'RUNNING' ? '' : (subRow.status === 'ABORTED' ? 'info' : 'danger')))" size="small" effect="plain">
+                                                    <el-tag :type="runStatusTagType(subRow.status)" size="small" effect="plain">
                                                         {{ subRow.status }}
                                                     </el-tag>
                                                 </template>
@@ -655,7 +633,7 @@ onUnmounted(() => {
                             
                             <el-table-column label="汇总状态" width="120">
                                 <template #default="{ row }">
-                                    <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'WARNING' ? 'warning' : (row.status === 'RUNNING' ? '' : (row.status === 'ABORTED' ? 'info' : 'danger')))">
+                                    <el-tag :type="runStatusTagType(row.status)">
                                         {{ row.status === 'RUNNING' ? '待完成' : row.status }}
                                     </el-tag>
                                 </template>
@@ -751,7 +729,7 @@ onUnmounted(() => {
                         </el-table-column>
                         <el-table-column label="状态" width="100" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="getFbStatusType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
                             </template>
                         </el-table-column>
                         <el-table-column label="崩溃" width="70" align="center">
@@ -855,7 +833,7 @@ onUnmounted(() => {
                         </el-table-column>
                         <el-table-column label="状态" width="100" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="getFbStatusType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
                             </template>
                         </el-table-column>
                         <el-table-column label="操作" width="120" align="center" fixed="right">
@@ -941,7 +919,7 @@ onUnmounted(() => {
                         </el-table-column>
                         <el-table-column label="状态" width="110" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="getCompatibilityStatusType(row.status)" size="small" effect="plain">
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">
                                     {{ getCompatibilityStatusText(row.status) }}
                                 </el-tag>
                             </template>
