@@ -117,6 +117,37 @@
 - `P3001_FASTBOT_ANDROID_ONLY`: Fastbot 仅支持 Android。
 - `P3002_WDA_IOS_ONLY`: WDA 健康检查仅支持 iOS。
 
+### 6.4 执行期错误码（E2xxx）
+
+执行期失败的步骤结果附带结构化字段（纯增量，原 `error` 字符串格式保持不变）：
+
+- `error_code`: 错误码（E2xxx，或透传的 P1xxx 预检码）。
+- `error_context`: 失败上下文 dict（至少含 `action`、`platform`、`device_id`，按动作附带 `selector/by`、`image_path`、`region`、`timeout` 等）。
+- `suggestion`: 中文修复建议（默认建议集中维护于 `backend/execution_errors.py`）。
+
+驱动层在语义明确的失败点抛出 `ExecutionStepError`（保持原异常消息与类型兼容）；
+未结构化的异常由 `classify_exception` 按异常类型（uiautomator2 / facebook-wda / requests / 内置连接与超时）与消息关键词兜底归类。
+
+| 错误码 | 含义 | 修复建议 |
+| --- | --- | --- |
+| `E2001_ELEMENT_NOT_FOUND` | 元素未找到 | 检查定位器是否正确、页面是否已加载；可在录制模式重新抓取该元素，或配置备选定位器。 |
+| `E2002_WAIT_TIMEOUT` | 元素定位等待超时 | 确认页面跳转是否完成，适当增大步骤 timeout，或在该步骤前增加等待。 |
+| `E2003_ASSERT_TEXT_FAILED` | 文本断言失败 | 核对期望文本与页面实际文案是否一致；页面加载较慢时在断言前增加等待。 |
+| `E2004_ASSERT_IMAGE_FAILED` | 图像断言失败 | 确认模板图与当前页面一致；分辨率、主题或文案变化会影响匹配，必要时重新截取模板图。 |
+| `E2005_IMAGE_NOT_MATCHED` | 图像模板未匹配 | 确认目标已出现在屏幕上，或重新截取更清晰、范围更小的模板图。 |
+| `E2006_OCR_NO_RESULT` | OCR 未提取到文本 | 检查识别区域坐标与提取规则是否正确、区域内是否有清晰文本；可扩大区域或增加等待。 |
+| `E2007_INPUT_FAILED` | 输入失败 | 确认目标为可输入控件且已获得焦点；可先点击输入框再输入，或检查键盘是否弹出。 |
+| `E2008_APP_CONTROL_FAILED` | 应用启动/停止失败 | 检查 app_key 映射的包名/BundleID 是否正确、应用是否已安装在该设备上。 |
+| `E2101_DEVICE_CONNECTION_LOST` | Android 设备连接丢失 | 检查 USB/网络连接与 adb devices 状态，必要时重新插拔设备或重新初始化 uiautomator2 服务。 |
+| `E2102_WDA_SESSION_ERROR` | iOS WDA 会话异常 | 确认 WebDriverAgent 正在运行且端口转发正常，必要时重启 WDA 后重试。 |
+| `E2201_INVALID_ARGS` | 执行期参数非法（预检已拦截的沿用 `P1006`） | 检查步骤的 args/value/selector 配置是否符合执行规范。 |
+| `E2999_EXECUTION_ERROR` | 未知执行异常（兜底） | 结合错误信息与后端日志排查；与设备状态相关时可重试或重启设备。 |
+
+补充说明：
+
+- 用户主动中止（`error="执行已被用户中止"`）不属于执行失败，不附带错误码与建议。
+- 步骤 `SKIP`（平台不匹配）会透传 `P1001_PLATFORM_NOT_ALLOWED` 作为 `error_code`。
+
 ## 7. 结果状态语义
 
 - 步骤级：`PASS/SKIP/WARNING/FAIL`。

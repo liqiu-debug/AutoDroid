@@ -18,6 +18,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import wda
 
 from .base_driver import BaseDriver
+from backend.execution_errors import (
+    E2001_ELEMENT_NOT_FOUND,
+    E2002_WAIT_TIMEOUT,
+    E2003_ASSERT_TEXT_FAILED,
+    E2004_ASSERT_IMAGE_FAILED,
+    E2005_IMAGE_NOT_MATCHED,
+    E2006_OCR_NO_RESULT,
+    E2007_INPUT_FAILED,
+    E2008_APP_CONTROL_FAILED,
+    E2102_WDA_SESSION_ERROR,
+    ExecutionStepAssertionError,
+    ExecutionStepError,
+    ExecutionStepRuntimeError,
+)
 from backend.utils import evaluate_page_text_assertion
 from backend.utils.ocr_compat import extract_ocr_text, iter_ocr_text_items, run_paddle_ocr
 from backend.ocr_service import get_ocr_engine, start_ocr_prewarm
@@ -498,8 +512,10 @@ class IOSDriver(BaseDriver):
             value = self.client.http.get("screenshot", timeout=effective_timeout).value
             raw_value = base64.b64decode(value)
         except Exception as exc:
-            final_exc = RuntimeError(
-                f"iOS.screenshot 请求失败或超时(>{effective_timeout:.1f}s): {exc}"
+            final_exc = ExecutionStepRuntimeError(
+                E2102_WDA_SESSION_ERROR,
+                f"iOS.screenshot 请求失败或超时(>{effective_timeout:.1f}s): {exc}",
+                context={"timeout": effective_timeout},
             )
             self._log_action_failure(
                 "screenshot",
@@ -511,7 +527,11 @@ class IOSDriver(BaseDriver):
 
         png_header = b"\x89PNG\r\n\x1a\n"
         if not raw_value.startswith(png_header):
-            final_exc = RuntimeError("iOS.screenshot 返回内容不是有效 PNG")
+            final_exc = ExecutionStepRuntimeError(
+                E2102_WDA_SESSION_ERROR,
+                "iOS.screenshot 返回内容不是有效 PNG",
+                context={"timeout": effective_timeout},
+            )
             self._log_action_failure(
                 "screenshot",
                 started_at,
@@ -1027,7 +1047,17 @@ class IOSDriver(BaseDriver):
                 errors.append("popup:budget-exhausted")
 
         detail = "; ".join(errors) if errors else "no-click-strategy-succeeded"
-        final_exc = RuntimeError(f"iOS.click_plan 失败: {detail}")
+        first_attempt = direct_attempts[0]
+        final_exc = ExecutionStepRuntimeError(
+            E2001_ELEMENT_NOT_FOUND,
+            f"iOS.click_plan 失败: {detail}",
+            context={
+                "selector": first_attempt.get("selector"),
+                "by": first_attempt.get("source_by") or first_attempt.get("by"),
+                "timeout": round(total_timeout, 2),
+                "attempts": len(errors),
+            },
+        )
         self._log_click_plan_timing("failed", timing_metrics)
         self._log_action_failure(
             "click_plan",
@@ -1071,8 +1101,10 @@ class IOSDriver(BaseDriver):
                 return fallback_obj, fallback_by
             attempts.append(f"{fallback_by}:not-found")
 
-        raise RuntimeError(
-            f"元素未找到: selector={selector!r}, by={by!r}, timeout={timeout}, attempts={attempts}"
+        raise ExecutionStepRuntimeError(
+            E2001_ELEMENT_NOT_FOUND,
+            f"元素未找到: selector={selector!r}, by={by!r}, timeout={timeout}, attempts={attempts}",
+            context={"selector": selector, "by": by, "timeout": timeout},
         )
 
     def _get_element(self, selector: str, by: str, timeout: int = 5) -> wda.Element:
@@ -1083,8 +1115,10 @@ class IOSDriver(BaseDriver):
         try:
             return selector_obj.get(timeout=timeout, raise_error=True)
         except Exception as exc:
-            raise RuntimeError(
-                f"iOS 元素获取失败: selector={selector!r}, by={by!r}, resolved_by={resolved_by!r}, error={exc}"
+            raise ExecutionStepRuntimeError(
+                E2001_ELEMENT_NOT_FOUND,
+                f"iOS 元素获取失败: selector={selector!r}, by={by!r}, resolved_by={resolved_by!r}, error={exc}",
+                context={"selector": selector, "by": by, "resolved_by": resolved_by},
             ) from exc
 
     def _collect_page_text_candidates(self) -> List[str]:
@@ -1239,8 +1273,16 @@ class IOSDriver(BaseDriver):
                     return
 
             detail = "; ".join(fallback_errors) if fallback_errors else "no-fallback-hit"
-            final_exc = RuntimeError(
-                f"iOS.click 失败: selector={selector!r}, by={by!r}, error={primary_exc}, fallback={detail}"
+            # 主定位异常已结构化时继承其错误码，否则按元素未找到归类。
+            primary_code = (
+                primary_exc.code
+                if isinstance(primary_exc, ExecutionStepError)
+                else E2001_ELEMENT_NOT_FOUND
+            )
+            final_exc = ExecutionStepRuntimeError(
+                primary_code,
+                f"iOS.click 失败: selector={selector!r}, by={by!r}, error={primary_exc}, fallback={detail}",
+                context={"selector": selector, "by": by},
             )
             self._log_action_failure(
                 "click",
@@ -1348,7 +1390,11 @@ class IOSDriver(BaseDriver):
                 errors.append(f"predicate={predicate!r}: {exc}")
 
         detail = "; ".join(errors) if errors else "unknown"
-        final_exc = RuntimeError(f"iOS.input_focused 执行失败: {detail}")
+        final_exc = ExecutionStepRuntimeError(
+            E2007_INPUT_FAILED,
+            f"iOS.input_focused 执行失败: {detail}",
+            context={"text_len": len(str(text or ""))},
+        )
         self._log_action_failure(
             "input_focused",
             started_at,
@@ -1429,6 +1475,13 @@ class IOSDriver(BaseDriver):
                 by=by,
                 timeout=timeout,
             )
+            if isinstance(exc, ExecutionStepError) and exc.code == E2001_ELEMENT_NOT_FOUND:
+                # 等待场景语义为超时未出现，重标记为 E2002（消息保持不变）。
+                raise ExecutionStepRuntimeError(
+                    E2002_WAIT_TIMEOUT,
+                    str(exc),
+                    context={**exc.context, "timeout": timeout},
+                ) from exc
             raise
 
     def assert_text(
@@ -1476,8 +1529,10 @@ class IOSDriver(BaseDriver):
                 )
                 return
 
-            final_exc = AssertionError(
-                f"断言失败: 期望页面{'不包含' if normalized_mode == 'not_contains' else '包含'} {expected!r}, 实际={preview!r}"
+            final_exc = ExecutionStepAssertionError(
+                E2003_ASSERT_TEXT_FAILED,
+                f"断言失败: 期望页面{'不包含' if normalized_mode == 'not_contains' else '包含'} {expected!r}, 实际={preview!r}",
+                context={"expected_text": expected, "match_mode": normalized_mode},
             )
             self._log_action_failure(
                 "assert_text",
@@ -1869,7 +1924,11 @@ class IOSDriver(BaseDriver):
                 errors.append(f"{method_name}: {exc}")
 
         detail = "; ".join(errors) if errors else "unknown"
-        final_exc = RuntimeError(f"iOS.start_app 执行失败: {detail}")
+        final_exc = ExecutionStepRuntimeError(
+            E2008_APP_CONTROL_FAILED,
+            f"iOS.start_app 执行失败: {detail}",
+            context={"app_id": app_id},
+        )
         self._log_action_failure(
             "start_app",
             started_at,
@@ -1939,7 +1998,11 @@ class IOSDriver(BaseDriver):
             pass
 
         detail = "; ".join(errors) if errors else "unknown"
-        final_exc = RuntimeError(f"iOS.stop_app 执行失败: {detail}")
+        final_exc = ExecutionStepRuntimeError(
+            E2008_APP_CONTROL_FAILED,
+            f"iOS.stop_app 执行失败: {detail}",
+            context={"app_id": app_id},
+        )
         self._log_action_failure(
             "stop_app",
             started_at,
@@ -2075,9 +2138,11 @@ class IOSDriver(BaseDriver):
             if first_match is not None:
                 center_x, center_y, score = first_match
                 if score >= self._IMAGE_ASSERT_FAST_FAIL_SCORE:
-                    raise AssertionError(
+                    raise ExecutionStepAssertionError(
+                        E2004_ASSERT_IMAGE_FAILED,
                         f"断言失败: 期望页面不存在图像 {target!r}，但已高置信度匹配到目标 "
-                        f"(score={score:.4f}, x={center_x:.1f}, y={center_y:.1f})"
+                        f"(score={score:.4f}, x={center_x:.1f}, y={center_y:.1f})",
+                        context={"image_path": target, "match_mode": normalized_mode},
                     )
 
             time.sleep(self._IMAGE_ASSERT_RECHECK_DELAY_SECONDS)
@@ -2089,9 +2154,11 @@ class IOSDriver(BaseDriver):
             confirmed_match = second_match if second_match is not None else None
             if confirmed_match is not None:
                 center_x, center_y, score = confirmed_match
-                raise AssertionError(
+                raise ExecutionStepAssertionError(
+                    E2004_ASSERT_IMAGE_FAILED,
                     f"断言失败: 期望页面不存在图像 {target!r}，但仍匹配到目标 "
-                    f"(score={score:.4f}, x={center_x:.1f}, y={center_y:.1f})"
+                    f"(score={score:.4f}, x={center_x:.1f}, y={center_y:.1f})",
+                    context={"image_path": target, "match_mode": normalized_mode},
                 )
 
             self._log_action_success(
@@ -2137,7 +2204,11 @@ class IOSDriver(BaseDriver):
             crop = screen_bgr[ry1:ry2, rx1:rx2]
             raw_text = self._extract_text_from_image(crop)
             if not raw_text:
-                final_exc = RuntimeError("extract_by_ocr 未识别到文本")
+                final_exc = ExecutionStepRuntimeError(
+                    E2006_OCR_NO_RESULT,
+                    "extract_by_ocr 未识别到文本",
+                    context={"region": region, "crop": f"[{rx1},{ry1},{rx2},{ry2}]"},
+                )
                 self._log_action_failure(
                     "extract_by_ocr",
                     started_at,
@@ -2262,8 +2333,18 @@ class IOSDriver(BaseDriver):
                 best_size = (tw, th)
 
         if best_score < threshold_value:
-            raise RuntimeError(
-                f"{action_name} 未匹配到足够置信度目标: score={best_score:.4f}, threshold={threshold_value:.2f}"
+            code = (
+                E2004_ASSERT_IMAGE_FAILED
+                if str(action_name or "").strip().lower() == "assert_image"
+                else E2005_IMAGE_NOT_MATCHED
+            )
+            raise ExecutionStepRuntimeError(
+                code,
+                f"{action_name} 未匹配到足够置信度目标: score={best_score:.4f}, threshold={threshold_value:.2f}",
+                context={
+                    "score": round(best_score, 4),
+                    "threshold": round(threshold_value, 2),
+                },
             )
 
         bx, by = best_loc
