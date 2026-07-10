@@ -1,18 +1,36 @@
+import os
 import unittest
 from queue import Queue
 from unittest.mock import patch
 
 from backend.device_stream.manager import (
     ANDROID_MOTION_EVENT_ACTION_DOWN,
+    DEFAULT_SCRCPY_BITRATE,
+    DEFAULT_SCRCPY_GOP,
+    DEFAULT_SCRCPY_MAX_FPS,
+    DEFAULT_SCRCPY_MAX_SIZE,
+    SCRCPY_BITRATE_ENV,
     SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT,
+    SCRCPY_GOP_ENV,
+    SCRCPY_MAX_FPS_ENV,
+    SCRCPY_MAX_SIZE_ENV,
     SCRCPY_POINTER_ID_GENERIC_FINGER,
     DeviceInfo,
     ScrcpyDeviceManager,
+    _build_scrcpy_server_command,
     _build_touch_control_packet,
     _collect_h264_nal_types,
     _get_h264_init_packets,
     _offer_video_packet,
     _update_h264_init_cache,
+    get_scrcpy_stream_params,
+)
+
+SCRCPY_ENV_NAMES = (
+    SCRCPY_MAX_SIZE_ENV,
+    SCRCPY_BITRATE_ENV,
+    SCRCPY_MAX_FPS_ENV,
+    SCRCPY_GOP_ENV,
 )
 
 
@@ -31,6 +49,100 @@ class _FakeAdbClient:
 
     def device(self, serial):
         return self._device
+
+
+class ScrcpyStreamParamsTests(unittest.TestCase):
+    def _clear_scrcpy_env(self):
+        for name in SCRCPY_ENV_NAMES:
+            os.environ.pop(name, None)
+
+    def test_defaults_when_env_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear_scrcpy_env()
+            params = get_scrcpy_stream_params()
+
+        self.assertEqual(
+            params,
+            {
+                "max_size": DEFAULT_SCRCPY_MAX_SIZE,
+                "video_bit_rate": DEFAULT_SCRCPY_BITRATE,
+                "max_fps": DEFAULT_SCRCPY_MAX_FPS,
+                "i_frame_interval": DEFAULT_SCRCPY_GOP,
+            },
+        )
+
+    def test_env_overrides_stream_params(self):
+        env = {
+            SCRCPY_MAX_SIZE_ENV: "1600",
+            SCRCPY_BITRATE_ENV: "12000000",
+            SCRCPY_MAX_FPS_ENV: "30",
+            SCRCPY_GOP_ENV: "2",
+        }
+        with patch.dict(os.environ, env):
+            params = get_scrcpy_stream_params()
+
+        self.assertEqual(
+            params,
+            {
+                "max_size": 1600,
+                "video_bit_rate": 12000000,
+                "max_fps": 30,
+                "i_frame_interval": 2,
+            },
+        )
+
+    def test_invalid_env_values_fall_back_to_defaults(self):
+        env = {
+            SCRCPY_MAX_SIZE_ENV: "abc",
+            SCRCPY_BITRATE_ENV: "0",
+            SCRCPY_MAX_FPS_ENV: "-5",
+            SCRCPY_GOP_ENV: "  ",
+        }
+        with patch.dict(os.environ, env):
+            params = get_scrcpy_stream_params()
+
+        self.assertEqual(
+            params,
+            {
+                "max_size": DEFAULT_SCRCPY_MAX_SIZE,
+                "video_bit_rate": DEFAULT_SCRCPY_BITRATE,
+                "max_fps": DEFAULT_SCRCPY_MAX_FPS,
+                "i_frame_interval": DEFAULT_SCRCPY_GOP,
+            },
+        )
+
+    def test_build_scrcpy_server_command_with_defaults(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear_scrcpy_env()
+            command = _build_scrcpy_server_command("serial-1")
+
+        self.assertEqual(
+            command,
+            "adb -s serial-1 shell "
+            "CLASSPATH=/data/local/tmp/scrcpy-server.jar "
+            "app_process / com.genymobile.scrcpy.Server 3.3.4 "
+            "log_level=info tunnel_forward=true video=true control=true audio=false "
+            "send_frame_meta=true "
+            "max_size=1920 "
+            "video_bit_rate=8000000 "
+            "max_fps=60 "
+            "i_frame_interval=1",
+        )
+
+    def test_build_scrcpy_server_command_uses_env_overrides(self):
+        env = {
+            SCRCPY_MAX_SIZE_ENV: "1280",
+            SCRCPY_BITRATE_ENV: "4000000",
+            SCRCPY_MAX_FPS_ENV: "25",
+            SCRCPY_GOP_ENV: "5",
+        }
+        with patch.dict(os.environ, env):
+            command = _build_scrcpy_server_command("serial-2")
+
+        self.assertIn("max_size=1280 ", command)
+        self.assertIn("video_bit_rate=4000000 ", command)
+        self.assertIn("max_fps=25 ", command)
+        self.assertTrue(command.endswith("i_frame_interval=5"))
 
 
 class DeviceStreamManagerCacheTests(unittest.TestCase):

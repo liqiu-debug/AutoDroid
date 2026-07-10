@@ -30,6 +30,21 @@ DEVICE_JAR_PATH = "/data/local/tmp/scrcpy-server.jar"
 # 端口分配范围
 PORT_RANGE_START = 27183
 PORT_RANGE_END = 27283
+
+# scrcpy server 版本（需与 assets/scrcpy-server.jar 一致）
+SCRCPY_SERVER_VERSION = "3.3.4"
+
+# scrcpy 视频流参数默认值（可通过环境变量覆盖，见 get_scrcpy_stream_params）
+DEFAULT_SCRCPY_MAX_SIZE = 1920        # 长边最大像素
+DEFAULT_SCRCPY_BITRATE = 8_000_000    # 视频码率 (bps)
+DEFAULT_SCRCPY_MAX_FPS = 60           # 最大帧率
+DEFAULT_SCRCPY_GOP = 1                # I 帧间隔（秒），即 i_frame_interval
+
+SCRCPY_MAX_SIZE_ENV = "AUTODROID_SCRCPY_MAX_SIZE"
+SCRCPY_BITRATE_ENV = "AUTODROID_SCRCPY_BITRATE"
+SCRCPY_MAX_FPS_ENV = "AUTODROID_SCRCPY_MAX_FPS"
+SCRCPY_GOP_ENV = "AUTODROID_SCRCPY_GOP"
+
 SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
 SCRCPY_POINTER_ID_GENERIC_FINGER = -2
 ANDROID_MOTION_EVENT_ACTION_DOWN = 0
@@ -61,6 +76,55 @@ class DeviceInfo:
         self.last_keyframe_packet: Optional[bytes] = None # 缓存最近 IDR，用于新连接首帧初始化
         self.recorder: Optional[RollingScrcpyRecorderSession] = None
         self.control_lock = threading.Lock()
+
+
+def _stream_param_from_env(env_name: str, default: int) -> int:
+    """从环境变量读取 scrcpy 投屏参数，非法值（非正整数）回退默认并告警。"""
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError(raw)
+        return value
+    except ValueError:
+        logger.warning("环境变量 %s=%r 非法，回退默认值 %s", env_name, raw, default)
+        return default
+
+
+def get_scrcpy_stream_params() -> Dict[str, int]:
+    """
+    解析当前生效的 scrcpy 视频流参数（每次启动设备流时求值）。
+
+    支持环境变量覆盖：
+    - AUTODROID_SCRCPY_MAX_SIZE: 画面长边最大像素（默认 1920）
+    - AUTODROID_SCRCPY_BITRATE: 视频码率 bps（默认 8000000）
+    - AUTODROID_SCRCPY_MAX_FPS: 最大帧率（默认 60）
+    - AUTODROID_SCRCPY_GOP: I 帧间隔秒数，对应 i_frame_interval（默认 1）
+    """
+    return {
+        "max_size": _stream_param_from_env(SCRCPY_MAX_SIZE_ENV, DEFAULT_SCRCPY_MAX_SIZE),
+        "video_bit_rate": _stream_param_from_env(SCRCPY_BITRATE_ENV, DEFAULT_SCRCPY_BITRATE),
+        "max_fps": _stream_param_from_env(SCRCPY_MAX_FPS_ENV, DEFAULT_SCRCPY_MAX_FPS),
+        "i_frame_interval": _stream_param_from_env(SCRCPY_GOP_ENV, DEFAULT_SCRCPY_GOP),
+    }
+
+
+def _build_scrcpy_server_command(serial: str, params: Optional[Dict[str, int]] = None) -> str:
+    """拼接 scrcpy server 启动命令；params 缺省时从环境变量解析。"""
+    effective = params if params is not None else get_scrcpy_stream_params()
+    return (
+        f"adb -s {serial} shell "
+        f"CLASSPATH={DEVICE_JAR_PATH} "
+        f"app_process / com.genymobile.scrcpy.Server {SCRCPY_SERVER_VERSION} "
+        f"log_level=info tunnel_forward=true video=true control=true audio=false "
+        f"send_frame_meta=true "
+        f"max_size={effective['max_size']} "
+        f"video_bit_rate={effective['video_bit_rate']} "
+        f"max_fps={effective['max_fps']} "
+        f"i_frame_interval={effective['i_frame_interval']}"
+    )
 
 
 def _collect_h264_nal_types(data: bytes) -> Set[int]:
@@ -365,16 +429,16 @@ class ScrcpyDeviceManager:
             device.forward(f"tcp:{local_port}", "localabstract:scrcpy")
             logger.info(f"端口转发: tcp:{local_port} → localabstract:scrcpy")
 
-            # 5. 使用 subprocess 启动 scrcpy server v3.3.4
-            scrcpy_cmd = (
-                f"adb -s {serial} shell "
-                f"CLASSPATH=/data/local/tmp/scrcpy-server.jar "
-                f"app_process / com.genymobile.scrcpy.Server 3.3.4 "
-                f"log_level=info tunnel_forward=true video=true control=true audio=false "
-                f"send_frame_meta=true "
-                f"max_size=1280 "
-                f"video_bit_rate=4000000 "
-                f"i_frame_interval=1"
+            # 5. 使用 subprocess 启动 scrcpy server（参数支持环境变量覆盖）
+            stream_params = get_scrcpy_stream_params()
+            scrcpy_cmd = _build_scrcpy_server_command(serial, stream_params)
+            logger.info(
+                "scrcpy 流参数生效: serial=%s max_size=%s video_bit_rate=%s max_fps=%s i_frame_interval=%s",
+                serial,
+                stream_params["max_size"],
+                stream_params["video_bit_rate"],
+                stream_params["max_fps"],
+                stream_params["i_frame_interval"],
             )
             logger.info(f"启动 scrcpy: {scrcpy_cmd}")
             proc = subprocess.Popen(
