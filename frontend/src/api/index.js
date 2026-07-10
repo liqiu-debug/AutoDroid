@@ -261,8 +261,8 @@ export default {
     },
 
     // Tasks (定时任务)
-    getTasks() {
-        return api.get('/tasks/')
+    getTasks(params) {
+        return api.get('/tasks/', { params })
     },
     createTask(data) {
         return api.post('/tasks/', data)

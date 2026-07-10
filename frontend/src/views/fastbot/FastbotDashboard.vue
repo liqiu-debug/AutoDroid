@@ -58,7 +58,7 @@ let pageActive = false
 const fetchLatestTask = async () => {
     try {
         const res = await api.getFastbotTasks({ limit: 1 })
-        const list = res.data || []
+        const list = res.data?.items || []
         latestTask.value = list.length > 0 ? list[0] : null
     } catch { /* ignore */ }
 }

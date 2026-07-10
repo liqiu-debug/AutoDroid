@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Search, Refresh, Edit, Timer, Calendar, Clock } from '@element-plus/icons-vue'
 import api from '@/api'
@@ -13,6 +13,9 @@ const environments = ref([])
 const loading = ref(false)
 const scenariosLoading = ref(false)
 const searchQuery = ref('')
+const currentPage = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
 let scenariosRequest = null
 
 // 弹窗
@@ -46,24 +49,41 @@ const form = reactive({
     fb_ignore_crashes: false,
 })
 
-// ---- 计算属性 ----
-const filteredTasks = computed(() => {
-    if (!searchQuery.value) return tasks.value
-    const q = searchQuery.value.toLowerCase()
-    return tasks.value.filter(t => t.name.toLowerCase().includes(q) || (t.scenario_name || '').toLowerCase().includes(q))
-})
-
 // ---- 方法 ----
 const fetchTasks = async () => {
     loading.value = true
     try {
-        const res = await api.getTasks()
-        tasks.value = res.data || []
+        const params = {
+            skip: (currentPage.value - 1) * pageSize.value,
+            limit: pageSize.value
+        }
+        if (searchQuery.value) {
+            params.keyword = searchQuery.value
+        }
+        const res = await api.getTasks(params)
+        tasks.value = res.data.items || []
+        total.value = res.data.total || 0
     } catch (err) {
         ElMessage.error('获取任务列表失败')
     } finally {
         loading.value = false
     }
+}
+
+const handleSearch = () => {
+    currentPage.value = 1
+    fetchTasks()
+}
+
+const handleSizeChange = (val) => {
+    pageSize.value = val
+    currentPage.value = 1
+    fetchTasks()
+}
+
+const handleCurrentChange = (val) => {
+    currentPage.value = val
+    fetchTasks()
 }
 
 const fetchScenarios = () => {
@@ -308,10 +328,12 @@ onMounted(() => {
                 <div class="left-tools">
                     <el-input
                         v-model="searchQuery"
-                        placeholder="搜索任务名称..."
+                        placeholder="搜索任务或场景名称..."
                         class="search-input"
                         :prefix-icon="Search"
                         clearable
+                        @keyup.enter="handleSearch"
+                        @clear="handleSearch"
                     />
                     <el-button :icon="Refresh" @click="fetchTasks" circle />
                 </div>
@@ -321,10 +343,10 @@ onMounted(() => {
             </div>
 
             <el-table
-                :data="filteredTasks"
+                :data="tasks"
                 v-loading="loading"
                 style="width: 100%"
-                height="calc(100vh - 160px)"
+                height="calc(100vh - 220px)"
                 :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
             >
                 <el-table-column prop="id" label="ID" width="60" align="center" />
@@ -388,6 +410,19 @@ onMounted(() => {
                     </template>
                 </el-table-column>
             </el-table>
+
+            <div class="pagination-footer" v-if="total > 0">
+                <el-pagination
+                    v-model:current-page="currentPage"
+                    v-model:page-size="pageSize"
+                    :page-sizes="[10, 20, 50, 100]"
+                    :background="true"
+                    layout="total, sizes, prev, pager, next, jumper"
+                    :total="total"
+                    @size-change="handleSizeChange"
+                    @current-change="handleCurrentChange"
+                />
+            </div>
         </div>
 
         <!-- 新建/编辑弹窗 -->
@@ -619,6 +654,13 @@ onMounted(() => {
 }
 
 .text-gray { color: #909399; }
+
+.pagination-footer {
+    flex-shrink: 0;
+    padding: 12px 10px 0;
+    display: flex;
+    justify-content: flex-end;
+}
 
 .task-form {
     padding: 10px 20px 0 0;
