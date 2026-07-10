@@ -1309,10 +1309,21 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
         try:
             start_time = execution.start_time
 
-            use_cross_platform_runner = (
-                is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
-                and bool(device_serial)
-            )
+            use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
+
+            if use_cross_platform_runner and not device_serial:
+                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+                logger.error(
+                    "cross-platform scenario execution requires device_serial: scenario_id=%s execution_id=%s",
+                    scenario_id,
+                    execution_id,
+                )
+                execution.status = "ERROR"
+                execution.end_time = datetime.now()
+                execution.duration = 0
+                session.add(execution)
+                session.commit()
+                return
 
             if use_cross_platform_runner:
                 abort_event = _prepare_cross_platform_device_execution(
@@ -1553,10 +1564,17 @@ async def run_scenario_api(
     requested_serials = request.device_serials or [None]
     runnable_serials: List[Optional[str]] = []
     blocked_prechecks: List[Dict[str, Any]] = []
+    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
 
     for serial in requested_serials:
         if not serial:
-            runnable_serials.append(serial)
+            if use_cross_platform_runner:
+                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+                blocked_prechecks.append(
+                    {"device_serial": serial, "reason": "请选择执行设备"}
+                )
+            else:
+                runnable_serials.append(serial)
             continue
         try:
             precheck = precheck_scenario_execution(
@@ -2407,10 +2425,27 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
                 },
             )
 
-            use_cross_platform_runner = (
-                is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
-                and bool(device_serial)
-            )
+            use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
+
+            if use_cross_platform_runner and not device_serial:
+                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+                execution.status = "ERROR"
+                execution.end_time = datetime.now()
+                execution.duration = 0
+                session.add(execution)
+                session.commit()
+                await manager.broadcast_log(ws_key, "error", "❌ 请选择执行设备")
+                await manager.send_message(
+                    ws_key,
+                    {
+                        "type": "run_complete",
+                        "success": False,
+                        "status": "ERROR",
+                        "summary": "请选择执行设备",
+                        "execution_id": execution.id,
+                    },
+                )
+                return
 
             if use_cross_platform_runner:
                 await manager.broadcast_log(ws_key, "info", "🧠 使用跨端执行引擎")

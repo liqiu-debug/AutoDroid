@@ -534,7 +534,7 @@ def _enrich_case_read(
     case_read = TestCaseRead.from_orm(case)
 
     if use_new_step_model is None:
-        use_new_step_model = is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False)
+        use_new_step_model = is_flag_enabled(session, FLAG_NEW_STEP_MODEL)
 
     if case.id and use_new_step_model:
         if standard_steps is None:
@@ -580,7 +580,7 @@ def create_test_case(
     session.commit()
     session.refresh(db_case)
 
-    if is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False):
+    if is_flag_enabled(session, FLAG_NEW_STEP_MODEL):
         _sync_standard_steps_from_legacy(session, db_case.id, db_case.steps or [])
 
     return _enrich_case_read(db_case, session)
@@ -632,7 +632,7 @@ def list_test_cases(
     total = count_query.scalar()
 
     results = query.offset(skip).limit(limit).all()
-    use_new_step_model = is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False)
+    use_new_step_model = is_flag_enabled(session, FLAG_NEW_STEP_MODEL)
     standard_steps_by_case: Dict[int, List[TestCaseStep]] = {}
     if use_new_step_model and results:
         case_ids = [case.id for case, *_ in results if case.id is not None]
@@ -700,7 +700,7 @@ def update_test_case(
     session.commit()
     session.refresh(db_case)
 
-    if is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False):
+    if is_flag_enabled(session, FLAG_NEW_STEP_MODEL):
         _sync_standard_steps_from_legacy(session, db_case.id, db_case.steps or [])
 
     _cleanup_unused_template_images(session, previous_image_paths)
@@ -736,7 +736,7 @@ def duplicate_test_case(
     session.commit()
     session.refresh(new_case)
 
-    if is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False):
+    if is_flag_enabled(session, FLAG_NEW_STEP_MODEL):
         source_standard_steps = _list_standard_steps(session, original_case.id)
         if source_standard_steps:
             payload = [_standard_row_to_write_dict(row) for row in source_standard_steps]
@@ -760,7 +760,7 @@ def get_case_standard_steps(case_id: int, session: Session = Depends(get_session
     standard_steps = _list_standard_steps(session, case_id)
     if (
         not standard_steps
-        and is_flag_enabled(session, FLAG_NEW_STEP_MODEL, default=False)
+        and is_flag_enabled(session, FLAG_NEW_STEP_MODEL)
         and case.steps
     ):
         standard_steps = _sync_standard_steps_from_legacy(session, case_id, case.steps)
@@ -902,19 +902,22 @@ def _run_case_background_cross_platform(
     user_id: Optional[int] = None,
     execution_lease=None,
 ):
-    # Cross-platform path currently requires explicit target device.
+    # Cross-platform path requires explicit target device.
     if not device_serial:
-        logger.error("cross-platform runner requires device_serial")
-        return _run_case_background(
-            case_id=case_id,
-            session_factory=session_factory,
-            env_id=env_id,
-            device_serial=device_serial,
-            run_id=run_id,
-            abort_event=abort_event,
-            user_id=user_id,
-            execution_lease=execution_lease,
+        logger.error(
+            "cross-platform runner requires device_serial: case_id=%s run_id=%s",
+            case_id,
+            run_id,
         )
+        if execution_lease is not None:
+            try:
+                execution_lease.release()
+            except Exception:
+                logger.exception("failed to release execution lease: run_id=%s", run_id)
+        with session_factory() as session:
+            _update_case_run_status(session, case_id, "FAIL")
+        registry.complete(run_id, "ERROR")
+        return
 
     try:
         with _case_execution_slot(
@@ -1002,10 +1005,10 @@ def run_test_case(
     def session_factory():
         return SQLSession(engine)
 
-    use_cross_platform_runner = (
-        is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
-        and bool(device_serial)
-    )
+    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
+    if use_cross_platform_runner and not device_serial:
+        # 跨端链路必须显式指定设备，不再静默回落 legacy。
+        raise HTTPException(status_code=400, detail="请选择执行设备")
     run_func = _run_case_background_cross_platform if use_cross_platform_runner else _run_case_background
     batch_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
@@ -1076,10 +1079,17 @@ def run_test_case_batch(
     requested_serials = request.device_serials or [None]
     runnable_serials: List[Optional[str]] = []
     blocked_prechecks: List[Dict[str, Any]] = []
+    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
 
     for serial in requested_serials:
         if not serial:
-            runnable_serials.append(serial)
+            if use_cross_platform_runner:
+                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+                blocked_prechecks.append(
+                    {"device_serial": serial, "reason": "请选择执行设备"}
+                )
+            else:
+                runnable_serials.append(serial)
             continue
         try:
             precheck = precheck_case_execution(
@@ -1116,7 +1126,6 @@ def run_test_case_batch(
     batch_id = str(uuid.uuid4())
     run_items = []
     rate_limited = False
-    use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
 
     for serial in runnable_serials:
         run_id = str(uuid.uuid4())
@@ -1182,7 +1191,7 @@ def run_test_case_batch(
     run_ids: List[str] = []
     for serial, run_record, execution_lease in run_items:
         run_ids.append(run_record.run_id)
-        run_func = _run_case_background_cross_platform if use_cross_platform_runner and serial else _run_case_background
+        run_func = _run_case_background_cross_platform if use_cross_platform_runner else _run_case_background
         threading.Thread(
             target=run_func,
             args=(

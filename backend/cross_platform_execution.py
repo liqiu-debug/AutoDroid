@@ -867,7 +867,7 @@ def precheck_case_execution(
     global_checks: List[Dict[str, Any]] = []
 
     if platform == "ios":
-        if not is_flag_enabled(session, FLAG_IOS_EXECUTION, default=False):
+        if not is_flag_enabled(session, FLAG_IOS_EXECUTION):
             global_checks.append(
                 {
                     "status": "FAIL",
@@ -1108,7 +1108,7 @@ def run_case_with_standard_runner(
     driver_kwargs: Dict[str, Any] = {}
 
     if platform == "ios":
-        if not is_flag_enabled(session, FLAG_IOS_EXECUTION, default=False):
+        if not is_flag_enabled(session, FLAG_IOS_EXECUTION):
             raise RuntimeError("iOS execution is disabled by feature flag")
         wda_url = resolve_ios_wda_url(session, device_serial)
         check_wda_health(wda_url)

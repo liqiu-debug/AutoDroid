@@ -248,16 +248,16 @@ npm run dev -- --host
 
 ### Feature Flags
 
-以下开关存储在 `SystemSetting` 中，用于逐步启用新链路：
+以下开关存储在 `SystemSetting` 中，未配置时使用代码内默认值（`backend/feature_flags.py`）：
 
-| 配置项 | 作用 |
-|---|---|
-| `new_step_model` | 启用标准步骤表的读写与兼容迁移 |
-| `cross_platform_runner` | 将执行入口切换到跨端 Runner |
-| `ios_execution` | 允许 iOS 执行 |
-| `ws_disconnect_abort` | 实时执行的 WebSocket 断开后立即中止对应执行（默认关闭） |
+| 配置项 | 默认值 | 作用 |
+|---|---|---|
+| `new_step_model` | 开启 | 启用标准步骤表的读写与兼容迁移 |
+| `cross_platform_runner` | 开启 | 执行入口统一走跨端 Runner（执行必须显式指定设备） |
+| `ios_execution` | 关闭 | 允许 iOS 执行 |
+| `ws_disconnect_abort` | 关闭 | 实时执行的 WebSocket 断开后立即中止对应执行 |
 
-生产环境建议按“标准步骤模型 -> 跨端 Runner -> iOS 执行”的顺序灰度启用。
+标准步骤模型与跨端 Runner 已默认启用；在 `SystemSetting` 中显式写入 `false` 可临时回退。iOS 执行仍需手动开启。
 
 ## 配置说明
 

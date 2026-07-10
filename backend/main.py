@@ -1104,7 +1104,7 @@ def execute_single_step(payload: SingleStepPayload, session: Session = Depends(g
     if platform == "ios":
         if not payload.device_serial:
             raise HTTPException(status_code=400, detail="iOS 单步执行必须选择一台设备。")
-        if not is_flag_enabled(session, FLAG_IOS_EXECUTION, default=False):
+        if not is_flag_enabled(session, FLAG_IOS_EXECUTION):
             raise HTTPException(status_code=400, detail="iOS 执行开关未开启")
 
         wda_url = resolve_ios_wda_url(session, payload.device_serial)
@@ -1228,13 +1228,12 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
             case_name_for_report = str(case.name or case_name_for_report)
             case_variables = list(case.variables or [])
             report_variables = list(case_variables)
-            use_cross_platform_runner = (
-                is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
-                and bool(device_serial)
-            )
-            abort_on_disconnect = is_flag_enabled(
-                session, FLAG_WS_DISCONNECT_ABORT, default=False
-            )
+            use_cross_platform_runner = is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER)
+            if use_cross_platform_runner and not device_serial:
+                # 跨端链路必须显式指定设备，不再静默回落 legacy。
+                await websocket.send_json({"type": "error", "message": "请选择执行设备"})
+                return
+            abort_on_disconnect = is_flag_enabled(session, FLAG_WS_DISCONNECT_ABORT)
             run_batch_id = str(uuid.uuid4())
             abort_event = register_device_abort(device_serial) if device_serial else threading.Event()
             disconnect_watcher = asyncio.create_task(
@@ -1255,14 +1254,10 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
             session.commit()
 
             if use_cross_platform_runner:
-                if not device_serial:
-                    await websocket.send_json({"type": "error", "message": "跨端执行必须指定设备"})
-                    return
-
                 platform = resolve_device_platform(session, device_serial)
                 driver_kwargs = {}
                 if platform == "ios":
-                    if not is_flag_enabled(session, FLAG_IOS_EXECUTION, default=False):
+                    if not is_flag_enabled(session, FLAG_IOS_EXECUTION):
                         await websocket.send_json({"type": "error", "message": "iOS 执行开关未开启"})
                         return
                     wda_url = resolve_ios_wda_url(session, device_serial)
