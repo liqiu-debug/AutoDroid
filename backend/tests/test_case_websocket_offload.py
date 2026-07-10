@@ -48,6 +48,9 @@ class _FakeFailingCrossPlatformRunner:
         return {
             "status": "FAIL",
             "error": "element not found",
+            "error_code": "E2001_ELEMENT_NOT_FOUND",
+            "error_context": {"action": "click", "selector": "login"},
+            "suggestion": "请检查定位器是否正确",
             "error_strategy": "ABORT",
             "duration": 0.01,
             "artifacts": {},
@@ -141,7 +144,7 @@ class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
              patch.object(main, "unregister_device_abort"), \
              patch.object(main, "CrossPlatformRunner", _FakeFailingCrossPlatformRunner), \
              patch.object(main, "_run_in_blocking_executor", side_effect=fake_run_in_blocking_executor), \
-             patch.object(main.report_generator, "generate_report", return_value="report-cross-2"), \
+             patch.object(main.report_generator, "generate_report", return_value="report-cross-2") as report_mock, \
              patch.object(main.manager, "connect", new=AsyncMock()), \
              patch.object(main.manager, "broadcast_run_start", new=AsyncMock()), \
              patch.object(main.manager, "broadcast_step_update", new=AsyncMock()) as step_update_mock, \
@@ -162,6 +165,18 @@ class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
         complete_kwargs = run_complete_mock.await_args.kwargs
         self.assertFalse(complete_kwargs.get("success"))
         self.assertEqual(complete_kwargs.get("failed"), 1)
+
+        # 失败步骤的 WS 广播携带结构化错误码/建议（纯增量字段）
+        failed_call = next(
+            call for call in step_update_mock.await_args_list if "failed" in call.args
+        )
+        self.assertEqual(failed_call.kwargs.get("error_code"), "E2001_ELEMENT_NOT_FOUND")
+        self.assertEqual(failed_call.kwargs.get("suggestion"), "请检查定位器是否正确")
+
+        # HTML 报告的步骤结果同样携带（经 report_display 渲染）
+        report_steps = report_mock.call_args.kwargs["steps_results"]
+        self.assertEqual(report_steps[0]["error_code"], "E2001_ELEMENT_NOT_FOUND")
+        self.assertEqual(report_steps[0]["suggestion"], "请检查定位器是否正确")
 
         with Session(self.engine) as session:
             case = session.get(TestCase, self.case_id)

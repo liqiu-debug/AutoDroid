@@ -105,6 +105,55 @@ class ScenarioCaseResultPersistenceTests(unittest.TestCase):
         self.assertEqual(rows[1].report_display["display_text"], "等待首页")
         self.assertEqual(rows[1].error_message, "ignored")
 
+    def test_persist_error_code_and_suggestion_into_report_display(self):
+        item = {"alias": "case-e", "case_name": "Case E"}
+        case_result = {
+            "case_id": 103,
+            "success": False,
+            "steps": [
+                {
+                    "step": {"action": "click", "selector": "登录", "selector_type": "text"},
+                    "success": True,
+                    "duration": 0.1,
+                },
+                {
+                    "step": {"action": "click", "selector": "提交", "selector_type": "text"},
+                    "success": False,
+                    "duration": 0.2,
+                    "error": "元素未找到: 提交",
+                    "error_code": "E2001_ELEMENT_NOT_FOUND",
+                    "error_context": {"action": "click", "selector": "提交"},
+                    "suggestion": "请检查定位器是否正确",
+                },
+            ],
+        }
+
+        case_entry, _, _ = _persist_case_result_and_build_case_report(
+            session=self.session,
+            execution_id=self.execution_id,
+            item=item,
+            case_result=case_result,
+            global_step_order=1,
+            step_name_prefix="case-e",
+        )
+        self.session.commit()
+
+        rows = self.session.exec(select(TestResult).order_by(TestResult.step_order)).all()
+        self.assertEqual(len(rows), 2)
+        # 成功步骤不携带结构化错误字段
+        self.assertNotIn("error_code", rows[0].report_display)
+        self.assertNotIn("suggestion", rows[0].report_display)
+        # 失败步骤的错误码/建议随 report_display 持久化
+        self.assertEqual(rows[1].status, "FAIL")
+        self.assertEqual(rows[1].error_message, "元素未找到: 提交")
+        self.assertEqual(rows[1].report_display["error_code"], "E2001_ELEMENT_NOT_FOUND")
+        self.assertEqual(rows[1].report_display["suggestion"], "请检查定位器是否正确")
+
+        # 场景报告使用的 case_entry 同步携带
+        failed_display = case_entry["steps"][1]["report_display"]
+        self.assertEqual(failed_display["error_code"], "E2001_ELEMENT_NOT_FOUND")
+        self.assertEqual(failed_display["suggestion"], "请检查定位器是否正确")
+
     def test_case_level_error_screenshot_fills_first_failed_step(self):
         item = {"alias": "case-b", "case_name": "Case B"}
         case_result = {
