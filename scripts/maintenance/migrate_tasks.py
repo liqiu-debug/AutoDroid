@@ -1,4 +1,9 @@
 """数据库迁移：创建 ScheduledTask 表"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from sqlmodel import Session, text
 from backend.database import engine
 

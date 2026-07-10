@@ -7,6 +7,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Secrets
+.jwt_secret
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -18,6 +21,8 @@ __pycache__/
 # Logs and databases
 *.log
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 auto_droid.db

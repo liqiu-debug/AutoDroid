@@ -1192,6 +1192,14 @@ class AndroidDriver(BaseDriver):
         finally:
             super().disconnect()
 
+    def health_check(self) -> bool:
+        """快速探测 uiautomator2 连接是否仍可用（供连接池复用前调用）。"""
+        try:
+            return bool(self._device.info)
+        except Exception as exc:
+            logger.info("Android 驱动健康检查失败 [%s]: %s", self.device_id, exc)
+            return False
+
     @classmethod
     def _get_ocr_engine(cls) -> Any:
         """获取 OCR 引擎（使用全局单例服务）"""

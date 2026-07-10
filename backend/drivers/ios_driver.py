@@ -2178,6 +2178,14 @@ class IOSDriver(BaseDriver):
         finally:
             super().disconnect()
 
+    def health_check(self) -> bool:
+        """快速探测 WDA 会话是否仍可用（供连接池复用前调用）。"""
+        try:
+            return bool(self.client.status())
+        except Exception as exc:
+            logger.info("iOS 驱动健康检查失败 [%s]: %s", self.device_id, exc)
+            return False
+
     @staticmethod
     def _load_opencv_numpy() -> Tuple[Any, Any]:
         try:

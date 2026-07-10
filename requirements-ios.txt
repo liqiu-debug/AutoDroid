@@ -1,2 +1,2 @@
-tidevice
-facebook-wda
+tidevice>=0.12
+facebook-wda>=1.5

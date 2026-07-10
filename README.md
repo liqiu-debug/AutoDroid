@@ -198,7 +198,7 @@ npm run dev -- --host
 密码：123456
 ```
 
-登录后请立即在账号设置中修改密码。对外部署前还必须替换 `backend/core/security.py` 中的 JWT `SECRET_KEY`，并根据需要关闭公开注册。
+登录后请立即在账号设置中修改密码。JWT 密钥默认会自动生成并持久化到项目根 `.jwt_secret`；对外部署时建议通过 `AUTODROID_SECRET_KEY` 环境变量显式指定，并根据需要关闭公开注册。注意：从旧版本（硬编码密钥）升级后，所有已登录用户需要重新登录一次。
 
 ## 推荐使用流程
 
@@ -255,6 +255,7 @@ npm run dev -- --host
 | `new_step_model` | 启用标准步骤表的读写与兼容迁移 |
 | `cross_platform_runner` | 将执行入口切换到跨端 Runner |
 | `ios_execution` | 允许 iOS 执行 |
+| `ws_disconnect_abort` | 实时执行的 WebSocket 断开后立即中止对应执行（默认关闭） |
 
 生产环境建议按“标准步骤模型 -> 跨端 Runner -> iOS 执行”的顺序灰度启用。
 
@@ -265,6 +266,12 @@ npm run dev -- --host
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `AUTODROID_DB_PATH` | `database.db` | SQLite 文件路径，相对路径基于项目根目录 |
+| `AUTODROID_SECRET_KEY` | 自动生成 | JWT 签名密钥；未设置时自动生成并持久化到项目根 `.jwt_secret`（勿提交） |
+| `AUTODROID_TOKEN_EXPIRE_MINUTES` | `43200`（30 天） | 登录 token 有效期（分钟），团队部署建议改小 |
+| `AUTODROID_CORS_ORIGINS` | `*` | 允许的跨域来源，逗号分隔；为 `*` 时自动关闭 credentials |
+| `AUTODROID_LIMIT_GLOBAL` | `20` | 系统全局最大并发执行数 |
+| `AUTODROID_LIMIT_PER_USER` | `5` | 单用户最大并发执行数 |
+| `AUTODROID_DRIVER_POOL` | `0` | 设为 `1` 时按设备复用执行驱动连接（连接池），团队服务器推荐开启 |
 | `HOST` | `0.0.0.0` | `start_lan.sh` 监听地址 |
 | `PORT` | `8000` | `start_lan.sh` 服务端口 |
 | `SKIP_BUILD` | `0` | 设置为 `1` 时跳过前端构建 |
@@ -280,6 +287,10 @@ npm run dev -- --host
 - 通知卡片使用的系统访问地址
 - AI 服务的 API Key、Base URL 和模型名称
 - 通知与 AI 连接测试
+
+另有仅通过设置 API（`POST /api/settings/`）维护的配置：
+
+- `report_retention_days`：报告保留天数。大于 0 时每日自动清理超期的 UI 执行、Fastbot 与兼容性报告（含磁盘产物）；缺省或 `0` 表示不清理。
 
 iOS WDA URL、设备映射、启动参数和故障处理见 [iOS WDA 运维手册](docs/IOS_WDA_OPS.md)。
 
@@ -303,6 +314,13 @@ source .venv/bin/activate
 python -m unittest discover -s backend/tests -p 'test_*.py'
 ```
 
+运行后端 lint（致命错误级检查）：
+
+```bash
+pip install -r requirements-dev.txt
+ruff check backend scripts
+```
+
 验证前端生产构建：
 
 ```bash
@@ -310,17 +328,18 @@ cd frontend
 npm run build
 ```
 
-提交前建议至少运行与改动模块相关的后端测试，并完成一次前端构建。
+提交前建议至少运行与改动模块相关的后端测试，并完成一次前端构建。push 后 GitHub Actions 会自动执行后端 lint + 全量测试和前端构建（见 `.github/workflows/ci.yml`）。
 
 ## 文档索引
 
 - [项目深度说明](docs/PROJECT_OVERVIEW_CN.md)：功能全景、核心实现、数据模型与运维建议
 - [执行规范](docs/EXECUTION_SPEC.md)：标准步骤模型、动作参数、平台覆盖与错误码
 - [iOS WDA 运维手册](docs/IOS_WDA_OPS.md)：WDA 启动、健康检查、端口映射和故障排查
+- [改进路线图](docs/IMPROVEMENT_ROADMAP.md)：能力补充与架构治理清单（P0/P1/P2）
 
 ## 安全与仓库维护
 
 - 不要提交真实 API Key、Webhook、访问令牌、用户数据库或设备隐私数据。
-- 不要提交 `database.db`、`reports/`、`uploads/`、运行日志、PID 文件、APK/IPA 等本地产物。
-- 默认管理员账号和静态 JWT 密钥仅适用于本地首次启动，部署前必须修改。
-- 公开部署时应限制 CORS、启用 HTTPS，并通过网络策略限制设备控制接口的访问范围。
+- 不要提交 `database.db`、`.jwt_secret`、`reports/`、`uploads/`、运行日志、PID 文件、APK/IPA 等本地产物。
+- 默认管理员初始密码仅适用于本地首次启动，部署前必须修改；JWT 密钥已自动生成，可用 `AUTODROID_SECRET_KEY` 显式管理。
+- 公开部署时应通过 `AUTODROID_CORS_ORIGINS` 限制来源、启用 HTTPS，并通过网络策略限制设备控制接口的访问范围。

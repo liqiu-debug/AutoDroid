@@ -216,6 +216,7 @@ from backend.drivers.cross_platform_runner import TestCaseRunner as CrossPlatfor
 from backend.feature_flags import (
     FLAG_CROSS_PLATFORM_RUNNER,
     FLAG_IOS_EXECUTION,
+    FLAG_WS_DISCONNECT_ABORT,
     is_flag_enabled,
 )
 from backend.step_contract import (
@@ -331,10 +332,19 @@ def redirect_legacy_api_report_asset(report_path: str):
     return RedirectResponse(url=_build_report_asset_url(normalized))
 
 
+def _cors_allow_origins() -> List[str]:
+    """允许来源通过 AUTODROID_CORS_ORIGINS 配置（逗号分隔），默认放开。"""
+    raw = (os.environ.get("AUTODROID_CORS_ORIGINS") or "").strip()
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return origins or ["*"]
+
+
+_cors_origins = _cors_allow_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    # 通配 origin 与 credentials 组合不符合 CORS 规范；前端走同源 Bearer header，无 cookie 依赖。
+    allow_credentials="*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -365,6 +375,14 @@ def on_startup():
     # 初始化定时任务调度器并恢复活跃任务
     _restore_scheduled_tasks()
 
+    # 注册报告保留策略每日清理（保留天数由系统配置 report_retention_days 控制，默认关闭）
+    try:
+        from backend.retention_service import register_retention_job
+
+        register_retention_job()
+    except Exception:
+        logger.exception("注册报告保留清理任务失败")
+
 
 @app.on_event("shutdown")
 def on_shutdown():
@@ -376,6 +394,12 @@ def on_shutdown():
         _recording_ios_session_pool.close_all()
     except Exception:
         logger.exception("关闭时停止 iOS 录制会话池失败")
+    try:
+        from backend.drivers.driver_pool import reset_execution_driver_pool
+
+        reset_execution_driver_pool()
+    except Exception:
+        logger.exception("关闭时停止执行驱动连接池失败")
     try:
         wda_relay_manager.stop_all()
     except Exception:
@@ -1154,6 +1178,33 @@ def execute_single_step(payload: SingleStepPayload, session: Session = Depends(g
 # ==================== WebSocket 实时执行 ====================
 
 
+async def _watch_ws_disconnect(
+    websocket: WebSocket,
+    abort_event: Optional[threading.Event],
+    abort_on_disconnect: bool,
+    case_id: int,
+) -> None:
+    """监听执行 WebSocket 的断开：开关开启时断开即触发中止事件。
+
+    执行主流程只发送不接收，且 socket_manager 会吞掉发送异常，
+    因此必须用独立的 receive 协程才能及时感知客户端断开。
+    """
+    try:
+        while True:
+            # 忽略客户端消息内容，只关心连接是否存活
+            await websocket.receive_text()
+    except asyncio.CancelledError:
+        raise
+    except (WebSocketDisconnect, RuntimeError):
+        if abort_on_disconnect and abort_event and not abort_event.is_set():
+            abort_event.set()
+            logger.info(
+                "Case WebSocket disconnected, aborting run: case_id=%s", case_id
+            )
+    except Exception:
+        logger.exception("WebSocket disconnect watcher failed: case_id=%s", case_id)
+
+
 @app.websocket("/ws/run/{case_id}")
 async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optional[int] = None, device_serial: Optional[str] = None):
     """WebSocket 端点：实时执行测试用例并推送步骤状态"""
@@ -1164,6 +1215,7 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
     run_id = None
     run_batch_id = None
     abort_event = None
+    disconnect_watcher = None
     try:
         runner = None
         case_name_for_report = f"case-{case_id}"
@@ -1180,8 +1232,14 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
                 and bool(device_serial)
             )
+            abort_on_disconnect = is_flag_enabled(
+                session, FLAG_WS_DISCONNECT_ABORT, default=False
+            )
             run_batch_id = str(uuid.uuid4())
             abort_event = register_device_abort(device_serial) if device_serial else threading.Event()
+            disconnect_watcher = asyncio.create_task(
+                _watch_ws_disconnect(websocket, abort_event, abort_on_disconnect, case_id)
+            )
             managed_device_serial = device_serial if device_serial else None
             run_record = registry.register(
                 kind="case",
@@ -1647,6 +1705,12 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
         logger.exception("Case WebSocket execution failed: case_id=%s", case_id)
         await websocket.send_json({"type": "error", "message": str(e)})
     finally:
+        if disconnect_watcher:
+            disconnect_watcher.cancel()
+            try:
+                await disconnect_watcher
+            except (asyncio.CancelledError, Exception):
+                pass
         try:
             if run_id:
                 with Session(engine) as status_session:

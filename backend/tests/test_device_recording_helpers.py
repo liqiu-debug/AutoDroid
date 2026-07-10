@@ -73,8 +73,12 @@ class DeviceRecordingHelperTests(unittest.TestCase):
         driver.disconnect.assert_called_once()
 
     def test_recording_post_action_delay_prefers_faster_ios_clicks(self):
-        self.assertLess(_get_recording_post_action_delay("ios", "click"), 1.0)
-        self.assertEqual(_get_recording_post_action_delay("android", "click"), 1.0)
+        # d78f30d 起固定等待改为“短等待 + 截图轮询”：iOS 点击最快，Android 通用 0.2s
+        self.assertLess(
+            _get_recording_post_action_delay("ios", "click"),
+            _get_recording_post_action_delay("android", "click"),
+        )
+        self.assertEqual(_get_recording_post_action_delay("android", "click"), 0.2)
 
     def test_build_device_dump_payload_can_skip_optional_parts(self):
         raw_png = b"\x89PNG\r\n\x1a\nfast"

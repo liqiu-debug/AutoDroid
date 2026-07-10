@@ -25,6 +25,7 @@ from backend.step_contract import (
 
 from .android_driver import AndroidDriver
 from .base_driver import BaseDriver
+from .driver_pool import get_execution_driver_pool, is_driver_pool_enabled
 from .ios_driver import IOSDriver
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,12 @@ class TestCaseRunner:
         self.platform = str(platform or "").strip().lower()
         self.device_id = device_id
         self.abort_event = abort_event
-        self.driver = DriverFactory.create(self.platform, device_id, **driver_kwargs)
+        # AUTODROID_DRIVER_POOL=1 时按设备复用驱动连接（团队服务器推荐开启）
+        self._driver_pool = get_execution_driver_pool() if is_driver_pool_enabled() else None
+        if self._driver_pool is not None:
+            self.driver = self._driver_pool.acquire(self.platform, device_id, **driver_kwargs)
+        else:
+            self.driver = DriverFactory.create(self.platform, device_id, **driver_kwargs)
         self.runtime_variables: Dict[str, str] = {}
         logger.info(
             "Cross-platform runner ready: platform=%s device_id=%s driver=%s",
@@ -350,6 +356,10 @@ class TestCaseRunner:
         }
 
     def disconnect(self) -> None:
+        if self._driver_pool is not None:
+            # 池化驱动归还复用，不真正断开
+            self._driver_pool.release(self.platform, self.device_id, self.driver)
+            return
         self.driver.disconnect()
 
     def _sleep_or_abort(self, seconds: float) -> bool:

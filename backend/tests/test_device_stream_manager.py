@@ -136,7 +136,11 @@ class DeviceStreamManagerInitializationTests(unittest.TestCase):
 
     def test_reconnect_does_not_clear_in_progress_status(self):
         manager = ScrcpyDeviceManager()
+        # 模拟 _on_device_connected 进行中的完整状态：_connecting 标记 + 初始化中的 _devices 条目
+        in_progress = DeviceInfo("serial-1", 0)
+        in_progress.initializing = True
         manager._connecting.add("serial-1")
+        manager._devices["serial-1"] = in_progress
 
         manager.reconnect_device("serial-1")
 
@@ -144,6 +148,7 @@ class DeviceStreamManagerInitializationTests(unittest.TestCase):
         self.assertEqual(len(devices), 1)
         self.assertEqual(devices[0]["serial"], "serial-1")
         self.assertFalse(devices[0]["ready"])
+        self.assertTrue(devices[0]["initializing"])
         self.assertIsNone(devices[0]["error"])
         self.assertIn("serial-1", manager._connecting)
 
