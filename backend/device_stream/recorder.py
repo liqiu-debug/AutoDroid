@@ -167,6 +167,20 @@ class _BufferSegment:
 
 
 class RollingScrcpyRecorderSession:
+    """
+    滚动 H.264 分段环形缓冲录制器，用于崩溃复现回放截取。
+
+    取流点：输入来自设备 reader 线程解析出的原始码流（见
+    manager._broadcast_video_packet，ingest 调用位于所有观看端队列与
+    丢帧路径之前），因此回放素材不受任何观看端拥塞/丢帧影响。
+
+    分段按时间滚动（segment_sec），不做关键帧对齐；导出回放时会在文件头
+    补写最新的 SPS/PPS + IDR（capture_replay/_write_replay_file），保证
+    回放 MP4 始终以干净的解码初始化序列开始。窗口起点到窗口内第一个
+    IDR 之间的 P 帧可能引用窗口外的参考帧，该起始伪影最多持续一个
+    GOP（i_frame_interval，默认 1 秒）。
+    """
+
     def __init__(
         self,
         serial: str,

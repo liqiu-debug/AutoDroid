@@ -110,6 +110,58 @@ class RollingScrcpyRecorderSessionTests(unittest.TestCase):
 
             recorder.stop(cleanup_buffer=True)
 
+    def test_capture_replay_head_is_latest_init_sequence_from_raw_stream(self):
+        """回放文件头必须是最新的 SPS/PPS + IDR（干净的解码初始化序列）。"""
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "backend.device_stream.recorder.time.monotonic",
+            side_effect=self._fake_monotonic,
+        ), patch(
+            "backend.device_stream.recorder.time.sleep",
+            side_effect=self._fake_sleep,
+        ), patch(
+            "backend.device_stream.recorder.transcode_h264_to_mp4",
+            side_effect=lambda source_path, output_path: os.replace(source_path, output_path),
+        ):
+            recorder = RollingScrcpyRecorderSession(
+                serial="device-5",
+                task_id=5,
+                report_dir=tmpdir,
+                project_root=tmpdir,
+                pre_roll_sec=2,
+                post_roll_sec=0,
+                segment_sec=1,
+            )
+
+            sps = b"\x00\x00\x00\x01\x67\x64\x00\x1f"
+            pps = b"\x00\x00\x00\x01\x68\xee\x3c\x80"
+            stale_idr = b"\x00\x00\x00\x01\x65\xaa\xbb\x01"
+            mid_p = b"\x00\x00\x00\x01\x41\x9a\x22\x02"
+            fresh_idr = b"\x00\x00\x00\x01\x65\xcc\xdd\x03"
+            newest_p = b"\x00\x00\x00\x01\x41\x9a\x22\x04"
+
+            recorder.ingest(sps)
+            recorder.ingest(pps)
+            recorder.ingest(stale_idr)
+            self._advance(1.1)
+            recorder.ingest(mid_p)
+            recorder.ingest(fresh_idr)
+            self._advance(1.1)
+            recorder.ingest(newest_p)
+
+            result = recorder.capture_replay("CRASH", "10:00:00")
+
+            self.assertEqual(result.status, "READY")
+            replay_path = os.path.join(tmpdir, result.path)
+            with open(replay_path, "rb") as handle:
+                content = handle.read()
+
+            # 头部为最新初始化序列，而不是窗口外的旧 IDR
+            self.assertTrue(content.startswith(sps + pps + fresh_idr))
+            self.assertNotIn(stale_idr, content)
+            self.assertIn(newest_p, content)
+
+            recorder.stop(cleanup_buffer=True)
+
     def test_seed_init_packets_prepends_decoder_headers_for_mid_stream_recording(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "backend.device_stream.recorder.time.monotonic",
