@@ -34,19 +34,27 @@ class _FakeCrossPlatformRunner:
         return None
 
 
-class _FakeLegacyRunner:
-    def __init__(self, device_serial=None):
-        self.device_serial = device_serial
-        self.d = object()
+class _FakeDriver:
+    def screenshot(self):
+        return b"fake-png"
 
-    def connect(self):
-        return None
 
-    def execute_step(self, step, variables):
+class _FakeFailingCrossPlatformRunner:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.driver = _FakeDriver()
+
+    def run_step(self, step):
         return {
-            "success": True,
+            "status": "FAIL",
+            "error": "element not found",
+            "error_strategy": "ABORT",
             "duration": 0.01,
+            "artifacts": {},
         }
+
+    def disconnect(self):
+        return None
 
 
 class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
@@ -85,7 +93,6 @@ class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
             return func(*args, **kwargs)
 
         with patch.object(main, "engine", self.engine), \
-             patch.object(main, "is_flag_enabled", return_value=True), \
              patch.object(main, "resolve_device_platform", return_value="android"), \
              patch.object(main, "prepare_case_steps_for_platform", return_value=([{"action": "click", "description": "点击登录", "error_strategy": "ABORT", "timeout": 10}], {})), \
              patch.object(main, "register_device_abort", return_value=threading.Event()), \
@@ -118,7 +125,7 @@ class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
         disconnect_mock.assert_called_once_with(websocket, self.case_id)
         websocket.send_json.assert_not_awaited()
 
-    async def test_websocket_run_case_legacy_steps_use_blocking_executor(self):
+    async def test_websocket_run_case_failed_step_offloads_screenshot_capture(self):
         websocket = _FakeWebSocket()
         call_names = []
 
@@ -127,15 +134,19 @@ class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
             return func(*args, **kwargs)
 
         with patch.object(main, "engine", self.engine), \
-             patch.object(main, "is_flag_enabled", return_value=False), \
-             patch.object(main, "TestRunner", _FakeLegacyRunner), \
+             patch.object(main, "resolve_device_platform", return_value="android"), \
+             patch.object(main, "prepare_case_steps_for_platform", return_value=([{"action": "click", "description": "点击登录", "error_strategy": "ABORT", "timeout": 10}], {})), \
+             patch.object(main, "register_device_abort", return_value=threading.Event()), \
+             patch.object(main, "restore_device_status_after_execution"), \
+             patch.object(main, "unregister_device_abort"), \
+             patch.object(main, "CrossPlatformRunner", _FakeFailingCrossPlatformRunner), \
              patch.object(main, "_run_in_blocking_executor", side_effect=fake_run_in_blocking_executor), \
-             patch.object(main.report_generator, "generate_report", return_value="report-legacy-1") as report_mock, \
-             patch.object(main.manager, "connect", new=AsyncMock()) as connect_mock, \
-             patch.object(main.manager, "broadcast_run_start", new=AsyncMock()) as run_start_mock, \
+             patch.object(main.report_generator, "generate_report", return_value="report-cross-2"), \
+             patch.object(main.manager, "connect", new=AsyncMock()), \
+             patch.object(main.manager, "broadcast_run_start", new=AsyncMock()), \
              patch.object(main.manager, "broadcast_step_update", new=AsyncMock()) as step_update_mock, \
              patch.object(main.manager, "broadcast_run_complete", new=AsyncMock()) as run_complete_mock, \
-             patch.object(main.manager, "disconnect") as disconnect_mock:
+             patch.object(main.manager, "disconnect"):
             await main.websocket_run_case(
                 websocket,
                 self.case_id,
@@ -143,16 +154,18 @@ class CaseWebSocketOffloadTests(unittest.IsolatedAsyncioTestCase):
                 device_serial="android-1",
             )
 
-        self.assertIn("_FakeLegacyRunner", call_names)
-        self.assertIn("connect", call_names)
-        self.assertIn("execute_step", call_names)
-        connect_mock.assert_awaited_once()
-        run_start_mock.assert_awaited_once()
+        # 失败截图采集也应经由 blocking executor 执行
+        self.assertIn("run_step", call_names)
+        self.assertIn("_capture_cross_platform_runner_screenshot", call_names)
         step_update_mock.assert_awaited()
         run_complete_mock.assert_awaited_once()
-        report_mock.assert_called_once()
-        disconnect_mock.assert_called_once_with(websocket, self.case_id)
-        websocket.send_json.assert_not_awaited()
+        complete_kwargs = run_complete_mock.await_args.kwargs
+        self.assertFalse(complete_kwargs.get("success"))
+        self.assertEqual(complete_kwargs.get("failed"), 1)
+
+        with Session(self.engine) as session:
+            case = session.get(TestCase, self.case_id)
+            self.assertEqual(case.last_run_status, "FAIL")
 
 
 if __name__ == "__main__":

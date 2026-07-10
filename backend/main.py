@@ -29,14 +29,18 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 from fastapi.middleware.cors import CORSMiddleware
+import uiautomator2 as u2
 
 from .models import Device, TestCase, GlobalVariable
-from .schemas import InteractionRequest, Step
-from .runner import TestRunner, register_device_abort, unregister_device_abort
+from .schemas import InteractionRequest
 from .socket_manager import manager
-from .utils.pydantic_compat import dump_model
 from .report_generator import report_generator
-from .run_control import ABORTED_STATUS, registry
+from .run_control import (
+    ABORTED_STATUS,
+    register_device_abort,
+    registry,
+    unregister_device_abort,
+)
 from .device_stream.router import rest_router as stream_rest_router
 from .device_stream.router import ws_router as stream_ws_router
 from .device_stream.manager import device_manager
@@ -214,7 +218,6 @@ from backend.cross_platform_execution import (
 from backend.drivers.ios_driver import IOSDriver
 from backend.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner
 from backend.feature_flags import (
-    FLAG_CROSS_PLATFORM_RUNNER,
     FLAG_IOS_EXECUTION,
     FLAG_WS_DISCONNECT_ABORT,
     is_flag_enabled,
@@ -540,9 +543,8 @@ def _connect_recording_device(
             raise HTTPException(status_code=400, detail=str(exc))
         return platform, driver, partial(_recording_ios_session_pool.release, serial, driver)
 
-    runner = TestRunner(device_serial=serial)
-    runner.connect()
-    return platform, runner.d, getattr(runner, "disconnect", None)
+    device = u2.connect(serial) if serial else u2.connect()
+    return platform, device, None
 
 
 def _cleanup_recording_device(cleanup) -> None:
@@ -998,12 +1000,6 @@ def _capture_cross_platform_runner_screenshot(runner) -> bytes:
     return runner.driver.screenshot()
 
 
-def _capture_legacy_runner_screenshot(runner) -> Optional[str]:
-    if not runner or not getattr(runner, "d", None):
-        return None
-    return _take_screenshot_base64(runner.d)
-
-
 def _disconnect_runner_if_supported(runner) -> None:
     if runner and hasattr(runner, "disconnect"):
         runner.disconnect()
@@ -1092,79 +1088,62 @@ def _cross_platform_result_to_legacy_payload(result: Dict[str, Any]) -> Dict[str
         "output": result.get("output"),
     }
 
+def _unwrap_runner_dump_device(driver, platform: str):
+    """跨端 Runner 的 Android 驱动内部持有 u2 设备，dump/截图需使用原始设备对象。"""
+    if platform == "android":
+        return getattr(driver, "_device", driver)
+    return driver
+
+
 @app.post("/api/device/execute_step")
 @app.post("/device/execute_step", include_in_schema=False)
 def execute_single_step(payload: SingleStepPayload, session: Session = Depends(get_session)):
     """
-    执行单个步骤并返回最新 UI 快照。
+    执行单个步骤并返回最新 UI 快照（统一走跨端 Runner）。
     """
+    if not payload.device_serial:
+        raise HTTPException(status_code=400, detail="请选择执行设备")
+
     platform = _resolve_recording_platform(session, payload.device_serial)
     variables_map = _merge_execution_variables(session, payload.env_id, payload.variables)
 
+    driver_kwargs = {}
     if platform == "ios":
-        if not payload.device_serial:
-            raise HTTPException(status_code=400, detail="iOS 单步执行必须选择一台设备。")
-        if not is_flag_enabled(session, FLAG_IOS_EXECUTION, default=False):
+        if not is_flag_enabled(session, FLAG_IOS_EXECUTION):
             raise HTTPException(status_code=400, detail="iOS 执行开关未开启")
-
         wda_url = resolve_ios_wda_url(session, payload.device_serial)
         check_wda_health(wda_url)
-        runner = None
-        try:
-            standard_step = _normalize_single_step_for_runner(
-                payload.step,
-                case_id=payload.case_id,
-                default_platform=platform,
-            )
-            runner = CrossPlatformRunner(
-                platform=platform,
-                device_id=payload.device_serial,
-                wda_url=wda_url,
-            )
-            runner.runtime_variables.update(
-                {
-                    str(key): "" if value is None else str(value)
-                    for key, value in variables_map.items()
-                    if str(key).strip()
-                }
-            )
-            step_result = runner.run_step(standard_step)
-            _wait_ui_stable(runner.driver, platform=platform, operation=standard_step.get("action", ""))
-            return {
-                "result": _cross_platform_result_to_legacy_payload(step_result),
-                "dump": _build_device_dump_payload(
-                    runner.driver,
-                    platform=platform,
-                    serial=payload.device_serial,
-                ),
-            }
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception("iOS 单步执行失败: device_serial=%s", payload.device_serial)
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            _disconnect_runner_if_supported(runner)
+        driver_kwargs["wda_url"] = wda_url
 
-    runner = TestRunner(device_serial=payload.device_serial)
+    runner = None
     try:
-        runner.connect()
-        d = runner.d
-
-        # 执行步骤 
-        step_model = Step.model_validate(payload.step)
-        result = runner.execute_step(step_model, variables_map)
-
-        # 等待 UI 稳定
-        _wait_ui_stable(d, platform="android", operation=step_model.action)
-
-        return {
-            "result": result,
-            "dump": {
-                "device_info": d.info,
-                "hierarchy_xml": d.dump_hierarchy(),
-                "screenshot": _take_screenshot_base64(d)
+        standard_step = _normalize_single_step_for_runner(
+            payload.step,
+            case_id=payload.case_id,
+            default_platform=platform,
+        )
+        runner = CrossPlatformRunner(
+            platform=platform,
+            device_id=payload.device_serial,
+            **driver_kwargs,
+        )
+        runner.runtime_variables.update(
+            {
+                str(key): "" if value is None else str(value)
+                for key, value in variables_map.items()
+                if str(key).strip()
             }
+        )
+        step_result = runner.run_step(standard_step)
+        dump_device = _unwrap_runner_dump_device(runner.driver, platform)
+        _wait_ui_stable(dump_device, platform=platform, operation=standard_step.get("action", ""))
+        return {
+            "result": _cross_platform_result_to_legacy_payload(step_result),
+            "dump": _build_device_dump_payload(
+                dump_device,
+                platform=platform,
+                serial=payload.device_serial,
+            ),
         }
     except HTTPException:
         raise
@@ -1228,19 +1207,17 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
             case_name_for_report = str(case.name or case_name_for_report)
             case_variables = list(case.variables or [])
             report_variables = list(case_variables)
-            use_cross_platform_runner = (
-                is_flag_enabled(session, FLAG_CROSS_PLATFORM_RUNNER, default=False)
-                and bool(device_serial)
-            )
-            abort_on_disconnect = is_flag_enabled(
-                session, FLAG_WS_DISCONNECT_ABORT, default=False
-            )
+            if not device_serial:
+                # 跨端链路必须显式指定设备。
+                await websocket.send_json({"type": "error", "message": "请选择执行设备"})
+                return
+            abort_on_disconnect = is_flag_enabled(session, FLAG_WS_DISCONNECT_ABORT)
             run_batch_id = str(uuid.uuid4())
-            abort_event = register_device_abort(device_serial) if device_serial else threading.Event()
+            abort_event = register_device_abort(device_serial)
             disconnect_watcher = asyncio.create_task(
                 _watch_ws_disconnect(websocket, abort_event, abort_on_disconnect, case_id)
             )
-            managed_device_serial = device_serial if device_serial else None
+            managed_device_serial = device_serial
             run_record = registry.register(
                 kind="case",
                 target_id=case_id,
@@ -1254,116 +1231,77 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
             session.add(case)
             session.commit()
 
-            if use_cross_platform_runner:
-                if not device_serial:
-                    await websocket.send_json({"type": "error", "message": "跨端执行必须指定设备"})
+            platform = resolve_device_platform(session, device_serial)
+            driver_kwargs = {}
+            if platform == "ios":
+                if not is_flag_enabled(session, FLAG_IOS_EXECUTION):
+                    await websocket.send_json({"type": "error", "message": "iOS 执行开关未开启"})
                     return
+                wda_url = resolve_ios_wda_url(session, device_serial)
+                await _run_in_blocking_executor(blocking_executor, check_wda_health, wda_url)
+                driver_kwargs["wda_url"] = wda_url
 
-                platform = resolve_device_platform(session, device_serial)
-                driver_kwargs = {}
-                if platform == "ios":
-                    if not is_flag_enabled(session, FLAG_IOS_EXECUTION, default=False):
-                        await websocket.send_json({"type": "error", "message": "iOS 执行开关未开启"})
-                        return
-                    wda_url = resolve_ios_wda_url(session, device_serial)
-                    await _run_in_blocking_executor(blocking_executor, check_wda_health, wda_url)
-                    driver_kwargs["wda_url"] = wda_url
+            steps, variables_map = prepare_case_steps_for_platform(
+                session=session,
+                case=case,
+                platform=platform,
+                env_id=env_id,
+            )
 
-                steps, variables_map = prepare_case_steps_for_platform(
-                    session=session,
-                    case=case,
-                    platform=platform,
-                    env_id=env_id,
-                )
+            await manager.broadcast_run_start(
+                case_id,
+                case.name,
+                len(steps),
+                batch_id=run_batch_id,
+                run_id=run_id,
+                device_serial=device_serial,
+            )
 
-                await manager.broadcast_run_start(
-                    case_id,
-                    case.name,
-                    len(steps),
-                    batch_id=run_batch_id,
-                    run_id=run_id,
-                    device_serial=device_serial,
-                )
+            device = session.exec(select(Device).where(Device.serial == device_serial)).first()
+            if device:
+                device.status = "BUSY"
+                device.updated_at = datetime.now()
+                session.add(device)
+                session.commit()
 
-                device = session.exec(select(Device).where(Device.serial == device_serial)).first()
-                if device:
-                    device.status = "BUSY"
-                    device.updated_at = datetime.now()
-                    session.add(device)
-                    session.commit()
+            runner = await _run_in_blocking_executor(
+                blocking_executor,
+                CrossPlatformRunner,
+                platform=platform,
+                device_id=device_serial,
+                abort_event=abort_event,
+                **driver_kwargs,
+            )
 
-                runner = await _run_in_blocking_executor(
-                    blocking_executor,
-                    CrossPlatformRunner,
-                    platform=platform,
-                    device_id=device_serial,
-                    abort_event=abort_event,
-                    **driver_kwargs,
-                )
+            start_time = datetime.now()
+            steps_results = []
+            passed = 0
+            failed = 0
 
-                start_time = datetime.now()
-                steps_results = []
-                passed = 0
-                failed = 0
-
-                for i, step in enumerate(steps):
-                    if abort_event and abort_event.is_set():
-                        await manager.broadcast_step_update(
-                            case_id,
-                            i,
-                            "warning",
-                            "执行已被用户终止",
-                        )
-                        break
-                    desc = step.get("description", "") if isinstance(step, dict) else ""
-                    action = step.get("action") if isinstance(step, dict) else ""
+            for i, step in enumerate(steps):
+                if abort_event and abort_event.is_set():
                     await manager.broadcast_step_update(
                         case_id,
                         i,
-                        "running",
-                        f"[{i+1}/{len(steps)}] 执行 {action}: {desc}",
+                        "warning",
+                        "执行已被用户终止",
                     )
+                    break
+                desc = step.get("description", "") if isinstance(step, dict) else ""
+                action = step.get("action") if isinstance(step, dict) else ""
+                await manager.broadcast_step_update(
+                    case_id,
+                    i,
+                    "running",
+                    f"[{i+1}/{len(steps)}] 执行 {action}: {desc}",
+                )
 
-                    step_result = await _run_in_blocking_executor(
-                        blocking_executor,
-                        runner.run_step,
-                        step,
-                    )
-                    if abort_event and abort_event.is_set():
-                        try:
-                            legacy_step = standard_step_to_legacy(step)
-                        except Exception:
-                            legacy_step = {
-                                "action": step.get("action"),
-                                "selector": None,
-                                "selector_type": None,
-                                "value": step.get("value"),
-                                "options": {},
-                                "description": step.get("description"),
-                                "timeout": step.get("timeout", 10),
-                                "error_strategy": step.get("error_strategy", "ABORT"),
-                            }
-                        steps_results.append(
-                            {
-                                **legacy_step,
-                                "status": "warning",
-                                "duration": round(float(step_result.get("duration") or 0), 2),
-                                "log": "执行已被用户终止",
-                                "error": "执行已被用户终止",
-                            }
-                        )
-                        await manager.broadcast_step_update(
-                            case_id,
-                            i,
-                            "warning",
-                            "执行已被用户终止",
-                        )
-                        break
-                    status = str(step_result.get("status") or "FAIL").upper()
-                    strategy = normalize_error_strategy(step_result.get("error_strategy", "ABORT"))
-                    error_msg = step_result.get("error")
-                    duration = float(step_result.get("duration") or 0)
-
+                step_result = await _run_in_blocking_executor(
+                    blocking_executor,
+                    runner.run_step,
+                    step,
+                )
+                if abort_event and abort_event.is_set():
                     try:
                         legacy_step = standard_step_to_legacy(step)
                     except Exception:
@@ -1377,90 +1315,102 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                             "timeout": step.get("timeout", 10),
                             "error_strategy": step.get("error_strategy", "ABORT"),
                         }
-
-                    screenshot_base64 = None
-                    artifacts = step_result.get("artifacts") if isinstance(step_result, dict) else None
-                    if isinstance(artifacts, dict):
-                        cached_screenshot = artifacts.get("screenshot_base64")
-                        if cached_screenshot:
-                            screenshot_base64 = str(cached_screenshot)
-                    if status in ("FAIL", "WARNING") and not screenshot_base64:
-                        try:
-                            raw_png = await _run_in_blocking_executor(
-                                blocking_executor,
-                                _capture_cross_platform_runner_screenshot,
-                                runner,
-                            )
-                            screenshot_base64 = base64.b64encode(raw_png).decode("utf-8")
-                        except Exception:
-                            screenshot_base64 = None
-
-                    if status == "PASS":
-                        passed += 1
-                        success_entry = {
-                            **legacy_step,
-                            "status": "success",
-                            "duration": round(duration, 2),
-                            "log": f"✓ 步骤成功 ({round(duration, 2)}s)",
-                        }
-                        if isinstance(step_result.get("output"), dict):
-                            success_entry["output"] = step_result.get("output")
-                        steps_results.append(success_entry)
-                        await manager.broadcast_step_update(
-                            case_id, i, "success", f"✓ 步骤 {i+1} 成功", duration
-                        )
-                        continue
-
-                    if status == "SKIP":
-                        steps_results.append(
-                            {
-                                **legacy_step,
-                                "status": "skipped",
-                                "duration": round(duration, 2),
-                                "log": f"↷ 步骤跳过: {error_msg or '平台不匹配'}",
-                                "error": error_msg,
-                            }
-                        )
-                        await manager.broadcast_step_update(
-                            case_id,
-                            i,
-                            "skipped",
-                            f"↷ 步骤 {i+1} 跳过: {error_msg or '平台不匹配'}",
-                            duration,
-                            None,
-                            error_msg,
-                        )
-                        continue
-
-                    if status == "WARNING" or (status == "FAIL" and strategy == "IGNORE"):
-                        steps_results.append(
-                            {
-                                **legacy_step,
-                                "status": "warning",
-                                "duration": round(duration, 2),
-                                "log": f"⚠ 步骤失败(IGNORE): {error_msg}",
-                                "error": error_msg,
-                                "screenshot": screenshot_base64,
-                            }
-                        )
-                        await manager.broadcast_step_update(
-                            case_id,
-                            i,
-                            "warning",
-                            f"⚠ 步骤 {i+1} 失败(已忽略): {error_msg}",
-                            duration,
-                            screenshot_base64,
-                            error_msg,
-                        )
-                        continue
-
-                    failed += 1
                     steps_results.append(
                         {
                             **legacy_step,
-                            "status": "failed",
+                            "status": "warning",
+                            "duration": round(float(step_result.get("duration") or 0), 2),
+                            "log": "执行已被用户终止",
+                            "error": "执行已被用户终止",
+                        }
+                    )
+                    await manager.broadcast_step_update(
+                        case_id,
+                        i,
+                        "warning",
+                        "执行已被用户终止",
+                    )
+                    break
+                status = str(step_result.get("status") or "FAIL").upper()
+                strategy = normalize_error_strategy(step_result.get("error_strategy", "ABORT"))
+                error_msg = step_result.get("error")
+                duration = float(step_result.get("duration") or 0)
+
+                try:
+                    legacy_step = standard_step_to_legacy(step)
+                except Exception:
+                    legacy_step = {
+                        "action": step.get("action"),
+                        "selector": None,
+                        "selector_type": None,
+                        "value": step.get("value"),
+                        "options": {},
+                        "description": step.get("description"),
+                        "timeout": step.get("timeout", 10),
+                        "error_strategy": step.get("error_strategy", "ABORT"),
+                    }
+
+                screenshot_base64 = None
+                artifacts = step_result.get("artifacts") if isinstance(step_result, dict) else None
+                if isinstance(artifacts, dict):
+                    cached_screenshot = artifacts.get("screenshot_base64")
+                    if cached_screenshot:
+                        screenshot_base64 = str(cached_screenshot)
+                if status in ("FAIL", "WARNING") and not screenshot_base64:
+                    try:
+                        raw_png = await _run_in_blocking_executor(
+                            blocking_executor,
+                            _capture_cross_platform_runner_screenshot,
+                            runner,
+                        )
+                        screenshot_base64 = base64.b64encode(raw_png).decode("utf-8")
+                    except Exception:
+                        screenshot_base64 = None
+
+                if status == "PASS":
+                    passed += 1
+                    success_entry = {
+                        **legacy_step,
+                        "status": "success",
+                        "duration": round(duration, 2),
+                        "log": f"✓ 步骤成功 ({round(duration, 2)}s)",
+                    }
+                    if isinstance(step_result.get("output"), dict):
+                        success_entry["output"] = step_result.get("output")
+                    steps_results.append(success_entry)
+                    await manager.broadcast_step_update(
+                        case_id, i, "success", f"✓ 步骤 {i+1} 成功", duration
+                    )
+                    continue
+
+                if status == "SKIP":
+                    steps_results.append(
+                        {
+                            **legacy_step,
+                            "status": "skipped",
                             "duration": round(duration, 2),
-                            "log": f"✗ 步骤失败: {error_msg}",
+                            "log": f"↷ 步骤跳过: {error_msg or '平台不匹配'}",
+                            "error": error_msg,
+                        }
+                    )
+                    await manager.broadcast_step_update(
+                        case_id,
+                        i,
+                        "skipped",
+                        f"↷ 步骤 {i+1} 跳过: {error_msg or '平台不匹配'}",
+                        duration,
+                        None,
+                        error_msg,
+                    )
+                    continue
+
+                if status == "WARNING" or (status == "FAIL" and strategy == "IGNORE"):
+                    steps_results.append(
+                        {
+                            **legacy_step,
+                            "status": "warning",
+                            "duration": round(duration, 2),
+                            "log": f"⚠ 步骤失败(IGNORE): {error_msg}",
                             "error": error_msg,
                             "screenshot": screenshot_base64,
                         }
@@ -1468,195 +1418,38 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                     await manager.broadcast_step_update(
                         case_id,
                         i,
-                        "failed",
-                        f"✗ 步骤 {i+1} 失败: {error_msg}",
+                        "warning",
+                        f"⚠ 步骤 {i+1} 失败(已忽略): {error_msg}",
                         duration,
                         screenshot_base64,
                         error_msg,
                     )
+                    continue
 
-                    if strategy == "ABORT":
-                        break
-
-            else:
-                steps = case.steps or []
-                variables = case_variables or []
-
-                # 准备变量映射表 (全局变量优先级低于用例局部变量)
-                variables_map = {}
-                if env_id:
-                    global_vars = session.exec(
-                        select(GlobalVariable).where(GlobalVariable.env_id == env_id)
-                    ).all()
-                    for gv in global_vars:
-                        variables_map[gv.key] = gv.value
-
-                # 广播执行开始
-                await manager.broadcast_run_start(
+                failed += 1
+                steps_results.append(
+                    {
+                        **legacy_step,
+                        "status": "failed",
+                        "duration": round(duration, 2),
+                        "log": f"✗ 步骤失败: {error_msg}",
+                        "error": error_msg,
+                        "screenshot": screenshot_base64,
+                    }
+                )
+                await manager.broadcast_step_update(
                     case_id,
-                    case.name,
-                    len(steps),
-                    batch_id=run_batch_id,
-                    run_id=run_id,
-                    device_serial=device_serial,
+                    i,
+                    "failed",
+                    f"✗ 步骤 {i+1} 失败: {error_msg}",
+                    duration,
+                    screenshot_base64,
+                    error_msg,
                 )
 
-                # 覆盖局部变量
-                for v in (variables if isinstance(variables, list) else []):
-                    if isinstance(v, dict):
-                        variables_map[v.get("key")] = v.get("value")
-                    else:
-                        variables_map[v.key] = v.value
+                if strategy == "ABORT":
+                    break
 
-                # 连接设备
-                runner = await _run_in_blocking_executor(
-                    blocking_executor,
-                    TestRunner,
-                    device_serial=device_serial,
-                )
-                runner.abort_event = abort_event
-                try:
-                    await _run_in_blocking_executor(blocking_executor, runner.connect)
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "message": f"设备连接失败: {e}"})
-                    return
-
-                # 逐步执行
-                start_time = datetime.now()
-                steps_results = []
-                passed = 0
-                failed = 0
-
-                for i, step in enumerate(steps):
-                    if abort_event and abort_event.is_set():
-                        await manager.broadcast_step_update(
-                            case_id,
-                            i,
-                            "warning",
-                            "执行已被用户终止",
-                        )
-                        break
-                    step_start = time.time()
-
-                    # 广播步骤开始
-                    try:
-                        desc = step.get("description", "") if isinstance(step, dict) else step.description
-                        action = step.get("action") if isinstance(step, dict) else step.action
-                        await manager.broadcast_step_update(
-                            case_id, i, "running",
-                            f"[{i+1}/{len(steps)}] 执行 {action}: {desc}"
-                        )
-                    except Exception as e:
-                        # 广播失败不影响实际执行流程。
-                        logger.debug("广播步骤开始状态失败: case_id=%s step_index=%s error=%s", case_id, i, e)
-
-                    try:
-                        # 将 dict 转换为 Step 对象
-                        step_obj = Step(**step) if isinstance(step, dict) else step
-                        result = await _run_in_blocking_executor(
-                            blocking_executor,
-                            runner.execute_step,
-                            step_obj,
-                            variables_map,
-                        )
-
-                        if not result.get("success"):
-                            raise Exception(result.get("error", "未知错误"))
-
-                        duration = time.time() - step_start
-                        passed += 1
-
-                        step_data = step if isinstance(step, dict) else dump_model(step)
-                        success_entry = {
-                            **step_data,
-                            "status": "success",
-                            "duration": round(duration, 2),
-                            "log": f"✓ 步骤成功 ({round(duration, 2)}s)"
-                        }
-                        if isinstance(result.get("output"), dict):
-                            success_entry["output"] = result.get("output")
-                        steps_results.append(success_entry)
-
-                        await manager.broadcast_step_update(
-                            case_id, i, "success",
-                            f"✓ 步骤 {i+1} 成功",
-                            duration
-                        )
-
-                    except Exception as e:
-                        duration = time.time() - step_start
-
-                        strategy = step.get("error_strategy", "ABORT") if isinstance(step, dict) else getattr(step, "error_strategy", "ABORT")
-                        if abort_event and abort_event.is_set():
-                            step_data = step if isinstance(step, dict) else dump_model(step)
-                            steps_results.append({
-                                **step_data,
-                                "status": "warning",
-                                "duration": round(duration, 2),
-                                "log": "执行已被用户终止",
-                                "error": "执行已被用户终止",
-                            })
-                            await manager.broadcast_step_update(
-                                case_id,
-                                i,
-                                "warning",
-                                "执行已被用户终止",
-                                duration,
-                                None,
-                                "执行已被用户终止",
-                            )
-                            break
-
-                        # 失败时尝试截图
-                        screenshot_base64 = None
-                        try:
-                            screenshot_base64 = await _run_in_blocking_executor(
-                                blocking_executor,
-                                _capture_legacy_runner_screenshot,
-                                runner,
-                            )
-                        except Exception as e:
-                            # 截图失败不影响步骤结果判断，仅缺失失败截图。
-                            logger.debug("失败截图采集异常: case_id=%s step_index=%s error=%s", case_id, i, e)
-
-                        step_data = step if isinstance(step, dict) else dump_model(step)
-
-                        if strategy == "IGNORE":
-                            steps_results.append({
-                                **step_data,
-                                "status": "warning",
-                                "duration": round(duration, 2),
-                                "log": f"⚠ 步骤失败(IGNORE): {str(e)}",
-                                "error": str(e),
-                                "screenshot": screenshot_base64
-                            })
-                            await manager.broadcast_step_update(
-                                case_id, i, "warning",
-                                f"⚠ 步骤 {i+1} 失败(已忽略): {str(e)}",
-                                duration,
-                                screenshot_base64,
-                                str(e)
-                            )
-                        else:
-                            failed += 1
-                            steps_results.append({
-                                **step_data,
-                                "status": "failed",
-                                "duration": round(duration, 2),
-                                "log": f"✗ 步骤失败: {str(e)}",
-                                "error": str(e),
-                                "screenshot": screenshot_base64
-                            })
-                            await manager.broadcast_step_update(
-                                case_id, i, "failed",
-                                f"✗ 步骤 {i+1} 失败: {str(e)}",
-                                duration,
-                                screenshot_base64,
-                                str(e)
-                            )
-
-                            if strategy == "ABORT":
-                                break
 
         # 生成测试报告
         end_time = datetime.now()

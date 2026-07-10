@@ -54,7 +54,7 @@ class DeviceUnlockTests(unittest.IsolatedAsyncioTestCase):
                 "error": "wda down",
             },
         ), patch("backend.api.devices.asyncio.create_subprocess_shell") as adb_mock, patch(
-            "backend.runner.trigger_device_abort"
+            "backend.run_control.trigger_device_abort"
         ) as abort_mock:
             payload = await unlock_device(
                 serial="ios-1",
@@ -87,7 +87,7 @@ class DeviceUnlockTests(unittest.IsolatedAsyncioTestCase):
                 "wda_url": "http://127.0.0.1:8201",
                 "error": None,
             },
-        ), patch("backend.runner.trigger_device_abort"):
+        ), patch("backend.run_control.trigger_device_abort"):
             payload = await unlock_device(
                 serial="ios-1",
                 session=self.session,
