@@ -74,36 +74,25 @@
 
 **验收**：`backend/tests/test_driver_pool.py` 覆盖复用、健康重建、参数变化、锁超时降级、TTL 回收与 Runner 集成。
 
-### ⬜ P1.3 异常信息结构化
+### ✅ P1.3 异常信息结构化（后端）
 
 **现状依据**：预检已有错误码体系（`P1xxx`/`S1001`），但执行期错误多为裸字符串，前端难以给出修复引导。
 
-**建议方案**：执行期错误统一 `{code, message, context, suggestion}` 结构；沿用现有错误码风格扩展执行期码段；前端 LogConsole/报告详情按结构渲染修复建议。
+**已落地方案**：新增 `backend/execution_errors.py`——12 个执行期错误码（E2xxx）+ 集中维护的中文修复建议；异常归类基于 uiautomator2/wda 真实异常类型逐一映射；驱动层在语义明确的失败点抛 `ExecutionStepError`（多继承保持 RuntimeError/AssertionError 血统，74 个既有断言测试零改动）；步骤结果纯增量新增 `error_code`/`error_context`/`suggestion` 字段。`docs/EXECUTION_SPEC.md` 新增 6.4 节。
 
-**验收**：常见失败（元素未找到、WDA 断连、设备离线）有明确建议文案。
+**遗留**：前端 LogConsole/报告详情按结构渲染建议（排入前端会话）。
 
-### ⬜ P1.4 双执行链路统一
+### ✅ P1.4 双执行链路统一
 
-**现状依据**：legacy `runner.py`（1072 行）与 `drivers/cross_platform_runner.py` 并存，靠 `new_step_model`/`cross_platform_runner` flag 灰度；双写增加维护与测试成本。
+**现状依据**：legacy `runner.py`（1072 行）与 `drivers/cross_platform_runner.py` 并存，靠 flag 灰度；双写增加维护与测试成本。
 
-**建议方案**（分三步，每步可回滚）：
-1. flag 默认全开，观察一个迭代
-2. 存量 `TestCase.steps` 迁移至 `TestCaseStep`（`backend/migrate_case_steps_to_standard.py` 已有雏形，补幂等与校验 `validate_case_steps_migration.py`）
-3. 删除 legacy 链路与前端双写逻辑
+**已落地方案**：`feature_flags.py` 引入按 key 默认值表（`new_step_model` 默认开、DB 显式 `false` 可回退）；启动时幂等回填 legacy 步骤（`database.py::backfill_case_steps_to_standard`，单条失败跳过）；删除 `runner.py` 与全部 legacy 分支（净 -3100 行），`cross_platform_runner` 开关随链路一起移除；abort 注册表迁入 `run_control.py`；所有执行入口设备必选校验。
 
-**验收**：全部执行走跨端 Runner；`runner.py` 删除后全量测试绿。
+### ✅ P1.5 巨型文件拆分（第一批）
 
-### ⬜ P1.5 巨型文件拆分
+**已落地方案**：`fastbot_runner.py` 2899→169 行（re-export shim + `backend/fastbot/` 10 模块，AST 验证名称覆盖 100%）；`DeviceStage.vue` 2071→1047 行（6 composables + 2 utils，defineExpose API 不变）；`FastbotReportDetail.vue` 2027→670 行（10 子组件）。
 
-**现状依据**：`fastbot_runner.py` 2899 行、`api/scenarios.py` 2547 行、`ios_driver.py` 2592 行、`main.py` 1741 行、前端 `DeviceStage.vue` 2071 行、`FastbotReportDetail.vue` 2027 行。
-
-**建议方案**（按收益排序）：
-- `main.py`：录制端点（`/device/*`）拆到 `api/recording.py`，WS 执行拆到 `ws_run.py`，SPA 托管拆到 `spa.py`
-- `fastbot_runner.py`：拆为 `fastbot/` 包（monkey / perf / jank / perfetto / startup 各模块）
-- `api/scenarios.py`：CRUD 与并发执行编排分离
-- 前端：`DeviceStage.vue` 抽 composables（投屏、触控、录制状态机）
-
-**验收**：行为不变（全量测试绿），单文件不超过 ~800 行。
+**剩余**：`main.py`（1741）、`api/scenarios.py`（2547）、`ios_driver.py`（2592）的拆分排后续批次（main.py/scenarios.py 在 P1.4 删 legacy 后体量已下降）。
 
 ### ✅ P1.6 SQLite 并发加固
 
@@ -129,9 +118,13 @@
 
 基于 `TestExecution`/`TestResult` 历史统计"最近 N 次通过率"，标记不稳定用例 Top；支持两次执行结果 diff 视图。
 
-### ⬜ P2.4 iOS 实时投屏
+### 🚧 P2.4 iOS 实时投屏（后端已落地，前端进行中）
 
-WDA 支持 `mjpegServerPort` MJPEG 流，可为 iOS 录制提供近实时画面（替代截图轮询）；改造 `DeviceStage.vue` 支持 MJPEG 源。
+后端：WDA MJPEG relay（9300-9399）+ `WS /ws/ios-mjpeg/{serial}`（二进制 JPEG 帧）与 `GET /api/stream/ios-mjpeg/{serial}`（multipart 透传）双端点，单上游连接多客户端广播，帧率/质量经 WDA settings 可配（`ios_mjpeg_*` SystemSetting）。前端接入 `DeviceStage` 排在进行中的前端会话。
+
+### ✅ 专项：Android Scrcpy 投屏质量（P1 批次新增）
+
+参数配置化（`AUTODROID_SCRCPY_MAX_SIZE/BITRATE/MAX_FPS/GOP`，默认 1920/8Mbps/60fps/1s）；花屏根因修复（客户端级"丢帧后等关键帧"状态机 + init 原子播种）；核查确认崩溃复现录制取原始流、不受观看端丢帧影响。前端 WebCodecs 解码器替换 jmuxer/MSE 排在进行中的前端会话。
 
 ### ⬜ P2.5 通知渠道扩展
 
