@@ -1,6 +1,6 @@
 import unittest
 
-from backend.fastbot_runner import _compute_summary
+from backend.fastbot.summary import _compute_summary
 
 
 class FastbotRunnerSummaryTests(unittest.TestCase):
