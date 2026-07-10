@@ -409,6 +409,18 @@ def on_shutdown():
         wda_relay_manager.stop_all()
     except Exception:
         logger.exception("关闭时停止 WDA relay 失败")
+    try:
+        from backend.device_stream.ios_mjpeg import ios_mjpeg_stream_manager
+
+        ios_mjpeg_stream_manager.shutdown()
+    except Exception:
+        logger.exception("关闭时停止 iOS MJPEG 流失败")
+    try:
+        from backend.wda_port_manager import ios_mjpeg_relay_manager
+
+        ios_mjpeg_relay_manager.stop_all()
+    except Exception:
+        logger.exception("关闭时停止 iOS MJPEG relay 失败")
 
 
 def _restore_scheduled_tasks():

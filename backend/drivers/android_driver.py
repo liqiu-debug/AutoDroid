@@ -24,6 +24,7 @@ from backend.execution_errors import (
     E2005_IMAGE_NOT_MATCHED,
     E2006_OCR_NO_RESULT,
     E2007_INPUT_FAILED,
+    E2009_CLICK_NO_EFFECT,
     ExecutionStepAssertionError,
     ExecutionStepRuntimeError,
 )
@@ -1081,7 +1082,11 @@ class AndroidDriver(BaseDriver):
                 time.sleep(0.12)
                 retry_signature = self._capture_page_signature_quick()
                 if retry_signature and retry_signature == before_signature:
-                    raise RuntimeError("图像模板匹配点击后页面未变化（tap-no-effect）")
+                    raise ExecutionStepRuntimeError(
+                        E2009_CLICK_NO_EFFECT,
+                        "图像模板匹配点击后页面未变化（tap-no-effect）",
+                        context={"image_path": target, "x": round(x, 1), "y": round(y, 1)},
+                    )
 
             self._log_action_success(
                 "click_image",

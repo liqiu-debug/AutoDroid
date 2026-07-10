@@ -28,6 +28,7 @@ E2005_IMAGE_NOT_MATCHED = "E2005_IMAGE_NOT_MATCHED"
 E2006_OCR_NO_RESULT = "E2006_OCR_NO_RESULT"
 E2007_INPUT_FAILED = "E2007_INPUT_FAILED"
 E2008_APP_CONTROL_FAILED = "E2008_APP_CONTROL_FAILED"
+E2009_CLICK_NO_EFFECT = "E2009_CLICK_NO_EFFECT"
 E2101_DEVICE_CONNECTION_LOST = "E2101_DEVICE_CONNECTION_LOST"
 E2102_WDA_SESSION_ERROR = "E2102_WDA_SESSION_ERROR"
 E2201_INVALID_ARGS = "E2201_INVALID_ARGS"
@@ -70,6 +71,10 @@ DEFAULT_SUGGESTIONS: Dict[str, str] = {
     E2008_APP_CONTROL_FAILED: (
         "应用启动/停止失败：请检查 app_key 映射的包名/BundleID 是否正确、"
         "应用是否已安装在该设备上。"
+    ),
+    E2009_CLICK_NO_EFFECT: (
+        "点击已执行但页面无变化：请检查元素是否可点击或被遮挡，"
+        "必要时改用坐标点击/图像点击。"
     ),
     E2101_DEVICE_CONNECTION_LOST: (
         "Android 设备连接异常：请检查 USB/网络连接与 adb devices 状态，"
@@ -222,6 +227,7 @@ _MESSAGE_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         E2005_IMAGE_NOT_MATCHED,
         ("图像模板匹配失败", "未匹配到足够置信度目标", "未在屏幕上找到匹配的图像"),
     ),
+    (E2009_CLICK_NO_EFFECT, ("tap-no-effect", "点击后页面未变化")),
     (E2001_ELEMENT_NOT_FOUND, ("元素未找到", "no such element")),
     (E2007_INPUT_FAILED, ("input 执行失败", "input_focused 执行失败")),
     (E2008_APP_CONTROL_FAILED, ("start_app 执行失败", "stop_app 执行失败")),
