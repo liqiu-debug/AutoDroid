@@ -65,11 +65,19 @@ const interactionMode = computed({
   }
 })
 
+// iOS MJPEG 实时流健康状态（由 IosMjpegPlayer streaming/disconnected 事件驱动）：
+// 流健康时静态截图轮询降频为低频兜底，层级轮询节奏不变（点击匹配的数据源）
+const iosStreamHealthy = ref(false)
+watch([selectedSerial, isIosLivePreview], () => {
+  iosStreamHealthy.value = false
+})
+
 // 截图 / 层级状态与刷新
 const dump = useDeviceDump({
   stage,
   selectedSerial,
   isIosLivePreview,
+  isIosStreamHealthy: iosStreamHealthy,
   onBeforeFetchDump: () => clearQuickImagePrompt()
 })
 const {
@@ -654,6 +662,9 @@ defineExpose({
         v-show="!isAnyCropMode && !quickImagePrompt"
         class="ios-live-layer"
         :serial="selectedSerial"
+        @streaming="iosStreamHealthy = true"
+        @disconnected="iosStreamHealthy = false"
+        @error="iosStreamHealthy = false"
         @wda-unavailable="fetchDevices()"
       />
 

@@ -3,13 +3,17 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import { parseHierarchy } from '@/utils/hierarchy'
 
+// iOS MJPEG 实时流健康时，静态截图退化为低频兜底刷新（层级轮询节奏不变）
+const IOS_STREAM_HEALTHY_SCREENSHOT_INTERVAL_MS = 3000
+
 /**
  * 设备截图 / UI 层级刷新：
  * - 持有截图、层级 XML、解析后的节点列表与设备信息
  * - 静态截图刷新（fetchDump）与投屏模式层级刷新（fetchLiveHierarchy）
  * - iOS 实时预览的轻量 dump 节流（隔次跳过层级抓取）
+ * - iOS MJPEG 流健康时（isIosStreamHealthy，可选）降低静态截图刷新频率
  */
-export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, onBeforeFetchDump }) {
+export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, isIosStreamHealthy, onBeforeFetchDump }) {
   const { isStageActive, isAbortError, createDumpRequestSignal } = stage
 
   const screenshot = ref('')
@@ -25,6 +29,7 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, onBefor
   const liveHierarchyLastUpdatedAt = ref(0)
 
   let iosLivePreviewLightDumpCount = 0
+  let lastScreenshotUpdatedAt = 0
 
   const resetIosLightDumpCount = () => {
     iosLivePreviewLightDumpCount = 0
@@ -73,8 +78,17 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, onBefor
       iosLivePreviewLightDumpCount += 1
     }
 
+    // MJPEG 实时流健康时，静态截图仅作低频兜底（画面由实时层承担）；
+    // 流断开或截图超期（3s）时恢复每次携带，保证框选/图像截取的数据源可用。
+    const streamHealthy = Boolean(isIosStreamHealthy?.value)
+    const screenshotFresh = Boolean(
+      streamHealthy
+      && lastScreenshotUpdatedAt > 0
+      && (Date.now() - lastScreenshotUpdatedAt) < IOS_STREAM_HEALTHY_SCREENSHOT_INTERVAL_MS
+    )
+
     return {
-      includeScreenshot: true,
+      includeScreenshot: !screenshotFresh,
       includeHierarchy,
       includeDeviceInfo: shouldRequestDeviceInfo()
     }
@@ -84,6 +98,7 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, onBefor
     if (!dump) return
     if (dump.screenshot) {
       screenshot.value = `data:image/png;base64,${dump.screenshot}`
+      lastScreenshotUpdatedAt = Date.now()
     }
     if (dump.device_info) {
       deviceInfo.value = dump.device_info
@@ -120,6 +135,7 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, onBefor
       deviceInfo.value = null
       nodes.value = []
       liveNodes.value = []
+      lastScreenshotUpdatedAt = 0
       resetLiveHierarchyMeta()
       return
     }
@@ -155,6 +171,10 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, onBefor
     }
     if (liveHierarchyLoading.value) return
     const dumpOptions = getLiveDumpOptions({ forceHierarchy })
+    if (!dumpOptions.includeScreenshot && !dumpOptions.includeHierarchy && !dumpOptions.includeDeviceInfo) {
+      // 本轮无需抓取任何数据（实时流健康 + 截图新鲜的轻量档），直接跳过请求
+      return
+    }
     const hierarchyRequested = Boolean(dumpOptions.includeHierarchy)
     if (hierarchyRequested) {
       liveHierarchyStatus.value = 'syncing'

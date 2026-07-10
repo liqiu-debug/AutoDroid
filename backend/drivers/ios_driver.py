@@ -27,6 +27,7 @@ from backend.execution_errors import (
     E2006_OCR_NO_RESULT,
     E2007_INPUT_FAILED,
     E2008_APP_CONTROL_FAILED,
+    E2009_CLICK_NO_EFFECT,
     E2102_WDA_SESSION_ERROR,
     ExecutionStepAssertionError,
     ExecutionStepError,
@@ -797,7 +798,11 @@ class IOSDriver(BaseDriver):
                 selector_by=by_text,
                 had_alert_before=had_alert_before,
             ):
-                raise RuntimeError("tap-no-effect")
+                raise ExecutionStepRuntimeError(
+                    E2009_CLICK_NO_EFFECT,
+                    "tap-no-effect",
+                    context={"selector": selector_text, "by": by_text},
+                )
 
     def _collect_popup_target_texts(self, locator_candidates: List[Dict[str, Any]]) -> List[str]:
         popup_semantic_by = {"label", "name", "id"}
@@ -1226,7 +1231,11 @@ class IOSDriver(BaseDriver):
                     selector_by=normalized_by,
                     had_alert_before=had_alert_before,
                 ):
-                    raise RuntimeError("tap-no-effect")
+                    raise ExecutionStepRuntimeError(
+                        E2009_CLICK_NO_EFFECT,
+                        "tap-no-effect",
+                        context={"selector": str(selector or "").strip(), "by": normalized_by},
+                    )
             self._log_action_success(
                 "click",
                 started_at,

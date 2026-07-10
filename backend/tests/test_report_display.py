@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+from backend.execution_errors import suggestion_for
 from backend.report_display import build_report_display, storage_report_display, with_report_display
 
 
@@ -141,6 +142,71 @@ class ReportDisplayTests(unittest.TestCase):
 
         self.assertEqual(step["report_display"]["display_text"], "已有展示")
         self.assertEqual(step["report_display"]["preview_base64"], "ZmFrZQ==")
+
+    def test_error_code_and_suggestion_merged_into_display(self):
+        display = build_report_display(
+            {
+                "action": "click",
+                "selector": "登录",
+                "error_code": "E2001_ELEMENT_NOT_FOUND",
+                "suggestion": "请检查定位器",
+            }
+        )
+
+        self.assertEqual(display["display_text"], "点击 登录")
+        self.assertEqual(display["error_code"], "E2001_ELEMENT_NOT_FOUND")
+        self.assertEqual(display["suggestion"], "请检查定位器")
+
+    def test_error_fields_kept_with_custom_description(self):
+        display = build_report_display(
+            {
+                "action": "click",
+                "description": "点头像",
+                "error_code": "E2002_WAIT_TIMEOUT",
+                "suggestion": "适当增大 timeout",
+            }
+        )
+
+        self.assertEqual(display["display_text"], "点头像")
+        self.assertEqual(display["error_code"], "E2002_WAIT_TIMEOUT")
+        self.assertEqual(display["suggestion"], "适当增大 timeout")
+
+    def test_error_code_without_suggestion_falls_back_to_default(self):
+        display = build_report_display(
+            {"action": "click", "error_code": "E2001_ELEMENT_NOT_FOUND"}
+        )
+
+        self.assertEqual(display["error_code"], "E2001_ELEMENT_NOT_FOUND")
+        self.assertEqual(display["suggestion"], suggestion_for("E2001_ELEMENT_NOT_FOUND"))
+
+        unknown = build_report_display({"action": "click", "error_code": "E9999_UNKNOWN"})
+        self.assertEqual(unknown["error_code"], "E9999_UNKNOWN")
+        self.assertNotIn("suggestion", unknown)
+
+    def test_display_without_error_fields_stays_clean(self):
+        display = build_report_display({"action": "click", "selector": "登录"})
+
+        self.assertNotIn("error_code", display)
+        self.assertNotIn("suggestion", display)
+
+    def test_storage_report_display_keeps_error_fields(self):
+        stored = storage_report_display(
+            {
+                "display_text": "点击 登录",
+                "error_code": "E2001_ELEMENT_NOT_FOUND",
+                "suggestion": "请检查定位器",
+                "preview_base64": "large",
+            }
+        )
+
+        self.assertEqual(
+            stored,
+            {
+                "display_text": "点击 登录",
+                "error_code": "E2001_ELEMENT_NOT_FOUND",
+                "suggestion": "请检查定位器",
+            },
+        )
 
 
 if __name__ == "__main__":

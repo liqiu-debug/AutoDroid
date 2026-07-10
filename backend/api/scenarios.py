@@ -316,6 +316,13 @@ def _persist_case_result_and_build_case_report(
         display_payload = dict(step_payload)
         if step_output:
             display_payload["output"] = step_output
+        # 结构化错误信息（纯增量）：随 report_display 持久化，避免 TestResult 加列迁移。
+        error_code = str(step_result.get("error_code") or "").strip()
+        error_suggestion = str(step_result.get("suggestion") or "").strip()
+        if error_code:
+            display_payload["error_code"] = error_code
+        if error_suggestion:
+            display_payload["suggestion"] = error_suggestion
         step_duration = float(step_result.get("duration", 0) or 0)
         case_duration += step_duration
 

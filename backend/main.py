@@ -409,6 +409,18 @@ def on_shutdown():
         wda_relay_manager.stop_all()
     except Exception:
         logger.exception("关闭时停止 WDA relay 失败")
+    try:
+        from backend.device_stream.ios_mjpeg import ios_mjpeg_stream_manager
+
+        ios_mjpeg_stream_manager.shutdown()
+    except Exception:
+        logger.exception("关闭时停止 iOS MJPEG 流失败")
+    try:
+        from backend.wda_port_manager import ios_mjpeg_relay_manager
+
+        ios_mjpeg_relay_manager.stop_all()
+    except Exception:
+        logger.exception("关闭时停止 iOS MJPEG relay 失败")
 
 
 def _restore_scheduled_tasks():
@@ -1336,6 +1348,9 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 status = str(step_result.get("status") or "FAIL").upper()
                 strategy = normalize_error_strategy(step_result.get("error_strategy", "ABORT"))
                 error_msg = step_result.get("error")
+                # 结构化错误信息（纯增量字段，见 cross_platform_runner._result）
+                error_code = str(step_result.get("error_code") or "").strip() or None
+                error_suggestion = str(step_result.get("suggestion") or "").strip() or None
                 duration = float(step_result.get("duration") or 0)
 
                 try:
@@ -1393,6 +1408,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                             "duration": round(duration, 2),
                             "log": f"↷ 步骤跳过: {error_msg or '平台不匹配'}",
                             "error": error_msg,
+                            "error_code": error_code,
+                            "suggestion": error_suggestion,
                         }
                     )
                     await manager.broadcast_step_update(
@@ -1403,6 +1420,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         duration,
                         None,
                         error_msg,
+                        error_code=error_code,
+                        suggestion=error_suggestion,
                     )
                     continue
 
@@ -1414,6 +1433,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                             "duration": round(duration, 2),
                             "log": f"⚠ 步骤失败(IGNORE): {error_msg}",
                             "error": error_msg,
+                            "error_code": error_code,
+                            "suggestion": error_suggestion,
                             "screenshot": screenshot_base64,
                         }
                     )
@@ -1425,6 +1446,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         duration,
                         screenshot_base64,
                         error_msg,
+                        error_code=error_code,
+                        suggestion=error_suggestion,
                     )
                     continue
 
@@ -1436,6 +1459,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         "duration": round(duration, 2),
                         "log": f"✗ 步骤失败: {error_msg}",
                         "error": error_msg,
+                        "error_code": error_code,
+                        "suggestion": error_suggestion,
                         "screenshot": screenshot_base64,
                     }
                 )
@@ -1447,6 +1472,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                     duration,
                     screenshot_base64,
                     error_msg,
+                    error_code=error_code,
+                    suggestion=error_suggestion,
                 )
 
                 if strategy == "ABORT":

@@ -138,6 +138,7 @@
 | `E2006_OCR_NO_RESULT` | OCR 未提取到文本 | 检查识别区域坐标与提取规则是否正确、区域内是否有清晰文本；可扩大区域或增加等待。 |
 | `E2007_INPUT_FAILED` | 输入失败 | 确认目标为可输入控件且已获得焦点；可先点击输入框再输入，或检查键盘是否弹出。 |
 | `E2008_APP_CONTROL_FAILED` | 应用启动/停止失败 | 检查 app_key 映射的包名/BundleID 是否正确、应用是否已安装在该设备上。 |
+| `E2009_CLICK_NO_EFFECT` | 点击无效果（点击已执行但页面未变化） | 检查元素是否可点击或被遮挡，必要时改用坐标点击/图像点击。 |
 | `E2101_DEVICE_CONNECTION_LOST` | Android 设备连接丢失 | 检查 USB/网络连接与 adb devices 状态，必要时重新插拔设备或重新初始化 uiautomator2 服务。 |
 | `E2102_WDA_SESSION_ERROR` | iOS WDA 会话异常 | 确认 WebDriverAgent 正在运行且端口转发正常，必要时重启 WDA 后重试。 |
 | `E2201_INVALID_ARGS` | 执行期参数非法（预检已拦截的沿用 `P1006`） | 检查步骤的 args/value/selector 配置是否符合执行规范。 |

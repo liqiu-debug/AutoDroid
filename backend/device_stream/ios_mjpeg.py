@@ -54,6 +54,9 @@ UPSTREAM_RECV_CHUNK = 65536
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 # 客户端队列长度：MJPEG 帧相互独立，拥塞时丢旧帧保实时性
 CLIENT_QUEUE_MAXSIZE = 3
+# 最后一个客户端断开后的延迟回收宽限期：吸收前端刷新/重连的毫秒级竞态，
+# 避免"断开即回收 relay"与"新客户端接入"互相踩踏（宽限期内新客户端直接复用上游）。
+IDLE_SHUTDOWN_GRACE_SEC = 2.0
 
 WDA_UNAVAILABLE_CODE = "P1005_WDA_UNAVAILABLE"
 
@@ -415,6 +418,7 @@ class _DeviceMjpegStream:
 
         self._socket: Optional[socket.socket] = None
         self._reader_thread: Optional[threading.Thread] = None
+        self._idle_timer: Optional[threading.Timer] = None
         self._started = False
         self._stop_requested = False
         self._finished = False
@@ -431,6 +435,11 @@ class _DeviceMjpegStream:
             client = MjpegClient(self)
             self._clients.append(client)
             last_frame = self._last_frame
+            idle_timer = self._idle_timer
+            self._idle_timer = None
+        if idle_timer is not None:
+            # 宽限期内新客户端接入：取消延迟回收，直接复用现有上游
+            idle_timer.cancel()
         if last_frame is not None:
             # 预置最近一帧，保证新客户端秒出画面
             _offer_latest(client.queue, last_frame)
@@ -442,7 +451,29 @@ class _DeviceMjpegStream:
                 self._clients.remove(client)
             has_clients = bool(self._clients)
         if not has_clients:
+            self._schedule_idle_shutdown()
+
+    def _schedule_idle_shutdown(self) -> None:
+        """最后一个客户端断开后延迟回收上游/relay；宽限期内接入的新客户端可复用。"""
+        grace = max(0.0, float(IDLE_SHUTDOWN_GRACE_SEC))
+        if grace <= 0:
             self.shutdown()
+            return
+        with self._clients_lock:
+            if self._finished or self._stop_requested or self._clients:
+                return
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+            timer = threading.Timer(grace, self._idle_shutdown_due)
+            timer.daemon = True
+            self._idle_timer = timer
+        timer.start()
+
+    def _idle_shutdown_due(self) -> None:
+        with self._clients_lock:
+            self._idle_timer = None
+        # shutdown 内部会再次确认当前确实没有客户端
+        self.shutdown()
 
     def client_count(self) -> int:
         with self._clients_lock:
@@ -527,6 +558,10 @@ class _DeviceMjpegStream:
                 return
             self._stop_requested = True
             sock = self._socket
+            idle_timer = self._idle_timer
+            self._idle_timer = None
+        if idle_timer is not None:
+            idle_timer.cancel()
         if sock is not None:
             try:
                 sock.close()  # 唤醒阻塞在 recv 的读取线程
@@ -697,8 +732,10 @@ class IOSMjpegStreamManager:
         with self._lock:
             if self._streams.get(stream.serial) is stream:
                 self._streams.pop(stream.serial, None)
+            # 新流已接管同一设备（快速重连），不回收其正在使用的 relay
+            replaced = self._streams.get(stream.serial) is not None
 
-        if stream.upstream.via_relay:
+        if stream.upstream.via_relay and not replaced:
             try:
                 self._relay_manager.stop_relay(stream.serial)
             except Exception as exc:
@@ -716,8 +753,8 @@ ios_mjpeg_stream_manager = IOSMjpegStreamManager()
 
 
 def _shutdown_at_exit() -> None:
-    # main.py 的 shutdown 钩子由主会话维护，这里通过 atexit 兜底清理，
-    # 避免 tidevice relay 子进程在服务退出后残留。
+    # main.py 的 on_shutdown 钩子会显式调用清理；这里通过 atexit 兜底，
+    # 覆盖非 FastAPI 生命周期的退出路径，避免 tidevice relay 子进程残留。
     try:
         ios_mjpeg_stream_manager.shutdown()
     except Exception:

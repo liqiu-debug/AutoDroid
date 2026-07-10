@@ -225,6 +225,7 @@ const buildPayload = () => {
 const handleSubmit = async () => {
     if (!form.name) return ElMessage.warning('请输入任务名称')
     if (form.task_type === 'ui' && !form.scenario_id) return ElMessage.warning('请选择执行场景')
+    if (form.task_type === 'ui' && (!form.device_serials || form.device_serials.length === 0)) return ElMessage.warning('UI 任务必须选择执行设备')
     if (form.task_type === 'fastbot' && !form.fb_package_name) return ElMessage.warning('请输入目标包名')
     if (form.task_type === 'fastbot' && (!form.device_serials || form.device_serials.length === 0)) return ElMessage.warning('智能探索任务必须选择执行设备')
     if (form.strategy === 'WEEKLY' && form.weekly_days.length === 0) {
@@ -476,7 +477,7 @@ onMounted(() => {
                 <el-form-item label="执行设备">
                     <el-select
                         v-model="form.device_serials"
-                        :placeholder="form.task_type === 'fastbot' ? '请选择运行设备' : '选择设备 (可选)'"
+                        placeholder="请选择运行设备"
                         multiple
                         collapse-tags
                         clearable

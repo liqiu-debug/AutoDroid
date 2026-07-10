@@ -62,3 +62,6 @@ frontend/.npm/
 /smart_stability_multi_run_dialog.png
 /smart_stability_multi_run_dialog_fixed.png
 /tasks_env_list_preview.png
+
+# Claude Code local workspace
+.claude/

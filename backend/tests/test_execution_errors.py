@@ -18,6 +18,7 @@ from backend.execution_errors import (
     E2006_OCR_NO_RESULT,
     E2007_INPUT_FAILED,
     E2008_APP_CONTROL_FAILED,
+    E2009_CLICK_NO_EFFECT,
     E2101_DEVICE_CONNECTION_LOST,
     E2102_WDA_SESSION_ERROR,
     E2201_INVALID_ARGS,
@@ -203,10 +204,25 @@ class ClassifyExceptionTests(unittest.TestCase):
             (RuntimeError("等待超时，元素未出现: selector='x'"), E2002_WAIT_TIMEOUT),
             (RuntimeError("元素未找到: selector='x', by='id'"), E2001_ELEMENT_NOT_FOUND),
             (RuntimeError("图像模板匹配失败: 未在屏幕上找到匹配的图像区域"), E2005_IMAGE_NOT_MATCHED),
+            (RuntimeError("tap-no-effect"), E2009_CLICK_NO_EFFECT),
+            (RuntimeError("图像模板匹配点击后页面未变化（tap-no-effect）"), E2009_CLICK_NO_EFFECT),
         ]
         for exc, expected in cases:
             code, _ = classify_exception(exc, platform="android", action="unknown")
             self.assertEqual(code, expected, msg=str(exc))
+
+    def test_click_no_effect_structured_error_passthrough(self):
+        exc = ExecutionStepRuntimeError(
+            E2009_CLICK_NO_EFFECT,
+            "tap-no-effect",
+            context={"selector": "确定", "by": "label"},
+        )
+        code, suggestion = classify_exception(exc, platform="ios", action="click")
+        self.assertEqual(code, E2009_CLICK_NO_EFFECT)
+        self.assertEqual(suggestion, suggestion_for(E2009_CLICK_NO_EFFECT))
+        self.assertTrue(suggestion)
+        # str(exc) 保持原始消息格式，供既有消息匹配逻辑（如 iOS 驱动内部回退）复用
+        self.assertEqual(str(exc), "tap-no-effect")
 
     def test_unknown_exception_falls_back_to_e2999(self):
         code, suggestion = classify_exception(

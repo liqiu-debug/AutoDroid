@@ -357,6 +357,12 @@ class MjpegRelayManagerTests(unittest.TestCase):
 
 
 class MjpegStreamManagerTests(unittest.TestCase):
+    def setUp(self):
+        # 缩短空闲回收宽限期，保证清理路径的用例快速且确定
+        patcher = patch.object(ios_mjpeg, "IDLE_SHUTDOWN_GRACE_SEC", 0.05)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _upstream(self, serial="ios-1", via_relay=True):
         return MjpegUpstream(
             serial=serial,
@@ -475,6 +481,57 @@ class MjpegStreamManagerTests(unittest.TestCase):
 
         self.assertEqual(connect_mock.call_count, 2)
         self.assertTrue(_wait_until(lambda: second_socket.closed.is_set()))
+
+    def test_quick_reconnect_within_grace_reuses_upstream(self):
+        """宽限期内的断开-重连不回收上游/relay（毫秒级竞态防护）。"""
+        fake_socket = _FakeUpstreamSocket(chunks=[], eof=False)
+        relay_manager = Mock()
+        manager = IOSMjpegStreamManager(relay_manager=relay_manager)
+
+        with patch.object(ios_mjpeg, "IDLE_SHUTDOWN_GRACE_SEC", 0.5), patch(
+            "backend.device_stream.ios_mjpeg.socket.create_connection",
+            return_value=fake_socket,
+        ) as connect_mock:
+            client = manager.open_client(self._upstream())
+            client.close()
+
+            # 宽限期内新客户端接入：复用同一条上游连接
+            reconnected = manager.open_client(self._upstream())
+            connect_mock.assert_called_once()
+            self.assertFalse(fake_socket.closed.is_set())
+            relay_manager.stop_relay.assert_not_called()
+
+            # 宽限期计时器已被取消：超过宽限期后流依旧存活
+            time.sleep(0.7)
+            self.assertFalse(fake_socket.closed.is_set())
+            self.assertEqual(len(manager.describe()), 1)
+
+            reconnected.close()
+
+        self.assertTrue(_wait_until(lambda: fake_socket.closed.is_set()))
+        self.assertTrue(_wait_until(lambda: relay_manager.stop_relay.called))
+
+    def test_stopped_stream_skips_relay_recycle_when_replaced(self):
+        """旧流停止回调不回收已被新流接管的 relay。"""
+        relay_manager = Mock()
+        manager = IOSMjpegStreamManager(relay_manager=relay_manager)
+        old_stream = ios_mjpeg._DeviceMjpegStream(
+            self._upstream(), on_stopped=manager._handle_stream_stopped
+        )
+        new_stream = ios_mjpeg._DeviceMjpegStream(
+            self._upstream(), on_stopped=manager._handle_stream_stopped
+        )
+        with manager._lock:
+            manager._streams["ios-1"] = new_stream
+
+        old_stream._finish("upstream lost")
+
+        relay_manager.stop_relay.assert_not_called()
+        self.assertIs(manager._streams.get("ios-1"), new_stream)
+
+        # 新流正常结束时才回收 relay
+        new_stream._finish(None)
+        relay_manager.stop_relay.assert_called_once_with("ios-1")
 
     def test_connect_failure_raises_p1005_and_cleans_up(self):
         relay_manager = Mock()
