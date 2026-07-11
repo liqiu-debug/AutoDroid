@@ -244,6 +244,12 @@ export default {
     getDashboardStats() {
         return api.get('/reports/dashboard/stats')
     },
+    getFlakyAnalysis(params) {
+        return api.get('/reports/flaky', { params })
+    },
+    compareExecutions(baseId, targetId) {
+        return api.get('/reports/executions/compare', { params: { base_id: baseId, target_id: targetId } })
+    },
     getDashboardOverview(params) {
         return api.get('/reports/dashboard/overview', { params })
     },

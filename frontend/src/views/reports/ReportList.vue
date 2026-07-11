@@ -1,12 +1,13 @@
 <script setup>
 import { ref, onActivated, onDeactivated, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Search, Refresh, Timer, Download, Delete, View, CircleClose } from '@element-plus/icons-vue'
+import { Search, Refresh, Timer, Download, Delete, View, CircleClose, TrendCharts } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
 import { runStatusTagType } from '@/utils/statusMeta'
+import FlakyAnalysisDrawer from './FlakyAnalysisDrawer.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -26,6 +27,7 @@ const pageSize = ref(20)
 const totalRecords = ref(0)
 const devicesMap = ref({})
 const stoppingDeviceSerial = ref('')
+const showFlakyDrawer = ref(false)
 
 const fetchDevices = async () => {
     try {
@@ -578,6 +580,9 @@ onUnmounted(() => {
                             </el-radio-group>
                         </div>
                         <div class="right-actions">
+                            <el-button type="primary" plain :icon="TrendCharts" @click="showFlakyDrawer = true">
+                                稳定性分析
+                            </el-button>
                             <el-button :icon="Refresh" circle @click="fetchData" />
                         </div>
                     </div>
@@ -963,6 +968,8 @@ onUnmounted(() => {
                 </el-tab-pane>
             </el-tabs>
         </div>
+
+        <FlakyAnalysisDrawer v-model="showFlakyDrawer" />
     </div>
 </template>
 
