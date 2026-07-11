@@ -18,6 +18,7 @@ from backend.step_contract import (
     build_standard_from_legacy_steps,
     normalize_action,
     normalize_execute_on,
+    normalize_retry_count,
 )
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
 from backend.wda_port_manager import wda_relay_manager
@@ -99,6 +100,7 @@ def _row_to_step_payload(row: TestCaseStep) -> Dict[str, Any]:
         "platform_overrides": row.platform_overrides or {},
         "timeout": row.timeout,
         "error_strategy": row.error_strategy,
+        "retry_count": getattr(row, "retry_count", 0) or 0,
         "description": row.description,
     }
 
@@ -547,6 +549,21 @@ def precheck_steps_for_platform(
         args = step_item.get("args") or {}
         if not isinstance(args, dict):
             msg = "P1006_INVALID_ARGS: args must be an object"
+            results.append(
+                _build_step_precheck_result(
+                    order=index,
+                    action=action,
+                    status="FAIL",
+                    code=_extract_error_code(msg),
+                    message=msg,
+                )
+            )
+            continue
+
+        try:
+            normalize_retry_count(step_item.get("retry_count"))
+        except Exception as exc:
+            msg = f"P1006_INVALID_ARGS: {exc}"
             results.append(
                 _build_step_precheck_result(
                     order=index,

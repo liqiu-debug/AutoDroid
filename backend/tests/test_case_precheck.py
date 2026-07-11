@@ -36,6 +36,7 @@ class CasePrecheckTests(unittest.TestCase):
         platform_overrides=None,
         args=None,
         value=None,
+        retry_count=0,
     ) -> None:
         self.session.add(
             TestCaseStep(
@@ -48,6 +49,7 @@ class CasePrecheckTests(unittest.TestCase):
                 value=value,
                 timeout=10,
                 error_strategy="ABORT",
+                retry_count=retry_count,
                 description=f"step-{order}",
             )
         )
@@ -122,6 +124,49 @@ class CasePrecheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["summary"]["fail"], 1)
         self.assertEqual(result["steps"][0]["code"], "P1003_SELECTOR_MISSING")
+
+    def test_precheck_pass_with_valid_retry_count(self):
+        case = self._create_case()
+        self._add_device("android-1", "android")
+        self._add_step(
+            case_id=case.id,
+            order=1,
+            action="click",
+            execute_on=["android"],
+            platform_overrides={"android": {"selector": "com.demo:id/login", "by": "id"}},
+            retry_count=3,
+        )
+
+        result = precheck_case_execution(
+            session=self.session,
+            case=case,
+            device_serial="android-1",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["steps"][0]["status"], "PASS")
+
+    def test_precheck_fail_on_retry_count_over_limit(self):
+        case = self._create_case()
+        self._add_device("android-1", "android")
+        self._add_step(
+            case_id=case.id,
+            order=1,
+            action="click",
+            execute_on=["android"],
+            platform_overrides={"android": {"selector": "com.demo:id/login", "by": "id"}},
+            retry_count=4,
+        )
+
+        result = precheck_case_execution(
+            session=self.session,
+            case=case,
+            device_serial="android-1",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["steps"][0]["code"], "P1006_INVALID_ARGS")
+        self.assertIn("retry_count", str(result["steps"][0]["message"]))
 
     def test_precheck_pass_on_input_without_selector(self):
         case = self._create_case()

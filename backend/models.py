@@ -318,6 +318,8 @@ class TestCaseStep(SQLModel, table=True):
     value: Optional[str] = None
     timeout: int = Field(default=10)
     error_strategy: str = Field(default="ABORT")
+    # 失败自动重试次数（0-3，0 表示不重试；总尝试 = 1 + retry_count）
+    retry_count: int = Field(default=0)
     description: Optional[str] = None
 
     # 核心字段 1：允许执行的平台列表，默认双端

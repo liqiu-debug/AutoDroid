@@ -110,6 +110,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
 
         testcasestep_cols = {c[1] for c in self._table_columns("testcasestep")}
         self.assertIn("step_order", testcasestep_cols)
+        self.assertIn("retry_count", testcasestep_cols)
         step_order = self.conn.execute("SELECT step_order FROM testcasestep WHERE id = 1").fetchone()[0]
         self.assertEqual(step_order, 7)
 
@@ -145,12 +146,52 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 9)
+        self.assertEqual(len(rows), 10)
 
         # Re-run should be no-op and keep same version records.
         _run_migrations_with_conn(self.conn)
         rows_again = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
         self.assertEqual(rows_again, rows)
+
+    def test_retry_count_added_for_db_upgraded_before_retry_column(self):
+        """已应用过 001 的旧库：由 010 版本迁移补 testcasestep.retry_count。"""
+        cursor = self.conn.cursor()
+        cursor.executescript(
+            """
+            CREATE TABLE schema_migration (
+                version VARCHAR PRIMARY KEY,
+                applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        applied_versions = [
+            "20260305_001_add_columns",
+            "20260305_002_backfill_testcasestep_order",
+            "20260305_003_scheduledtask_scenario_nullable",
+            "20260312_004_fastbotreport_jank_fields",
+            "20260519_005_testresult_report_display",
+            "20260616_006_compatibility_tables",
+            "20260616_007_compatibility_current_baseline",
+            "20260616_008_compatibility_page_set_snapshot",
+            "20260710_009_scenario_folders",
+        ]
+        cursor.executemany(
+            "INSERT INTO schema_migration(version) VALUES (?)",
+            [(version,) for version in applied_versions],
+        )
+        self.conn.commit()
+
+        self.assertNotIn("retry_count", {c[1] for c in self._table_columns("testcasestep")})
+
+        _run_migrations_with_conn(self.conn)
+
+        testcasestep_cols = {c[1] for c in self._table_columns("testcasestep")}
+        self.assertIn("retry_count", testcasestep_cols)
+        versions = {
+            row[0]
+            for row in self.conn.execute("SELECT version FROM schema_migration").fetchall()
+        }
+        self.assertIn("20260711_010_testcasestep_retry_count", versions)
 
     def test_compatibility_page_set_snapshot_migration_backfills_existing_runs(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)

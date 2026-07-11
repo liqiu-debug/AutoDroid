@@ -41,6 +41,19 @@ class Step(BaseModel):
     description: Optional[str] = None
     timeout: int = 10  # Default timeout in seconds
     error_strategy: ErrorStrategy = ErrorStrategy.ABORT # Error routing strategy
+    retry_count: int = 0  # 失败自动重试次数（0-3，0 表示不重试）
+
+    @field_validator("retry_count", mode="before")
+    @classmethod
+    def normalize_retry_count_lenient(cls, value):
+        # legacy JSON 兼容：非法值回退 0，范围收敛到 0..3
+        from backend.step_contract import MAX_RETRY_COUNT
+
+        try:
+            retry_count = int(str(value).strip())
+        except Exception:
+            return 0
+        return max(0, min(retry_count, MAX_RETRY_COUNT))
 
     @field_validator("selector_type", mode="before")
     @classmethod
@@ -852,6 +865,7 @@ class TestCaseStepWrite(BaseModel):
     platform_overrides: PlatformOverrides = Field(default_factory=PlatformOverrides)
     timeout: int = Field(default=10, ge=1)
     error_strategy: str = Field(default="ABORT", description="ABORT | CONTINUE | IGNORE")
+    retry_count: int = Field(default=0, ge=0, le=3, description="失败自动重试次数（0-3）")
     description: Optional[str] = None
 
     @field_validator("args", "value", "description", mode="before")
