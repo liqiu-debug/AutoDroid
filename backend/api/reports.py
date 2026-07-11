@@ -557,6 +557,7 @@ def get_reports(
     platform: Optional[str] = None,
     device_serial: Optional[str] = None,
     keyword: Optional[str] = None,
+    batch_id: Optional[str] = None,
     session: Session = Depends(get_session)
 ):
     query = select(TestExecution, User.full_name, User.username).outerjoin(User, TestExecution.executor_id == User.id)
@@ -571,6 +572,8 @@ def get_reports(
         conditions.append(TestExecution.platform == platform.lower())
     if device_serial:
         conditions.append(TestExecution.device_serial == device_serial)
+    if batch_id:
+        conditions.append(TestExecution.batch_id == batch_id)
     if keyword:
         conditions.append(
             or_(
