@@ -298,6 +298,7 @@ iOS WDA URL、设备映射、启动参数和故障处理见 [iOS WDA 运维手�
 - 主要业务 API：`/api/auth`、`/api/cases`、`/api/scenarios`、`/api/devices`、`/api/tasks`、`/api/reports`、`/api/fastbot`
 - 冷热启动专项 API：`POST /api/fastbot/startup/run`、`GET /api/fastbot/startup/tasks`
 - 兼容性测试 API：`/api/compatibility/page-sets`、`/api/compatibility/runs`
+- CI 集成（API Token 机器凭证、上传包 → 触发回归 → 轮询结果）：见 [CI 集成指南](docs/CI_INTEGRATION.md)
 - 实时执行与视频流：`/ws/*`
 - 部分无 `/api` 前缀的路由继续保留，用于兼容历史客户端
 

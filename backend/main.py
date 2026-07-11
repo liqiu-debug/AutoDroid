@@ -57,6 +57,7 @@ if STATIC_DIR.exists():
 from backend import spa
 from backend.api import auth, cases
 from backend.api import admin
+from backend.api import tokens
 
 from backend.api import folders
 from backend.api import scenarios
@@ -88,6 +89,7 @@ def _register_http_routers(
 ) -> None:
     target.include_router(auth.router, prefix="/auth", tags=["auth"], include_in_schema=include_in_schema)
     target.include_router(admin.router, prefix="/admin", tags=["admin"], include_in_schema=include_in_schema)
+    target.include_router(tokens.router, prefix="/tokens", tags=["tokens"], include_in_schema=include_in_schema)
     target.include_router(cases.router, prefix="/cases", tags=["cases"], include_in_schema=include_in_schema)
     target.include_router(folders.router, prefix="/folders", tags=["folders"], include_in_schema=include_in_schema)
     target.include_router(folders.scenario_router, prefix="/scenario-folders", tags=["scenario-folders"], include_in_schema=include_in_schema)

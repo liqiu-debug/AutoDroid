@@ -56,6 +56,7 @@ class ReportFiltersTests(unittest.TestCase):
                 scenario_id=scenario.id,
                 scenario_name="登录冒烟",
                 batch_name="夜间批次-01",
+                batch_id="batch-ci-001",
                 status="FAIL",
                 start_time=base_time + timedelta(minutes=3),
                 device_serial="android-002",
@@ -108,6 +109,17 @@ class ReportFiltersTests(unittest.TestCase):
         result = get_reports(keyword="登录冒烟", status="FAIL", session=self.session)
         self.assertEqual(result.total, 1)
         self.assertEqual(result.items[0].status, "FAIL")
+
+    def test_filter_by_batch_id(self):
+        result = get_reports(batch_id="batch-ci-001", session=self.session)
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.items[0].batch_id, "batch-ci-001")
+        self.assertEqual(result.items[0].status, "FAIL")
+
+    def test_filter_by_unknown_batch_id_returns_empty(self):
+        result = get_reports(batch_id="batch-missing", session=self.session)
+        self.assertEqual(result.total, 0)
+        self.assertEqual(result.items, [])
 
 
 if __name__ == "__main__":

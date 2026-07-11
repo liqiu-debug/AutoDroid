@@ -31,6 +31,22 @@ class User(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
+class ApiToken(SQLModel, table=True):
+    """长效 API Token（机器凭证），供外部 CI 系统调用业务接口。
+
+    仅存储 sha256 哈希，明文只在创建时返回一次。
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    token_hash: str = Field(index=True, unique=True)
+    token_prefix: str
+    user_id: int = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.now)
+    last_used_at: Optional[datetime] = None
+    is_active: bool = Field(default=True)
+
+
 class TestCase(TestCaseBase, SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = Field(default_factory=datetime.now)
