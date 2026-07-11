@@ -203,6 +203,35 @@ const hasWdaDownDevice = () => devices.value.some(d => d.status === 'WDA_DOWN')
 
 const isCaseRunActive = (row) => Boolean(activeCaseRuns.value[row.id])
 
+const caseQueueInfo = (row) => activeCaseRuns.value[row.id]?.queue || null
+
+const caseStatusText = (row) => {
+    const s = normalizeRunStatus(row.last_run_status)
+    if (s === 'QUEUED') {
+        const queue = caseQueueInfo(row)
+        return queue?.position ? `排队中（第 ${queue.position} 位）` : '排队中'
+    }
+    return s
+}
+
+// 从 /runs/active 的 items 构建活跃 run 条目（含排队信息）
+const buildActiveCaseEntry = (items, fallback = {}) => {
+    const entry = {
+        batch_id: items[0]?.batch_id ?? fallback.batch_id,
+        run_ids: items.map(item => item.run_id).filter(Boolean),
+        device_serials: items.map(item => item.device_serial).filter(Boolean)
+    }
+    const queuedItems = items.filter(item => String(item.status || '').toUpperCase() === 'QUEUED')
+    if (queuedItems.length > 0) {
+        const positions = queuedItems.map(item => item.queue_position).filter(p => Number.isFinite(p))
+        entry.queue = {
+            count: queuedItems.length,
+            position: positions.length ? Math.min(...positions) : null
+        }
+    }
+    return entry
+}
+
 const handleRunClick = async (row) => {
     if (isCaseRunActive(row)) {
         await terminateCaseRun(row)
@@ -238,23 +267,45 @@ const confirmRun = async () => {
 
         const { data } = await api.runTestCaseBatch(runningCaseId.value, runForm.envId, runnable)
 
+        // 并发超限的任务会进入 FIFO 队列而非失败：区分"已开始 / 已加入队列"
+        const runs = Array.isArray(data?.runs) ? data.runs : []
+        const queuedRuns = runs.filter(item => item.queued)
+        const startedCount = runs.length - queuedRuns.length
+        const queuePositions = queuedRuns.map(item => item.queue_position).filter(p => Number.isFinite(p))
+        const minQueuePosition = queuePositions.length ? Math.min(...queuePositions) : null
+
+        let startMsg
+        if (queuedRuns.length === 0) {
+            startMsg = `已在 ${runnable.length} 台设备上开始后台执行`
+        } else if (startedCount === 0) {
+            startMsg = `并发已满，已加入执行队列（${queuedRuns.length} 台${minQueuePosition ? `，最前第 ${minQueuePosition} 位` : ''}）`
+        } else {
+            startMsg = `已开始 ${startedCount} 台；${queuedRuns.length} 台已加入队列${minQueuePosition ? `（最前第 ${minQueuePosition} 位）` : ''}`
+        }
+
         if (blocked.length > 0) {
             const first = blocked[0]
-            ElMessage.warning(`已在 ${runnable.length} 台设备启动；${blocked.length} 台预检失败（示例：${first.serial} - ${first.reason}）`)
+            ElMessage.warning(`${startMsg}；${blocked.length} 台预检失败（示例：${first.serial} - ${first.reason}）`)
+        } else if (queuedRuns.length > 0) {
+            ElMessage.info(startMsg)
         } else {
-            ElMessage.success(`已在 ${runForm.deviceSerials.length} 台设备上开始后台执行`)
+            ElMessage.success(startMsg)
         }
         runDialogVisible.value = false
         // Update the item status optimistically
         const caseItem = cases.value.find(c => c.id === runningCaseId.value)
-        if (caseItem) caseItem.last_run_status = 'RUNNING'
+        if (caseItem) caseItem.last_run_status = startedCount > 0 || queuedRuns.length === 0 ? 'RUNNING' : 'QUEUED'
+        const activeEntry = {
+            batch_id: data?.batch_id,
+            run_ids: data?.run_ids || [],
+            device_serials: runnable
+        }
+        if (queuedRuns.length > 0) {
+            activeEntry.queue = { count: queuedRuns.length, position: minQueuePosition }
+        }
         activeCaseRuns.value = {
             ...activeCaseRuns.value,
-            [runningCaseId.value]: {
-                batch_id: data?.batch_id,
-                run_ids: data?.run_ids || [],
-                device_serials: runnable
-            }
+            [runningCaseId.value]: activeEntry
         }
         startActiveRunPolling()
     } catch (err) {
@@ -284,7 +335,7 @@ const terminateCaseRun = async (row) => {
 }
 
 const restoreActiveCaseRuns = async () => {
-    const runningRows = cases.value.filter(row => normalizeRunStatus(row.last_run_status) === 'RUNNING')
+    const runningRows = cases.value.filter(row => ['RUNNING', 'QUEUED'].includes(normalizeRunStatus(row.last_run_status)))
     if (runningRows.length === 0) return
     const next = { ...activeCaseRuns.value }
     for (const row of runningRows) {
@@ -292,11 +343,7 @@ const restoreActiveCaseRuns = async () => {
             const { data } = await api.getActiveRuns('case', row.id)
             const items = data?.items || []
             if (items.length > 0) {
-                next[row.id] = {
-                    batch_id: items[0]?.batch_id,
-                    run_ids: items.map(item => item.run_id).filter(Boolean),
-                    device_serials: items.map(item => item.device_serial).filter(Boolean)
-                }
+                next[row.id] = buildActiveCaseEntry(items, next[row.id])
             }
         } catch {}
     }
@@ -317,9 +364,17 @@ const startActiveRunPolling = () => {
         for (const [caseId] of entries) {
             try {
                 const { data } = await api.getActiveRuns('case', Number(caseId))
-                if ((data?.items || []).length === 0) {
+                const items = data?.items || []
+                if (items.length === 0) {
                     delete next[caseId]
                     changed = true
+                    continue
+                }
+                next[caseId] = buildActiveCaseEntry(items, next[caseId])
+                // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
+                const caseItem = cases.value.find(c => c.id === Number(caseId))
+                if (caseItem && normalizeRunStatus(caseItem.last_run_status) === 'QUEUED' && !next[caseId].queue) {
+                    caseItem.last_run_status = 'RUNNING'
                 }
             } catch {}
         }
@@ -469,7 +524,7 @@ onUnmounted(stopActiveRunPolling)
                         :type="runStatusTagType(item.last_run_status)"
                         size="small"
                     >
-                        {{ normalizeRunStatus(item.last_run_status) }}
+                        {{ caseStatusText(item) }}
                     </el-tag>
                 </div>
 
@@ -596,7 +651,7 @@ onUnmounted(stopActiveRunPolling)
                                         :type="runStatusTagType(row.last_run_status)"
                                         size="small"
                                     >
-                                        {{ normalizeRunStatus(row.last_run_status) }}
+                                        {{ caseStatusText(row) }}
                                     </el-tag>
                                     <span v-else class="text-gray">-</span>
                                 </template>

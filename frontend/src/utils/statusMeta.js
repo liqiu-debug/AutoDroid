@@ -22,7 +22,7 @@ export const normalizeRunStatus = (status) => {
 export const runStatusTagType = (status) => {
     const s = normalizeRunStatus(status)
     if (s === 'PASS' || s === 'COMPLETED') return 'success'
-    if (s === 'WARNING') return 'warning'
+    if (s === 'WARNING' || s === 'QUEUED') return 'warning'
     if (s === 'FAIL' || s === 'ERROR') return 'danger'
     if (s === 'RUNNING') return 'primary'
     return 'info' // ABORTED / SKIP / PENDING / 未知
@@ -38,6 +38,7 @@ export const runStatusLabel = (status) => {
         WARNING: '告警',
         RUNNING: '运行中',
         PENDING: '排队中',
+        QUEUED: '排队中',
         ABORTED: '已终止',
         SKIP: '跳过',
         COMPLETED: '已完成',
@@ -49,7 +50,7 @@ export const runStatusLabel = (status) => {
 export const runStatusColor = (status) => {
     const s = normalizeRunStatus(status)
     if (s === 'PASS' || s === 'COMPLETED') return '#67C23A'
-    if (s === 'WARNING' || s === 'ERROR') return '#E6A23C'
+    if (s === 'WARNING' || s === 'ERROR' || s === 'QUEUED') return '#E6A23C'
     if (s === 'FAIL') return '#F56C6C'
     if (s === 'RUNNING') return '#409EFF'
     return '#909399' // ABORTED / PENDING / 未执行 / 未知
