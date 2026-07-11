@@ -702,12 +702,11 @@ onUnmounted(() => {
                     </div>
 
                     <!-- 探索报告表格 -->
+                    <div class="list-scroll-area" v-loading="fbLoading">
                     <el-table
                         :data="fbTasksWithDevice"
-                        v-loading="fbLoading"
                         style="width: 100%"
                         :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-                        max-height="calc(100vh - 280px)"
                     >
                         <el-table-column prop="id" label="ID" width="60" align="center" />
                         <el-table-column label="目标包名" min-width="200">
@@ -753,6 +752,7 @@ onUnmounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                    </div>
 
                     <div class="pagination-footer" v-if="fbTotal > 0">
                         <el-pagination
@@ -786,12 +786,11 @@ onUnmounted(() => {
                         </div>
                     </div>
 
+                    <div class="list-scroll-area" v-loading="startupLoading">
                     <el-table
                         :data="startupTasksWithDevice"
-                        v-loading="startupLoading"
                         style="width: 100%"
                         :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-                        max-height="calc(100vh - 280px)"
                     >
                         <el-table-column prop="id" label="ID" width="60" align="center" />
                         <el-table-column label="目标包名" min-width="190">
@@ -847,6 +846,7 @@ onUnmounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                    </div>
 
                     <div class="pagination-footer" v-if="startupTotal > 0">
                         <el-pagination
@@ -887,12 +887,11 @@ onUnmounted(() => {
                         </div>
                     </div>
 
+                    <div class="list-scroll-area" v-loading="compatibilityLoading">
                     <el-table
                         :data="compatibilityRuns"
-                        v-loading="compatibilityLoading"
                         style="width: 100%"
                         :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-                        max-height="calc(100vh - 280px)"
                     >
                         <el-table-column prop="id" label="ID" width="64" align="center" />
                         <el-table-column label="任务" min-width="220">
@@ -947,6 +946,7 @@ onUnmounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                    </div>
 
                     <div class="pagination-footer" v-if="compatibilityTotal > 0">
                         <el-pagination
