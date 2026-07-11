@@ -288,6 +288,17 @@ export default {
         return api.post('/settings/test-notification', { webhook_url: webhookUrl })
     },
 
+    // API Tokens (CI 集成机器凭证)
+    getApiTokens(params) {
+        return api.get('/tokens/', { params })
+    },
+    createApiToken(name) {
+        return api.post('/tokens/', { name })
+    },
+    revokeApiToken(id) {
+        return api.delete(`/tokens/${id}`)
+    },
+
     // Admin (用户管理)
     getAdminRegistrationSettings() {
         return api.get('/admin/registration-settings')
