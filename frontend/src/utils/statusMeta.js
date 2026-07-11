@@ -68,3 +68,29 @@ export const deviceStatusTagType = (status) => DEVICE_STATUS_META[status]?.tagTy
 
 /** 设备状态 → 中文标签 */
 export const deviceStatusLabel = (status) => DEVICE_STATUS_META[status]?.label || status
+
+/**
+ * 执行对比 diff 分类元信息（延伸自执行状态映射）：
+ * regressed 新失败(红) / fixed 已修复(绿) / still-failing 持续失败(灰红) /
+ * unchanged 无变化(灰) / added 新增步骤 / removed 移除步骤
+ */
+const DIFF_CHANGE_META = {
+    regressed: { tagType: 'danger', effect: 'dark', label: '新失败', rowClass: 'diff-row-regressed' },
+    fixed: { tagType: 'success', effect: 'dark', label: '已修复', rowClass: 'diff-row-fixed' },
+    'still-failing': { tagType: 'danger', effect: 'plain', label: '持续失败', rowClass: 'diff-row-still-failing' },
+    unchanged: { tagType: 'info', effect: 'plain', label: '无变化', rowClass: '' },
+    added: { tagType: 'primary', effect: 'plain', label: '新增步骤', rowClass: 'diff-row-added' },
+    removed: { tagType: 'info', effect: 'dark', label: '移除步骤', rowClass: 'diff-row-removed' },
+}
+
+/** diff 分类 → el-tag type */
+export const diffChangeTagType = (change) => DIFF_CHANGE_META[change]?.tagType || 'info'
+
+/** diff 分类 → el-tag effect */
+export const diffChangeEffect = (change) => DIFF_CHANGE_META[change]?.effect || 'plain'
+
+/** diff 分类 → 中文标签 */
+export const diffChangeLabel = (change) => DIFF_CHANGE_META[change]?.label || change
+
+/** diff 分类 → 表格行 class */
+export const diffChangeRowClass = (change) => DIFF_CHANGE_META[change]?.rowClass || ''

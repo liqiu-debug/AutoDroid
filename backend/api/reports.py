@@ -12,6 +12,12 @@ from backend.scheduler_service import SchedulerService
 
 from backend.utils.pydantic_compat import dump_model
 from backend.paths import project_path, project_relative_path
+from backend.flaky_analysis import (
+    DEFAULT_MIN_SAMPLES,
+    ExecutionCompareError,
+    build_execution_compare,
+    compute_flaky_report,
+)
 
 router = APIRouter()
 REPORT_ASSET_ANCHORS = ("reports", "screenshots", "fastbot")
@@ -123,6 +129,97 @@ class DashboardOverview(BaseModel):
     alerts: List[DashboardAlert] = []
     recent_executions: List[TestExecutionRead] = []
     upcoming_tasks: List[DashboardTaskItem] = []
+
+
+# --- Flaky 分析 / 执行对比 Schemas ---
+
+class FlakyScenarioItem(BaseModel):
+    scenario_id: int
+    scenario_name: str
+    total: int
+    pass_count: int
+    fail_count: int
+    pass_rate: float
+    flip_count: int
+    flip_rate: float
+    score: float
+    last_status: str
+    last_time: Optional[datetime] = None
+
+
+class FlakyStepItem(BaseModel):
+    scenario_id: int
+    scenario_name: str
+    step_order: int
+    step_name: str
+    total: int
+    pass_count: int
+    fail_count: int
+    flip_count: int
+    score: float
+    last_status: str
+
+
+class FlakyReport(BaseModel):
+    days: int
+    min_samples: int
+    generated_at: datetime
+    total_scenarios: int
+    items: List[FlakyScenarioItem] = []
+    step_items: List[FlakyStepItem] = []
+
+
+class CompareExecutionMeta(BaseModel):
+    id: int
+    status: str
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    duration: Optional[float] = None  # seconds
+    device_serial: Optional[str] = None
+    device_info: Optional[str] = None
+    platform: Optional[str] = None
+    executor_name: Optional[str] = None
+    batch_name: Optional[str] = None
+
+
+class CompareStepSide(BaseModel):
+    id: Optional[int] = None
+    step_name: str
+    status: str
+    duration: float = 0.0  # milliseconds
+    error_message: Optional[str] = None
+    error_code: Optional[str] = None
+    suggestion: Optional[str] = None
+    display_text: Optional[str] = None
+
+
+class CompareStepRow(BaseModel):
+    step_order: int
+    step_name: str
+    change: str  # regressed | fixed | still-failing | unchanged | added | removed
+    name_changed: bool = False
+    duration_delta: Optional[float] = None  # milliseconds (target - base)
+    base: Optional[CompareStepSide] = None
+    target: Optional[CompareStepSide] = None
+
+
+class CompareSummary(BaseModel):
+    regressed: int = 0
+    fixed: int = 0
+    still_failing: int = 0
+    unchanged: int = 0
+    added: int = 0
+    removed: int = 0
+
+
+class ExecutionCompareResult(BaseModel):
+    scenario_id: int
+    scenario_name: str
+    base: CompareExecutionMeta
+    target: CompareExecutionMeta
+    duration_delta: Optional[float] = None  # seconds (target - base)
+    summary: CompareSummary
+    steps: List[CompareStepRow] = []
 
 
 # --- API Endpoints ---
@@ -595,6 +692,45 @@ def get_reports(
         response.append(TestExecutionRead(**data))
 
     return PaginatedTestExecutionRead(total=total, items=response)
+
+
+@router.get("/flaky", response_model=FlakyReport)
+def get_flaky_report(
+    days: int = Query(default=30, ge=1, le=365),
+    limit: int = Query(default=20, ge=1, le=100),
+    min_samples: int = Query(default=DEFAULT_MIN_SAMPLES, ge=2, le=100),
+    include_steps: bool = Query(default=True),
+    session: Session = Depends(get_session),
+):
+    # Keep function directly callable in unit tests (see get_dashboard_overview).
+    days = days if isinstance(days, int) else 30
+    limit = limit if isinstance(limit, int) else 20
+    min_samples = min_samples if isinstance(min_samples, int) else DEFAULT_MIN_SAMPLES
+    include_steps = include_steps if isinstance(include_steps, bool) else True
+
+    report = compute_flaky_report(
+        session,
+        days=days,
+        limit=limit,
+        min_samples=min_samples,
+        include_steps=include_steps,
+    )
+    return FlakyReport(**report)
+
+
+# NOTE: must be registered before "/executions/{execution_id}" so that
+# "compare" is not captured as an execution_id path parameter.
+@router.get("/executions/compare", response_model=ExecutionCompareResult)
+def compare_executions(
+    base_id: int = Query(...),
+    target_id: int = Query(...),
+    session: Session = Depends(get_session),
+):
+    try:
+        payload = build_execution_compare(session, base_id, target_id)
+    except ExecutionCompareError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    return ExecutionCompareResult(**payload)
 
 
 @router.get("/executions/{execution_id}", response_model=TestExecutionDetail)

@@ -1,13 +1,14 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, Monitor, Timer, User, Picture, View } from '@element-plus/icons-vue'
+import { ArrowLeft, Monitor, Timer, User, Picture, View, Switch } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
 import { runStatusTagType as getStatusTagType } from '@/utils/statusMeta'
 import { useClientMode } from '@/composables/useClientMode'
+import ExecutionCompareDialog from './ExecutionCompareDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -23,6 +24,51 @@ const showScreenshot = ref(false)
 const currentScreenshot = ref('')
 const currentPreviewTitle = ref('步骤预览')
 const devices = ref([])
+
+// 执行对比（与上一次同场景执行 diff）
+const showCompareDialog = ref(false)
+const compareBaseId = ref(null)
+const compareLoading = ref(false)
+
+const isCompletedStatus = (status) => {
+    const normalized = String(status || '').toUpperCase()
+    return ['PASS', 'FAIL', 'WARNING', 'ERROR', 'ABORTED'].includes(normalized)
+}
+
+const handleCompareWithPrevious = async () => {
+    if (!execution.value) return
+    compareLoading.value = true
+    try {
+        const { data } = await api.getReports({
+            scenario_id: execution.value.scenario_id,
+            limit: 100,
+        })
+        const items = data.items || []
+        const currentId = Number(id)
+        const currentStart = execution.value.start_time
+        // 列表按 start_time 倒序：取比当前执行更早的已完结记录
+        const candidates = items.filter(item => (
+            item.id !== currentId
+            && isCompletedStatus(item.status)
+            && (!currentStart || item.start_time <= currentStart)
+            && item.id < currentId
+        ))
+        if (candidates.length === 0) {
+            ElMessage.info('未找到该场景更早的执行记录，无法对比')
+            return
+        }
+        // 优先同设备的最近一次执行
+        const sameDevice = candidates.find(item => (
+            item.device_serial && item.device_serial === execution.value.device_serial
+        ))
+        compareBaseId.value = (sameDevice || candidates[0]).id
+        showCompareDialog.value = true
+    } catch (err) {
+        ElMessage.error('查询历史执行记录失败')
+    } finally {
+        compareLoading.value = false
+    }
+}
 
 // Methods
 const fetchDevices = async () => {
@@ -342,6 +388,16 @@ onMounted(() => {
                  <span class="meta-item"><el-icon><User /></el-icon> {{ execution.executor_name || 'System' }}</span>
                  <span class="meta-item"><el-icon><Timer /></el-icon> {{ formatDate(execution.start_time) }}</span>
                  <span class="meta-item"><el-icon><Monitor /></el-icon> {{ formatDeviceName(execution.device_serial, execution.device_info) || 'Unknown Device' }}</span>
+                 <el-button
+                    type="primary"
+                    plain
+                    size="small"
+                    :icon="Switch"
+                    :loading="compareLoading"
+                    @click="handleCompareWithPrevious"
+                 >
+                    与上一次对比
+                 </el-button>
             </div>
         </div>
 
@@ -457,6 +513,13 @@ onMounted(() => {
                 <img :src="currentScreenshot" alt="步骤预览" />
             </div>
         </el-dialog>
+
+        <!-- Execution Compare Dialog -->
+        <ExecutionCompareDialog
+            v-model="showCompareDialog"
+            :base-id="compareBaseId"
+            :target-id="Number(id)"
+        />
     </div>
 </template>
 
