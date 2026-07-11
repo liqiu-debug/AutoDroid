@@ -17,7 +17,21 @@
 - `platform_overrides`: 平台覆盖配置（定位器与平台专属参数）。
 - `timeout`: 超时秒数。
 - `error_strategy`: 容错策略（`ABORT/CONTINUE/IGNORE`）。
+- `retry_count`: 失败自动重试次数（`0-3`，默认 `0` 不重试）。
 - `description`: 步骤描述。
+
+### 2.1 失败自动重试（retry_count）
+
+用于降低 UI 不稳定（页面加载慢、瞬时渲染抖动）导致的误报，建议仅对不稳定步骤开启。语义如下：
+
+1. 步骤失败（`FAIL`）且 `retry_count > 0` 时自动重试，最多再试 `retry_count` 次（总尝试 = `1 + retry_count`）。
+2. 每次重试前有约 1s 的短退避；退避期间用户中止（abort）会立即停止重试并走中止路径（`error="执行已被用户中止"`）。
+3. `SKIP`（平台不允许，`P1001`）不重试；断言类失败（`assert_text/assert_image` 等）同样会重试——页面加载慢正是重试的目标场景。
+4. 重试后成功 → 最终 `status=PASS`；重试耗尽仍失败 → 原失败语义不变，`error/error_code/suggestion/artifacts` 取最后一次尝试的结果。
+5. 结果 dict 新增 `attempts` 字段记录总尝试次数（`1` 表示无重试，纯增量字段）；`attempts > 1` 时会并入 `report_display`，供报告与 Flaky 统计使用。
+6. `error_strategy` 只在最终结果上生效：重试期间的中间失败不触发 `ABORT/CONTINUE/IGNORE` 判断。
+
+校验：`retry_count` 必须为非负整数且不超过 `3`，非法值预检失败（`P1006_INVALID_ARGS`）；legacy JSON 转换链路对非法值宽松回退（收敛到 `0-3`）。
 
 ## 3. 平台覆盖与兼容规则
 

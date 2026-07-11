@@ -44,6 +44,14 @@ const CROSS_PLATFORM_ACTIONS = [
 
 const VARIABLE_PLACEHOLDER_PATTERN = /\{\{\s*([A-Z0-9_]+)\s*\}\}/g
 
+const MAX_RETRY_COUNT = 3
+
+function normalizeRetryCount(value) {
+    const retryCount = Number.parseInt(value, 10)
+    if (!Number.isFinite(retryCount)) return 0
+    return Math.min(Math.max(retryCount, 0), MAX_RETRY_COUNT)
+}
+
 function formatVariablePlaceholder(key) {
     return `{{${String(key || '').trim()}}}`
 }
@@ -138,6 +146,8 @@ function ensureCrossPlatformFields(step) {
     if (!normalized.error_strategy) {
         normalized.error_strategy = 'ABORT'
     }
+
+    normalized.retry_count = normalizeRetryCount(normalized.retry_count)
 
     const timeout = Number.parseInt(normalized.timeout, 10)
     normalized.timeout = Number.isFinite(timeout) && timeout > 0 ? timeout : 10
@@ -234,6 +244,7 @@ function standardStepToUiStep(step) {
         description: step?.description || '',
         timeout: step?.timeout || 10,
         error_strategy: step?.error_strategy || 'ABORT',
+        retry_count: normalizeRetryCount(step?.retry_count),
         execute_on: step?.execute_on,
         platform_overrides: action === 'assert_text' ? {} : (step?.platform_overrides || {})
     })
@@ -292,7 +303,8 @@ function uiStepToLegacyStep(step) {
                 : (normalized.options && typeof normalized.options === 'object' ? normalized.options : {}),
         description: normalized.description || '',
         timeout: normalized.timeout,
-        error_strategy: normalized.error_strategy || 'ABORT'
+        error_strategy: normalized.error_strategy || 'ABORT',
+        retry_count: normalizeRetryCount(normalized.retry_count)
     }
 }
 
@@ -360,6 +372,7 @@ function uiStepToStandardStep(step, order) {
         platform_overrides,
         timeout: normalized.timeout,
         error_strategy: normalized.error_strategy || 'ABORT',
+        retry_count: normalizeRetryCount(normalized.retry_count),
         description: normalized.description || ''
     }
 }
