@@ -269,6 +269,7 @@ npm run dev -- --host
 | `AUTODROID_CORS_ORIGINS` | `*` | 允许的跨域来源，逗号分隔；为 `*` 时自动关闭 credentials |
 | `AUTODROID_LIMIT_GLOBAL` | `20` | 系统全局最大并发执行数 |
 | `AUTODROID_LIMIT_PER_USER` | `5` | 单用户最大并发执行数 |
+| `AUTODROID_QUEUE_TIMEOUT` | `1800` | 并发超限时的排队等待上限（秒），超时任务标记 ERROR |
 | `AUTODROID_DRIVER_POOL` | `0` | 设为 `1` 时按设备复用执行驱动连接（连接池），团队服务器推荐开启 |
 | `HOST` | `0.0.0.0` | `start_lan.sh` 监听地址 |
 | `PORT` | `8000` | `start_lan.sh` 服务端口 |
