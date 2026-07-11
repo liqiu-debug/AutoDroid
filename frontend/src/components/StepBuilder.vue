@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, watch, nextTick } from 'vue'
-import { Plus, Delete, Rank, ArrowDown, VideoPlay, MagicStick, Crop } from '@element-plus/icons-vue'
+import { Plus, Delete, Rank, ArrowDown, VideoPlay, MagicStick, Crop, QuestionFilled } from '@element-plus/icons-vue'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { storeToRefs } from 'pinia'
 import { VueDraggable } from 'vue-draggable-plus'
@@ -130,6 +130,9 @@ const ensureCrossPlatformConfig = (step) => {
   if (!step.error_strategy) {
     step.error_strategy = 'ABORT'
   }
+
+  const retryCount = Number.parseInt(step.retry_count, 10)
+  step.retry_count = Number.isFinite(retryCount) ? Math.min(Math.max(retryCount, 0), 3) : 0
 
   if (!step.timeout || Number(step.timeout) < 1) {
     step.timeout = 10
@@ -439,6 +442,7 @@ const resetStepDetailsForAction = (step) => {
   step.description = ''
   step.timeout = 10
   step.error_strategy = 'ABORT'
+  step.retry_count = 0
   step.options = {}
   step.platform_overrides = {
     android: null,
@@ -509,6 +513,7 @@ const addCustomStep = () => {
     options: {},
     description: '',
     error_strategy: 'ABORT',
+    retry_count: 0,
     execute_on: ['android', 'ios'],
     platform_overrides: {
       android: null
@@ -938,6 +943,26 @@ const handleExecuteStep = async (step) => {
                   </el-select>
                 </div>
               </div>
+
+              <div class="form-row">
+                <label>失败重试</label>
+                <div class="retry-group">
+                  <el-input-number
+                    v-model="step.retry_count"
+                    :min="0"
+                    :max="3"
+                    :step="1"
+                    controls-position="right"
+                    size="small"
+                  />
+                  <el-tooltip
+                    content="失败后自动重试次数（0-3，默认 0 不重试），建议仅对不稳定步骤开启"
+                    placement="top"
+                  >
+                    <el-icon class="retry-help-icon"><QuestionFilled /></el-icon>
+                  </el-tooltip>
+                </div>
+              </div>
               
               <div class="form-row">
                 <label>描述</label>
@@ -1199,6 +1224,18 @@ const handleExecuteStep = async (step) => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.retry-group {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.retry-help-icon {
+  color: #909399;
+  cursor: help;
 }
 
 .boundary-inputs {

@@ -45,6 +45,7 @@ from backend.step_contract import (
     normalize_error_strategy,
     normalize_execute_on,
     normalize_platform_overrides,
+    normalize_retry_count,
 )
 from backend.execution_limiter import (
     QueueAbortedError,
@@ -419,6 +420,7 @@ def _row_to_standard_step_read(row: TestCaseStep) -> TestCaseStepRead:
         platform_overrides=row.platform_overrides or {},
         timeout=row.timeout,
         error_strategy=row.error_strategy,
+        retry_count=getattr(row, "retry_count", 0) or 0,
         description=row.description,
     )
 
@@ -441,6 +443,7 @@ def _standard_row_to_write_dict(row: TestCaseStep) -> Dict[str, Any]:
         "platform_overrides": row.platform_overrides or {},
         "timeout": row.timeout,
         "error_strategy": row.error_strategy,
+        "retry_count": getattr(row, "retry_count", 0) or 0,
         "description": row.description,
     }
 
@@ -452,6 +455,7 @@ def _validate_standard_step_write(step: TestCaseStepWrite, index: int) -> Dict[s
     execute_on = normalize_execute_on(raw.get("execute_on"))
     platform_overrides = normalize_platform_overrides(raw.get("platform_overrides"))
     error_strategy = normalize_error_strategy(raw.get("error_strategy", "ABORT"))
+    retry_count = normalize_retry_count(raw.get("retry_count", 0))
 
     args = raw.get("args") or {}
     if not isinstance(args, dict):
@@ -482,6 +486,7 @@ def _validate_standard_step_write(step: TestCaseStepWrite, index: int) -> Dict[s
         "platform_overrides": platform_overrides,
         "timeout": timeout,
         "error_strategy": error_strategy,
+        "retry_count": retry_count,
         "description": raw.get("description"),
     }
 
@@ -508,6 +513,7 @@ def _replace_standard_steps(
                 platform_overrides=item.get("platform_overrides") or {},
                 timeout=item.get("timeout", 10),
                 error_strategy=item.get("error_strategy", "ABORT"),
+                retry_count=item.get("retry_count", 0) or 0,
                 description=item.get("description"),
             )
         )

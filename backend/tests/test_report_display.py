@@ -189,6 +189,30 @@ class ReportDisplayTests(unittest.TestCase):
         self.assertNotIn("error_code", display)
         self.assertNotIn("suggestion", display)
 
+    def test_attempts_merged_into_display_when_retried(self):
+        display = build_report_display(
+            {"action": "click", "selector": "登录", "attempts": 3}
+        )
+
+        self.assertEqual(display["attempts"], 3)
+
+    def test_attempts_kept_with_custom_description(self):
+        display = build_report_display(
+            {"action": "click", "description": "点头像", "attempts": 2}
+        )
+
+        self.assertEqual(display["display_text"], "点头像")
+        self.assertEqual(display["attempts"], 2)
+
+    def test_attempts_omitted_without_retry(self):
+        for payload in (
+            {"action": "click", "selector": "登录"},
+            {"action": "click", "selector": "登录", "attempts": 1},
+            {"action": "click", "selector": "登录", "attempts": "oops"},
+        ):
+            display = build_report_display(payload)
+            self.assertNotIn("attempts", display)
+
     def test_storage_report_display_keeps_error_fields(self):
         stored = storage_report_display(
             {

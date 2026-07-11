@@ -96,6 +96,7 @@ def _migration_add_columns(cursor) -> None:
         ("testcasestep", "args", "JSON"),
         ("testcasestep", "timeout", "INTEGER DEFAULT 10"),
         ("testcasestep", "error_strategy", "VARCHAR DEFAULT 'ABORT'"),
+        ("testcasestep", "retry_count", "INTEGER DEFAULT 0"),
         ("testcasestep", "description", "VARCHAR"),
         ("testexecution", "device_serial", "VARCHAR"),
         ("testexecution", "platform", "VARCHAR"),
@@ -521,6 +522,8 @@ def _run_migrations_with_conn(conn) -> None:
         ("20260616_007_compatibility_current_baseline", _migrate_compatibility_old_package_nullable),
         ("20260616_008_compatibility_page_set_snapshot", _migrate_compatibility_run_page_set_snapshot),
         ("20260710_009_scenario_folders", _migrate_scenario_folders),
+        # 复用 _migration_add_columns（幂等按列检查），为已应用过 001 的库补 retry_count 列
+        ("20260711_010_testcasestep_retry_count", _migration_add_columns),
     ]
 
     for version, migration_func in migration_plan:
@@ -598,6 +601,7 @@ def backfill_case_steps_to_standard(session: Session, *, force: bool = False) ->
                         platform_overrides=item.get("platform_overrides") or {},
                         timeout=item.get("timeout", 10),
                         error_strategy=item.get("error_strategy", "ABORT"),
+                        retry_count=item.get("retry_count", 0) or 0,
                         description=item.get("description"),
                     )
                 )

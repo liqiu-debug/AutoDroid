@@ -1,6 +1,7 @@
 import unittest
 import base64
 import threading
+from unittest.mock import patch
 
 from backend.drivers.base_driver import BaseDriver
 from backend.drivers.cross_platform_runner import DriverFactory, TestCaseRunner
@@ -16,10 +17,25 @@ class FakeDriver(BaseDriver):
         self.swipe_calls = []
         self.ocr_calls = 0
         self.ocr_failures_before_success = int(kwargs.get("ocr_failures_before_success", 0) or 0)
+        self.click_attempts = 0
+        self.click_failures_before_success = int(kwargs.get("click_failures_before_success", 0) or 0)
+        self.assert_attempts = 0
+        self.assert_failures_before_success = int(kwargs.get("assert_failures_before_success", 0) or 0)
+        self.abort_on_click = kwargs.get("abort_on_click")
 
     def click(self, selector: str, by: str) -> None:
         if selector == "fail":
             raise RuntimeError("click failed")
+        if selector == "fail-and-abort":
+            self.click_attempts += 1
+            if self.abort_on_click is not None:
+                self.abort_on_click.set()
+            raise RuntimeError("click failed before abort")
+        if selector == "flaky":
+            self.click_attempts += 1
+            if self.click_attempts <= self.click_failures_before_success:
+                raise RuntimeError(f"flaky click failed (attempt {self.click_attempts})")
+            return
         if selector == "prefer-name" and by == "label":
             raise RuntimeError("label not found")
 
@@ -60,6 +76,10 @@ class FakeDriver(BaseDriver):
         )
         if expected_text == "mismatch":
             raise AssertionError("assert failed")
+        if expected_text == "flaky-assert":
+            self.assert_attempts += 1
+            if self.assert_attempts <= self.assert_failures_before_success:
+                raise AssertionError(f"flaky assert failed (attempt {self.assert_attempts})")
 
     def swipe(self, direction: str) -> None:
         self.swipe_calls.append(direction)
@@ -625,6 +645,182 @@ class CrossPlatformRunnerTests(unittest.TestCase):
             self.assertEqual(getattr(ios_runner.driver, "screenshot_calls", 0), 0)
         finally:
             ios_runner.disconnect()
+
+
+@patch("backend.drivers.cross_platform_runner.RETRY_BACKOFF_SECONDS", 0.01)
+class StepRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_android_driver = DriverFactory._registry.get("android")
+        DriverFactory.register("android", FakeDriver)
+
+    def tearDown(self) -> None:
+        if self.original_android_driver is not None:
+            DriverFactory.register("android", self.original_android_driver)
+
+    def _make_runner(self, **driver_kwargs) -> TestCaseRunner:
+        return TestCaseRunner(platform="android", device_id="device-retry", **driver_kwargs)
+
+    @staticmethod
+    def _flaky_click_step(retry_count=None, error_strategy="ABORT"):
+        step = {
+            "action": "click",
+            "platform_overrides": {"android": {"selector": "flaky", "by": "id"}},
+            "execute_on": ["android"],
+            "error_strategy": error_strategy,
+        }
+        if retry_count is not None:
+            step["retry_count"] = retry_count
+        return step
+
+    def test_retry_succeeds_after_transient_failures(self):
+        runner = self._make_runner(click_failures_before_success=2)
+        try:
+            result = runner.run_step(self._flaky_click_step(retry_count=2))
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["attempts"], 3)
+        self.assertIsNone(result["error"])
+        self.assertEqual(runner.driver.click_attempts, 3)
+
+    def test_retry_exhausted_keeps_last_attempt_error(self):
+        runner = self._make_runner(click_failures_before_success=99)
+        try:
+            result = runner.run_step(self._flaky_click_step(retry_count=2))
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["attempts"], 3)
+        # 总尝试 = 1 + retry_count，error 取最后一次尝试的
+        self.assertEqual(runner.driver.click_attempts, 3)
+        self.assertIn("attempt 3", str(result["error"]))
+        self.assertTrue(result.get("error_code"))
+
+    def test_retry_count_zero_keeps_single_attempt(self):
+        runner = self._make_runner(click_failures_before_success=99)
+        try:
+            result = runner.run_step(self._flaky_click_step())
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(runner.driver.click_attempts, 1)
+
+    def test_skip_is_not_retried(self):
+        runner = self._make_runner()
+        try:
+            result = runner.run_step(
+                {
+                    "action": "click",
+                    "platform_overrides": {"android": {"selector": "flaky", "by": "id"}},
+                    "execute_on": ["ios"],
+                    "retry_count": 3,
+                }
+            )
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "SKIP")
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(runner.driver.click_attempts, 0)
+
+    def test_assert_failure_is_retried(self):
+        runner = self._make_runner(assert_failures_before_success=1)
+        try:
+            result = runner.run_step(
+                {
+                    "action": "assert_text",
+                    "args": {"expected_text": "flaky-assert", "match_mode": "contains"},
+                    "execute_on": ["android"],
+                    "retry_count": 1,
+                }
+            )
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(runner.driver.assert_attempts, 2)
+
+    def test_abort_stops_retry_immediately(self):
+        abort_event = threading.Event()
+        runner = TestCaseRunner(
+            platform="android",
+            device_id="device-retry-abort",
+            abort_event=abort_event,
+            abort_on_click=abort_event,
+        )
+        try:
+            result = runner.run_step(
+                {
+                    "action": "click",
+                    "platform_overrides": {"android": {"selector": "fail-and-abort", "by": "id"}},
+                    "execute_on": ["android"],
+                    "retry_count": 3,
+                }
+            )
+        finally:
+            runner.disconnect()
+
+        # 第一次尝试失败期间 abort 触发：立即停止重试并走中止路径
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["error"], "执行已被用户中止")
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(runner.driver.click_attempts, 1)
+
+    def test_error_strategy_applies_only_to_final_result(self):
+        # ABORT 策略 + 重试成功：run_all 不应中断后续步骤
+        runner = self._make_runner(click_failures_before_success=1)
+        try:
+            result = runner.run_all(
+                [
+                    self._flaky_click_step(retry_count=1, error_strategy="ABORT"),
+                    {
+                        "action": "click",
+                        "platform_overrides": {"android": {"selector": "ok", "by": "id"}},
+                        "execute_on": ["android"],
+                    },
+                ]
+            )
+        finally:
+            runner.disconnect()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(result["steps"]), 2)
+        self.assertEqual(result["steps"][0]["status"], "PASS")
+        self.assertEqual(result["steps"][0]["attempts"], 2)
+        self.assertEqual(result["steps"][1]["status"], "PASS")
+
+    def test_ignore_strategy_applies_after_retries_exhausted(self):
+        runner = self._make_runner(click_failures_before_success=99)
+        try:
+            result = runner.run_all(
+                [
+                    self._flaky_click_step(retry_count=1, error_strategy="IGNORE"),
+                ]
+            )
+        finally:
+            runner.disconnect()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["steps"][0]["status"], "WARNING")
+        self.assertEqual(result["steps"][0]["attempts"], 2)
+        self.assertEqual(runner.driver.click_attempts, 2)
+
+    def test_invalid_retry_count_is_clamped_defensively(self):
+        runner = self._make_runner(click_failures_before_success=99)
+        try:
+            result = runner.run_step(self._flaky_click_step(retry_count=99))
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "FAIL")
+        # 执行期防御性收敛到上限 3（总尝试 4 次）
+        self.assertEqual(result["attempts"], 4)
+        self.assertEqual(runner.driver.click_attempts, 4)
 
 
 if __name__ == "__main__":
