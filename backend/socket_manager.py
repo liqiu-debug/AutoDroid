@@ -69,14 +69,16 @@ class ConnectionManager:
         await self.send_message(key, payload)
 
     async def broadcast_step_update(
-        self, 
-        case_id: int, 
+        self,
+        case_id: int,
         step_index: int,
         status: str,  # "running", "success", "failed", "retry"
         log: str,
         duration: float = 0,
         screenshot_base64: str = None,
-        error: str = None
+        error: str = None,
+        error_code: str = None,
+        suggestion: str = None
     ):
         """广播步骤状态更新 (兼容旧 Case 执行)"""
         message = {
@@ -88,12 +90,17 @@ class ConnectionManager:
             "duration": round(duration, 2),
             "timestamp": datetime.now().isoformat()
         }
-        
+
         if screenshot_base64:
             message["screenshot"] = screenshot_base64
         if error:
             message["error"] = error
-            
+        # 结构化错误信息（纯增量字段，老前端可忽略）
+        if error_code:
+            message["error_code"] = error_code
+        if suggestion:
+            message["suggestion"] = suggestion
+
         await self.send_message(case_id, message)
     
     async def broadcast_run_start(self, case_id: int, case_name: str, total_steps: int, **run_meta):

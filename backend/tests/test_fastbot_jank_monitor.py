@@ -5,28 +5,34 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from backend.fastbot_runner import (
-    JANK_ACTIVE_FRAME_THRESHOLD,
-    JANK_MAX_TRACE_EXPORTS,
+from backend.fastbot.framestats import (
     FRAMESTATS_MIN_SDK_INT,
     VSYNC_PERIOD_NS,
     FrameStatsSample,
     FramestatsMonitorState,
+    _classify_jank_sample,
+    _compute_framestats_sample,
+    _detect_vsync_period,
+    _find_closest_perf_sample,
+    _parse_framestats_output,
+)
+from backend.fastbot.perf_monitor import (
+    JANK_ACTIVE_FRAME_THRESHOLD,
+    _parse_gfxinfo_output,
+)
+from backend.fastbot.perfetto import (
+    JANK_MAX_TRACE_EXPORTS,
     PerfettoSessionState,
     _analyze_exported_traces,
     _build_trace_artifact,
     _build_perfetto_trace_config,
-    _classify_jank_sample,
-    _compute_framestats_sample,
-    _compute_jank_summary,
     _detect_perfetto_support,
-    _detect_vsync_period,
     _export_perfetto_trace,
-    _find_closest_perf_sample,
-    _parse_framestats_output,
-    _parse_gfxinfo_output,
-    _resolve_jank_monitoring_mode,
     _should_export_perfetto_trace,
+)
+from backend.fastbot.summary import (
+    _compute_jank_summary,
+    _resolve_jank_monitoring_mode,
 )
 from backend.paths import project_path
 
@@ -265,19 +271,19 @@ class FastbotPerfettoSupportTests(unittest.IsolatedAsyncioTestCase):
             perfetto_state.session_pid = None
 
         with patch(
-            "backend.fastbot_runner._start_perfetto_ring_buffer",
+            "backend.fastbot.perfetto._start_perfetto_ring_buffer",
             new=AsyncMock(side_effect=start_side_effect),
         ), patch(
-            "backend.fastbot_runner._stop_perfetto_ring_buffer",
+            "backend.fastbot.perfetto._stop_perfetto_ring_buffer",
             new=AsyncMock(side_effect=stop_side_effect),
         ), patch(
-            "backend.fastbot_runner._check_remote_file",
+            "backend.fastbot.perfetto._check_remote_file",
             new=AsyncMock(return_value=True),
         ), patch(
-            "backend.fastbot_runner._adb_pull",
+            "backend.fastbot.perfetto._adb_pull",
             new=AsyncMock(),
         ), patch(
-            "backend.fastbot_runner._cleanup_perfetto_remote_files",
+            "backend.fastbot.perfetto._cleanup_perfetto_remote_files",
             new=AsyncMock(),
         ):
             artifact = await _export_perfetto_trace(
@@ -304,7 +310,7 @@ class FastbotPerfettoSupportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_detect_perfetto_support_marks_android_12_as_supported(self):
         with patch(
-            "backend.fastbot_runner._adb_shell",
+            "backend.fastbot.perfetto._adb_shell",
             side_effect=["31", "/system/bin/perfetto"],
         ):
             state = await _detect_perfetto_support("emulator-5554", _temp_path("fastbot-report"))
@@ -315,7 +321,7 @@ class FastbotPerfettoSupportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_detect_perfetto_support_disables_old_sdk(self):
         with patch(
-            "backend.fastbot_runner._adb_shell",
+            "backend.fastbot.perfetto._adb_shell",
             side_effect=["28", "/system/bin/perfetto"],
         ):
             state = await _detect_perfetto_support("emulator-5554", _temp_path("fastbot-report"))

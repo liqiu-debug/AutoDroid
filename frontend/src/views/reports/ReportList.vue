@@ -6,6 +6,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
+import { runStatusTagType } from '@/utils/statusMeta'
 
 const router = useRouter()
 const route = useRoute()
@@ -71,16 +72,12 @@ const fetchData = async () => {
         if (filterStatus.value !== 'all') {
             params.status = filterStatus.value.toUpperCase()
         }
-        const [reportsRes, statsRes] = await Promise.all([
-            api.getReports(params),
-            api.getDashboardStats()
-        ])
-        let data = reportsRes.data.items || []
-        totalRecords.value = reportsRes.data.total || 0
         if (searchQuery.value) {
-            const query = searchQuery.value.toLowerCase()
-            data = data.filter(e => e.scenario_name.toLowerCase().includes(query))
+            params.keyword = searchQuery.value
         }
+        const reportsRes = await api.getReports(params)
+        const data = reportsRes.data.items || []
+        totalRecords.value = reportsRes.data.total || 0
         const grouped = []
         const batchMap = {}
         
@@ -207,16 +204,6 @@ const formatDate = (date) => {
     if (!date) return '-'
     return dayjs(date).format('MM-DD HH:mm:ss')
 }
-const getStatusColor = (status) => {
-    if (!status) return '#909399'
-    const s = status.toLowerCase()
-    if (s === 'pass') return '#67C23A'
-    if (s === 'warning') return '#E6A23C'
-    if (s === 'fail') return '#F56C6C'
-    if (s === 'error') return '#E6A23C'
-    if (s === 'running') return '#409EFF'
-    return '#909399'
-}
 const getDuration = (seconds) => {
     if (!seconds) return '0s'
     if (seconds < 60) return `${Math.round(seconds)}s`
@@ -229,21 +216,36 @@ const getDuration = (seconds) => {
 const fbLoading = ref(false)
 const fbTasks = ref([])
 const fbSearch = ref('')
+const fbPage = ref(1)
+const fbPageSize = ref(20)
+const fbTotal = ref(0)
 const startupLoading = ref(false)
 const startupTasks = ref([])
 const startupSearch = ref('')
+const startupPage = ref(1)
+const startupPageSize = ref(20)
+const startupTotal = ref(0)
 const compatibilityLoading = ref(false)
 const compatibilityRuns = ref([])
 const compatibilitySearch = ref('')
 const compatibilityStatus = ref('all')
+const compatibilityPage = ref(1)
+const compatibilityPageSize = ref(20)
+const compatibilityTotal = ref(0)
 let fbPollTimer = null
 let pageActive = false
 
 const fetchFbTasks = async () => {
     fbLoading.value = true
     try {
-        const res = await api.getFastbotTasks()
-        fbTasks.value = res.data || []
+        const params = {
+            skip: (fbPage.value - 1) * fbPageSize.value,
+            limit: fbPageSize.value,
+        }
+        if (fbSearch.value) params.keyword = fbSearch.value
+        const res = await api.getFastbotTasks(params)
+        fbTasks.value = res.data.items || []
+        fbTotal.value = res.data.total || 0
     } catch (err) {
         console.error('获取探索任务失败', err)
     } finally {
@@ -251,11 +253,21 @@ const fetchFbTasks = async () => {
     }
 }
 
+const handleFbSearch = () => { fbPage.value = 1; fetchFbTasks() }
+const handleFbPageChange = (val) => { fbPage.value = val; fetchFbTasks() }
+const handleFbSizeChange = (val) => { fbPageSize.value = val; fbPage.value = 1; fetchFbTasks() }
+
 const fetchStartupTasks = async () => {
     startupLoading.value = true
     try {
-        const res = await api.getStartupTasks({ limit: 100 })
-        startupTasks.value = res.data || []
+        const params = {
+            skip: (startupPage.value - 1) * startupPageSize.value,
+            limit: startupPageSize.value,
+        }
+        if (startupSearch.value) params.keyword = startupSearch.value
+        const res = await api.getStartupTasks(params)
+        startupTasks.value = res.data.items || []
+        startupTotal.value = res.data.total || 0
     } catch (err) {
         console.error('获取冷热启动任务失败', err)
     } finally {
@@ -263,11 +275,22 @@ const fetchStartupTasks = async () => {
     }
 }
 
+const handleStartupSearch = () => { startupPage.value = 1; fetchStartupTasks() }
+const handleStartupPageChange = (val) => { startupPage.value = val; fetchStartupTasks() }
+const handleStartupSizeChange = (val) => { startupPageSize.value = val; startupPage.value = 1; fetchStartupTasks() }
+
 const fetchCompatibilityRuns = async () => {
     compatibilityLoading.value = true
     try {
-        const { data } = await api.getCompatibilityRuns({ skip: 0, limit: 100 })
+        const params = {
+            skip: (compatibilityPage.value - 1) * compatibilityPageSize.value,
+            limit: compatibilityPageSize.value,
+        }
+        if (compatibilitySearch.value) params.keyword = compatibilitySearch.value
+        if (compatibilityStatus.value !== 'all') params.status = compatibilityStatus.value
+        const { data } = await api.getCompatibilityRuns(params)
         compatibilityRuns.value = data.items || []
+        compatibilityTotal.value = data.total || 0
     } catch (err) {
         console.error('获取兼容性报告失败', err)
     } finally {
@@ -275,68 +298,26 @@ const fetchCompatibilityRuns = async () => {
     }
 }
 
-const filteredFbTasks = computed(() => {
-    const map = devicesMap.value
-    let list = fbTasks.value
-    if (fbSearch.value) {
-        const q = fbSearch.value.toLowerCase()
-        list = list.filter(item => item.package_name.toLowerCase().includes(q) || item.device_serial.toLowerCase().includes(q))
-    }
-    return list.map(item => {
-        let name = item.device_serial
-        const dev = map[item.device_serial]
-        if (dev) {
-            const p = dev.custom_name || dev.market_name || dev.model
-            if (p) name = p
-        }
-        return {
-            ...item,
-            _resolved_device: name
-        }
-    })
-})
+const handleCompatibilitySearch = () => { compatibilityPage.value = 1; fetchCompatibilityRuns() }
+const handleCompatibilityPageChange = (val) => { compatibilityPage.value = val; fetchCompatibilityRuns() }
+const handleCompatibilitySizeChange = (val) => { compatibilityPageSize.value = val; compatibilityPage.value = 1; fetchCompatibilityRuns() }
 
-const filteredStartupTasks = computed(() => {
-    const map = devicesMap.value
-    let list = startupTasks.value
-    if (startupSearch.value) {
-        const q = startupSearch.value.toLowerCase()
-        list = list.filter(item => item.package_name.toLowerCase().includes(q) || item.device_serial.toLowerCase().includes(q))
+const resolveDeviceForRow = (item) => {
+    const dev = devicesMap.value[item.device_serial]
+    if (dev) {
+        const p = dev.custom_name || dev.market_name || dev.model
+        if (p) return p
     }
-    return list.map(item => {
-        let name = item.device_serial
-        const dev = map[item.device_serial]
-        if (dev) {
-            const p = dev.custom_name || dev.market_name || dev.model
-            if (p) name = p
-        }
-        return {
-            ...item,
-            _resolved_device: name
-        }
-    })
-})
+    return item.device_serial
+}
 
-const filteredCompatibilityRuns = computed(() => {
-    let list = compatibilityRuns.value || []
-    if (compatibilityStatus.value !== 'all') {
-        const status = compatibilityStatus.value.toUpperCase()
-        list = list.filter(item => {
-            const itemStatus = String(item.status || '').toUpperCase()
-            if (status === 'RUNNING') return itemStatus === 'RUNNING' || itemStatus === 'PENDING'
-            if (status === 'FAIL') return itemStatus === 'FAIL' || itemStatus === 'ERROR'
-            return itemStatus === status
-        })
-    }
-    if (compatibilitySearch.value) {
-        const q = compatibilitySearch.value.toLowerCase()
-        list = list.filter(item => (
-            String(item.name || '').toLowerCase().includes(q)
-            || String(item.package_name || '').toLowerCase().includes(q)
-        ))
-    }
-    return list
-})
+const fbTasksWithDevice = computed(() => (
+    fbTasks.value.map(item => ({ ...item, _resolved_device: resolveDeviceForRow(item) }))
+))
+
+const startupTasksWithDevice = computed(() => (
+    startupTasks.value.map(item => ({ ...item, _resolved_device: resolveDeviceForRow(item) }))
+))
 
 const handleFbView = (taskId) => { router.push(`/special/fastbot/report/${taskId}`) }
 const handleCompatibilityView = (runId) => { router.push(`/execution/reports/compatibility/${runId}`) }
@@ -370,19 +351,6 @@ const handleCompatibilityDelete = async (row) => {
             ElMessage.error(err.response?.data?.detail || '删除失败')
         }
     }
-}
-
-const getFbStatusType = (status) => {
-    const map = { RUNNING: '', COMPLETED: 'success', FAILED: 'danger', PENDING: 'info' }
-    return map[status] || 'info'
-}
-
-const getCompatibilityStatusType = (status) => {
-    const normalized = String(status || '').toUpperCase()
-    if (normalized === 'PASS') return 'success'
-    if (normalized === 'WARNING' || normalized === 'RUNNING') return 'warning'
-    if (['FAIL', 'ERROR', 'ABORTED'].includes(normalized)) return 'danger'
-    return 'info'
 }
 
 const getCompatibilityStatusText = (status) => String(status || 'PENDING').toUpperCase()
@@ -536,7 +504,7 @@ onUnmounted(() => {
                         <strong>{{ group.batch_name }}</strong>
                         <span>{{ formatDate(group.start_time) }} · {{ group.executions.length }} 台设备</span>
                     </div>
-                    <el-tag :type="group.status === 'PASS' ? 'success' : (group.status === 'WARNING' ? 'warning' : (group.status === 'RUNNING' ? '' : 'danger'))" size="small">
+                    <el-tag :type="runStatusTagType(group.status)" size="small">
                         {{ group.status === 'RUNNING' ? '运行中' : group.status }}
                     </el-tag>
                 </header>
@@ -552,7 +520,7 @@ onUnmounted(() => {
                             <span>{{ getDuration(item.duration) }} · {{ item.executor_name || group.executor_name || '-' }}</span>
                         </div>
                         <div class="mobile-report-execution-actions">
-                            <el-tag size="small" :type="item.status === 'PASS' ? 'success' : (item.status === 'WARNING' ? 'warning' : (isExecutionRunning(item.status) ? '' : 'danger'))">
+                            <el-tag size="small" :type="runStatusTagType(item.status)">
                                 {{ item.status }}
                             </el-tag>
                             <el-button
@@ -630,7 +598,7 @@ onUnmounted(() => {
                                             </el-table-column>
                                             <el-table-column label="状态" width="100">
                                                 <template #default="{ row: subRow }">
-                                                    <el-tag :type="subRow.status === 'PASS' ? 'success' : (subRow.status === 'WARNING' ? 'warning' : (subRow.status === 'RUNNING' ? '' : (subRow.status === 'ABORTED' ? 'info' : 'danger')))" size="small" effect="plain">
+                                                    <el-tag :type="runStatusTagType(subRow.status)" size="small" effect="plain">
                                                         {{ subRow.status }}
                                                     </el-tag>
                                                 </template>
@@ -665,7 +633,7 @@ onUnmounted(() => {
                             
                             <el-table-column label="汇总状态" width="120">
                                 <template #default="{ row }">
-                                    <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'WARNING' ? 'warning' : (row.status === 'RUNNING' ? '' : (row.status === 'ABORTED' ? 'info' : 'danger')))">
+                                    <el-tag :type="runStatusTagType(row.status)">
                                         {{ row.status === 'RUNNING' ? '待完成' : row.status }}
                                     </el-tag>
                                 </template>
@@ -720,10 +688,12 @@ onUnmounted(() => {
                         <div class="left-filters">
                             <el-input
                                 v-model="fbSearch"
-                                placeholder="搜索包名..."
+                                placeholder="搜索包名或设备..."
                                 :prefix-icon="Search"
                                 clearable
                                 class="search-input"
+                                @keyup.enter="handleFbSearch"
+                                @clear="handleFbSearch"
                             />
                         </div>
                         <div class="right-actions">
@@ -732,12 +702,11 @@ onUnmounted(() => {
                     </div>
 
                     <!-- 探索报告表格 -->
+                    <div class="list-scroll-area" v-loading="fbLoading">
                     <el-table
-                        :data="filteredFbTasks"
-                        v-loading="fbLoading"
+                        :data="fbTasksWithDevice"
                         style="width: 100%"
                         :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-                        max-height="calc(100vh - 240px)"
                     >
                         <el-table-column prop="id" label="ID" width="60" align="center" />
                         <el-table-column label="目标包名" min-width="200">
@@ -759,7 +728,7 @@ onUnmounted(() => {
                         </el-table-column>
                         <el-table-column label="状态" width="100" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="getFbStatusType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
                             </template>
                         </el-table-column>
                         <el-table-column label="崩溃" width="70" align="center">
@@ -783,6 +752,20 @@ onUnmounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                    </div>
+
+                    <div class="pagination-footer" v-if="fbTotal > 0">
+                        <el-pagination
+                            v-model:current-page="fbPage"
+                            v-model:page-size="fbPageSize"
+                            :page-sizes="[10, 20, 50, 100]"
+                            :background="true"
+                            layout="total, sizes, prev, pager, next, jumper"
+                            :total="fbTotal"
+                            @size-change="handleFbSizeChange"
+                            @current-change="handleFbPageChange"
+                        />
+                    </div>
                 </el-tab-pane>
 
                 <el-tab-pane label="冷热启动报告" name="startup">
@@ -794,6 +777,8 @@ onUnmounted(() => {
                                 :prefix-icon="Search"
                                 clearable
                                 class="search-input"
+                                @keyup.enter="handleStartupSearch"
+                                @clear="handleStartupSearch"
                             />
                         </div>
                         <div class="right-actions">
@@ -801,12 +786,11 @@ onUnmounted(() => {
                         </div>
                     </div>
 
+                    <div class="list-scroll-area" v-loading="startupLoading">
                     <el-table
-                        :data="filteredStartupTasks"
-                        v-loading="startupLoading"
+                        :data="startupTasksWithDevice"
                         style="width: 100%"
                         :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-                        max-height="calc(100vh - 240px)"
                     >
                         <el-table-column prop="id" label="ID" width="60" align="center" />
                         <el-table-column label="目标包名" min-width="190">
@@ -848,7 +832,7 @@ onUnmounted(() => {
                         </el-table-column>
                         <el-table-column label="状态" width="100" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="getFbStatusType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
                             </template>
                         </el-table-column>
                         <el-table-column label="操作" width="120" align="center" fixed="right">
@@ -862,6 +846,20 @@ onUnmounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                    </div>
+
+                    <div class="pagination-footer" v-if="startupTotal > 0">
+                        <el-pagination
+                            v-model:current-page="startupPage"
+                            v-model:page-size="startupPageSize"
+                            :page-sizes="[10, 20, 50, 100]"
+                            :background="true"
+                            layout="total, sizes, prev, pager, next, jumper"
+                            :total="startupTotal"
+                            @size-change="handleStartupSizeChange"
+                            @current-change="handleStartupPageChange"
+                        />
+                    </div>
                 </el-tab-pane>
 
                 <el-tab-pane label="兼容性报告" name="compatibility">
@@ -873,8 +871,10 @@ onUnmounted(() => {
                                 :prefix-icon="Search"
                                 clearable
                                 class="search-input"
+                                @keyup.enter="handleCompatibilitySearch"
+                                @clear="handleCompatibilitySearch"
                             />
-                            <el-radio-group v-model="compatibilityStatus">
+                            <el-radio-group v-model="compatibilityStatus" @change="handleCompatibilitySearch">
                                 <el-radio-button value="all">全部</el-radio-button>
                                 <el-radio-button value="pass">通过</el-radio-button>
                                 <el-radio-button value="warning">警告</el-radio-button>
@@ -887,12 +887,11 @@ onUnmounted(() => {
                         </div>
                     </div>
 
+                    <div class="list-scroll-area" v-loading="compatibilityLoading">
                     <el-table
-                        :data="filteredCompatibilityRuns"
-                        v-loading="compatibilityLoading"
+                        :data="compatibilityRuns"
                         style="width: 100%"
                         :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-                        max-height="calc(100vh - 240px)"
                     >
                         <el-table-column prop="id" label="ID" width="64" align="center" />
                         <el-table-column label="任务" min-width="220">
@@ -919,7 +918,7 @@ onUnmounted(() => {
                         </el-table-column>
                         <el-table-column label="状态" width="110" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="getCompatibilityStatusType(row.status)" size="small" effect="plain">
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">
                                     {{ getCompatibilityStatusText(row.status) }}
                                 </el-tag>
                             </template>
@@ -947,6 +946,20 @@ onUnmounted(() => {
                             </template>
                         </el-table-column>
                     </el-table>
+                    </div>
+
+                    <div class="pagination-footer" v-if="compatibilityTotal > 0">
+                        <el-pagination
+                            v-model:current-page="compatibilityPage"
+                            v-model:page-size="compatibilityPageSize"
+                            :page-sizes="[10, 20, 50, 100]"
+                            :background="true"
+                            layout="total, sizes, prev, pager, next, jumper"
+                            :total="compatibilityTotal"
+                            @size-change="handleCompatibilitySizeChange"
+                            @current-change="handleCompatibilityPageChange"
+                        />
+                    </div>
                 </el-tab-pane>
             </el-tabs>
         </div>

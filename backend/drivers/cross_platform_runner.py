@@ -15,6 +15,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Type
 
+from backend.execution_errors import (
+    E2006_OCR_NO_RESULT,
+    ExecutionStepError,
+    ExecutionStepRuntimeError,
+    classify_exception,
+    suggestion_for,
+)
 from backend.locator_resolution import resolve_locator_candidates
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
 from backend.step_contract import (
@@ -160,6 +167,14 @@ class TestCaseRunner:
                     output=None,
                     artifacts=None,
                     duration=time.time() - started_at,
+                    error_code="P1001_PLATFORM_NOT_ALLOWED",
+                    error_context={
+                        "action": action,
+                        "platform": self.platform,
+                        "device_id": self.device_id,
+                        "execute_on": list(execute_on),
+                    },
+                    suggestion=suggestion_for("P1001_PLATFORM_NOT_ALLOWED") or None,
                 )
 
             args = step_data.get("args") or {}
@@ -177,6 +192,8 @@ class TestCaseRunner:
                 }
                 for item in resolve_locator_candidates(step_data, platform=self.platform)
             ]
+            # 供失败时构建 error_context 使用（纯错误路径辅助信息）。
+            step_context["locator_candidates"] = locator_candidates
             unresolved = _collect_unresolved_templates(
                 {
                     "args": args,
@@ -223,6 +240,11 @@ class TestCaseRunner:
             )
             return result
         except Exception as exc:
+            error_code, suggestion = classify_exception(
+                exc,
+                platform=self.platform,
+                action=action,
+            )
             return self._result(
                 step_data=step_data,
                 action=action,
@@ -232,6 +254,13 @@ class TestCaseRunner:
                 output=None,
                 artifacts=self._extract_step_artifacts(step_context),
                 duration=time.time() - started_at,
+                error_code=error_code or None,
+                error_context=self._build_error_context(
+                    action=action,
+                    exc=exc,
+                    step_context=step_context,
+                ),
+                suggestion=suggestion or None,
             )
 
     def run_all(self, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -405,6 +434,39 @@ class TestCaseRunner:
         if not isinstance(artifacts, dict) or not artifacts:
             return None
         return dict(artifacts)
+
+    def _build_error_context(
+        self,
+        *,
+        action: str,
+        exc: Exception,
+        step_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """构建失败上下文（至少含 action/platform/device_id，按需附 selector/by 等）。"""
+        context: Dict[str, Any] = {
+            "action": action,
+            "platform": self.platform,
+            "device_id": self.device_id,
+        }
+        candidates = (step_context or {}).get("locator_candidates")
+        if isinstance(candidates, list):
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                selector = str(item.get("selector") or "").strip()
+                by = str(item.get("by") or "").strip()
+                if not selector and not by:
+                    continue
+                if selector:
+                    context["selector"] = selector
+                if by:
+                    context["by"] = by
+                break
+        if isinstance(exc, ExecutionStepError):
+            for key, value in exc.context.items():
+                if value not in (None, ""):
+                    context[key] = value
+        return context
 
     @staticmethod
     def _result_screenshot_base64(result: Dict[str, Any]) -> Optional[str]:
@@ -735,9 +797,19 @@ class TestCaseRunner:
         message = (
             f"extract_by_ocr 未识别到文本（重试 {attempt} 次，耗时 {elapsed:.2f}s，region={region}）"
         )
+        final_exc = ExecutionStepRuntimeError(
+            E2006_OCR_NO_RESULT,
+            message,
+            context={
+                "action": "extract_by_ocr",
+                "region": region,
+                "timeout": wait_seconds,
+                "attempts": attempt,
+            },
+        )
         if last_error is not None:
-            raise RuntimeError(message) from last_error
-        raise RuntimeError(message)
+            raise final_exc from last_error
+        raise final_exc
 
     def _dispatch_with_locator_fallback(
         self,
@@ -761,6 +833,7 @@ class TestCaseRunner:
             )
 
         errors = []
+        first_exc: Optional[Exception] = None
         for candidate in valid_candidates:
             selector = candidate["selector"]
             by = candidate["by"]
@@ -768,10 +841,34 @@ class TestCaseRunner:
                 dispatch(selector, by)
                 return None
             except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
                 errors.append(f"selector={selector!r}, by={by!r}, error={exc}")
 
         if errors:
-            raise RuntimeError("; ".join(errors))
+            # 以首个（主定位器）异常归类，聚合消息格式保持不变。
+            code, suggestion = classify_exception(
+                first_exc,
+                platform=self.platform,
+                action=action,
+            )
+            primary = valid_candidates[0]
+            context: Dict[str, Any] = {
+                "action": action,
+                "selector": primary["selector"],
+                "by": primary["by"],
+                "attempts": len(valid_candidates),
+            }
+            if isinstance(first_exc, ExecutionStepError):
+                for key, value in first_exc.context.items():
+                    if value not in (None, ""):
+                        context.setdefault(key, value)
+            raise ExecutionStepRuntimeError(
+                code,
+                "; ".join(errors),
+                context=context,
+                suggestion=suggestion or None,
+            ) from first_exc
         return None
 
     def _result(
@@ -784,6 +881,9 @@ class TestCaseRunner:
         output: Optional[Dict[str, Any]],
         artifacts: Optional[Dict[str, Any]],
         duration: float,
+        error_code: Optional[str] = None,
+        error_context: Optional[Dict[str, Any]] = None,
+        suggestion: Optional[str] = None,
     ) -> Dict[str, Any]:
         return {
             "action": action,
@@ -793,6 +893,10 @@ class TestCaseRunner:
             "error_strategy": error_strategy,
             "duration": round(duration, 3),
             "error": error,
+            # 结构化错误信息（纯增量字段，原 error 字符串格式保持不变）。
+            "error_code": error_code,
+            "error_context": error_context,
+            "suggestion": suggestion,
             "output": output,
             "artifacts": artifacts,
             "step": step_data,

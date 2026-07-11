@@ -479,6 +479,34 @@ def _migrate_compatibility_run_page_set_snapshot(cursor) -> None:
     cursor.execute("ALTER TABLE compatibilityrun_new RENAME TO compatibilityrun")
 
 
+def _migrate_scenario_folders(cursor) -> None:
+    """创建场景目录表并为 testscenario 补充 folder_id 外键列。"""
+    if not _table_exists(cursor, "scenariofolder"):
+        cursor.execute(
+            """
+            CREATE TABLE scenariofolder (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                parent_id INTEGER REFERENCES scenariofolder(id),
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        logger.info("Migration: CREATE TABLE scenariofolder")
+
+    if not _table_exists(cursor, "testscenario"):
+        logger.warning("Migration skip: table testscenario not found when adding column folder_id")
+        return
+
+    cursor.execute("PRAGMA table_info(testscenario)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "folder_id" not in existing_cols:
+        cursor.execute(
+            "ALTER TABLE testscenario ADD COLUMN folder_id INTEGER REFERENCES scenariofolder(id)"
+        )
+        logger.info("Migration: ALTER TABLE testscenario ADD COLUMN folder_id")
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     _ensure_schema_migration_table(cursor)
@@ -492,6 +520,7 @@ def _run_migrations_with_conn(conn) -> None:
         ("20260616_006_compatibility_tables", _migrate_compatibility_tables),
         ("20260616_007_compatibility_current_baseline", _migrate_compatibility_old_package_nullable),
         ("20260616_008_compatibility_page_set_snapshot", _migrate_compatibility_run_page_set_snapshot),
+        ("20260710_009_scenario_folders", _migrate_scenario_folders),
     ]
 
     for version, migration_func in migration_plan:
@@ -515,9 +544,92 @@ def _run_migrations():
         conn.close()
 
 
+def backfill_case_steps_to_standard(session: Session, *, force: bool = False) -> dict:
+    """Idempotent backfill: convert legacy TestCase.steps JSON into TestCaseStep rows.
+
+    - 默认（force=False）：仅处理"无标准步骤记录且存在 legacy 步骤"的用例；
+      已有标准步骤或无 legacy 步骤的用例跳过，可安全地在每次启动时执行。
+    - force=True（CLI 使用）：替换所有用例的标准步骤。
+    - 单个用例转换失败仅记录并跳过，不阻塞其他用例/启动流程。
+    """
+    from backend.models import TestCase, TestCaseStep
+    from backend.step_contract import build_standard_from_legacy_steps
+
+    migrated_cases = 0
+    skipped_cases = 0
+    failed_cases = 0
+    created_steps = 0
+
+    case_ids = session.exec(select(TestCase.id)).all()
+    for case_id in case_ids:
+        try:
+            case = session.get(TestCase, case_id)
+            if not case:
+                skipped_cases += 1
+                continue
+
+            legacy_steps = list(case.steps or [])
+            existing = session.exec(
+                select(TestCaseStep).where(TestCaseStep.case_id == case.id)
+            ).all()
+
+            if existing and not force:
+                skipped_cases += 1
+                continue
+            if not existing and not legacy_steps:
+                skipped_cases += 1
+                continue
+
+            if existing and force:
+                for row in existing:
+                    session.delete(row)
+                session.flush()
+
+            payload = build_standard_from_legacy_steps(legacy_steps, case_id=case.id)
+            for item in payload:
+                session.add(
+                    TestCaseStep(
+                        case_id=case.id,
+                        order=item["order"],
+                        action=item["action"],
+                        args=item.get("args") or {},
+                        value=item.get("value"),
+                        execute_on=item.get("execute_on") or ["android", "ios"],
+                        platform_overrides=item.get("platform_overrides") or {},
+                        timeout=item.get("timeout", 10),
+                        error_strategy=item.get("error_strategy", "ABORT"),
+                        description=item.get("description"),
+                    )
+                )
+            session.commit()
+            migrated_cases += 1
+            created_steps += len(payload)
+        except Exception as exc:
+            session.rollback()
+            failed_cases += 1
+            logger.warning(
+                "case step backfill failed, skipped: case_id=%s error=%s", case_id, exc
+            )
+
+    summary = {
+        "migrated_cases": migrated_cases,
+        "skipped_cases": skipped_cases,
+        "failed_cases": failed_cases,
+        "created_steps": created_steps,
+        "force": force,
+    }
+    logger.info("case step backfill finished: %s", summary)
+    return summary
+
+
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
     _run_migrations()
+    try:
+        with Session(engine) as session:
+            backfill_case_steps_to_standard(session)
+    except Exception:
+        logger.exception("startup case step backfill failed")
 
 
 def backfill_legacy_asset_owners(session: Session, admin_user_id: int) -> dict:

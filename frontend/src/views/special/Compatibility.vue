@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { Collection, Refresh, VideoPlay, View } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { runStatusTagType } from '@/utils/statusMeta'
 
 const CURRENT_BASELINE_VALUE = '__current_installed__'
 
@@ -84,17 +85,20 @@ const formatDevice = (serial) => {
 }
 const formatTime = (value) => value ? dayjs(value).format('MM-DD HH:mm:ss') : '-'
 const statusText = (status) => String(status || 'PENDING').toUpperCase()
-const statusType = (status) => {
-  const value = statusText(status)
-  if (value === 'PASS') return 'success'
-  if (value === 'WARNING' || value === 'RUNNING') return 'warning'
-  if (['FAIL', 'ERROR', 'ABORTED'].includes(value)) return 'danger'
-  return 'info'
-}
+const statusType = (status) => runStatusTagType(statusText(status))
 
 const fetchPackages = async () => {
-  const { data } = await api.getPackages({ page: 1, page_size: 100 })
-  packages.value = data.items || []
+  // 循环拉全量：包列表兼作旧/新版本配对与包名过滤的查找表，不适合改远程搜索
+  const pageSize = 100
+  const all = []
+  for (let page = 1; page <= 20; page += 1) {
+    const { data } = await api.getPackages({ page, page_size: pageSize })
+    const items = data.items || []
+    all.push(...items)
+    const totalCount = Number(data.total ?? all.length)
+    if (all.length >= totalCount || items.length < pageSize) break
+  }
+  packages.value = all
 }
 const fetchDevices = async () => {
   const { data } = await api.getDeviceList()

@@ -1,19 +1,32 @@
 <script setup>
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Search, Refresh, Edit, Timer, Calendar, Clock } from '@element-plus/icons-vue'
 import api from '@/api'
 import dayjs from 'dayjs'
+import { useRemoteSearch } from '@/composables/useRemoteSearch'
 
 // ---- 数据 ----
 const tasks = ref([])
-const scenarios = ref([])
 const devices = ref([])
 const environments = ref([])
 const loading = ref(false)
-const scenariosLoading = ref(false)
 const searchQuery = ref('')
-let scenariosRequest = null
+const currentPage = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
+
+// 场景选择器：远程搜索，避免场景超量时静默截断
+const {
+    options: scenarioOptions,
+    loading: scenariosLoading,
+    search: searchScenarios,
+    ensureOption: ensureScenarioOption,
+} = useRemoteSearch({
+    fetcher: (keyword) => api.getScenarios({ skip: 0, limit: 50, keyword: keyword || undefined })
+        .then((res) => res.data.items || res.data || []),
+    resolver: (id) => api.getScenario(id).then((res) => res.data).catch(() => null),
+})
 
 // 弹窗
 const dialogVisible = ref(false)
@@ -46,19 +59,20 @@ const form = reactive({
     fb_ignore_crashes: false,
 })
 
-// ---- 计算属性 ----
-const filteredTasks = computed(() => {
-    if (!searchQuery.value) return tasks.value
-    const q = searchQuery.value.toLowerCase()
-    return tasks.value.filter(t => t.name.toLowerCase().includes(q) || (t.scenario_name || '').toLowerCase().includes(q))
-})
-
 // ---- 方法 ----
 const fetchTasks = async () => {
     loading.value = true
     try {
-        const res = await api.getTasks()
-        tasks.value = res.data || []
+        const params = {
+            skip: (currentPage.value - 1) * pageSize.value,
+            limit: pageSize.value
+        }
+        if (searchQuery.value) {
+            params.keyword = searchQuery.value
+        }
+        const res = await api.getTasks(params)
+        tasks.value = res.data.items || []
+        total.value = res.data.total || 0
     } catch (err) {
         ElMessage.error('获取任务列表失败')
     } finally {
@@ -66,28 +80,24 @@ const fetchTasks = async () => {
     }
 }
 
-const fetchScenarios = () => {
-    if (scenariosRequest) return scenariosRequest
+const handleSearch = () => {
+    currentPage.value = 1
+    fetchTasks()
+}
 
-    scenariosLoading.value = true
-    scenariosRequest = api.getScenarios()
-        .then((res) => {
-            scenarios.value = res.data.items || res.data || []
-        })
-        .catch((err) => {
-            console.error('获取场景列表失败', err)
-            ElMessage.error('获取场景列表失败')
-        })
-        .finally(() => {
-            scenariosLoading.value = false
-            scenariosRequest = null
-        })
+const handleSizeChange = (val) => {
+    pageSize.value = val
+    currentPage.value = 1
+    fetchTasks()
+}
 
-    return scenariosRequest
+const handleCurrentChange = (val) => {
+    currentPage.value = val
+    fetchTasks()
 }
 
 const handleScenarioDropdownVisible = (visible) => {
-    if (visible) fetchScenarios()
+    if (visible && scenarioOptions.value.length === 0) searchScenarios('')
 }
 
 const fetchDevices = async () => {
@@ -140,6 +150,7 @@ const handleEdit = (row) => {
     dialogTitle.value = '编辑定时任务'
     form.name = row.name
     form.scenario_id = row.scenario_id
+    if (row.scenario_id) ensureScenarioOption(row.scenario_id)
     form.device_serials = row.device_serials || []
     form.strategy = row.strategy
 
@@ -214,6 +225,7 @@ const buildPayload = () => {
 const handleSubmit = async () => {
     if (!form.name) return ElMessage.warning('请输入任务名称')
     if (form.task_type === 'ui' && !form.scenario_id) return ElMessage.warning('请选择执行场景')
+    if (form.task_type === 'ui' && (!form.device_serials || form.device_serials.length === 0)) return ElMessage.warning('UI 任务必须选择执行设备')
     if (form.task_type === 'fastbot' && !form.fb_package_name) return ElMessage.warning('请输入目标包名')
     if (form.task_type === 'fastbot' && (!form.device_serials || form.device_serials.length === 0)) return ElMessage.warning('智能探索任务必须选择执行设备')
     if (form.strategy === 'WEEKLY' && form.weekly_days.length === 0) {
@@ -308,10 +320,12 @@ onMounted(() => {
                 <div class="left-tools">
                     <el-input
                         v-model="searchQuery"
-                        placeholder="搜索任务名称..."
+                        placeholder="搜索任务或场景名称..."
                         class="search-input"
                         :prefix-icon="Search"
                         clearable
+                        @keyup.enter="handleSearch"
+                        @clear="handleSearch"
                     />
                     <el-button :icon="Refresh" @click="fetchTasks" circle />
                 </div>
@@ -321,10 +335,10 @@ onMounted(() => {
             </div>
 
             <el-table
-                :data="filteredTasks"
+                :data="tasks"
                 v-loading="loading"
                 style="width: 100%"
-                height="calc(100vh - 160px)"
+                height="calc(100vh - 220px)"
                 :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
             >
                 <el-table-column prop="id" label="ID" width="60" align="center" />
@@ -388,6 +402,19 @@ onMounted(() => {
                     </template>
                 </el-table-column>
             </el-table>
+
+            <div class="pagination-footer" v-if="total > 0">
+                <el-pagination
+                    v-model:current-page="currentPage"
+                    v-model:page-size="pageSize"
+                    :page-sizes="[10, 20, 50, 100]"
+                    :background="true"
+                    layout="total, sizes, prev, pager, next, jumper"
+                    :total="total"
+                    @size-change="handleSizeChange"
+                    @current-change="handleCurrentChange"
+                />
+            </div>
         </div>
 
         <!-- 新建/编辑弹窗 -->
@@ -408,13 +435,16 @@ onMounted(() => {
                 <el-form-item v-if="form.task_type === 'ui'" label="执行场景">
                     <el-select
                         v-model="form.scenario_id"
-                        placeholder="选择场景"
+                        placeholder="选择场景（可输入关键字搜索）"
                         style="width: 100%"
+                        filterable
+                        remote
+                        :remote-method="searchScenarios"
                         :loading="scenariosLoading"
                         @visible-change="handleScenarioDropdownVisible"
                     >
                         <el-option
-                            v-for="s in scenarios"
+                            v-for="s in scenarioOptions"
                             :key="s.id"
                             :label="s.name"
                             :value="s.id"
@@ -447,7 +477,7 @@ onMounted(() => {
                 <el-form-item label="执行设备">
                     <el-select
                         v-model="form.device_serials"
-                        :placeholder="form.task_type === 'fastbot' ? '请选择运行设备' : '选择设备 (可选)'"
+                        placeholder="请选择运行设备"
                         multiple
                         collapse-tags
                         clearable
@@ -619,6 +649,13 @@ onMounted(() => {
 }
 
 .text-gray { color: #909399; }
+
+.pagination-footer {
+    flex-shrink: 0;
+    padding: 12px 10px 0;
+    display: flex;
+    justify-content: flex-end;
+}
 
 .task-form {
     padding: 10px 20px 0 0;

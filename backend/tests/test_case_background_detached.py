@@ -8,24 +8,6 @@ from backend.api import cases as cases_api
 from backend.models import Device, TestCase
 
 
-class _FakeLegacyRunner:
-    def __init__(self, device_serial=None):  # noqa: ARG002
-        self.device_serial = device_serial
-
-    def connect(self):
-        return None
-
-    def run_case(self, case, extra_variables=None):  # noqa: ARG002
-        # The background path should pass a detached-safe snapshot here.
-        self._captured_case = case
-        return {
-            "case_id": case.id,
-            "success": True,
-            "steps": [{"success": True, "status": "PASS"}],
-            "exported_variables": {},
-        }
-
-
 class CaseBackgroundDetachedTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
@@ -89,30 +71,24 @@ class CaseBackgroundDetachedTests(unittest.TestCase):
             self.assertEqual(db_case.last_run_status, "PASS")
             self.assertIsNotNone(db_case.last_run_time)
 
-    def test_legacy_background_uses_case_snapshot(self):
-        captured = {}
-
-        class _FakeRunnerWithCapture(_FakeLegacyRunner):
-            def run_case(self, case, extra_variables=None):  # noqa: ARG002
-                captured["case"] = case
-                return super().run_case(case, extra_variables=extra_variables)
-
-        with patch("backend.runner.TestRunner", _FakeRunnerWithCapture):
-            cases_api._run_case_background(
+    def test_cross_platform_background_without_device_marks_case_failed(self):
+        with patch(
+            "backend.api.cases.run_case_with_standard_runner"
+        ) as run_mock, self.assertLogs("backend.api.cases", level="ERROR") as logs:
+            cases_api._run_case_background_cross_platform(
                 case_id=self.case_id,
                 session_factory=self._session_factory,
                 env_id=None,
-                device_serial="device-1",
+                device_serial=None,
+                run_id="run-no-device",
             )
 
-        passed_case = captured.get("case")
-        self.assertIsNotNone(passed_case)
-        self.assertEqual(passed_case.__class__.__name__, "_CaseSnapshot")
+        run_mock.assert_not_called()
+        self.assertIn("requires device_serial", "\n".join(logs.output))
 
         with Session(self.engine) as session:
             db_case = session.get(TestCase, self.case_id)
-            self.assertEqual(db_case.last_run_status, "PASS")
-            self.assertIsNotNone(db_case.last_run_time)
+            self.assertEqual(db_case.last_run_status, "FAIL")
 
 
 if __name__ == "__main__":

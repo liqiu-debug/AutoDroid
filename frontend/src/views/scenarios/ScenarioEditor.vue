@@ -11,6 +11,7 @@ import {
 import LogConsole from '@/components/LogConsole.vue'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
+import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 
 const route = useRoute()
@@ -189,7 +190,12 @@ const saveSteps = async () => {
 
     // Create if new
     if (!targetId) {
-         const res = await api.createScenario({ name: currentScenario.value.name })
+         const createPayload = { name: currentScenario.value.name }
+         const folderId = route.query.folder_id ? Number(route.query.folder_id) : null
+         if (folderId) {
+             createPayload.folder_id = folderId
+         }
+         const res = await api.createScenario(createPayload)
          targetId = res.data.id
          await router.replace(`/ui/scenarios/${targetId}/edit`)
          ElMessage.success('场景创建成功')
@@ -517,18 +523,6 @@ const stopActiveRunPolling = () => {
 }
 
 onUnmounted(stopActiveRunPolling)
-
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
-}
 
 const isDeviceSelectable = (device) => device?.status === 'IDLE'
 

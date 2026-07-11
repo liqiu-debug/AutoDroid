@@ -127,11 +127,12 @@ class TestScenarioBase(BaseModel):
     description: Optional[str] = None
 
 class TestScenarioCreate(TestScenarioBase):
-    pass
+    folder_id: Optional[int] = None
 
 class TestScenarioRead(TestScenarioBase):
     id: int
     user_id: Optional[int] = None
+    folder_id: Optional[int] = None
     created_at: Any
     updated_at: Any = None
     step_count: int = 0
@@ -197,6 +198,10 @@ class ScheduledTaskUpdate(BaseModel):
     strategy: Optional[TaskStrategy] = None
     strategy_config: Optional[Dict[str, Any]] = None
     enable_notification: Optional[bool] = None
+
+class PaginatedScheduledTaskRead(BaseModel):
+    total: int
+    items: List[ScheduledTaskRead]
 
 class UserRead(BaseModel):
     id: int
@@ -297,6 +302,10 @@ class FastbotTaskRead(BaseModel):
 
     class Config:
         from_attributes = True
+
+class PaginatedFastbotTaskRead(BaseModel):
+    total: int
+    items: List[FastbotTaskRead]
 
 class FastbotReportRead(BaseModel):
     id: int
@@ -480,6 +489,10 @@ class StartupTaskRead(BaseModel):
 
     class Config:
         from_attributes = True
+
+class PaginatedStartupTaskRead(BaseModel):
+    total: int
+    items: List[StartupTaskRead]
 
 class DeviceStatusRead(BaseModel):
     serial: str

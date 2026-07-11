@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
+import { runStatusTagType as getStatusTagType } from '@/utils/statusMeta'
 import { useClientMode } from '@/composables/useClientMode'
 
 const route = useRoute()
@@ -63,16 +64,6 @@ const translateStepDesc = (desc) => {
     return desc
 }
 
-const getStatusTagType = (status) => {
-    const s = normalizeStatus(status)
-    if (s === 'PASS') return 'success'
-    if (s === 'WARNING') return 'warning'
-    if (s === 'SKIP') return 'info'
-    if (s === 'RUNNING') return ''
-    if (s === 'ABORTED') return 'info'
-    return 'danger'
-}
-
 const getMessageClass = (status) => {
     const s = normalizeStatus(status)
     if (s === 'WARNING') return 'warning-text'
@@ -85,6 +76,19 @@ const formatStepMessage = (row) => {
     return normalizeStatus(row.status) === 'SKIP'
         ? `跳过原因: ${row.error_message}`
         : row.error_message
+}
+
+// 结构化错误信息（错误码/修复建议）仅对失败/告警步骤展示
+const isFailedLikeStep = (row) => ['FAIL', 'WARNING'].includes(normalizeStatus(row?.status))
+
+const getStepErrorCode = (row) => {
+    if (!isFailedLikeStep(row)) return ''
+    return String(row?.report_display?.error_code || '').trim()
+}
+
+const getStepSuggestion = (row) => {
+    if (!isFailedLikeStep(row)) return ''
+    return String(row?.report_display?.suggestion || '').trim()
 }
 
 const resolvePreviewUrl = (path) => {
@@ -282,7 +286,11 @@ onMounted(() => {
                                         <strong>{{ row.display_name || row.step_name }}</strong>
                                         <el-tag :type="getStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
                                     </div>
-                                    <p v-if="row.error_message" :class="getMessageClass(row.status)">{{ formatStepMessage(row) }}</p>
+                                    <p v-if="row.error_message" :class="getMessageClass(row.status)">
+                                        <el-tag v-if="getStepErrorCode(row)" :type="getStatusTagType(row.status)" size="small" effect="plain" class="error-code-tag">{{ getStepErrorCode(row) }}</el-tag>
+                                        {{ formatStepMessage(row) }}
+                                    </p>
+                                    <p v-if="getStepSuggestion(row)" class="suggestion-text">建议：{{ getStepSuggestion(row) }}</p>
                                     <div class="mobile-step-meta">
                                         <span>{{ getDuration(row.duration) }}</span>
                                         <el-button
@@ -378,7 +386,11 @@ onMounted(() => {
                                          <el-tag v-if="normalizeStatus(row.status) === 'WARNING'" size="small" type="warning" effect="light" style="margin-left: 8px;">已忽略错误</el-tag>
                                          <el-tag v-if="normalizeStatus(row.status) === 'SKIP'" size="small" type="info" effect="light" style="margin-left: 8px;">步骤跳过</el-tag>
                                      </div>
-                                     <div v-if="row.error_message" :class="getMessageClass(row.status)">{{ formatStepMessage(row) }}</div>
+                                     <div v-if="row.error_message" :class="getMessageClass(row.status)">
+                                         <el-tag v-if="getStepErrorCode(row)" :type="getStatusTagType(row.status)" size="small" effect="plain" class="error-code-tag">{{ getStepErrorCode(row) }}</el-tag>
+                                         {{ formatStepMessage(row) }}
+                                     </div>
+                                     <div v-if="getStepSuggestion(row)" class="suggestion-text">建议：{{ getStepSuggestion(row) }}</div>
                                  </template>
                              </el-table-column>
                              
@@ -530,6 +542,18 @@ onMounted(() => {
     font-size: 12px;
     color: #909399;
     margin-top: 4px;
+}
+
+.error-code-tag {
+    margin-right: 6px;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+}
+
+.suggestion-text {
+    font-size: 12px;
+    color: #909399;
+    margin-top: 4px;
+    line-height: 1.5;
 }
 
 .screenshot-wrapper {

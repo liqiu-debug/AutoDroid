@@ -72,7 +72,59 @@ WDA 地址解析优先级：
 2. 若是 `WDA` 问题，按 5.1 修复。
 3. 若是动作/选择器问题，按执行规范补齐 iOS 覆盖。
 
-## 6. 发布建议
+## 6. MJPEG 实时画面
+
+基于 WDA 内置 MJPEG server（设备端默认端口 `9100`）提供 iOS 近实时画面流。
+
+### 6.1 端口与 relay 策略
+
+- 设备端 MJPEG 端口默认 `9100`（WDA `mjpegServerPort`）。
+- WDA URL 解析为本机（含自动 relay）时，系统通过 `tidevice relay` 将设备端
+  MJPEG 端口映射到本地 `9300-9399` 端口段，与 WDA HTTP relay（8200-8299）相互独立。
+- WDA URL 指向远端主机时，直接连接 `{远端主机}:{MJPEG端口}`，不建立本地 relay。
+- 每台设备只维持一条上游连接，多客户端共享广播；客户端全部断开或上游断开后，
+  自动关闭上游连接并回收对应 relay。
+
+### 6.2 配置项（SystemSetting）
+
+解析优先级对齐 `ios_wda_url` 风格（scoped -> map -> global -> 默认值）：
+
+| 配置 key | 说明 | 默认值 |
+| --- | --- | --- |
+| `ios_mjpeg_port.{serial}` / `ios_mjpeg_port_map`(JSON) / `ios_mjpeg_port` | 设备端 MJPEG 端口 | `9100` |
+| `ios_mjpeg_framerate.{serial}` / `ios_mjpeg_framerate` | 推流帧率（1-60） | `15` |
+| `ios_mjpeg_quality.{serial}` / `ios_mjpeg_quality` | 截图质量（1-100） | `50` |
+
+帧率/质量在新建流时通过 WDA `/appium/settings`
+（`mjpegServerFramerate` / `mjpegServerScreenshotQuality`）尽力设置，
+失败仅记录日志、不阻断推流（此时使用 WDA 端默认参数）。
+
+### 6.3 端点契约
+
+- `WS /ws/ios-mjpeg/{serial}`：每条二进制消息为一帧完整 JPEG（前端 blob -> img 渲染）。
+  - 关闭码 `4005`：WDA/MJPEG 上游不可用，reason 含 `P1005_WDA_UNAVAILABLE`；
+  - 关闭码 `4000`：内部错误；
+  - 关闭码 `1000`：上游正常结束（如 WDA 停止）。
+- `GET /api/stream/ios-mjpeg/{serial}`：`multipart/x-mixed-replace` 透传，
+  可直接用于 `<img src>`（兼容路径 `/stream/ios-mjpeg/{serial}` 等）。
+  - `503`：WDA/MJPEG 上游不可用，detail 含 `P1005_WDA_UNAVAILABLE`；
+  - `500`：内部错误。
+
+两类端点共享同一条上游连接，可混用；鉴权姿态与 `/ws/scrcpy/{serial}` 一致（无鉴权）。
+
+### 6.4 故障排查
+
+1. 建流返回 `P1005_WDA_UNAVAILABLE`：
+   - 先按 5.1 确认 WDA 本身健康（`POST /devices/{serial}/wda/check`）；
+   - 确认设备上 WDA 版本带 MJPEG server（Appium WDA 均内置，端口 9100）；
+   - 若设备端 MJPEG 端口非默认值，配置 `ios_mjpeg_port.{serial}`；
+   - 检查本地 `9300-9399` 端口段是否被占用。
+2. 连接后无画面 / 画面停止：
+   - 上游持续 15 秒无数据会被判定为 WDA 挂死并主动断开客户端，重连即可；
+   - WDA 崩溃后重启 WDA，再重新发起连接（relay 会自动重建）。
+3. 带宽/CPU 过高：调低 `ios_mjpeg_framerate` 与 `ios_mjpeg_quality`。
+
+## 7. 发布建议
 
 1. 先灰度开启 `ios_execution`，观察失败率。
 2. 监控 `WDA_DOWN` 比例与平均恢复时间。

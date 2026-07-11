@@ -12,7 +12,7 @@ class IOSDriverAppControlTests(unittest.TestCase):
         driver.scale = 3.0
         return driver
 
-    @patch("backend.drivers.ios_driver.time.sleep", return_value=None)
+    @patch("backend.drivers.ios.app_control.time.sleep", return_value=None)
     def test_start_app_fallback_to_app_launch(self, _):
         driver = self._new_driver()
         driver.client.app_activate.side_effect = RuntimeError("activate failed")
@@ -27,7 +27,7 @@ class IOSDriverAppControlTests(unittest.TestCase):
             wait_for_quiescence=False,
         )
 
-    @patch("backend.drivers.ios_driver.time.sleep", return_value=None)
+    @patch("backend.drivers.ios.app_control.time.sleep", return_value=None)
     def test_stop_app_treats_not_running_as_success(self, _):
         driver = self._new_driver()
         session = Mock()
@@ -41,7 +41,7 @@ class IOSDriverAppControlTests(unittest.TestCase):
         driver.client.app_terminate.assert_called_once_with("com.demo.mall.ios")
         session.app_terminate.assert_not_called()
 
-    @patch("backend.drivers.ios_driver.time.sleep", return_value=None)
+    @patch("backend.drivers.ios.app_control.time.sleep", return_value=None)
     def test_stop_app_raises_when_still_running(self, _):
         driver = self._new_driver()
         session = Mock()

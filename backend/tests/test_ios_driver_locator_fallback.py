@@ -320,7 +320,7 @@ class IOSDriverLocatorFallbackTests(unittest.TestCase):
         driver._decode_png_to_bgr = Mock(return_value=_FakeImage())
         driver._get_ocr_engine = Mock(return_value="ocr-engine")
 
-        with patch("backend.drivers.ios_driver.run_paddle_ocr", return_value=[("ok", 0.99)]) as mock_ocr:
+        with patch("backend.drivers.ios.vision.run_paddle_ocr", return_value=[("ok", 0.99)]) as mock_ocr:
             first = IOSDriver._get_step_ocr_result(driver, step_context=step_context, timeout=1.0)
             second = IOSDriver._get_step_ocr_result(driver, step_context=step_context, timeout=1.0)
 
@@ -343,7 +343,7 @@ class IOSDriverLocatorFallbackTests(unittest.TestCase):
         driver._decode_png_to_bgr = Mock(return_value=_FakeImage())
         driver._get_ocr_engine = Mock(return_value="ocr-engine")
 
-        with patch("backend.drivers.ios_driver.run_paddle_ocr", return_value=[("ok", 0.99)]) as mock_ocr:
+        with patch("backend.drivers.ios.vision.run_paddle_ocr", return_value=[("ok", 0.99)]) as mock_ocr:
             payload = IOSDriver._get_step_ocr_result(
                 driver,
                 step_context=step_context,
@@ -371,7 +371,7 @@ class IOSDriverLocatorFallbackTests(unittest.TestCase):
         driver._decode_png_to_bgr = Mock(return_value=_FakeImage())
         driver._get_ocr_engine = Mock(return_value="ocr-engine")
 
-        with patch("backend.drivers.ios_driver.run_paddle_ocr", return_value=[("ok", 0.99)]) as mock_ocr:
+        with patch("backend.drivers.ios.vision.run_paddle_ocr", return_value=[("ok", 0.99)]) as mock_ocr:
             payload = IOSDriver._get_step_ocr_result(
                 driver,
                 step_context=step_context,
@@ -484,7 +484,7 @@ class IOSDriverLocatorFallbackTests(unittest.TestCase):
         driver._tap_alert_button = Mock(return_value=False)
         driver._tap_by_ocr_text = Mock(return_value=True)
 
-        with patch("backend.drivers.ios_driver.time.time", side_effect=clock.time):
+        with patch("backend.drivers.ios.locator.time.time", side_effect=clock.time):
             IOSDriver.click_with_fallback_plan(
                 driver,
                 [{"selector": "确定", "by": "id"}],

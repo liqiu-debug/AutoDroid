@@ -45,13 +45,12 @@ AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 ```mermaid
 flowchart TD
     A["Vue3 前端<br/>Case/Scenario/Device/Task/Report/Dashboard"] -->|"HTTP + WebSocket"| B["FastAPI 后端"]
-    B --> C["步骤模型层<br/>legacy + standard"]
-    C --> D1["Legacy Runner<br/>Android uiautomator2"]
-    C --> D2["Cross-Platform Runner<br/>Android/iOS"]
+    B --> C["标准步骤模型层<br/>TestCaseStep（legacy JSON 自动回填）"]
+    C --> D2["Cross-Platform Runner<br/>Android/iOS 统一执行链路"]
     D2 --> E1["AndroidDriver<br/>uiautomator2"]
     D2 --> E2["IOSDriver<br/>facebook-wda + tidevice"]
     B --> F["设备中心<br/>ADB + tidevice + WDA relay"]
-    B --> G["Scrcpy 流媒体<br/>H.264 WebSocket"]
+    B --> G["流媒体<br/>Scrcpy H.264 / iOS MJPEG"]
     B --> H["调度与通知<br/>APScheduler + Feishu"]
     B --> I["报告与大盘<br/>SQLite + HTML Report + Dashboard API"]
 ```
@@ -78,20 +77,17 @@ flowchart TD
 
 ## 5. 核心实现机制（深度）
 
-### 5.1 双执行架构并存与灰度开关
+### 5.1 统一执行链路与 Feature Flags
 
-项目同时保留两套执行链路：
+执行统一走标准跨端链路 `backend/drivers/cross_platform_runner.py`（原 legacy `backend/runner.py` 已删除，`cross_platform_runner` 开关随之移除）。执行必须显式指定设备。
 
-- Legacy（Android 传统链路）：`backend/runner.py`（`TestRunner` / `ScenarioRunner`）
-- Cross-Platform（标准跨端链路）：`backend/drivers/cross_platform_runner.py`
+Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAULTS`，`SystemSetting` 可覆盖）：
 
-通过 Feature Flags 控制灰度：
+- `new_step_model`：标准步骤模型读写（默认开启，DB 显式 `false` 可临时回退）
+- `ios_execution`：是否允许 iOS 执行（默认关闭）
+- `ws_disconnect_abort`：执行 WebSocket 断开即中止（默认关闭）
 
-- `new_step_model`：启用标准步骤模型读写
-- `cross_platform_runner`：执行入口切换到跨端 Runner
-- `ios_execution`：是否允许 iOS 执行
-
-对应实现：`backend/feature_flags.py`，读取 `SystemSetting` 动态生效。
+存量 `TestCase.steps`（legacy JSON）会在每次启动时幂等回填到 `TestCaseStep` 标准表（`backend/database.py::backfill_case_steps_to_standard`，单条失败跳过不阻塞启动）。
 
 ### 5.2 标准步骤模型与 legacy 兼容迁移
 
@@ -155,7 +151,7 @@ flowchart TD
 - `CONTINUE`：标记失败但继续后续步骤/用例
 - `IGNORE`：失败降级为 warning，继续执行
 
-该语义在 legacy 与 cross-platform 执行链路中均保持一致。
+该语义在跨端执行链路中统一实现。
 
 ### 5.6 预检体系与错误码
 
@@ -397,8 +393,8 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
 建议按以下顺序灰度上线：
 
-1. 开启 `new_step_model`：先完成步骤模型双轨稳定。  
-2. 开启 `cross_platform_runner`：先在 Android 小流量验证跨端链路。  
+1. `new_step_model` 默认开启，legacy 步骤在启动时自动回填标准表；如需临时回退可在 `SystemSetting` 显式写 `false`。  
+2. 跨端 Runner 已是唯一执行链路（原 `cross_platform_runner` 开关已移除），关注执行必须选择设备的交互变化。  
 3. 开启 `ios_execution`：WDA 运维稳定后逐步引入 iOS 执行。  
 
 配套监控建议：

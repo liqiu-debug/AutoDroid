@@ -13,6 +13,13 @@ class CaseFolder(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
+class ScenarioFolder(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    parent_id: Optional[int] = Field(default=None, foreign_key="scenariofolder.id")
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     username: str = Field(index=True, unique=True)
@@ -56,6 +63,7 @@ class TestScenario(SQLModel, table=True):
     updater_id: Optional[int] = Field(default=None, foreign_key="user.id")
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
+    folder_id: Optional[int] = Field(default=None, foreign_key="scenariofolder.id")
     
     # Statistics
     step_count: int = Field(default=0)

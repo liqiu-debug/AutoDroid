@@ -1,6 +1,6 @@
 import unittest
 
-from backend.api.scenarios import (
+from backend.scenario_results import (
     _build_scenario_summary_message,
     _determine_case_status,
     _find_last_failed_step_name,

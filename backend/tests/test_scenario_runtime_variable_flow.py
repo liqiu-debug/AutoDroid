@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from sqlmodel import SQLModel, Session, create_engine
 
-from backend.api.scenarios import _run_scenario_cross_platform
+from backend.scenario_execution import _run_scenario_cross_platform
 from backend.models import ScenarioStep, TestCase, TestScenario
 
 
@@ -64,7 +64,7 @@ class ScenarioRuntimeVariableFlowTests(unittest.TestCase):
                 "exported_variables": dict(variables_map or {}),
             }
 
-        with patch("backend.api.scenarios.run_case_with_standard_runner", side_effect=_fake_run_case):
+        with patch("backend.scenario_execution.run_case_with_standard_runner", side_effect=_fake_run_case):
             result = _run_scenario_cross_platform(
                 scenario_id=scenario.id,
                 session=self.session,

@@ -10,6 +10,7 @@ import { useCaseStore } from '@/stores/useCaseStore'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
+import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import api from '@/api'
 
 const route = useRoute()
@@ -302,18 +303,6 @@ const handleRequestImageCrop = (step) => {
   if (deviceStageRef.value?.startImageCrop) {
     deviceStageRef.value.startImageCrop(step)
   }
-}
-
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
 }
 
 const connectedRunDevices = computed(() => deviceStageRef.value?.connectedDevices || [])

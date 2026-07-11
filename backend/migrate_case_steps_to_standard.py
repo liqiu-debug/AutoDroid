@@ -1,5 +1,9 @@
 """One-off migration tool: testcase.steps -> testcasestep rows.
 
+The same backfill also runs automatically (idempotently) on app startup via
+`backend.database.create_db_and_tables`. This CLI stays for manual runs and
+for `--force` rebuilds.
+
 Usage:
   python -m backend.migrate_case_steps_to_standard
   python -m backend.migrate_case_steps_to_standard --force
@@ -8,67 +12,17 @@ from __future__ import annotations
 
 import argparse
 
-from sqlmodel import Session, select
+from sqlmodel import Session
 
-from backend.database import engine
-from backend.models import TestCase, TestCaseStep
-from backend.step_contract import build_standard_from_legacy_steps
+from backend.database import backfill_case_steps_to_standard, engine
 
 
-def migrate(force: bool = False) -> None:
-    migrated_cases = 0
-    skipped_cases = 0
-    created_steps = 0
-
+def migrate(force: bool = False) -> dict:
     with Session(engine) as session:
-        cases = session.exec(select(TestCase)).all()
+        summary = backfill_case_steps_to_standard(session, force=force)
 
-        for case in cases:
-            legacy_steps = list(case.steps or [])
-            existing = session.exec(
-                select(TestCaseStep).where(TestCaseStep.case_id == case.id)
-            ).all()
-
-            if existing and not force:
-                skipped_cases += 1
-                continue
-
-            if existing and force:
-                for row in existing:
-                    session.delete(row)
-                session.flush()
-
-            payload = build_standard_from_legacy_steps(legacy_steps, case_id=case.id)
-            for item in payload:
-                session.add(
-                    TestCaseStep(
-                        case_id=case.id,
-                        order=item["order"],
-                        action=item["action"],
-                        args=item.get("args") or {},
-                        value=item.get("value"),
-                        execute_on=item.get("execute_on") or ["android", "ios"],
-                        platform_overrides=item.get("platform_overrides") or {},
-                        timeout=item.get("timeout", 10),
-                        error_strategy=item.get("error_strategy", "ABORT"),
-                        description=item.get("description"),
-                    )
-                )
-
-            migrated_cases += 1
-            created_steps += len(payload)
-
-        session.commit()
-
-    print(
-        "migration finished:",
-        {
-            "migrated_cases": migrated_cases,
-            "skipped_cases": skipped_cases,
-            "created_steps": created_steps,
-            "force": force,
-        },
-    )
+    print("migration finished:", summary)
+    return summary
 
 
 def main() -> None:

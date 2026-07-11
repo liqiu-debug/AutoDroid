@@ -5,6 +5,7 @@ import { ArrowLeft, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { runStatusTagType } from '@/utils/statusMeta'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,13 +25,7 @@ const hasRunningRun = computed(() => {
 
 const formatTime = (value) => value ? dayjs(value).format('MM-DD HH:mm:ss') : '-'
 const statusText = (status) => String(status || 'PENDING').toUpperCase()
-const statusType = (status) => {
-  const value = statusText(status)
-  if (value === 'PASS' || value === 'COMPLETED') return 'success'
-  if (value === 'WARNING' || value === 'RUNNING') return 'warning'
-  if (['FAIL', 'ERROR', 'ABORTED'].includes(value)) return 'danger'
-  return 'info'
-}
+const statusType = (status) => runStatusTagType(statusText(status))
 const metricLabels = {
   pixel_diff_ratio: '像素差异比例',
   ssim: '结构相似度',

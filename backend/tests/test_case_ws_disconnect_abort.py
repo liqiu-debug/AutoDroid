@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import WebSocketDisconnect
 from sqlmodel import Session, SQLModel, create_engine
 
-from backend import main
+from backend.api import ws_run
 from backend.models import Device, TestCase
 from backend.run_control import ABORTED_STATUS
 
@@ -21,25 +21,30 @@ class _DisconnectingWebSocket:
         raise WebSocketDisconnect(code=1001)
 
 
-class _FakeLegacyRunner:
-    def __init__(self, device_serial=None):
-        self.device_serial = device_serial
-        self.d = object()
+class _FakeCrossPlatformRunner:
+    run_step_calls = 0
 
-    def connect(self):
-        return None
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
 
-    def execute_step(self, step, variables):
+    def run_step(self, step):
+        type(self).run_step_calls += 1
         return {
-            "success": True,
+            "status": "PASS",
+            "error_strategy": "ABORT",
             "duration": 0.01,
+            "artifacts": {},
         }
+
+    def disconnect(self):
+        return None
 
 
 class CaseWebSocketDisconnectAbortTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
         SQLModel.metadata.create_all(self.engine)
+        _FakeCrossPlatformRunner.run_step_calls = 0
 
         with Session(self.engine) as session:
             case = TestCase(
@@ -75,24 +80,26 @@ class CaseWebSocketDisconnectAbortTests(unittest.IsolatedAsyncioTestCase):
             return func(*args, **kwargs)
 
         def fake_flag(session, key, default=False):
-            if key == main.FLAG_WS_DISCONNECT_ABORT:
+            if key == ws_run.FLAG_WS_DISCONNECT_ABORT:
                 return disconnect_abort_enabled
-            return False  # 其余 flag 关闭，走 legacy 执行路径
+            return False
 
-        with patch.object(main, "engine", self.engine), \
-             patch.object(main, "is_flag_enabled", side_effect=fake_flag), \
-             patch.object(main, "TestRunner", _FakeLegacyRunner), \
-             patch.object(main, "register_device_abort", return_value=abort_event), \
-             patch.object(main, "unregister_device_abort"), \
-             patch.object(main, "restore_device_status_after_execution"), \
-             patch.object(main, "_run_in_blocking_executor", side_effect=fake_run_in_blocking_executor), \
-             patch.object(main.report_generator, "generate_report", return_value="report-1"), \
-             patch.object(main.manager, "connect", new=AsyncMock()), \
-             patch.object(main.manager, "broadcast_run_start", new=AsyncMock()), \
-             patch.object(main.manager, "broadcast_step_update", new=AsyncMock()), \
-             patch.object(main.manager, "broadcast_run_complete", new=AsyncMock()), \
-             patch.object(main.manager, "disconnect"):
-            await main.websocket_run_case(
+        with patch.object(ws_run, "engine", self.engine), \
+             patch.object(ws_run, "is_flag_enabled", side_effect=fake_flag), \
+             patch.object(ws_run, "resolve_device_platform", return_value="android"), \
+             patch.object(ws_run, "prepare_case_steps_for_platform", return_value=([{"action": "click", "description": "点击登录", "error_strategy": "ABORT", "timeout": 10}], {})), \
+             patch.object(ws_run, "CrossPlatformRunner", _FakeCrossPlatformRunner), \
+             patch.object(ws_run, "register_device_abort", return_value=abort_event), \
+             patch.object(ws_run, "unregister_device_abort"), \
+             patch.object(ws_run, "restore_device_status_after_execution"), \
+             patch.object(ws_run, "_run_in_blocking_executor", side_effect=fake_run_in_blocking_executor), \
+             patch.object(ws_run.report_generator, "generate_report", return_value="report-1"), \
+             patch.object(ws_run.manager, "connect", new=AsyncMock()), \
+             patch.object(ws_run.manager, "broadcast_run_start", new=AsyncMock()), \
+             patch.object(ws_run.manager, "broadcast_step_update", new=AsyncMock()), \
+             patch.object(ws_run.manager, "broadcast_run_complete", new=AsyncMock()), \
+             patch.object(ws_run.manager, "disconnect"):
+            await ws_run.websocket_run_case(
                 websocket,
                 self.case_id,
                 env_id=None,
@@ -107,7 +114,8 @@ class CaseWebSocketDisconnectAbortTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(abort_event.is_set())
-        self.assertNotIn("execute_step", call_names)
+        self.assertNotIn("run_step", call_names)
+        self.assertEqual(_FakeCrossPlatformRunner.run_step_calls, 0)
 
         with Session(self.engine) as session:
             case = session.get(TestCase, self.case_id)
@@ -119,7 +127,8 @@ class CaseWebSocketDisconnectAbortTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(abort_event.is_set())
-        self.assertIn("execute_step", call_names)
+        self.assertIn("run_step", call_names)
+        self.assertEqual(_FakeCrossPlatformRunner.run_step_calls, 1)
 
         with Session(self.engine) as session:
             case = session.get(TestCase, self.case_id)

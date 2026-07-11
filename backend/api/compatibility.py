@@ -11,9 +11,10 @@ import threading
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from sqlalchemy import or_
 from sqlmodel import Session, select, func, col
 
 from backend.api import deps
@@ -987,13 +988,39 @@ def delete_page_set(
 @router.get("/runs", response_model=PaginatedCompatibilityRunRead)
 def list_runs(
     skip: int = 0,
-    limit: int = Query(20, ge=1, le=100),
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    keyword: Optional[str] = None,
+    status: Optional[str] = None,
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
-    total = session.exec(select(func.count()).select_from(select(CompatibilityRun).subquery())).one()
+    """分页获取兼容性任务，keyword 匹配任务名/包名，status 支持 pass/warning/fail/running/all"""
+    conditions = []
+    if keyword:
+        conditions.append(
+            or_(
+                col(CompatibilityRun.name).contains(keyword),
+                col(CompatibilityRun.package_name).contains(keyword),
+            )
+        )
+    normalized_status = str(status or "").strip().upper()
+    if normalized_status and normalized_status != "ALL":
+        if normalized_status == "RUNNING":
+            conditions.append(col(CompatibilityRun.status).in_(["RUNNING", "PENDING"]))
+        elif normalized_status == "FAIL":
+            conditions.append(col(CompatibilityRun.status).in_(["FAIL", "ERROR"]))
+        else:
+            conditions.append(CompatibilityRun.status == normalized_status)
+
+    count_query = select(func.count(col(CompatibilityRun.id)))
+    query = select(CompatibilityRun)
+    for condition in conditions:
+        count_query = count_query.where(condition)
+        query = query.where(condition)
+
+    total = session.exec(count_query).one()
     rows = session.exec(
-        select(CompatibilityRun)
+        query
         .order_by(col(CompatibilityRun.created_at).desc())
         .offset(skip)
         .limit(limit)

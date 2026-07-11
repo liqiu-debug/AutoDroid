@@ -1,15 +1,22 @@
 <script setup>
 /**
  * ScrcpyPlayer - Scrcpy H.264 视频流播放器组件
- * 
- * 通过 WebSocket 接收 H.264 原始流，使用 jmuxer 解码后在 <video> 标签中播放。
+ *
+ * 通过 WebSocket 接收裸 Annex-B H.264 流并解码渲染：
+ * - 主路径：WebCodecs VideoDecoder 逐帧解码后绘制到 <canvas>（低延迟，
+ *   拥塞恢复由后端 SPS/PPS→IDR 原子播种保证，对码流不连续天然鲁棒）；
+ * - 降级路径：jmuxer + MSE 在 <video> 播放（浏览器不支持 WebCodecs、
+ *   目标 codec 不受支持、连续解码失败，或通过 URL query / localStorage
+ *   `scrcpyDecoder=jmuxer` 强制指定时启用）。
  * 支持点击触控事件转发、元素悬浮高亮、测试步骤录制。
  */
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import JMuxer from 'jmuxer'
+import { ElMessage } from 'element-plus'
 import { VideoPlay, VideoPause, Refresh, Loading } from '@element-plus/icons-vue'
 import api from '@/api'
 import { findBestRecordableNode } from '@/utils/recordableNode'
+import { useWebCodecsDecoder, isWebCodecsSupported } from '@/composables/useWebCodecsDecoder'
 
 const props = defineProps({
   /** 设备序列号 */
@@ -49,6 +56,7 @@ const emit = defineEmits(['touch', 'error', 'connected', 'disconnected'])
 // ==================== 响应式状态 ====================
 
 const videoRef = ref(null)
+const canvasRef = ref(null)
 const playerContentRef = ref(null)
 const status = ref('disconnected')
 const errorMsg = ref('')
@@ -58,11 +66,42 @@ const LIVE_EDGE_CHECK_INTERVAL_MS = 1000
 const LIVE_EDGE_MAX_LAG_SECONDS = 0.8
 const LIVE_EDGE_SEEK_OFFSET_SECONDS = 0.1
 
+const DECODER_WEBCODECS = 'webcodecs'
+const DECODER_JMUXER = 'jmuxer'
+/** 当前连接使用的解码路径（决定 <canvas> 与 <video> 哪个为活动渲染面） */
+const activeDecoder = ref(DECODER_JMUXER)
+
 let jmuxer = null
+let webcodecs = null
 let ws = null
 let frameCount = 0
 let fpsTimer = null
 let liveEdgeTimer = null
+/** WebCodecs 运行期降级标记（连续解码失败 / codec 不支持后置位，切换设备时重置） */
+let runtimeFallbackToJmuxer = false
+
+// ==================== 解码路径选择 ====================
+
+/**
+ * 读取强制解码器配置（调试用）：URL query 优先于 localStorage，键均为 scrcpyDecoder。
+ * 仅 'jmuxer' 有强制语义；其余值走自动检测。
+ */
+function resolveForcedDecoder() {
+  try {
+    const fromQuery = new URLSearchParams(window.location.search).get('scrcpyDecoder')
+    if (fromQuery) return fromQuery
+    return window.localStorage?.getItem('scrcpyDecoder') || ''
+  } catch {
+    return ''
+  }
+}
+
+function pickDecoder() {
+  if (resolveForcedDecoder() === DECODER_JMUXER) return DECODER_JMUXER
+  if (runtimeFallbackToJmuxer) return DECODER_JMUXER
+  if (!isWebCodecsSupported()) return DECODER_JMUXER
+  return DECODER_WEBCODECS
+}
 
 // ==================== 状态计算 ====================
 
@@ -87,15 +126,31 @@ const statusType = computed(() => {
 
 // ==================== 坐标映射 ====================
 
+/** 当前活动渲染面：WebCodecs 路径为 <canvas>，jmuxer 路径为 <video> */
+function getActiveSurface() {
+  return activeDecoder.value === DECODER_WEBCODECS ? canvasRef.value : videoRef.value
+}
+
+/** 读取渲染面的内在像素尺寸（video 为 videoWidth/Height，canvas 为 width/height 属性） */
+function getSurfaceIntrinsicSize(surface) {
+  if (!surface) return null
+  const isVideo = surface.tagName === 'VIDEO'
+  const width = isVideo ? surface.videoWidth : surface.width
+  const height = isVideo ? surface.videoHeight : surface.height
+  if (!width || !height) return null
+  return { width, height }
+}
+
 /**
- * 计算视频在容器中的实际渲染区域（处理 object-fit: contain 的黑边）
+ * 计算画面在容器中的实际渲染区域（处理 object-fit: contain 的黑边）
  */
 function getVideoRenderArea() {
-  const video = videoRef.value
-  if (!video || !video.videoWidth || !video.videoHeight) return null
+  const surface = getActiveSurface()
+  const intrinsic = getSurfaceIntrinsicSize(surface)
+  if (!intrinsic) return null
 
-  const rect = video.getBoundingClientRect()
-  const videoAspect = video.videoWidth / video.videoHeight
+  const rect = surface.getBoundingClientRect()
+  const videoAspect = intrinsic.width / intrinsic.height
   const containerAspect = rect.width / rect.height
 
   let renderWidth, renderHeight, offsetX, offsetY
@@ -132,12 +187,7 @@ function getCoordinateSpace() {
     return { width: maxX, height: maxY }
   }
 
-  const video = videoRef.value
-  if (video?.videoWidth && video?.videoHeight) {
-    return { width: video.videoWidth, height: video.videoHeight }
-  }
-
-  return null
+  return getSurfaceIntrinsicSize(getActiveSurface())
 }
 
 /**
@@ -188,7 +238,7 @@ function onMouseLeave() {
 }
 
 const overlayStyle = computed(() => {
-  if (!hoveredNode.value || !videoRef.value) return { display: 'none' }
+  if (!hoveredNode.value || !getActiveSurface()) return { display: 'none' }
 
   const area = getVideoRenderArea()
   const target = getCoordinateSpace()
@@ -224,19 +274,45 @@ const overlayStyle = computed(() => {
 
 // ==================== 连接管理 ====================
 
+/**
+ * WebCodecs 管线不可恢复（codec 不支持 / 连续解码失败）时降级：
+ * 置位运行期标记并整体重连。后端对新客户端原子播种 SPS/PPS→IDR，
+ * 因此重连后 jmuxer 能拿到干净的起始序列，无需在旧流中间拼接。
+ */
+function handleWebCodecsFallback(reason) {
+  if (activeDecoder.value !== DECODER_WEBCODECS) return
+  runtimeFallbackToJmuxer = true
+  console.warn(`WebCodecs 解码不可用（${reason}），已降级为 jmuxer 兼容模式`)
+  ElMessage.warning('硬件解码不可用，已切换至兼容播放模式')
+  reconnect()
+}
+
 function connect() {
   if (ws) disconnect()
 
   status.value = 'connecting'
   errorMsg.value = ''
+  activeDecoder.value = pickDecoder()
 
-  jmuxer = new JMuxer({
-    node: videoRef.value,
-    mode: 'video',
-    flushingTime: 100,
-    fps: 60,
-    debug: false
-  })
+  if (activeDecoder.value === DECODER_WEBCODECS) {
+    webcodecs = useWebCodecsDecoder({
+      canvas: canvasRef.value,
+      fpsHint: 60,
+      debug: import.meta.env.DEV,
+      onFrameDecoded: () => {
+        frameCount++
+      },
+      onFallback: handleWebCodecsFallback
+    })
+  } else {
+    jmuxer = new JMuxer({
+      node: videoRef.value,
+      mode: 'video',
+      flushingTime: 100,
+      fps: 60,
+      debug: false
+    })
+  }
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${wsProtocol}//${window.location.host}/ws/scrcpy/${props.serial}`
@@ -248,14 +324,20 @@ function connect() {
     status.value = 'connected'
     emit('connected')
     startFpsCounter()
-    startLiveEdgeSync()
+    // 追赶实时边界仅对 MSE 缓冲播放有意义；WebCodecs 路径逐帧直绘，天然贴近实时
+    if (activeDecoder.value === DECODER_JMUXER) {
+      startLiveEdgeSync()
+    }
   }
 
   ws.onmessage = (event) => {
-    if (jmuxer && event.data) {
-      jmuxer.feed({
-        video: new Uint8Array(event.data)
-      })
+    if (!event.data) return
+    const bytes = new Uint8Array(event.data)
+    if (webcodecs) {
+      // FPS 计数由解码输出回调驱动（onFrameDecoded）
+      webcodecs.push(bytes)
+    } else if (jmuxer) {
+      jmuxer.feed({ video: bytes })
       frameCount++
     }
   }
@@ -287,6 +369,10 @@ function disconnect() {
     ws.onclose = null
     ws.close()
     ws = null
+  }
+  if (webcodecs) {
+    webcodecs.destroy()
+    webcodecs = null
   }
   if (jmuxer) {
     jmuxer.destroy()
@@ -385,6 +471,8 @@ onUnmounted(() => {
 
 watch(() => props.serial, (newSerial) => {
   if (newSerial) {
+    // 切换设备时重置运行期降级标记：新码流重新走自动检测
+    runtimeFallbackToJmuxer = false
     reconnect()
   } else {
     disconnect()
@@ -438,12 +526,22 @@ watch(() => props.serial, (newSerial) => {
       @mouseleave="onMouseLeave"
     >
       <video
+        v-show="activeDecoder === DECODER_JMUXER"
         ref="videoRef"
         autoplay
         muted
         playsinline
         class="scrcpy-video"
       ></video>
+
+      <!-- WebCodecs 主路径渲染画布：与 <video> 共用 .scrcpy-video 尺寸/object-fit 行为 -->
+      <canvas
+        v-show="activeDecoder === DECODER_WEBCODECS"
+        ref="canvasRef"
+        class="scrcpy-video"
+        width="0"
+        height="0"
+      ></canvas>
 
       <!-- 元素高亮框 -->
       <div class="hover-overlay" :style="overlayStyle"></div>

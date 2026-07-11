@@ -29,7 +29,10 @@
           <template v-else-if="log.status === 'failed'">✗</template>
           <template v-else>📌</template>
         </span>
-        <span class="log-text">{{ log.log }}</span>
+        <span class="log-text">
+          {{ log.log }}
+          <span v-if="log.suggestion" class="log-suggestion">建议: {{ log.suggestion }}</span>
+        </span>
       </div>
     </div>
     
@@ -121,9 +124,11 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
         timestamp: data.timestamp,
         status: data.status,
         log: data.log,
-        stepIndex: data.step_index
+        stepIndex: data.step_index,
+        errorCode: data.error_code,
+        suggestion: data.suggestion
       })
-      
+
       emit('stepUpdate', data)
       scrollToBottom()
     }
@@ -358,6 +363,13 @@ onUnmounted(() => {
 .log-text {
   color: #606266;
   word-break: break-all;
+}
+
+.log-suggestion {
+  display: block;
+  color: #909399;
+  font-size: 11px;
+  margin-top: 2px;
 }
 
 .log-item.failed .log-text {

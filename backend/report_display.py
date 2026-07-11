@@ -5,6 +5,7 @@ import base64
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from backend.execution_errors import suggestion_for
 from backend.paths import project_path
 from backend.step_contract import ACTION_DISPLAY_NAMES
 from backend.utils.pydantic_compat import dump_model
@@ -216,6 +217,22 @@ def _build_preview(
         display["preview_base64"] = preview_base64
 
 
+def _merge_error_fields(display: Dict[str, Any], step: Dict[str, Any]) -> None:
+    """并入结构化错误信息（error_code/suggestion，纯增量字段）。
+
+    步骤载荷可携带执行期错误码与修复建议（见 cross_platform_runner._result）；
+    仅缺 suggestion 时按错误码回填默认建议，便于报告/前端统一渲染。
+    """
+    error_code = _clean_text(step.get("error_code"))
+    suggestion = _clean_text(step.get("suggestion"))
+    if error_code:
+        display["error_code"] = error_code
+        if not suggestion:
+            suggestion = suggestion_for(error_code)
+    if suggestion:
+        display["suggestion"] = suggestion
+
+
 def build_report_display(
     step: Any,
     *,
@@ -234,6 +251,7 @@ def build_report_display(
         "action_label": action_label,
         "has_custom_description": bool(description),
     }
+    _merge_error_fields(display, step_data)
 
     if description:
         return display

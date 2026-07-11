@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose } from '@element-plus/icons-vue'
 import api from '@/api'
 import { useClientMode } from '@/composables/useClientMode'
+import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 
 const { isMobileMode } = useClientMode()
 
@@ -229,18 +230,6 @@ const stopAutoRefresh = () => {
   if (!autoRefreshTimer.value) return
   clearInterval(autoRefreshTimer.value)
   autoRefreshTimer.value = null
-}
-
-/** 状态标签类型映射 */
-const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
-  return map[status] || 'info'
-}
-
-/** 状态中文映射 */
-const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
-  return map[status] || status
 }
 
 // ==================== 生命周期 ====================

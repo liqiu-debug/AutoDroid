@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from backend.fastbot_runner import (
+from backend.fastbot.startup import (
     _compute_startup_aggregate,
     _parse_am_start_output,
     _parse_duration_token_to_ms,
@@ -90,11 +90,11 @@ class StartupRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "returncode": 0,
             }
 
-        with patch("backend.fastbot_runner._build_fastbot_report_dir", return_value=tempfile.gettempdir()), \
-            patch("backend.fastbot_runner._adb_shell", new=AsyncMock(side_effect=fake_shell)), \
-            patch("backend.fastbot_runner._adb_shell_result", new=AsyncMock(side_effect=fake_shell_result)), \
-            patch("backend.fastbot_runner._capture_logcat_snapshot", new=AsyncMock(return_value="")), \
-            patch("backend.fastbot_runner._wait_for_startup_ready", new=AsyncMock(return_value={"status": "DISABLED", "error": ""})):
+        with patch("backend.fastbot.startup._build_fastbot_report_dir", return_value=tempfile.gettempdir()), \
+            patch("backend.fastbot.startup._adb_shell", new=AsyncMock(side_effect=fake_shell)), \
+            patch("backend.fastbot.startup._adb_shell_result", new=AsyncMock(side_effect=fake_shell_result)), \
+            patch("backend.fastbot.startup._capture_logcat_snapshot", new=AsyncMock(return_value="")), \
+            patch("backend.fastbot.startup._wait_for_startup_ready", new=AsyncMock(return_value={"status": "DISABLED", "error": ""})):
             result = await run_startup_task(
                 "device-1",
                 "com.example",
@@ -125,11 +125,11 @@ class StartupRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "returncode": 0,
             }
 
-        with patch("backend.fastbot_runner._build_fastbot_report_dir", return_value=tempfile.gettempdir()), \
-            patch("backend.fastbot_runner._adb_shell", new=AsyncMock(side_effect=fake_shell)), \
-            patch("backend.fastbot_runner._adb_shell_result", new=AsyncMock(side_effect=fake_shell_result)), \
-            patch("backend.fastbot_runner._capture_logcat_snapshot", new=AsyncMock(return_value="")), \
-            patch("backend.fastbot_runner._wait_for_startup_ready", new=AsyncMock(return_value={"status": "DISABLED", "error": ""})):
+        with patch("backend.fastbot.startup._build_fastbot_report_dir", return_value=tempfile.gettempdir()), \
+            patch("backend.fastbot.startup._adb_shell", new=AsyncMock(side_effect=fake_shell)), \
+            patch("backend.fastbot.startup._adb_shell_result", new=AsyncMock(side_effect=fake_shell_result)), \
+            patch("backend.fastbot.startup._capture_logcat_snapshot", new=AsyncMock(return_value="")), \
+            patch("backend.fastbot.startup._wait_for_startup_ready", new=AsyncMock(return_value={"status": "DISABLED", "error": ""})):
             await run_startup_task(
                 "device-1",
                 "com.example",
@@ -151,13 +151,13 @@ class StartupRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "returncode": 0,
             }
 
-        with patch("backend.fastbot_runner._build_fastbot_report_dir", return_value=tempfile.gettempdir()), \
-            patch("backend.fastbot_runner._adb_shell", new=AsyncMock(return_value="")), \
-            patch("backend.fastbot_runner._adb_shell_result", new=AsyncMock(side_effect=fake_shell_result)), \
-            patch("backend.fastbot_runner._capture_logcat_snapshot", new=AsyncMock(return_value="")), \
-            patch("backend.fastbot_runner._wait_for_startup_ready", new=AsyncMock(return_value={"status": "DISABLED", "error": ""})), \
+        with patch("backend.fastbot.startup._build_fastbot_report_dir", return_value=tempfile.gettempdir()), \
+            patch("backend.fastbot.startup._adb_shell", new=AsyncMock(return_value="")), \
+            patch("backend.fastbot.startup._adb_shell_result", new=AsyncMock(side_effect=fake_shell_result)), \
+            patch("backend.fastbot.startup._capture_logcat_snapshot", new=AsyncMock(return_value="")), \
+            patch("backend.fastbot.startup._wait_for_startup_ready", new=AsyncMock(return_value={"status": "DISABLED", "error": ""})), \
             patch(
-                "backend.fastbot_runner._capture_startup_perfetto_trace",
+                "backend.fastbot.startup._capture_startup_perfetto_trace",
                 new=AsyncMock(return_value={
                     "mode": "cold",
                     "trace_exported": True,

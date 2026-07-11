@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from backend.api.scenarios import _convert_cross_result_to_legacy_case_result
+from backend.scenario_results import _convert_cross_result_to_legacy_case_result
 
 
 class ScenarioCrossResultConversionTests(unittest.TestCase):
