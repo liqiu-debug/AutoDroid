@@ -233,6 +233,16 @@ def _merge_error_fields(display: Dict[str, Any], step: Dict[str, Any]) -> None:
         display["suggestion"] = suggestion
 
 
+def _merge_attempts_field(display: Dict[str, Any], step: Dict[str, Any]) -> None:
+    """attempts>1（发生过失败重试）时并入 report_display（纯增量字段，供 Flaky 统计）。"""
+    try:
+        attempts = int(step.get("attempts") or 0)
+    except Exception:
+        return
+    if attempts > 1:
+        display["attempts"] = attempts
+
+
 def build_report_display(
     step: Any,
     *,
@@ -252,6 +262,7 @@ def build_report_display(
         "has_custom_description": bool(description),
     }
     _merge_error_fields(display, step_data)
+    _merge_attempts_field(display, step_data)
 
     if description:
         return display
