@@ -13,9 +13,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-RUNNING_STATUSES = {"RUNNING", "PENDING"}
+RUNNING_STATUSES = {"RUNNING", "PENDING", "QUEUED"}
 TERMINAL_STATUSES = {"PASS", "WARNING", "FAIL", "ERROR", "ABORTED"}
 ABORTED_STATUS = "ABORTED"
+QUEUED_STATUS = "QUEUED"
 
 
 # ============ 全局设备中止注册表 ============
@@ -24,10 +25,15 @@ _device_abort_events: Dict[str, threading.Event] = {}
 _abort_lock = threading.Lock()
 
 
-def register_device_abort(serial: str) -> threading.Event:
-    """注册设备中止事件，返回 Event 给 runner 监听"""
+def register_device_abort(serial: str, event: Optional[threading.Event] = None) -> threading.Event:
+    """注册设备中止事件，返回 Event 给 runner 监听。
+
+    可传入已有 event（排队任务获得槽位后把排队期的中止事件安装到设备上），
+    避免排队期与执行期使用两个不同的事件。
+    """
     with _abort_lock:
-        event = threading.Event()
+        if event is None:
+            event = threading.Event()
         _device_abort_events[serial] = event
         return event
 
@@ -104,6 +110,7 @@ class RunRegistry:
         run_id: Optional[str] = None,
         execution_id: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        status: str = "RUNNING",
     ) -> RunRecord:
         normalized_kind = str(kind or "").strip().lower()
         if normalized_kind not in {"case", "scenario"}:
@@ -117,11 +124,22 @@ class RunRegistry:
             device_serial=str(device_serial).strip() if device_serial else None,
             abort_event=abort_event or threading.Event(),
             execution_id=execution_id,
+            status=str(status or "RUNNING").upper(),
             metadata=dict(metadata or {}),
         )
         with self._lock:
             self._runs[record.run_id] = record
         return record
+
+    def update_status(self, run_id: Optional[str], status: str) -> Optional[RunRecord]:
+        """更新活跃 run 的状态（例如 QUEUED -> RUNNING）。"""
+        if not run_id or not status:
+            return None
+        with self._lock:
+            record = self._runs.get(str(run_id))
+            if record:
+                record.status = str(status).upper()
+            return record
 
     def complete(self, run_id: Optional[str], status: Optional[str] = None) -> None:
         if not run_id:
@@ -172,13 +190,17 @@ class RunRegistry:
             device_serials=device_serials,
         )
         now = datetime.now()
+        running_serials = set()
         for record in records:
+            was_queued = record.status == QUEUED_STATUS
             record.status = ABORTED_STATUS
             record.cancel_requested_at = now
             record.abort_event.set()
+            # 排队中的任务尚未占用设备，禁止向设备当前占用者发送中止信号
+            if not was_queued and record.device_serial:
+                running_serials.add(record.device_serial)
 
-        serials = sorted({record.device_serial for record in records if record.device_serial})
-        for serial in serials:
+        for serial in sorted(running_serials):
             try:
                 trigger_device_abort(serial)
             except Exception:

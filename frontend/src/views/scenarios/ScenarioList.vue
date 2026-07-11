@@ -196,6 +196,37 @@ const fetchRunConfigOptions = async () => {
 
 const isScenarioRunActive = (row) => Boolean(activeScenarioRuns.value[row.id])
 
+const scenarioQueueInfo = (row) => activeScenarioRuns.value[row.id]?.queue || null
+
+const scenarioQueueSuffix = (row) => {
+    const queue = scenarioQueueInfo(row)
+    return queue?.position ? `（第 ${queue.position} 位）` : ''
+}
+
+const scenarioStatusText = (item) => {
+    const s = normalizeRunStatus(item.last_run_status)
+    if (s === 'queued') return `排队中${scenarioQueueSuffix(item)}`
+    return s || 'not_run'
+}
+
+// 从 /runs/active 的 items 构建活跃 run 条目（含排队信息）
+const buildActiveScenarioEntry = (items, fallback = {}) => {
+    const entry = {
+        batch_id: items[0]?.batch_id ?? fallback.batch_id,
+        execution_ids: items.map(item => item.execution_id).filter(Boolean),
+        device_serials: items.map(item => item.device_serial).filter(Boolean)
+    }
+    const queuedItems = items.filter(item => String(item.status || '').toUpperCase() === 'QUEUED')
+    if (queuedItems.length > 0) {
+        const positions = queuedItems.map(item => item.queue_position).filter(p => Number.isFinite(p))
+        entry.queue = {
+            count: queuedItems.length,
+            position: positions.length ? Math.min(...positions) : null
+        }
+    }
+    return entry
+}
+
 const handleRunClick = async (row) => {
     if (isScenarioRunActive(row)) {
         await terminateScenarioRun(row)
@@ -230,27 +261,50 @@ const confirmRun = async () => {
         const { data } = await api.runScenario(runningScenarioId.value, runForm.envId, runnable)
         const backendBlocked = Array.isArray(data?.blocked_prechecks) ? data.blocked_prechecks : []
         const allBlocked = blocked.concat(backendBlocked)
+
+        // 并发超限的任务会进入 FIFO 队列而非失败：区分"已开始 / 已加入队列"
+        const runs = Array.isArray(data?.runs) ? data.runs : []
+        const queuedRuns = runs.filter(item => item.queued)
+        const startedCount = runs.length - queuedRuns.length
+        const queuePositions = queuedRuns.map(item => item.queue_position).filter(p => Number.isFinite(p))
+        const minQueuePosition = queuePositions.length ? Math.min(...queuePositions) : null
+
+        let startMsg
+        if (queuedRuns.length === 0) {
+            startMsg = `场景已在 ${runnable.length} 台设备开始批次执行`
+        } else if (startedCount === 0) {
+            startMsg = `并发已满，场景已加入执行队列（${queuedRuns.length} 台${minQueuePosition ? `，最前第 ${minQueuePosition} 位` : ''}）`
+        } else {
+            startMsg = `已开始 ${startedCount} 台；${queuedRuns.length} 台已加入队列${minQueuePosition ? `（最前第 ${minQueuePosition} 位）` : ''}`
+        }
+
         if (allBlocked.length > 0) {
             const first = allBlocked[0]
-            ElMessage.warning(`已在 ${runnable.length} 台设备启动；${allBlocked.length} 台预检失败（示例：${first.device_serial} - ${first.reason}）`)
+            ElMessage.warning(`${startMsg}；${allBlocked.length} 台预检失败（示例：${first.device_serial} - ${first.reason}）`)
+        } else if (queuedRuns.length > 0) {
+            ElMessage.info(startMsg)
         } else {
-            ElMessage.success(`场景已在 ${runnable.length} 台设备开始批次执行`)
+            ElMessage.success(startMsg)
         }
 
         runDialogVisible.value = false
         // Optimistic update
         const item = scenarios.value.find(s => s.id === runningScenarioId.value)
-        if (item) item.last_run_status = 'RUNNING'
+        if (item) item.last_run_status = startedCount > 0 || queuedRuns.length === 0 ? 'RUNNING' : 'QUEUED'
+        const activeEntry = {
+            batch_id: data?.batch_id,
+            execution_ids: data?.execution_ids || [],
+            device_serials: runnable
+        }
+        if (queuedRuns.length > 0) {
+            activeEntry.queue = { count: queuedRuns.length, position: minQueuePosition }
+        }
         activeScenarioRuns.value = {
             ...activeScenarioRuns.value,
-            [runningScenarioId.value]: {
-                batch_id: data?.batch_id,
-                execution_ids: data?.execution_ids || [],
-                device_serials: runnable
-            }
+            [runningScenarioId.value]: activeEntry
         }
         startActiveRunPolling()
-        fetchScenarios() 
+        fetchScenarios()
     } catch (err) {
         ElMessage.error('启动失败: ' + summarizeHttpDetail(err))
     }
@@ -278,7 +332,7 @@ const terminateScenarioRun = async (row) => {
 }
 
 const restoreActiveScenarioRuns = async () => {
-    const runningRows = scenarios.value.filter(row => normalizeRunStatus(row.last_run_status) === 'running')
+    const runningRows = scenarios.value.filter(row => ['running', 'queued'].includes(normalizeRunStatus(row.last_run_status)))
     if (runningRows.length === 0) return
     const next = { ...activeScenarioRuns.value }
     for (const row of runningRows) {
@@ -286,11 +340,7 @@ const restoreActiveScenarioRuns = async () => {
             const { data } = await api.getActiveRuns('scenario', row.id)
             const items = data?.items || []
             if (items.length > 0) {
-                next[row.id] = {
-                    batch_id: items[0]?.batch_id,
-                    execution_ids: items.map(item => item.execution_id).filter(Boolean),
-                    device_serials: items.map(item => item.device_serial).filter(Boolean)
-                }
+                next[row.id] = buildActiveScenarioEntry(items, next[row.id])
             }
         } catch {}
     }
@@ -311,9 +361,17 @@ const startActiveRunPolling = () => {
         for (const [scenarioId] of entries) {
             try {
                 const { data } = await api.getActiveRuns('scenario', Number(scenarioId))
-                if ((data?.items || []).length === 0) {
+                const items = data?.items || []
+                if (items.length === 0) {
                     delete next[scenarioId]
                     changed = true
+                    continue
+                }
+                next[scenarioId] = buildActiveScenarioEntry(items, next[scenarioId])
+                // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
+                const item = scenarios.value.find(s => s.id === Number(scenarioId))
+                if (item && normalizeRunStatus(item.last_run_status) === 'queued' && !next[scenarioId].queue) {
+                    item.last_run_status = 'RUNNING'
                 }
             } catch {}
         }
@@ -456,7 +514,7 @@ onUnmounted(stopActiveRunPolling)
                             <strong>{{ item.name }}</strong>
                         </div>
                         <el-tag size="small" effect="plain">
-                            {{ normalizeRunStatus(item.last_run_status) || 'not_run' }}
+                            {{ scenarioStatusText(item) }}
                         </el-tag>
                     </div>
                     <div class="mobile-scenario-info-line">
@@ -577,6 +635,11 @@ onUnmounted(stopActiveRunPolling)
                                  <template v-else-if="normalizeRunStatus(item.last_run_status) === 'running'">
                                     <span class="status-text running">
                                         <el-icon class="is-loading"><Refresh /></el-icon> 执行中...
+                                    </span>
+                                </template>
+                                <template v-else-if="normalizeRunStatus(item.last_run_status) === 'queued'">
+                                    <span class="status-text warning">
+                                        <el-icon><Timer /></el-icon> 排队中{{ scenarioQueueSuffix(item) }}，等待执行槽位
                                     </span>
                                 </template>
                                 <template v-else-if="normalizeRunStatus(item.last_run_status) === 'aborted' || normalizeRunStatus(item.last_run_status) === 'cancelled'">

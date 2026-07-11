@@ -12,6 +12,7 @@ from backend.cross_platform_execution import (
 from backend.models import TestScenario, ScenarioStep, User, TestCase, TestExecution
 from backend.run_control import (
     ABORTED_STATUS,
+    QUEUED_STATUS,
     registry,
     unregister_device_abort,
 )
@@ -22,6 +23,7 @@ from backend.scenario_execution import (
     _prepare_cross_platform_device_execution,
     _resolve_device_meta,
     _schedule_concurrent_runs,
+    scenario_queue_task_id,
 )
 from backend.scenario_execution import execute_scenario_batch_background as execute_scenario_batch_background  # noqa: F401  执行链路迁移后的兼容再导出（backend.api.tasks 延迟导入）
 from backend.schemas import (
@@ -421,46 +423,11 @@ async def run_scenario_api(
         )
 
     limiter = get_execution_limiter()
-    run_items = []
-    rate_limited = False
-    for serial in runnable_serials:
-        try:
-            execution_lease = limiter.acquire_lease(
-                user_id=current_user.id,
-                device_serial=serial,
-                task_id=f"scenario:{batch_id}:{serial or 'default'}",
-                timeout=0.0,
-            )
-        except RuntimeError as exc:
-            rate_limited = True
-            blocked_prechecks.append(
-                {
-                    "device_serial": serial,
-                    "reason": str(exc),
-                    "code": "RATE_LIMITED",
-                }
-            )
-            continue
-        run_items.append((serial, execution_lease))
-
-    if not run_items:
-        raise HTTPException(
-            status_code=429 if rate_limited else 400,
-            detail={
-                "code": "S1002_SCENARIO_RATE_LIMITED"
-                if rate_limited
-                else "S1001_SCENARIO_PRECHECK_FAILED",
-                "message": "scenario execution blocked by concurrency limits"
-                if rate_limited
-                else "scenario precheck failed for all selected devices",
-                "items": blocked_prechecks,
-            },
-        )
-
-    execution_leases = []
+    execution_tickets = []
     scheduled_serials = []
+    runs_payload: List[Dict[str, Any]] = []
     try:
-        for serial, execution_lease in run_items:
+        for serial in runnable_serials:
             meta = _resolve_device_meta(
                 session,
                 serial,
@@ -482,27 +449,53 @@ async def run_scenario_api(
             session.add(execution)
             session.commit()
             session.refresh(execution)
+
+            # 并发超限时不再 429 拒绝，而是进入 FIFO 等待队列。
+            ticket = limiter.enqueue(
+                user_id=current_user.id,
+                device_serial=serial,
+                task_id=scenario_queue_task_id(execution.id),
+                kind="scenario",
+                target_id=scenario_id,
+            )
+            queued = ticket.lease is None
+            if queued:
+                execution.status = QUEUED_STATUS
+                session.add(execution)
+                session.commit()
+
             execution_ids.append(execution.id)
-            execution_leases.append(execution_lease)
+            execution_tickets.append(ticket)
             scheduled_serials.append(serial)
+            runs_payload.append(
+                {
+                    "execution_id": execution.id,
+                    "device_serial": serial,
+                    "queued": queued,
+                    "queue_position": ticket.initial_queue_position if queued else None,
+                }
+            )
 
         asyncio.create_task(_schedule_concurrent_runs(
             execution_ids=execution_ids,
             scenario_id=scenario_id,
             device_serials=scheduled_serials,
             env_id=request.env_id,
-            execution_leases=execution_leases,
+            execution_tickets=execution_tickets,
         ))
     except Exception:
-        for _serial, execution_lease in run_items:
-            execution_lease.release()
+        for ticket in execution_tickets:
+            ticket.cancel()
         raise
 
+    queued_count = sum(1 for item in runs_payload if item["queued"])
     return {
         "message": "Batch execution started",
         "batch_id": batch_id,
         "execution_ids": execution_ids,
         "blocked_prechecks": blocked_prechecks,
+        "runs": runs_payload,
+        "queued_count": queued_count,
     }
 
 

@@ -265,6 +265,10 @@ export default {
     getActiveRuns(kind, targetId) {
         return api.get('/runs/active', { params: { kind, target_id: targetId } })
     },
+    // Limiter (执行限流/排队)
+    getLimiterStats() {
+        return api.get('/limiter/stats')
+    },
 
     // Tasks (定时任务)
     getTasks(params) {
