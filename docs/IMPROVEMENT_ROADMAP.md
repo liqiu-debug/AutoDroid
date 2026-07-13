@@ -126,6 +126,10 @@
 
 参数配置化（`AUTODROID_SCRCPY_MAX_SIZE/BITRATE/MAX_FPS/GOP`，默认 1920/8Mbps/60fps/1s）；花屏根因修复（客户端级"丢帧后等关键帧"状态机 + init 原子播种）；核查确认崩溃复现录制取原始流、不受观看端丢帧影响。前端 `ScrcpyPlayer` 已接入 WebCodecs 主解码路径（Annex-B 直喂、SPS 变化才重配、连续失败自动降级 jmuxer，`?scrcpyDecoder=jmuxer` 可强制回退），Safari 兼容性待真机验证。
 
+### ✅ 专项：兼容性测试机型横向对比
+
+**已落地方案**：`CompatibilityRun` 新增 `compare_mode`（version 默认 | device）与 `baseline_device_serial`，`CompatibilityCell.is_baseline` 标记基准设备（三列由版本迁移 `20260713_011` 幂等补齐，旧库回填为 version/null/0）。补上纵向对比盲区——某机型页面"一直坏的"新旧 diff 为零会误报 PASS，只有横向能发现。device 模式单包 + ≥2 设备 + 指定基准，每台采集一次后由 `_run_cross_device_comparison`（`_execute_run_async` join 后）逐页与基准横向比对。判定结构语义为主（`compare_device_pages`）：Crash/ANR、必需文本缺失、`_normalize_activity` 归一化后 Activity 组件不一致 → FAIL；归一化 XML 结构差异 → WARNING；像素/SSIM 仅同分辨率参与、跨分辨率仅计算展示且不产 diff 图。基准设备采集失败时非基准页面显式置 ERROR（不静默 PASS）。前端：创建页"对比维度"分段 + 基准设备选择 + 阈值提示；报告详情基准徽标 + mode-aware 标签 + 按页面横向画廊。
+
 ### ⬜ P2.5 通知渠道扩展
 
 `notification_service.py` 抽象通知 Provider，扩展钉钉/企微/邮件/通用 Webhook（现仅飞书卡片）。
