@@ -244,6 +244,12 @@ export default {
     getDashboardStats() {
         return api.get('/reports/dashboard/stats')
     },
+    getFlakyAnalysis(params) {
+        return api.get('/reports/flaky', { params })
+    },
+    compareExecutions(baseId, targetId) {
+        return api.get('/reports/executions/compare', { params: { base_id: baseId, target_id: targetId } })
+    },
     getDashboardOverview(params) {
         return api.get('/reports/dashboard/overview', { params })
     },
@@ -258,6 +264,10 @@ export default {
     },
     getActiveRuns(kind, targetId) {
         return api.get('/runs/active', { params: { kind, target_id: targetId } })
+    },
+    // Limiter (执行限流/排队)
+    getLimiterStats() {
+        return api.get('/limiter/stats')
     },
 
     // Tasks (定时任务)
@@ -286,6 +296,17 @@ export default {
     },
     sendTestNotification(webhookUrl) {
         return api.post('/settings/test-notification', { webhook_url: webhookUrl })
+    },
+
+    // API Tokens (CI 集成机器凭证)
+    getApiTokens(params) {
+        return api.get('/tokens/', { params })
+    },
+    createApiToken(name) {
+        return api.post('/tokens/', { name })
+    },
+    revokeApiToken(id) {
+        return api.delete(`/tokens/${id}`)
     },
 
     // Admin (用户管理)

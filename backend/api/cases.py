@@ -25,6 +25,7 @@ from backend.feature_flags import (
 from backend.models import CaseFolder, Device, TestCase, TestCaseStep, User
 from backend.run_control import (
     ABORTED_STATUS,
+    QUEUED_STATUS,
     register_device_abort,
     registry,
     unregister_device_abort,
@@ -44,8 +45,13 @@ from backend.step_contract import (
     normalize_error_strategy,
     normalize_execute_on,
     normalize_platform_overrides,
+    normalize_retry_count,
 )
-from backend.execution_limiter import get_execution_limiter
+from backend.execution_limiter import (
+    QueueAbortedError,
+    QueueTimeoutError,
+    get_execution_limiter,
+)
 from backend.utils.pydantic_compat import dump_model
 
 router = APIRouter()
@@ -284,8 +290,14 @@ def _make_case_run_record(
     batch_id: Optional[str],
     device_serial: Optional[str],
     run_id: Optional[str] = None,
+    queued: bool = False,
 ):
-    abort_event = _new_abort_event_for_device(device_serial)
+    if queued:
+        # 排队中的任务尚未占用设备：使用独立事件，避免覆盖设备当前
+        # 占用者已注册的中止事件；获得槽位后再安装到设备（见后台执行函数）。
+        abort_event = threading.Event()
+    else:
+        abort_event = _new_abort_event_for_device(device_serial)
     return registry.register(
         kind="case",
         target_id=case_id,
@@ -293,6 +305,8 @@ def _make_case_run_record(
         device_serial=device_serial,
         abort_event=abort_event,
         run_id=run_id,
+        status=QUEUED_STATUS if queued else "RUNNING",
+        metadata={"limiter_task_id": run_id} if run_id else None,
     )
 
 
@@ -406,6 +420,7 @@ def _row_to_standard_step_read(row: TestCaseStep) -> TestCaseStepRead:
         platform_overrides=row.platform_overrides or {},
         timeout=row.timeout,
         error_strategy=row.error_strategy,
+        retry_count=getattr(row, "retry_count", 0) or 0,
         description=row.description,
     )
 
@@ -428,6 +443,7 @@ def _standard_row_to_write_dict(row: TestCaseStep) -> Dict[str, Any]:
         "platform_overrides": row.platform_overrides or {},
         "timeout": row.timeout,
         "error_strategy": row.error_strategy,
+        "retry_count": getattr(row, "retry_count", 0) or 0,
         "description": row.description,
     }
 
@@ -439,6 +455,7 @@ def _validate_standard_step_write(step: TestCaseStepWrite, index: int) -> Dict[s
     execute_on = normalize_execute_on(raw.get("execute_on"))
     platform_overrides = normalize_platform_overrides(raw.get("platform_overrides"))
     error_strategy = normalize_error_strategy(raw.get("error_strategy", "ABORT"))
+    retry_count = normalize_retry_count(raw.get("retry_count", 0))
 
     args = raw.get("args") or {}
     if not isinstance(args, dict):
@@ -469,6 +486,7 @@ def _validate_standard_step_write(step: TestCaseStepWrite, index: int) -> Dict[s
         "platform_overrides": platform_overrides,
         "timeout": timeout,
         "error_strategy": error_strategy,
+        "retry_count": retry_count,
         "description": raw.get("description"),
     }
 
@@ -495,6 +513,7 @@ def _replace_standard_steps(
                 platform_overrides=item.get("platform_overrides") or {},
                 timeout=item.get("timeout", 10),
                 error_strategy=item.get("error_strategy", "ABORT"),
+                retry_count=item.get("retry_count", 0) or 0,
                 description=item.get("description"),
             )
         )
@@ -829,6 +848,57 @@ def sync_case_standard_steps_from_legacy(
     return [_row_to_standard_step_read(item) for item in saved_steps]
 
 
+def _wait_for_queued_case_slot(
+    *,
+    ticket,
+    case_id: int,
+    session_factory,
+    run_id: Optional[str],
+    abort_event,
+    device_serial: Optional[str],
+):
+    """排队中的用例任务阻塞等待执行槽位。
+
+    返回获得的 lease；排队被取消或超时则完成收尾并返回 None。
+    """
+    limiter = get_execution_limiter()
+    try:
+        lease = ticket.wait(timeout=limiter.queue_timeout, abort_event=abort_event)
+    except QueueAbortedError:
+        logger.info("排队任务已被取消: case_id=%s run_id=%s", case_id, run_id)
+        with session_factory() as session:
+            _update_case_run_status(session, case_id, ABORTED_STATUS)
+        registry.complete(run_id, ABORTED_STATUS)
+        return None
+    except QueueTimeoutError as exc:
+        logger.warning("排队超时: case_id=%s run_id=%s error=%s", case_id, run_id, exc)
+        with session_factory() as session:
+            _update_case_run_status(session, case_id, "ERROR")
+        registry.complete(run_id, "ERROR")
+        return None
+
+    # 获得槽位：QUEUED -> RUNNING，并把排队期的中止事件安装到设备
+    registry.update_status(run_id, "RUNNING")
+    with session_factory() as session:
+        _update_case_run_status(session, case_id, "RUNNING")
+    if device_serial and abort_event is not None:
+        register_device_abort(device_serial, abort_event)
+    return lease
+
+
+def _spawn_case_background_thread(*args) -> None:
+    """在独立守护线程中运行用例后台执行。
+
+    排队任务的后台函数会阻塞等待槽位（最长 AUTODROID_QUEUE_TIMEOUT），
+    不能占用 Starlette 的共享线程池，否则大量排队会拖垮其他同步端点。
+    """
+    threading.Thread(
+        target=_run_case_background_cross_platform,
+        args=args,
+        daemon=True,
+    ).start()
+
+
 def _run_case_background_cross_platform(
     case_id: int,
     session_factory,
@@ -837,7 +907,7 @@ def _run_case_background_cross_platform(
     run_id: Optional[str] = None,
     abort_event=None,
     user_id: Optional[int] = None,
-    execution_lease=None,
+    ticket=None,
 ):
     # Cross-platform path requires explicit target device.
     if not device_serial:
@@ -846,15 +916,30 @@ def _run_case_background_cross_platform(
             case_id,
             run_id,
         )
-        if execution_lease is not None:
+        if ticket is not None:
             try:
-                execution_lease.release()
+                ticket.cancel()
             except Exception:
-                logger.exception("failed to release execution lease: run_id=%s", run_id)
+                logger.exception("failed to cancel execution ticket: run_id=%s", run_id)
         with session_factory() as session:
             _update_case_run_status(session, case_id, "FAIL")
         registry.complete(run_id, "ERROR")
         return
+
+    execution_lease = None
+    if ticket is not None:
+        execution_lease = ticket.lease
+        if execution_lease is None:
+            execution_lease = _wait_for_queued_case_slot(
+                ticket=ticket,
+                case_id=case_id,
+                session_factory=session_factory,
+                run_id=run_id,
+                abort_event=abort_event,
+                device_serial=device_serial,
+            )
+            if execution_lease is None:
+                return
 
     try:
         with _case_execution_slot(
@@ -947,15 +1032,16 @@ def run_test_case(
         raise HTTPException(status_code=400, detail="请选择执行设备")
     batch_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
-    try:
-        execution_lease = get_execution_limiter().acquire_lease(
-            user_id=current_user.id,
-            device_serial=device_serial,
-            task_id=run_id,
-            timeout=0.0,
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=429, detail=str(e)) from e
+    # 并发超限时不再 429 拒绝，而是进入 FIFO 等待队列。
+    ticket = get_execution_limiter().enqueue(
+        user_id=current_user.id,
+        device_serial=device_serial,
+        task_id=run_id,
+        kind="case",
+        target_id=case_id,
+    )
+    queued = ticket.lease is None
+    queue_position = ticket.initial_queue_position if queued else None
 
     try:
         run_record = _make_case_run_record(
@@ -963,10 +1049,11 @@ def run_test_case(
             batch_id=batch_id,
             device_serial=device_serial,
             run_id=run_id,
+            queued=queued,
         )
-        _update_case_run_status(session, case_id, "RUNNING")
+        _update_case_run_status(session, case_id, QUEUED_STATUS if queued else "RUNNING")
         background_tasks.add_task(
-            _run_case_background_cross_platform,
+            _spawn_case_background_thread,
             case_id,
             session_factory,
             env_id,
@@ -974,22 +1061,24 @@ def run_test_case(
             run_record.run_id,
             run_record.abort_event,
             current_user.id,  # 传递 user_id 用于限流
-            execution_lease,
+            ticket,
         )
     except Exception:
-        execution_lease.release()
-        if device_serial:
+        ticket.cancel()
+        if device_serial and not queued:
             unregister_device_abort(device_serial)
         registry.complete(run_id, "ERROR")
         raise
 
     return {
-        "message": "Execution started",
+        "message": "已加入执行队列" if queued else "Execution started",
         "case_id": case_id,
         "batch_id": batch_id,
         "run_id": run_record.run_id,
         "device_serial": device_serial,
         "runner": "cross_platform",
+        "queued": queued,
+        "queue_position": queue_position,
     }
 
 
@@ -1056,27 +1145,18 @@ def run_test_case_batch(
 
     batch_id = str(uuid.uuid4())
     run_items = []
-    rate_limited = False
 
     for serial in runnable_serials:
         run_id = str(uuid.uuid4())
-        try:
-            execution_lease = get_execution_limiter().acquire_lease(
-                user_id=current_user.id,
-                device_serial=serial,
-                task_id=run_id,
-                timeout=0.0,
-            )
-        except RuntimeError as exc:
-            rate_limited = True
-            blocked_prechecks.append(
-                {
-                    "device_serial": serial,
-                    "reason": str(exc),
-                    "code": "RATE_LIMITED",
-                }
-            )
-            continue
+        # 并发超限时不再 429 拒绝，而是进入 FIFO 等待队列。
+        ticket = get_execution_limiter().enqueue(
+            user_id=current_user.id,
+            device_serial=serial,
+            task_id=run_id,
+            kind="case",
+            target_id=case_id,
+        )
+        queued = ticket.lease is None
 
         try:
             run_record = _make_case_run_record(
@@ -1084,44 +1164,45 @@ def run_test_case_batch(
                 batch_id=batch_id,
                 device_serial=serial,
                 run_id=run_id,
+                queued=queued,
             )
         except Exception:
-            execution_lease.release()
-            if serial:
+            ticket.cancel()
+            if serial and not queued:
                 unregister_device_abort(serial)
-            for prev_serial, prev_record, prev_lease in run_items:
-                prev_lease.release()
-                if prev_serial:
+            for prev_serial, prev_record, prev_ticket, prev_queued in run_items:
+                prev_ticket.cancel()
+                if prev_serial and not prev_queued:
                     unregister_device_abort(prev_serial)
                 registry.complete(prev_record.run_id, "ERROR")
             raise
-        run_items.append((serial, run_record, execution_lease))
-
-    if not run_items:
-        raise HTTPException(
-            status_code=429 if rate_limited else 400,
-            detail={
-                "code": "C1002_CASE_RATE_LIMITED" if rate_limited else "C1001_CASE_PRECHECK_FAILED",
-                "message": "case execution blocked by concurrency limits"
-                if rate_limited
-                else "case precheck failed for all selected devices",
-                "items": blocked_prechecks,
-            },
-        )
+        run_items.append((serial, run_record, ticket, queued))
 
     try:
-        _update_case_run_status(session, case_id, "RUNNING")
+        any_started = any(not queued for _serial, _record, _ticket, queued in run_items)
+        _update_case_run_status(
+            session, case_id, "RUNNING" if any_started else QUEUED_STATUS
+        )
     except Exception:
-        for serial, run_record, execution_lease in run_items:
-            execution_lease.release()
-            if serial:
+        for serial, run_record, ticket, queued in run_items:
+            ticket.cancel()
+            if serial and not queued:
                 unregister_device_abort(serial)
             registry.complete(run_record.run_id, "ERROR")
         raise
 
     run_ids: List[str] = []
-    for serial, run_record, execution_lease in run_items:
+    runs_payload: List[Dict[str, Any]] = []
+    for serial, run_record, ticket, queued in run_items:
         run_ids.append(run_record.run_id)
+        runs_payload.append(
+            {
+                "run_id": run_record.run_id,
+                "device_serial": serial,
+                "queued": queued,
+                "queue_position": ticket.initial_queue_position if queued else None,
+            }
+        )
         threading.Thread(
             target=_run_case_background_cross_platform,
             args=(
@@ -1132,11 +1213,12 @@ def run_test_case_batch(
                 run_record.run_id,
                 run_record.abort_event,
                 current_user.id,
-                execution_lease,
+                ticket,
             ),
             daemon=True,
         ).start()
 
+    queued_count = sum(1 for item in runs_payload if item["queued"])
     return {
         "message": "Batch execution started",
         "case_id": case_id,
@@ -1144,6 +1226,8 @@ def run_test_case_batch(
         "run_ids": run_ids,
         "device_serials": runnable_serials,
         "blocked_prechecks": blocked_prechecks,
+        "runs": runs_payload,
+        "queued_count": queued_count,
     }
 
 

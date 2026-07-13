@@ -53,7 +53,7 @@ def get_settings(
 def save_settings(
     items: List[SettingItem],
     session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user)
+    current_user: User = Depends(deps.get_current_user_no_token)
 ):
     """批量保存系统配置 (Upsert)"""
     for item in items:
@@ -79,7 +79,7 @@ def save_settings(
 @router.post("/test-notification")
 def test_notification(
     req: TestNotificationRequest,
-    current_user: User = Depends(deps.get_current_user)
+    current_user: User = Depends(deps.get_current_user_no_token)
 ):
     """发送测试通知到飞书群"""
     if not req.webhook_url:

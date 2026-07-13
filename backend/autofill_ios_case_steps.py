@@ -66,6 +66,7 @@ def _replace_case_rows(
                 platform_overrides=item.get("platform_overrides") or {},
                 timeout=int(item.get("timeout", 10)),
                 error_strategy=str(item.get("error_strategy") or "ABORT"),
+                retry_count=int(item.get("retry_count", 0) or 0),
                 description=item.get("description"),
             )
         )

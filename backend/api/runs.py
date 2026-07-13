@@ -6,8 +6,10 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from backend.database import get_session
+from backend.execution_limiter import get_execution_limiter
 from backend.models import TestCase, TestExecution, TestScenario
-from backend.run_control import ABORTED_STATUS, RUNNING_STATUSES, registry
+from backend.run_control import ABORTED_STATUS, QUEUED_STATUS, RUNNING_STATUSES, registry
+from backend.scenario_execution import scenario_queue_task_id
 
 router = APIRouter()
 
@@ -62,7 +64,10 @@ def active_runs(
     target_id: int = Query(...),
     session: Session = Depends(get_session),
 ):
-    """Return active in-process runs, plus scenario DB runs still marked running."""
+    """Return active in-process runs, plus scenario DB runs still marked running.
+
+    排队中的 run（status=QUEUED）附带 queue_position（1 起始）。
+    """
     normalized_kind = str(kind or "").strip().lower()
     runs = [record.to_dict() for record in registry.active(kind=normalized_kind, target_id=target_id)]
 
@@ -90,7 +95,21 @@ def active_runs(
                 }
             )
 
+    _attach_queue_positions(runs)
     return {"items": runs}
+
+
+def _attach_queue_positions(runs: List[Dict[str, Any]]) -> None:
+    """为排队中的 run 附加实时排队位置。"""
+    limiter = get_execution_limiter()
+    for item in runs:
+        if str(item.get("status") or "").upper() != QUEUED_STATUS:
+            continue
+        metadata = item.get("metadata") or {}
+        task_id = metadata.get("limiter_task_id") or item.get("run_id")
+        if not task_id and item.get("kind") == "scenario" and item.get("execution_id"):
+            task_id = scenario_queue_task_id(int(item["execution_id"]))
+        item["queue_position"] = limiter.get_queue_position(task_id)
 
 
 def _mark_case_aborted(session: Session, case_id: int) -> int:

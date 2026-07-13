@@ -224,6 +224,12 @@ const routes = [
             name: 'notification-settings',
             meta: { title: '通知设置', keepAlive: true },
             component: () => import('../views/settings/NotificationSettings.vue')
+          },
+          {
+            path: 'tokens',
+            name: 'api-tokens',
+            meta: { title: 'API Token', keepAlive: true },
+            component: () => import('../views/settings/ApiTokens.vue')
           }
         ]
       },

@@ -18,14 +18,43 @@ let pollTimer = null
 let pageActive = false
 
 const matrixPages = computed(() => run.value?.page_set?.pages || [])
+const isDeviceCompare = computed(() => run.value?.compare_mode === 'device')
 const hasRunningRun = computed(() => {
   const status = String(run.value?.status || '').toUpperCase()
   return ['PENDING', 'RUNNING'].includes(status)
 })
+const galleryPageKey = ref('')
+const galleryPage = computed(() => (
+  matrixPages.value.find(page => (page.key || page.name) === galleryPageKey.value) || null
+))
+const galleryCards = computed(() => {
+  if (!galleryPage.value || !run.value?.cells?.length) return []
+  const cards = run.value.cells.map(cell => ({
+    cell,
+    result: findPageResult(cell, galleryPage.value) || null,
+  }))
+  return cards.sort((a, b) => Number(b.cell.is_baseline || false) - Number(a.cell.is_baseline || false))
+})
+
+watch(matrixPages, (pages) => {
+  if (!pages.length) {
+    galleryPageKey.value = ''
+    return
+  }
+  if (!pages.some(page => (page.key || page.name) === galleryPageKey.value)) {
+    galleryPageKey.value = pages[0].key || pages[0].name
+  }
+}, { immediate: true })
 
 const formatTime = (value) => value ? dayjs(value).format('MM-DD HH:mm:ss') : '-'
 const statusText = (status) => String(status || 'PENDING').toUpperCase()
 const statusType = (status) => runStatusTagType(statusText(status))
+const statusColor = (status) => ({
+  PASS: '#67C23A',
+  WARNING: '#E6A23C',
+  FAIL: '#F56C6C',
+  ERROR: '#F56C6C',
+}[statusText(status)] || '#dcdfe6')
 const metricLabels = {
   pixel_diff_ratio: '像素差异比例',
   ssim: '结构相似度',
@@ -34,9 +63,15 @@ const metricLabels = {
   size_changed: '截图尺寸变化',
   has_crash_or_anr: 'Crash/ANR',
   required_text_missing: '必需文本缺失',
+  same_resolution: '与基准同分辨率',
+  activity_mismatch: 'Activity 不一致',
+  resolution: '分辨率',
+  baseline_device_serial: '基准设备',
+  is_baseline: '基准设备行',
 }
 const hiddenMetricKeys = new Set(['ocr_diff_ratio', 'ocr_error_baseline', 'ocr_error_candidate'])
 const formatMode = (mode) => mode === 'clean' ? '干净对比' : '升级兼容'
+const formatCompareMode = (mode) => mode === 'device' ? '机型对比' : '版本对比'
 const formatMetricLabel = (key) => metricLabels[key] || key
 const formatMetricValue = (value) => {
   if (typeof value === 'boolean') return value ? '是' : '否'
@@ -150,7 +185,9 @@ onUnmounted(deactivatePage)
           <span class="kpi-label">状态</span>
           <el-tag :type="statusType(run.status)" effect="plain">{{ statusText(run.status) }}</el-tag>
         </div>
+        <div class="kpi-item"><span class="kpi-label">对比维度</span><strong>{{ formatCompareMode(run.compare_mode) }}</strong></div>
         <div class="kpi-item"><span class="kpi-label">模式</span><strong>{{ formatMode(run.mode) }}</strong></div>
+        <div v-if="isDeviceCompare" class="kpi-item"><span class="kpi-label">基准设备</span><strong>{{ formatDevice(run.baseline_device_serial) }}</strong></div>
         <div class="kpi-item"><span class="kpi-label">设备</span><strong>{{ run.total_cells }}</strong></div>
         <div class="kpi-item"><span class="kpi-label">页面</span><strong>{{ matrixPages.length }}</strong></div>
         <div class="kpi-item"><span class="kpi-label">通过</span><strong class="pass">{{ run.pass_count }}</strong></div>
@@ -163,7 +200,10 @@ onUnmounted(deactivatePage)
         <el-table :data="run.cells || []" border class="matrix-table" height="100%">
           <el-table-column label="设备" fixed min-width="180">
             <template #default="{ row }">
-              <div class="run-name">{{ formatDevice(row.device_serial) }}</div>
+              <div class="run-name">
+                {{ formatDevice(row.device_serial) }}
+                <el-tag v-if="row.is_baseline" size="small" type="info" effect="plain">基准</el-tag>
+              </div>
               <div class="muted-text">{{ row.os_version || '-' }} / {{ row.resolution || '-' }}</div>
             </template>
           </el-table-column>
@@ -195,7 +235,49 @@ onUnmounted(deactivatePage)
         </el-table>
       </section>
 
-      <div v-else class="empty-state">暂无兼容性报告详情</div>
+      <section v-if="run && galleryCards.length" class="gallery-panel">
+        <div class="gallery-header">
+          <span class="card-title">页面画廊</span>
+          <el-select v-model="galleryPageKey" filterable class="gallery-page-select" size="small">
+            <el-option
+              v-for="page in matrixPages"
+              :key="page.key || page.name"
+              :label="page.name"
+              :value="page.key || page.name"
+            />
+          </el-select>
+          <span class="muted-text">同一页面各设备截图横向对照{{ isDeviceCompare ? '（基准设备置首）' : '' }}</span>
+        </div>
+        <div class="gallery-row">
+          <div
+            v-for="card in galleryCards"
+            :key="card.cell.id"
+            class="gallery-card"
+            :style="{ borderColor: statusColor(card.result?.status) }"
+            @click="card.result && openResult(card.cell, galleryPage)"
+          >
+            <div class="gallery-caption">
+              <span class="gallery-device">
+                {{ formatDevice(card.cell.device_serial) }}
+                <el-tag v-if="card.cell.is_baseline" size="small" type="info" effect="plain">基准</el-tag>
+              </span>
+              <el-tag v-if="card.result" :type="statusType(card.result.status)" size="small" effect="plain">
+                {{ statusText(card.result.status) }}
+              </el-tag>
+            </div>
+            <div class="gallery-meta muted-text">{{ card.cell.resolution || '-' }}</div>
+            <img
+              v-if="card.result?.candidate_screenshot_path"
+              :src="assetUrl(card.result.candidate_screenshot_path)"
+              :alt="card.cell.device_serial"
+              loading="lazy"
+            />
+            <div v-else class="gallery-empty muted-text">暂无截图</div>
+          </div>
+        </div>
+      </section>
+
+      <div v-else-if="!run" class="empty-state">暂无兼容性报告详情</div>
     </div>
 
     <el-drawer v-model="resultDrawerVisible" size="64%" title="页面对比详情">
@@ -216,25 +298,26 @@ onUnmounted(deactivatePage)
         </div>
         <div class="image-grid">
           <div>
-            <div class="image-title">旧版</div>
+            <div class="image-title">{{ isDeviceCompare ? '基准设备' : '旧版' }}</div>
             <img v-if="selectedResult.baseline_screenshot_path" :src="assetUrl(selectedResult.baseline_screenshot_path)" alt="baseline" />
           </div>
           <div>
-            <div class="image-title">新版</div>
+            <div class="image-title">{{ isDeviceCompare ? '当前设备' : '新版' }}</div>
             <img v-if="selectedResult.candidate_screenshot_path" :src="assetUrl(selectedResult.candidate_screenshot_path)" alt="candidate" />
           </div>
           <div>
             <div class="image-title">差异</div>
             <img v-if="selectedResult.diff_screenshot_path" :src="assetUrl(selectedResult.diff_screenshot_path)" alt="diff" />
+            <div v-else-if="isDeviceCompare" class="muted-text">跨分辨率不生成差异图</div>
           </div>
         </div>
         <div class="xml-summary">
           <div>
-            <span class="kpi-label">旧版 XML</span>
+            <span class="kpi-label">{{ isDeviceCompare ? '基准 XML' : '旧版 XML' }}</span>
             <strong>{{ selectedResult.baseline_xml_path || '-' }}</strong>
           </div>
           <div>
-            <span class="kpi-label">新版 XML</span>
+            <span class="kpi-label">{{ isDeviceCompare ? '当前 XML' : '新版 XML' }}</span>
             <strong>{{ selectedResult.candidate_xml_path || '-' }}</strong>
           </div>
           <div>
@@ -346,6 +429,83 @@ onUnmounted(deactivatePage)
 
 .matrix-table {
   height: 100%;
+}
+
+.gallery-panel {
+  flex-shrink: 0;
+  border-top: 1px solid #ebeef5;
+  padding-top: 10px;
+}
+
+.gallery-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.gallery-header .card-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #303133;
+}
+
+.gallery-page-select {
+  width: 220px;
+}
+
+.gallery-row {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.gallery-card {
+  flex: 0 0 156px;
+  padding: 6px;
+  border: 2px solid #dcdfe6;
+  border-radius: 6px;
+  background: #fafafa;
+  cursor: pointer;
+}
+
+.gallery-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.gallery-device {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.gallery-meta {
+  margin: 2px 0 4px;
+}
+
+.gallery-card img {
+  width: 100%;
+  height: 216px;
+  object-fit: contain;
+  border-radius: 4px;
+  background: #111;
+}
+
+.gallery-empty {
+  height: 216px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .empty-state {

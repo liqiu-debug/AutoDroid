@@ -31,6 +31,22 @@ class User(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
+class ApiToken(SQLModel, table=True):
+    """长效 API Token（机器凭证），供外部 CI 系统调用业务接口。
+
+    仅存储 sha256 哈希，明文只在创建时返回一次。
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    token_hash: str = Field(index=True, unique=True)
+    token_prefix: str
+    user_id: int = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.now)
+    last_used_at: Optional[datetime] = None
+    is_active: bool = Field(default=True)
+
+
 class TestCase(TestCaseBase, SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = Field(default_factory=datetime.now)
@@ -236,6 +252,8 @@ class CompatibilityRun(SQLModel, table=True):
     old_package_id: Optional[int] = Field(default=None, foreign_key="apppackage.id", index=True)
     new_package_id: int = Field(foreign_key="apppackage.id", index=True)
     package_name: str = Field(default="", index=True)
+    compare_mode: str = Field(default="version", index=True)  # version（同设备新旧对比）| device（跨设备横向对比）
+    baseline_device_serial: Optional[str] = Field(default=None)  # device 模式下的基准设备
     mode: str = Field(default="upgrade")  # upgrade | clean
     env_id: Optional[int] = Field(default=None, foreign_key="environment.id")
     device_serials: List[str] = Field(default=[], sa_column=Column(PydanticListType(str)))
@@ -262,6 +280,7 @@ class CompatibilityCell(SQLModel, table=True):
     device_info: Optional[str] = None
     os_version: Optional[str] = None
     resolution: Optional[str] = None
+    is_baseline: bool = Field(default=False)  # device 模式下该设备是否为横向对比基准
     status: str = Field(default="PENDING", index=True)
     current_stage: Optional[str] = None
     old_install_status: Optional[str] = None
@@ -318,6 +337,8 @@ class TestCaseStep(SQLModel, table=True):
     value: Optional[str] = None
     timeout: int = Field(default=10)
     error_strategy: str = Field(default="ABORT")
+    # 失败自动重试次数（0-3，0 表示不重试；总尝试 = 1 + retry_count）
+    retry_count: int = Field(default=0)
     description: Optional[str] = None
 
     # 核心字段 1：允许执行的平台列表，默认双端

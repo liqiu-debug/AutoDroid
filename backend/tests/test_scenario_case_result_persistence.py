@@ -154,6 +154,47 @@ class ScenarioCaseResultPersistenceTests(unittest.TestCase):
         self.assertEqual(failed_display["error_code"], "E2001_ELEMENT_NOT_FOUND")
         self.assertEqual(failed_display["suggestion"], "请检查定位器是否正确")
 
+    def test_persist_attempts_into_report_display_when_retried(self):
+        item = {"alias": "case-r", "case_name": "Case R"}
+        case_result = {
+            "case_id": 104,
+            "success": True,
+            "steps": [
+                {
+                    "step": {"action": "click", "selector": "登录", "selector_type": "text"},
+                    "success": True,
+                    "duration": 0.1,
+                    "attempts": 3,
+                },
+                {
+                    "step": {"action": "back"},
+                    "success": True,
+                    "duration": 0.1,
+                },
+            ],
+        }
+
+        case_entry, _, _ = _persist_case_result_and_build_case_report(
+            session=self.session,
+            execution_id=self.execution_id,
+            item=item,
+            case_result=case_result,
+            global_step_order=1,
+            step_name_prefix="case-r",
+        )
+        self.session.commit()
+
+        rows = self.session.exec(select(TestResult).order_by(TestResult.step_order)).all()
+        self.assertEqual(len(rows), 2)
+        # 重试过的步骤（attempts>1）随 report_display 持久化
+        self.assertEqual(rows[0].report_display["attempts"], 3)
+        self.assertNotIn("attempts", rows[1].report_display)
+
+        # 场景报告使用的 case_entry 同步携带
+        self.assertEqual(case_entry["steps"][0]["attempts"], 3)
+        self.assertEqual(case_entry["steps"][0]["report_display"]["attempts"], 3)
+        self.assertNotIn("attempts", case_entry["steps"][1])
+
     def test_case_level_error_screenshot_fills_first_failed_step(self):
         item = {"alias": "case-b", "case_name": "Case B"}
         case_result = {

@@ -106,17 +106,17 @@
 
 ## P2 — 能力补充（按需排期）
 
-### ⬜ P2.1 步骤级重试
+### ✅ P2.1 步骤级重试
 
-`error_strategy` 之外增加 `retry_count`（标准步骤模型字段 + 预检 + 前端 StepBuilder），对不稳定 UI 一次自动重试可显著降低误报。
+**已落地方案**：`TestCaseStep.retry_count`（0-3，默认 0，版本化迁移补列）；执行语义——总尝试 = 1+retry_count、每次重试 1s 退避且 abort 立即中断、SKIP 不重试、断言失败可重试、`error_strategy` 仅对最终结果生效、耗尽取最后一次 error/error_code；`attempts` 字段入结果与 `report_display`（供 Flaky 统计识别"靠重试通过"）。前端 StepBuilder 容错策略旁"失败重试"输入；legacy 双向转换宽松兼容、预检严格校验（超限报 P1006）。
 
-### ⬜ P2.2 执行排队替代 429 拒绝
+### ✅ P2.2 执行排队替代 429 拒绝
 
-限流超限时任务入队等待（带队列上限与超时），前端展示排队位置；比直接 429 更符合团队共用心智。
+**已落地方案**：`execution_limiter.py` 重写为单 Condition + FIFO deque（弃用不保证唤醒顺序的 Semaphore），等待者状态机 WAITING→GRANTED→CLAIMED/CANCELLED；用例与场景（含定时任务）链路超限入队而非 429，HTTP 立即返回 `queued/queue_position`；QUEUED 状态入 run registry 与执行记录，`/runs/active`、`/limiter/stats` 暴露队列；排队可取消（独立事件防误杀设备当前占用者）、超时默认 30 分钟（`AUTODROID_QUEUE_TIMEOUT`）；单用例后台任务改独立守护线程防拖垮共享线程池；WS 交互式执行保持直接执行。前端 Case/Scenario 列表显示"排队中（第 N 位）"。
 
-### ⬜ P2.3 Flaky 用例识别与报告对比
+### ✅ P2.3 Flaky 用例识别与报告对比
 
-基于 `TestExecution`/`TestResult` 历史统计"最近 N 次通过率"，标记不稳定用例 Top；支持两次执行结果 diff 视图。
+**已落地方案**：`backend/flaky_analysis.py` 纯查询计算（不建新表）——评分 = 60%×翻转率 + 40%×失败均衡度，样本 <5 不排名、持续失败/全过不入榜；场景级 + 步骤级 Top（用例级因 TestResult 无 case_id 降级，步骤名天然带用例前缀）。端点 `GET /reports/flaky`、`GET /reports/executions/compare`（同场景强制、diff 分类 regressed/fixed/still-failing/unchanged/added/removed）。前端：报告中心"稳定性分析"抽屉 + ReportDetail"与上一次对比"对话框。
 
 ### ✅ P2.4 iOS 实时投屏
 
@@ -126,6 +126,10 @@
 
 参数配置化（`AUTODROID_SCRCPY_MAX_SIZE/BITRATE/MAX_FPS/GOP`，默认 1920/8Mbps/60fps/1s）；花屏根因修复（客户端级"丢帧后等关键帧"状态机 + init 原子播种）；核查确认崩溃复现录制取原始流、不受观看端丢帧影响。前端 `ScrcpyPlayer` 已接入 WebCodecs 主解码路径（Annex-B 直喂、SPS 变化才重配、连续失败自动降级 jmuxer，`?scrcpyDecoder=jmuxer` 可强制回退），Safari 兼容性待真机验证。
 
+### ✅ 专项：兼容性测试机型横向对比
+
+**已落地方案**：`CompatibilityRun` 新增 `compare_mode`（version 默认 | device）与 `baseline_device_serial`，`CompatibilityCell.is_baseline` 标记基准设备（三列由版本迁移 `20260713_011` 幂等补齐，旧库回填为 version/null/0）。补上纵向对比盲区——某机型页面"一直坏的"新旧 diff 为零会误报 PASS，只有横向能发现。device 模式单包 + ≥2 设备 + 指定基准，每台采集一次后由 `_run_cross_device_comparison`（`_execute_run_async` join 后）逐页与基准横向比对。判定结构语义为主（`compare_device_pages`）：Crash/ANR、必需文本缺失、`_normalize_activity` 归一化后 Activity 组件不一致 → FAIL；归一化 XML 结构差异 → WARNING；像素/SSIM 仅同分辨率参与、跨分辨率仅计算展示且不产 diff 图。基准设备采集失败时非基准页面显式置 ERROR（不静默 PASS）。前端：创建页"对比维度"分段 + 基准设备选择 + 阈值提示；报告详情基准徽标 + mode-aware 标签 + 按页面横向画廊。
+
 ### ⬜ P2.5 通知渠道扩展
 
 `notification_service.py` 抽象通知 Provider，扩展钉钉/企微/邮件/通用 Webhook（现仅飞书卡片）。
@@ -134,9 +138,15 @@
 
 记录执行/删除/配置变更的操作者与时间（团队共用必要），可先复用 `SystemSetting` + 轻量 `AuditLog` 表。
 
-### ⬜ P2.7 CI 集成 API Token
+### ✅ P2.7 CI 集成 API Token
 
-长效 API Token（可撤销）供外部 CI 触发用例/场景执行并查询结果，打通"代码合并 → 自动回归"。
+**已落地方案**：`ApiToken` 模型（只存 sha256 哈希 + 展示前缀，明文仅创建时返回一次）；`adk_` 前缀在认证层与 JWT 分流，恒时比较、last_used 节流记录；机器凭证禁入 admin/设置写/改密/Token 管理（`get_current_user_no_token` 依赖，admin 路由一处上游替换全覆盖）；管理页 `/settings/tokens`（创建/列表/吊销，admin 可查全部）；补齐 `GET /reports/executions?batch_id=` CI 轮询过滤；`docs/CI_INTEGRATION.md` 含完整回归脚本与 GitHub Actions/Jenkins 示例。
+
+### ⬜ P2.9 报告端点认证收口（新增治理项）
+
+**现状依据**：P2.7 实施时发现 `GET /reports/executions` 等报告读取端点自基线起就无认证依赖，无凭证可读。内网风险可控，但与全站 JWT/Token 体系不一致。
+
+**建议方案**：报告读取端点统一挂 `get_current_user`；注意 HTML 报告静态资源（`/api/report-assets/`）与报告分享链路的兼容评估。
 
 ### ⬜ P2.8 前端测试与渐进 TS
 

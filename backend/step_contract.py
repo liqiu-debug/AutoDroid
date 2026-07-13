@@ -61,6 +61,8 @@ ACTION_DISPLAY_NAMES = {
 
 VALID_PLATFORMS = {"android", "ios"}
 VALID_ERROR_STRATEGIES = {"ABORT", "CONTINUE", "IGNORE"}
+# 步骤失败自动重试上限（总尝试 = 1 + retry_count）
+MAX_RETRY_COUNT = 3
 
 SELECTOR_TYPE_TO_BY = {
     "resourceId": "id",
@@ -117,6 +119,24 @@ def normalize_error_strategy(strategy: Any) -> str:
     if raw not in VALID_ERROR_STRATEGIES:
         raise ValueError(f"unsupported error_strategy: {raw}")
     return raw
+
+
+def normalize_retry_count(value: Any) -> int:
+    """严格校验 retry_count：非负整数，上限 MAX_RETRY_COUNT。"""
+    value = _unwrap_enum(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"retry_count must be a non-negative integer, got: {value!r}")
+    try:
+        retry_count = int(str(value).strip())
+    except Exception as exc:
+        raise ValueError(f"retry_count must be a non-negative integer, got: {value!r}") from exc
+    if retry_count < 0:
+        raise ValueError(f"retry_count must be a non-negative integer, got: {value!r}")
+    if retry_count > MAX_RETRY_COUNT:
+        raise ValueError(f"retry_count cannot exceed {MAX_RETRY_COUNT}, got: {retry_count}")
+    return retry_count
 
 
 def normalize_execute_on(execute_on: Optional[Iterable[Any]]) -> List[str]:
@@ -215,6 +235,19 @@ def _safe_seconds(value: Any, default: float = 1.0) -> float:
         return default
 
 
+def _safe_retry_count(value: Any, default: int = 0) -> int:
+    """宽松解析 retry_count（转换链路用）：非法取默认，范围收敛到 0..MAX_RETRY_COUNT。"""
+    try:
+        retry_count = normalize_retry_count(value)
+    except Exception:
+        try:
+            retry_count = int(str(value).strip())
+        except Exception:
+            return default
+        retry_count = max(0, min(retry_count, MAX_RETRY_COUNT))
+    return retry_count
+
+
 def legacy_step_to_standard(step: Any, case_id: int, order: int) -> Dict[str, Any]:
     raw = _to_dict(step)
 
@@ -294,6 +327,7 @@ def legacy_step_to_standard(step: Any, case_id: int, order: int) -> Dict[str, An
         "platform_overrides": overrides,
         "timeout": _safe_timeout(raw.get("timeout"), default=10),
         "error_strategy": normalize_error_strategy(raw.get("error_strategy", "ABORT")),
+        "retry_count": _safe_retry_count(raw.get("retry_count"), default=0),
         "description": raw.get("description"),
     }
 
@@ -360,6 +394,7 @@ def standard_step_to_legacy(step: Any) -> Dict[str, Any]:
         "description": raw.get("description"),
         "timeout": _safe_timeout(raw.get("timeout"), default=10),
         "error_strategy": normalize_error_strategy(raw.get("error_strategy", "ABORT")),
+        "retry_count": _safe_retry_count(raw.get("retry_count"), default=0),
     }
 
 

@@ -24,6 +24,18 @@ def get_limiter_stats(current_user: User = Depends(deps.get_current_user)):
             "active_devices": list[str],  # 正在使用的设备列表
             "max_global": int,  # 全局最大并发数
             "max_per_user": int,  # 每用户最大并发数
+            "queue_length": int,  # 等待队列长度
+            "queued_tasks": [  # FIFO 顺序的排队项
+                {
+                    "position": int,  # 排队位置（1 起始）
+                    "task_id": str | None,
+                    "user_id": int,
+                    "device_serial": str | None,
+                    "kind": str | None,  # case / scenario
+                    "target_id": int | None,
+                    "waited_seconds": float,  # 已等待时长
+                },
+            ],
         }
     """
     limiter = get_execution_limiter()

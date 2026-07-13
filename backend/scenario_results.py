@@ -38,6 +38,14 @@ def _step_ui_status(step_result: Dict[str, Any]) -> str:
     return "failed"
 
 
+def _safe_attempts(value: Any) -> int:
+    """解析步骤总尝试次数（见 cross_platform_runner.run_step，非法值归 0）。"""
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
 def _summarize_scenario_raw_results(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Aggregate scenario status from raw case results.
@@ -263,6 +271,10 @@ def _persist_case_result_and_build_case_report(
             display_payload["error_code"] = error_code
         if error_suggestion:
             display_payload["suggestion"] = error_suggestion
+        # 失败重试次数（纯增量）：attempts>1 时随 report_display 持久化，供报告/Flaky 统计。
+        attempts = _safe_attempts(step_result.get("attempts"))
+        if attempts > 1:
+            display_payload["attempts"] = attempts
         step_duration = float(step_result.get("duration", 0) or 0)
         case_duration += step_duration
 
@@ -316,6 +328,8 @@ def _persist_case_result_and_build_case_report(
             "error": step_result.get("error"),
             "report_display": report_display,
         }
+        if attempts > 1:
+            step_entry["attempts"] = attempts
         if step_output:
             step_entry["output"] = step_output
         if screenshot_b64:
@@ -516,6 +530,10 @@ def _convert_cross_result_to_legacy_case_result(
             converted["output"] = step_item.get("output")
         if step_item.get("screenshot"):
             converted["screenshot"] = step_item.get("screenshot")
+        # 失败重试次数（纯增量字段，见 cross_platform_runner.run_step）。
+        attempts = _safe_attempts(step_item.get("attempts"))
+        if attempts > 1:
+            converted["attempts"] = attempts
         if status == "WARNING":
             converted["success"] = False
             converted["is_warning"] = True

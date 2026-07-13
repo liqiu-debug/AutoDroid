@@ -137,7 +137,7 @@ class ScenarioRunPrecheckApiTests(unittest.IsolatedAsyncioTestCase):
         execution_count = len(self.session.exec(select(TestExecution)).all())
         self.assertEqual(execution_count, 0)
 
-    async def test_run_returns_429_when_device_is_rate_limited(self):
+    async def test_run_queues_when_device_is_rate_limited(self):
         scenario = self._create_scenario_with_android_only_case()
         user = self._create_user()
         self._add_devices()
@@ -154,23 +154,51 @@ class ScenarioRunPrecheckApiTests(unittest.IsolatedAsyncioTestCase):
                 "backend.api.scenarios.asyncio.create_task",
                 side_effect=self._consume_task,
             ) as create_task_mock:
-                with self.assertRaises(HTTPException) as context:
-                    await run_scenario_api(
-                        scenario_id=scenario.id,
-                        request=req,
-                        session=self.session,
-                        current_user=user,
-                    )
+                resp = await run_scenario_api(
+                    scenario_id=scenario.id,
+                    request=req,
+                    session=self.session,
+                    current_user=user,
+                )
         finally:
             lease.release()
 
-        exc = context.exception
-        self.assertEqual(exc.status_code, 429)
-        self.assertIsInstance(exc.detail, dict)
-        self.assertEqual(exc.detail.get("code"), "S1002_SCENARIO_RATE_LIMITED")
-        create_task_mock.assert_not_called()
-        execution_count = len(self.session.exec(select(TestExecution)).all())
-        self.assertEqual(execution_count, 0)
+        # 并发超限不再 429：任务进入 FIFO 队列并立即返回排队信息
+        create_task_mock.assert_called_once()
+        self.assertEqual(len(resp["execution_ids"]), 1)
+        self.assertEqual(resp["queued_count"], 1)
+        self.assertEqual(len(resp["runs"]), 1)
+        run_item = resp["runs"][0]
+        self.assertTrue(run_item["queued"])
+        self.assertEqual(run_item["queue_position"], 1)
+        self.assertEqual(run_item["device_serial"], "android-1")
+
+        execution = self.session.get(TestExecution, resp["execution_ids"][0])
+        self.assertIsNotNone(execution)
+        self.assertEqual(execution.status, "QUEUED")
+
+    async def test_run_starts_without_queueing_when_slots_available(self):
+        scenario = self._create_scenario_with_android_only_case()
+        user = self._create_user()
+        self._add_devices()
+        req = ScenarioRunRequest(device_serials=["android-1"], env_id=None)
+
+        with patch(
+            "backend.api.scenarios.asyncio.create_task",
+            side_effect=self._consume_task,
+        ):
+            resp = await run_scenario_api(
+                scenario_id=scenario.id,
+                request=req,
+                session=self.session,
+                current_user=user,
+            )
+
+        self.assertEqual(resp["queued_count"], 0)
+        self.assertFalse(resp["runs"][0]["queued"])
+        self.assertIsNone(resp["runs"][0]["queue_position"])
+        execution = self.session.get(TestExecution, resp["execution_ids"][0])
+        self.assertEqual(execution.status, "PENDING")
 
 
 if __name__ == "__main__":

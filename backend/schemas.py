@@ -1,6 +1,6 @@
 from typing import List, Optional, Any, Dict
 from enum import Enum
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.utils.variable_render import normalize_variable_placeholders
 
@@ -41,6 +41,19 @@ class Step(BaseModel):
     description: Optional[str] = None
     timeout: int = 10  # Default timeout in seconds
     error_strategy: ErrorStrategy = ErrorStrategy.ABORT # Error routing strategy
+    retry_count: int = 0  # 失败自动重试次数（0-3，0 表示不重试）
+
+    @field_validator("retry_count", mode="before")
+    @classmethod
+    def normalize_retry_count_lenient(cls, value):
+        # legacy JSON 兼容：非法值回退 0，范围收敛到 0..3
+        from backend.step_contract import MAX_RETRY_COUNT
+
+        try:
+            retry_count = int(str(value).strip())
+        except Exception:
+            return 0
+        return max(0, min(retry_count, MAX_RETRY_COUNT))
 
     @field_validator("selector_type", mode="before")
     @classmethod
@@ -639,6 +652,8 @@ class CompatibilityRunCreate(BaseModel):
     new_package_id: int
     page_set_id: int
     device_serials: List[str]
+    compare_mode: str = "version"
+    baseline_device_serial: Optional[str] = None
     mode: str = "upgrade"
     env_id: Optional[int] = None
     thresholds: CompatibilityThresholds = Field(default_factory=CompatibilityThresholds)
@@ -659,6 +674,20 @@ class CompatibilityRunCreate(BaseModel):
             raise ValueError("mode must be upgrade or clean")
         return mode
 
+    @field_validator("compare_mode", mode="before")
+    @classmethod
+    def normalize_compare_mode(cls, value):
+        mode = str(value or "version").strip().lower()
+        if mode not in {"version", "device"}:
+            raise ValueError("compare_mode must be version or device")
+        return mode
+
+    @field_validator("baseline_device_serial", mode="before")
+    @classmethod
+    def normalize_baseline_serial(cls, value):
+        serial = str(value or "").strip()
+        return serial or None
+
     @field_validator("device_serials", mode="before")
     @classmethod
     def normalize_serials(cls, value):
@@ -673,6 +702,21 @@ class CompatibilityRunCreate(BaseModel):
         if not serials:
             raise ValueError("device_serials must not be empty")
         return serials
+
+    @model_validator(mode="after")
+    def validate_device_compare_mode(self):
+        if self.compare_mode == "device":
+            if self.old_package_id is not None:
+                raise ValueError("机型对比模式只需一个测试包，old_package_id 必须为空")
+            if len(self.device_serials) < 2:
+                raise ValueError("机型对比模式至少需要 2 台设备")
+            if self.baseline_device_serial is None:
+                self.baseline_device_serial = self.device_serials[0]
+            elif self.baseline_device_serial not in self.device_serials:
+                raise ValueError("基准设备必须在所选设备列表中")
+        else:
+            self.baseline_device_serial = None
+        return self
 
 
 class CompatibilityPageResultRead(BaseModel):
@@ -707,6 +751,7 @@ class CompatibilityCellRead(BaseModel):
     device_info: Optional[str] = None
     os_version: Optional[str] = None
     resolution: Optional[str] = None
+    is_baseline: bool = False
     status: str = "PENDING"
     current_stage: Optional[str] = None
     old_install_status: Optional[str] = None
@@ -729,6 +774,8 @@ class CompatibilityRunRead(BaseModel):
     old_package_id: Optional[int] = None
     new_package_id: int
     package_name: str = ""
+    compare_mode: str = "version"
+    baseline_device_serial: Optional[str] = None
     mode: str = "upgrade"
     env_id: Optional[int] = None
     device_serials: List[str] = Field(default_factory=list)
@@ -852,6 +899,7 @@ class TestCaseStepWrite(BaseModel):
     platform_overrides: PlatformOverrides = Field(default_factory=PlatformOverrides)
     timeout: int = Field(default=10, ge=1)
     error_strategy: str = Field(default="ABORT", description="ABORT | CONTINUE | IGNORE")
+    retry_count: int = Field(default=0, ge=0, le=3, description="失败自动重试次数（0-3）")
     description: Optional[str] = None
 
     @field_validator("args", "value", "description", mode="before")

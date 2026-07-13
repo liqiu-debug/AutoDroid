@@ -66,7 +66,7 @@ def change_password(
     *,
     password_in: PasswordChange,
     session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_active_user),
+    current_user: User = Depends(deps.get_current_user_no_token),
 ) -> Any:
     """
     Change password for the current user after verifying the current password.

@@ -25,6 +25,7 @@ from backend.execution_errors import (
 from backend.locator_resolution import resolve_locator_candidates
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
 from backend.step_contract import (
+    MAX_RETRY_COUNT,
     normalize_action,
     normalize_error_strategy,
     normalize_execute_on,
@@ -37,6 +38,8 @@ from .ios_driver import IOSDriver
 
 logger = logging.getLogger(__name__)
 _UNRESOLVED_VAR_PATTERN = re.compile(r"{{\s*([A-Z0-9_]+)\s*}}")
+# 步骤失败自动重试的间隔（短退避，配合 _sleep_or_abort 支持即时中止）
+RETRY_BACKOFF_SECONDS = 1.0
 _SUPPORTED_ACTIONS_BY_PLATFORM = {
     "android": {
         "click",
@@ -126,7 +129,48 @@ class TestCaseRunner:
         )
 
     def run_step(self, step_data: Dict[str, Any]) -> Dict[str, Any]:
-        """执行单步并返回结构化结果。"""
+        """执行单步并返回结构化结果。
+
+        重试语义（retry_count，0-3）：
+        - 仅 FAIL 触发重试（SKIP/PASS 不重试），最多再试 retry_count 次（总尝试 = 1 + retry_count）；
+        - 每次重试前短退避 RETRY_BACKOFF_SECONDS，abort 触发时立即停止重试并走中止路径；
+        - 重试耗尽仍失败时，error/error_code 取最后一次尝试的结果；
+        - error_strategy 只在最终结果上生效（由 run_all 判断，重试期间不触发）；
+        - 结果 dict 的 attempts 记录总尝试次数（1 表示无重试，纯增量字段）。
+        """
+        retry_count = _parse_retry_count((step_data or {}).get("retry_count"))
+        started_at = time.time()
+
+        result = self._run_step_attempt(step_data)
+        attempts = 1
+        while attempts <= retry_count and result.get("status") == "FAIL":
+            # 短退避后重试；abort 触发时立即停止重试并走中止路径。
+            if self._sleep_or_abort(RETRY_BACKOFF_SECONDS):
+                result = self._build_abort_result(
+                    step_data=step_data,
+                    action=str(result.get("action") or "unknown"),
+                    error_strategy=str(result.get("error_strategy") or "ABORT"),
+                    duration=time.time() - started_at,
+                )
+                break
+            attempts += 1
+            logger.info(
+                "runner step retry: attempt %s/%s action=%s last_error=%s",
+                attempts,
+                1 + retry_count,
+                result.get("action"),
+                result.get("error") or "-",
+            )
+            result = self._run_step_attempt(step_data)
+
+        result["attempts"] = attempts
+        if attempts > 1:
+            # 汇总首次尝试开始至今的总耗时（含退避间隔）。
+            result["duration"] = round(time.time() - started_at, 3)
+        return result
+
+    def _run_step_attempt(self, step_data: Dict[str, Any]) -> Dict[str, Any]:
+        """执行单次尝试并返回结构化结果（不含重试语义）。"""
         started_at = time.time()
         step_context: Dict[str, Any] = {}
 
@@ -892,6 +936,8 @@ class TestCaseRunner:
             "device_id": self.device_id,
             "error_strategy": error_strategy,
             "duration": round(duration, 3),
+            # 总尝试次数（纯增量字段，1 表示无重试；见 run_step 重试语义）。
+            "attempts": 1,
             "error": error,
             # 结构化错误信息（纯增量字段，原 error 字符串格式保持不变）。
             "error_code": error_code,
@@ -911,6 +957,15 @@ def _parse_timeout(value: Any, default: int = 10) -> int:
     except Exception:
         pass
     return default
+
+
+def _parse_retry_count(value: Any, default: int = 0) -> int:
+    """执行期防御性解析 retry_count：非法取默认，收敛到 0..MAX_RETRY_COUNT。"""
+    try:
+        retry_count = int(str(value).strip())
+    except Exception:
+        return default
+    return max(0, min(retry_count, MAX_RETRY_COUNT))
 
 
 def _parse_seconds(value: Any, default: float = 1.0) -> float:

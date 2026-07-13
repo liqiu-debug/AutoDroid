@@ -10,6 +10,7 @@
 """
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -21,10 +22,15 @@ from backend.cross_platform_execution import (
     run_case_with_standard_runner,
 )
 from backend.database import engine
-from backend.execution_limiter import get_execution_limiter
+from backend.execution_limiter import (
+    QueueAbortedError,
+    QueueTimeoutError,
+    get_execution_limiter,
+)
 from backend.models import Device, ScenarioStep, TestCase, TestExecution, TestScenario
 from backend.run_control import (
     ABORTED_STATUS,
+    QUEUED_STATUS,
     register_device_abort,
     registry,
     unregister_device_abort,
@@ -496,13 +502,41 @@ def _run_single_device_sync(execution_id: int, scenario_id: int, device_serial: 
                 ABORTED_STATUS if abort_event and abort_event.is_set() else None,
             )
 
-def _run_single_device_sync_with_lease(
+def scenario_queue_task_id(execution_id: int) -> str:
+    """场景执行在限流队列中的 task_id（供排队位置查询）。"""
+    return f"scenario-exec:{execution_id}"
+
+
+def _run_single_device_sync_queued(
     execution_id: int,
     scenario_id: int,
     device_serial: Optional[str] = None,
     env_id: Optional[int] = None,
-    execution_lease=None,
+    ticket=None,
 ):
+    """带排队语义的单设备执行入口：无空闲槽位时进入 FIFO 队列等待。"""
+    limiter = get_execution_limiter()
+    if ticket is None:
+        # 定时任务等未预先入队的调用方在此入队
+        ticket = limiter.enqueue(
+            user_id=0,
+            device_serial=device_serial,
+            task_id=scenario_queue_task_id(execution_id),
+            kind="scenario",
+            target_id=scenario_id,
+        )
+
+    lease = ticket.lease
+    if lease is None:
+        lease = _wait_for_queued_scenario_slot(
+            ticket=ticket,
+            execution_id=execution_id,
+            scenario_id=scenario_id,
+            device_serial=device_serial,
+        )
+        if lease is None:
+            return None
+
     try:
         return _run_single_device_sync(
             execution_id=execution_id,
@@ -511,24 +545,77 @@ def _run_single_device_sync_with_lease(
             env_id=env_id,
         )
     finally:
-        if execution_lease is not None:
-            execution_lease.release()
+        lease.release()
 
 
-def _mark_scenario_execution_rate_limited(execution_id: int, reason: str) -> None:
+def _wait_for_queued_scenario_slot(
+    *,
+    ticket,
+    execution_id: int,
+    scenario_id: int,
+    device_serial: Optional[str],
+):
+    """排队等待场景执行槽位；返回 lease，取消/超时则完成收尾并返回 None。"""
+    from sqlmodel import Session as SQLSession
+
+    limiter = get_execution_limiter()
+
+    batch_id = None
+    with SQLSession(engine) as session:
+        execution = session.get(TestExecution, execution_id)
+        if not execution or str(execution.status or "").upper() == ABORTED_STATUS:
+            ticket.cancel()
+            return None
+        batch_id = execution.batch_id
+        if str(execution.status or "").upper() != QUEUED_STATUS:
+            execution.status = QUEUED_STATUS
+            session.add(execution)
+            session.commit()
+
+    # 排队中的任务尚未占用设备：注册独立中止事件的 QUEUED run 记录，
+    # 供报告中心展示与 /runs/cancel 终止排队。
+    abort_event = threading.Event()
+    run_record = registry.register(
+        kind="scenario",
+        target_id=scenario_id,
+        batch_id=batch_id,
+        device_serial=device_serial,
+        abort_event=abort_event,
+        execution_id=execution_id,
+        status=QUEUED_STATUS,
+        metadata={"limiter_task_id": ticket.task_id},
+    )
+    try:
+        lease = ticket.wait(timeout=limiter.queue_timeout, abort_event=abort_event)
+    except QueueAbortedError:
+        _mark_scenario_execution_not_run(execution_id, ABORTED_STATUS, "排队中被终止")
+        registry.complete(run_record.run_id, ABORTED_STATUS)
+        return None
+    except QueueTimeoutError as exc:
+        _mark_scenario_execution_not_run(execution_id, "ERROR", str(exc))
+        registry.complete(run_record.run_id, "ERROR")
+        return None
+
+    # 获得槽位：移除排队记录；执行链路随后注册新的 RUNNING 记录
+    registry.complete(run_record.run_id)
+    return lease
+
+
+def _mark_scenario_execution_not_run(execution_id: int, status: str, reason: str) -> None:
     from sqlmodel import Session as SQLSession
 
     with SQLSession(engine) as session:
         execution = session.get(TestExecution, execution_id)
         if not execution:
             return
-        execution.status = "ERROR"
+        execution.status = status
         execution.end_time = datetime.now()
         session.add(execution)
         session.commit()
         logger.warning(
-            "scenario execution rate limited: execution_id=%s reason=%s",
+            "scenario execution did not run: execution_id=%s status=%s reason=%s",
             execution_id,
+            status,
             reason,
         )
 
@@ -538,7 +625,7 @@ async def _schedule_concurrent_runs(
     scenario_id: int,
     device_serials: List[str],
     env_id: Optional[int] = None,
-    execution_leases: Optional[List[Any]] = None,
+    execution_tickets: Optional[List[Any]] = None,
 ):
     """使用 ThreadPoolExecutor 并发执行每个设备的测试"""
     loop = asyncio.get_running_loop()
@@ -548,32 +635,20 @@ async def _schedule_concurrent_runs(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         tasks = []
         for index, (exec_id, serial) in enumerate(zip(execution_ids, device_serials)):
-            execution_lease = (
-                execution_leases[index]
-                if execution_leases is not None and index < len(execution_leases)
+            ticket = (
+                execution_tickets[index]
+                if execution_tickets is not None and index < len(execution_tickets)
                 else None
             )
-            if execution_lease is None:
-                try:
-                    execution_lease = get_execution_limiter().acquire_lease(
-                        user_id=0,
-                        device_serial=serial,
-                        task_id=f"scenario:{exec_id}",
-                        timeout=0.0,
-                    )
-                except RuntimeError as exc:
-                    _mark_scenario_execution_rate_limited(exec_id, str(exc))
-                    continue
-
             # run_in_executor 将同步阻塞的 Runner 任务放入线程池调度
             task = loop.run_in_executor(
                 executor,
-                _run_single_device_sync_with_lease,  # 传入同步目标函数
+                _run_single_device_sync_queued,  # 传入同步目标函数
                 exec_id,
                 scenario_id,
                 serial,
                 env_id,
-                execution_lease,
+                ticket,
             )
             tasks.append(task)
 
