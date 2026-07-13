@@ -137,6 +137,10 @@ class DatabaseMigrationsTests(unittest.TestCase):
         compatibilityrun_col_names = {c[1] for c in compatibilityrun_cols}
         self.assertIn("page_set_name", compatibilityrun_col_names)
         self.assertIn("page_set_snapshot", compatibilityrun_col_names)
+        self.assertIn("compare_mode", compatibilityrun_col_names)
+        self.assertIn("baseline_device_serial", compatibilityrun_col_names)
+        compatibilitycell_col_names = {c[1] for c in self._table_columns("compatibilitycell")}
+        self.assertIn("is_baseline", compatibilitycell_col_names)
 
         scenario_folder_table = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name = 'scenariofolder'"
@@ -146,7 +150,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 10)
+        self.assertEqual(len(rows), 11)
 
         # Re-run should be no-op and keep same version records.
         _run_migrations_with_conn(self.conn)
@@ -192,6 +196,70 @@ class DatabaseMigrationsTests(unittest.TestCase):
             for row in self.conn.execute("SELECT version FROM schema_migration").fetchall()
         }
         self.assertIn("20260711_010_testcasestep_retry_count", versions)
+
+    def test_compatibility_compare_mode_added_for_existing_compat_tables(self):
+        """已应用过 001~010 的旧库：由 011 版本迁移补机型对比列。"""
+        cursor = self.conn.cursor()
+        cursor.executescript(
+            """
+            CREATE TABLE schema_migration (
+                version VARCHAR PRIMARY KEY,
+                applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO schema_migration(version) VALUES
+                ('20260305_001_add_columns'),
+                ('20260305_002_backfill_testcasestep_order'),
+                ('20260305_003_scheduledtask_scenario_nullable'),
+                ('20260312_004_fastbotreport_jank_fields'),
+                ('20260519_005_testresult_report_display'),
+                ('20260616_006_compatibility_tables'),
+                ('20260616_007_compatibility_current_baseline'),
+                ('20260616_008_compatibility_page_set_snapshot'),
+                ('20260710_009_scenario_folders'),
+                ('20260711_010_testcasestep_retry_count');
+            CREATE TABLE compatibilityrun (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                mode VARCHAR DEFAULT 'upgrade',
+                status VARCHAR DEFAULT 'PENDING',
+                created_at TIMESTAMP NOT NULL
+            );
+            CREATE TABLE compatibilitycell (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                device_serial VARCHAR NOT NULL,
+                status VARCHAR DEFAULT 'PENDING'
+            );
+            INSERT INTO compatibilityrun(id, name, created_at) VALUES (1, 'legacy', CURRENT_TIMESTAMP);
+            INSERT INTO compatibilitycell(id, run_id, device_serial) VALUES (1, 1, 'android-1');
+            """
+        )
+        self.conn.commit()
+
+        self.assertNotIn("compare_mode", {c[1] for c in self._table_columns("compatibilityrun")})
+
+        _run_migrations_with_conn(self.conn)
+
+        run_cols = {c[1] for c in self._table_columns("compatibilityrun")}
+        self.assertIn("compare_mode", run_cols)
+        self.assertIn("baseline_device_serial", run_cols)
+        cell_cols = {c[1] for c in self._table_columns("compatibilitycell")}
+        self.assertIn("is_baseline", cell_cols)
+
+        legacy_row = self.conn.execute(
+            "SELECT compare_mode, baseline_device_serial FROM compatibilityrun WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(legacy_row[0], "version")
+        self.assertIsNone(legacy_row[1])
+        legacy_cell = self.conn.execute(
+            "SELECT is_baseline FROM compatibilitycell WHERE id = 1"
+        ).fetchone()
+        self.assertEqual(legacy_cell[0], 0)
+        versions = {
+            row[0]
+            for row in self.conn.execute("SELECT version FROM schema_migration").fetchall()
+        }
+        self.assertIn("20260713_011_compatibility_compare_mode", versions)
 
     def test_compatibility_page_set_snapshot_migration_backfills_existing_runs(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)

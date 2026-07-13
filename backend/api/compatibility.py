@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 TERMINAL_STATUSES = {"PASS", "WARNING", "FAIL", "ERROR", "ABORTED"}
+_CRASH_PATTERN = re.compile(r"FATAL EXCEPTION|ANR in|Application Not Responding", re.I)
 _RUN_ABORT_EVENTS: Dict[int, threading.Event] = {}
 _RUN_ABORT_LOCK = threading.Lock()
 
@@ -156,6 +157,7 @@ def _cell_read(session: Session, row: CompatibilityCell, include_pages: bool = T
         device_info=row.device_info,
         os_version=row.os_version,
         resolution=row.resolution,
+        is_baseline=bool(row.is_baseline),
         status=row.status,
         current_stage=row.current_stage,
         old_install_status=row.old_install_status,
@@ -188,6 +190,8 @@ def _run_read(session: Session, row: CompatibilityRun, include_detail: bool = Fa
         old_package_id=row.old_package_id,
         new_package_id=row.new_package_id,
         package_name=row.package_name,
+        compare_mode=row.compare_mode or "version",
+        baseline_device_serial=row.baseline_device_serial,
         mode=row.mode,
         env_id=row.env_id,
         device_serials=row.device_serials or [],
@@ -453,10 +457,36 @@ def _load_report_asset_bytes(path: Optional[str]) -> bytes:
     return candidate.read_bytes()
 
 
+def _load_report_text(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    reports_root = project_path("reports").resolve()
+    candidate = (reports_root / str(path)).resolve()
+    candidate.relative_to(reports_root)
+    try:
+        return candidate.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 def _normalize_xml(xml_text: str) -> str:
     text = re.sub(r'bounds="[^"]*"', "", xml_text or "")
     text = re.sub(r'(focused|selected|checked|index)="[^"]*"', "", text)
     return text
+
+
+def _normalize_activity(raw: str) -> str:
+    """从 dumpsys window 焦点行提取 `包名/Activity` 组件，剥离窗口 hash 等噪音以便跨设备比较。
+
+    相对写法（com.pkg/.ui.Main）展开为完整组件，不同 ROM 输出风格才可等值比较。
+    """
+    match = re.search(r'([A-Za-z][A-Za-z0-9_.]*)/(\.?[A-Za-z0-9_.$]+)', raw or "")
+    if not match:
+        return ""
+    package, activity = match.group(1), match.group(2)
+    if activity.startswith("."):
+        activity = package + activity
+    return f"{package}/{activity}"
 
 
 def compare_page_snapshots(
@@ -520,7 +550,7 @@ def compare_page_snapshots(
         str(baseline.get("logcat_errors") or ""),
         str(candidate.get("logcat_errors") or ""),
     ])
-    has_crash = bool(re.search(r"FATAL EXCEPTION|ANR in|Application Not Responding", crash_text, re.I))
+    has_crash = bool(_CRASH_PATTERN.search(crash_text))
     required_text = str(page.get("required_text") or "").strip()
     required_text_missing = bool(
         required_text
@@ -572,6 +602,119 @@ def _image_to_png_bytes(image: Any) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def compare_device_pages(
+    *,
+    baseline: Dict[str, Any],
+    candidate: Dict[str, Any],
+    page: Dict[str, Any],
+    thresholds: Dict[str, Any],
+    run_id: int,
+    cell_id: int,
+) -> Dict[str, Any]:
+    """机型对比：候选设备页面 vs 基准设备页面。
+
+    结构语义为主：Crash/必需文本/Activity 不一致直接 FAIL；归一化 XML 结构差异触发 WARNING；
+    像素/SSIM 仅在两台设备分辨率相同时参与判定，跨分辨率仅计算展示（size 差异是预期，不告警）。
+    """
+    try:
+        from PIL import Image, ImageChops
+        import numpy as np
+    except Exception as exc:
+        return {
+            "status": "FAIL",
+            "reason": f"图像对比依赖缺失: {exc}",
+            "metrics": {},
+            "diff_screenshot_path": None,
+        }
+
+    reasons: List[str] = []
+    status = "PASS"
+
+    if candidate.get("has_crash_or_anr"):
+        status = "FAIL"
+        reasons.append("检测到 Crash/ANR 日志")
+    required_text = str(page.get("required_text") or "").strip()
+    if candidate.get("required_text_missing"):
+        status = "FAIL"
+        reasons.append(f"页面缺少必需文本: {required_text}")
+
+    baseline_activity = _normalize_activity(str(baseline.get("activity") or ""))
+    candidate_activity = _normalize_activity(str(candidate.get("activity") or ""))
+    activity_mismatch = bool(
+        baseline_activity and candidate_activity and baseline_activity != candidate_activity
+    )
+    if activity_mismatch:
+        status = "FAIL"
+        reasons.append(f"页面 Activity 与基准不一致: {candidate_activity} != {baseline_activity}")
+
+    baseline_img = Image.open(io.BytesIO(_load_report_asset_bytes(baseline.get("screenshot_path")))).convert("RGB")
+    candidate_img = Image.open(io.BytesIO(_load_report_asset_bytes(candidate.get("screenshot_path")))).convert("RGB")
+    same_resolution = baseline_img.size == candidate_img.size
+    compare_img = candidate_img if same_resolution else candidate_img.resize(baseline_img.size)
+
+    diff = ImageChops.difference(baseline_img, compare_img)
+    diff_arr = np.asarray(diff)
+    changed = np.any(diff_arr > 24, axis=2)
+    pixel_diff_ratio = float(np.count_nonzero(changed) / max(1, changed.size))
+    mean_abs_diff = float(diff_arr.mean() / 255.0)
+    visual_similarity = max(0.0, min(1.0, 1.0 - mean_abs_diff))
+
+    try:
+        from skimage.metrics import structural_similarity
+        import cv2
+
+        gray_a = cv2.cvtColor(np.asarray(baseline_img), cv2.COLOR_RGB2GRAY)
+        gray_b = cv2.cvtColor(np.asarray(compare_img), cv2.COLOR_RGB2GRAY)
+        ssim_score = float(structural_similarity(gray_a, gray_b))
+    except Exception:
+        ssim_score = visual_similarity
+
+    diff_path = None
+    if same_resolution:
+        overlay_arr = np.asarray(candidate_img).copy()
+        overlay_arr[changed] = [255, 64, 64]
+        diff_img = Image.fromarray(overlay_arr)
+        diff_path = _store_png_bytes(
+            project_path("reports", "compatibility", str(run_id), str(cell_id), "diff", f"{page.get('key')}.png"),
+            _image_to_png_bytes(diff_img),
+        )
+
+    baseline_xml = _normalize_xml(str(baseline.get("xml_text") or ""))
+    candidate_xml = _normalize_xml(str(candidate.get("xml_text") or ""))
+    xml_similarity = SequenceMatcher(None, baseline_xml, candidate_xml).ratio() if (baseline_xml or candidate_xml) else 1.0
+    xml_diff_ratio = 1.0 - xml_similarity
+
+    pixel_warn = float(thresholds.get("pixel_diff_ratio_warn", 0.03))
+    ssim_warn = float(thresholds.get("ssim_warn", 0.96))
+    xml_warn = float(thresholds.get("xml_diff_ratio_warn", 0.35))
+    if status != "FAIL":
+        if xml_diff_ratio > xml_warn:
+            status = "WARNING"
+            reasons.append("UI 层级与基准设备差异超过阈值")
+        if same_resolution and (pixel_diff_ratio > pixel_warn or ssim_score < ssim_warn):
+            status = "WARNING"
+            reasons.append("视觉差异超过阈值")
+
+    metrics = {
+        "pixel_diff_ratio": round(pixel_diff_ratio, 6),
+        "ssim": round(ssim_score, 6),
+        "visual_similarity": round(visual_similarity, 6),
+        "xml_diff_ratio": round(xml_diff_ratio, 6),
+        "same_resolution": same_resolution,
+        "has_crash_or_anr": bool(candidate.get("has_crash_or_anr")),
+        "required_text_missing": bool(candidate.get("required_text_missing")),
+        "activity_mismatch": activity_mismatch,
+        "baseline_device_serial": str(baseline.get("device_serial") or ""),
+    }
+
+    return {
+        "status": status,
+        "reason": "；".join(reasons) if reasons else None,
+        "metrics": metrics,
+        "diff_screenshot_path": diff_path,
+    }
 
 
 async def _run_page_capture(
@@ -656,111 +799,10 @@ async def _execute_cell(run_id: int, cell_id: int, pages: List[Dict[str, Any]], 
             if _is_cancelled(session, run_id, abort_event):
                 raise asyncio.CancelledError()
 
-            if run.old_package_id is None:
-                cell.current_stage = "检查当前版本"
-                cell.old_install_status = "SKIPPED"
-                session.add(cell)
-                session.commit()
-                try:
-                    await _ensure_package_installed(cell.device_serial, run.package_name)
-                except Exception:
-                    cell.old_install_status = "FAIL"
-                    session.add(cell)
-                    session.commit()
-                    raise
+            if run.compare_mode == "device":
+                await _execute_cell_device_body(session, run, cell, pages, abort_event, run_id)
             else:
-                cell.current_stage = "安装旧版本"
-                cell.old_install_status = "RUNNING"
-                session.add(cell)
-                session.commit()
-                await install_app_package_to_device(
-                    session=session,
-                    package_id=run.old_package_id,
-                    serial=cell.device_serial,
-                    require_idle=False,
-                    uninstall_first=True,
-                    allow_uninstall_retry=True,
-                    allow_downgrade=True,
-                )
-                cell.old_install_status = "PASS"
-                session.add(cell)
-                session.commit()
-
-            baseline_by_key: Dict[str, Dict[str, Any]] = {}
-            for page in pages:
-                if _is_cancelled(session, run_id, abort_event):
-                    raise asyncio.CancelledError()
-                cell.current_stage = f"采集旧版: {page.get('name')}"
-                session.add(cell)
-                session.commit()
-                try:
-                    baseline_by_key[str(page.get("key"))] = await _run_page_capture(
-                        session=session,
-                        run=run,
-                        cell=cell,
-                        page=page,
-                        phase="baseline",
-                        abort_event=abort_event,
-                    )
-                except Exception as exc:
-                    _record_capture_failure(session, run, cell, page, "baseline", exc)
-
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-
-            cell.current_stage = "安装新版本"
-            cell.new_install_status = "RUNNING"
-            session.add(cell)
-            session.commit()
-            await install_app_package_to_device(
-                session=session,
-                package_id=run.new_package_id,
-                serial=cell.device_serial,
-                require_idle=False,
-                uninstall_first=(run.mode == "clean"),
-                allow_uninstall_retry=False,
-                allow_downgrade=False,
-            )
-            cell.new_install_status = "PASS"
-            session.add(cell)
-            session.commit()
-
-            for page in pages:
-                if _is_cancelled(session, run_id, abort_event):
-                    raise asyncio.CancelledError()
-                cell.current_stage = f"采集新版: {page.get('name')}"
-                session.add(cell)
-                session.commit()
-                baseline = baseline_by_key.get(str(page.get("key")))
-                try:
-                    candidate = await _run_page_capture(
-                        session=session,
-                        run=run,
-                        cell=cell,
-                        page=page,
-                        phase="candidate",
-                        abort_event=abort_event,
-                    )
-                    if not baseline:
-                        raise RuntimeError("旧版基线采集失败，无法对比")
-                    _record_compare_result(session, run, cell, page, baseline, candidate)
-                except Exception as exc:
-                    _record_capture_failure(session, run, cell, page, "candidate", exc, baseline=baseline)
-
-            page_rows = session.exec(
-                select(CompatibilityPageResult).where(CompatibilityPageResult.cell_id == cell.id)
-            ).all()
-            statuses = {str(item.status or "").upper() for item in page_rows}
-            if any(item in statuses for item in {"FAIL", "ERROR"}):
-                cell.status = "FAIL"
-            elif "WARNING" in statuses:
-                cell.status = "WARNING"
-            else:
-                cell.status = "PASS"
-            cell.current_stage = "完成"
-            cell.finished_at = _now()
-            session.add(cell)
-            session.commit()
+                await _execute_cell_version_body(session, run, cell, pages, abort_event, run_id)
         except asyncio.CancelledError:
             cell.status = "ABORTED"
             cell.current_stage = "已取消"
@@ -785,6 +827,174 @@ async def _execute_cell(run_id: int, cell_id: int, pages: List[Dict[str, Any]], 
             except Exception:
                 logger.exception("compatibility restore device failed: %s", cell.device_serial)
             _update_run_summary(session, run_id, final=False)
+
+
+async def _execute_cell_version_body(
+    session: Session,
+    run: CompatibilityRun,
+    cell: CompatibilityCell,
+    pages: List[Dict[str, Any]],
+    abort_event: threading.Event,
+    run_id: int,
+) -> None:
+    """版本对比（纵向）：同设备安装旧版→采集基线→安装新版→采集并逐页对比。"""
+    if run.old_package_id is None:
+        cell.current_stage = "检查当前版本"
+        cell.old_install_status = "SKIPPED"
+        session.add(cell)
+        session.commit()
+        try:
+            await _ensure_package_installed(cell.device_serial, run.package_name)
+        except Exception:
+            cell.old_install_status = "FAIL"
+            session.add(cell)
+            session.commit()
+            raise
+    else:
+        cell.current_stage = "安装旧版本"
+        cell.old_install_status = "RUNNING"
+        session.add(cell)
+        session.commit()
+        await install_app_package_to_device(
+            session=session,
+            package_id=run.old_package_id,
+            serial=cell.device_serial,
+            require_idle=False,
+            uninstall_first=True,
+            allow_uninstall_retry=True,
+            allow_downgrade=True,
+        )
+        cell.old_install_status = "PASS"
+        session.add(cell)
+        session.commit()
+
+    baseline_by_key: Dict[str, Dict[str, Any]] = {}
+    for page in pages:
+        if _is_cancelled(session, run_id, abort_event):
+            raise asyncio.CancelledError()
+        cell.current_stage = f"采集旧版: {page.get('name')}"
+        session.add(cell)
+        session.commit()
+        try:
+            baseline_by_key[str(page.get("key"))] = await _run_page_capture(
+                session=session,
+                run=run,
+                cell=cell,
+                page=page,
+                phase="baseline",
+                abort_event=abort_event,
+            )
+        except Exception as exc:
+            _record_capture_failure(session, run, cell, page, "baseline", exc)
+
+    if _is_cancelled(session, run_id, abort_event):
+        raise asyncio.CancelledError()
+
+    cell.current_stage = "安装新版本"
+    cell.new_install_status = "RUNNING"
+    session.add(cell)
+    session.commit()
+    await install_app_package_to_device(
+        session=session,
+        package_id=run.new_package_id,
+        serial=cell.device_serial,
+        require_idle=False,
+        uninstall_first=(run.mode == "clean"),
+        allow_uninstall_retry=False,
+        allow_downgrade=False,
+    )
+    cell.new_install_status = "PASS"
+    session.add(cell)
+    session.commit()
+
+    for page in pages:
+        if _is_cancelled(session, run_id, abort_event):
+            raise asyncio.CancelledError()
+        cell.current_stage = f"采集新版: {page.get('name')}"
+        session.add(cell)
+        session.commit()
+        baseline = baseline_by_key.get(str(page.get("key")))
+        try:
+            candidate = await _run_page_capture(
+                session=session,
+                run=run,
+                cell=cell,
+                page=page,
+                phase="candidate",
+                abort_event=abort_event,
+            )
+            if not baseline:
+                raise RuntimeError("旧版基线采集失败，无法对比")
+            _record_compare_result(session, run, cell, page, baseline, candidate)
+        except Exception as exc:
+            _record_capture_failure(session, run, cell, page, "candidate", exc, baseline=baseline)
+
+    page_rows = session.exec(
+        select(CompatibilityPageResult).where(CompatibilityPageResult.cell_id == cell.id)
+    ).all()
+    statuses = {str(item.status or "").upper() for item in page_rows}
+    if any(item in statuses for item in {"FAIL", "ERROR"}):
+        cell.status = "FAIL"
+    elif "WARNING" in statuses:
+        cell.status = "WARNING"
+    else:
+        cell.status = "PASS"
+    cell.current_stage = "完成"
+    cell.finished_at = _now()
+    session.add(cell)
+    session.commit()
+
+
+async def _execute_cell_device_body(
+    session: Session,
+    run: CompatibilityRun,
+    cell: CompatibilityCell,
+    pages: List[Dict[str, Any]],
+    abort_event: threading.Event,
+    run_id: int,
+) -> None:
+    """机型对比（横向）：单次安装测试包，每页采集一次并落 PENDING 页面行；横向对比在所有 cell 完成后统一进行。"""
+    cell.current_stage = "安装测试包"
+    cell.old_install_status = "SKIPPED"
+    cell.new_install_status = "RUNNING"
+    session.add(cell)
+    session.commit()
+    await install_app_package_to_device(
+        session=session,
+        package_id=run.new_package_id,
+        serial=cell.device_serial,
+        require_idle=False,
+        uninstall_first=(run.mode == "clean"),
+        allow_uninstall_retry=(run.mode == "clean"),
+        allow_downgrade=True,
+    )
+    cell.new_install_status = "PASS"
+    session.add(cell)
+    session.commit()
+
+    for page in pages:
+        if _is_cancelled(session, run_id, abort_event):
+            raise asyncio.CancelledError()
+        cell.current_stage = f"采集页面: {page.get('name')}"
+        session.add(cell)
+        session.commit()
+        try:
+            snapshot = await _run_page_capture(
+                session=session,
+                run=run,
+                cell=cell,
+                page=page,
+                phase="candidate",
+                abort_event=abort_event,
+            )
+            _record_device_capture(session, run, cell, page, snapshot)
+        except Exception as exc:
+            _record_capture_failure(session, run, cell, page, "candidate", exc)
+
+    # 采集阶段结束：cell 状态暂留 RUNNING，终态由 join 后的横向对比统一收敛
+    cell.current_stage = "采集完成，等待横向对比"
+    session.add(cell)
+    session.commit()
 
 
 def _record_capture_failure(
@@ -817,6 +1027,49 @@ def _record_capture_failure(
         row.baseline_screenshot_path = baseline.get("screenshot_path")
         row.baseline_xml_path = baseline.get("xml_path")
         row.baseline_activity = baseline.get("activity")
+    row.updated_at = _now()
+    session.add(row)
+    session.commit()
+
+
+def _record_device_capture(
+    session: Session,
+    run: CompatibilityRun,
+    cell: CompatibilityCell,
+    page: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> None:
+    """机型对比模式：采集即落 PENDING 页面行，并持久化单机自检事实（Crash/必需文本），横向对比在 join 后统一进行。"""
+    has_crash = bool(_CRASH_PATTERN.search(str(snapshot.get("logcat_errors") or "")))
+    required_text = str(page.get("required_text") or "").strip()
+    normalized_xml = _normalize_xml(str(snapshot.get("xml_text") or ""))
+    required_text_missing = bool(required_text and required_text not in normalized_xml)
+
+    existing = session.exec(
+        select(CompatibilityPageResult)
+        .where(
+            CompatibilityPageResult.cell_id == cell.id,
+            CompatibilityPageResult.page_key == str(page.get("key")),
+        )
+    ).first()
+    row = existing or CompatibilityPageResult(
+        run_id=run.id,
+        cell_id=cell.id,
+        page_key=str(page.get("key") or ""),
+        page_name=str(page.get("name") or ""),
+        case_id=int(page.get("case_id") or 0),
+        required_text=page.get("required_text"),
+    )
+    row.status = "PENDING"
+    row.reason = None
+    row.candidate_screenshot_path = snapshot.get("screenshot_path")
+    row.candidate_xml_path = snapshot.get("xml_path")
+    row.candidate_activity = _normalize_activity(str(snapshot.get("activity") or ""))
+    row.metrics = {
+        "has_crash_or_anr": has_crash,
+        "required_text_missing": required_text_missing,
+        "resolution": cell.resolution or "",
+    }
     row.updated_at = _now()
     session.add(row)
     session.commit()
@@ -884,6 +1137,8 @@ async def _execute_run_async(run_id: int, pages: List[Dict[str, Any]]) -> None:
     abort_event = _abort_event_for_run(run_id)
     try:
         with SQLSession(engine) as session:
+            run = session.get(CompatibilityRun, run_id)
+            compare_mode = str((run.compare_mode if run else None) or "version")
             cells = session.exec(
                 select(CompatibilityCell).where(CompatibilityCell.run_id == run_id)
             ).all()
@@ -893,6 +1148,9 @@ async def _execute_run_async(run_id: int, pages: List[Dict[str, Any]]) -> None:
             for cell in cells
             if cell.id is not None
         ])
+
+        if compare_mode == "device":
+            await asyncio.to_thread(_run_cross_device_comparison, run_id, pages, abort_event)
 
         with SQLSession(engine) as session:
             _update_run_summary(session, run_id, final=True)
@@ -908,6 +1166,175 @@ async def _execute_run_async(run_id: int, pages: List[Dict[str, Any]]) -> None:
                 session.commit()
     finally:
         _discard_abort_event(run_id)
+
+
+def _baseline_snapshot_from_row(cell: CompatibilityCell, row: CompatibilityPageResult) -> Dict[str, Any]:
+    return {
+        "screenshot_path": row.candidate_screenshot_path,
+        "xml_path": row.candidate_xml_path,
+        "xml_text": _load_report_text(row.candidate_xml_path),
+        "activity": row.candidate_activity or "",
+        "device_serial": cell.device_serial,
+    }
+
+
+def _finalize_standalone_page_status(row: CompatibilityPageResult, *, is_baseline: bool) -> None:
+    """依据采集期持久化的单机自检事实（Crash/必需文本）收敛页面状态。"""
+    metrics = dict(row.metrics or {})
+    reasons: List[str] = []
+    status = "PASS"
+    if metrics.get("has_crash_or_anr"):
+        status = "FAIL"
+        reasons.append("检测到 Crash/ANR 日志")
+    if metrics.get("required_text_missing"):
+        status = "FAIL"
+        reasons.append(f"页面缺少必需文本: {row.required_text or ''}")
+    if is_baseline:
+        metrics["is_baseline"] = True
+    row.status = status
+    row.reason = "；".join(reasons) if reasons else None
+    row.metrics = metrics
+    row.updated_at = _now()
+
+
+def _run_cross_device_comparison(run_id: int, pages: List[Dict[str, Any]], abort_event: threading.Event) -> None:
+    """机型对比：所有 cell 采集完成后，非基准设备逐页与基准设备横向对比。"""
+    from sqlmodel import Session as SQLSession
+
+    with SQLSession(engine) as session:
+        run = session.get(CompatibilityRun, run_id)
+        if not run:
+            return
+        cells = session.exec(
+            select(CompatibilityCell).where(CompatibilityCell.run_id == run_id).order_by(CompatibilityCell.id)
+        ).all()
+        baseline_cell = next((item for item in cells if item.is_baseline), None)
+        if baseline_cell is None:
+            baseline_cell = next(
+                (item for item in cells if item.device_serial == run.baseline_device_serial), None
+            )
+
+        rows = session.exec(
+            select(CompatibilityPageResult).where(CompatibilityPageResult.run_id == run_id)
+        ).all()
+        rows_by_cell_page: Dict[Tuple[int, str], CompatibilityPageResult] = {
+            (item.cell_id, item.page_key): item for item in rows
+        }
+
+        cancelled = _is_cancelled(session, run_id, abort_event)
+
+        # 先收敛基准设备自身页面状态（仅单机自检，不与他机对比）
+        baseline_rows: Dict[str, CompatibilityPageResult] = {}
+        if baseline_cell is not None:
+            for page in pages:
+                page_key = str(page.get("key") or "")
+                row = rows_by_cell_page.get((baseline_cell.id, page_key))
+                if row is None:
+                    continue
+                baseline_rows[page_key] = row
+                if str(row.status or "").upper() == "PENDING" and not cancelled:
+                    _finalize_standalone_page_status(row, is_baseline=True)
+                    session.add(row)
+            session.commit()
+
+        for cell in cells:
+            if baseline_cell is not None and cell.id == baseline_cell.id:
+                continue
+            if not cancelled and _is_cancelled(session, run_id, abort_event):
+                cancelled = True
+            for page in pages:
+                page_key = str(page.get("key") or "")
+                row = rows_by_cell_page.get((cell.id, page_key))
+                if row is None or str(row.status or "").upper() != "PENDING":
+                    continue
+                if cancelled:
+                    continue
+
+                cell_stage_owner = session.get(CompatibilityCell, cell.id)
+                if cell_stage_owner and cell_stage_owner.status == "RUNNING":
+                    cell_stage_owner.current_stage = f"横向对比: {page.get('name')}"
+                    session.add(cell_stage_owner)
+                    session.commit()
+
+                baseline_row = baseline_rows.get(page_key)
+                if (
+                    baseline_cell is None
+                    or baseline_row is None
+                    or not baseline_row.candidate_screenshot_path
+                    or not baseline_row.candidate_xml_path
+                ):
+                    row.status = "ERROR"
+                    row.reason = "基准设备页面采集失败，无法横向对比"
+                    row.updated_at = _now()
+                    session.add(row)
+                    session.commit()
+                    continue
+
+                baseline_snapshot = _baseline_snapshot_from_row(baseline_cell, baseline_row)
+                capture_metrics = dict(row.metrics or {})
+                candidate_snapshot = {
+                    "screenshot_path": row.candidate_screenshot_path,
+                    "xml_text": _load_report_text(row.candidate_xml_path),
+                    "activity": row.candidate_activity or "",
+                    "has_crash_or_anr": bool(capture_metrics.get("has_crash_or_anr")),
+                    "required_text_missing": bool(capture_metrics.get("required_text_missing")),
+                }
+                try:
+                    comparison = compare_device_pages(
+                        baseline=baseline_snapshot,
+                        candidate=candidate_snapshot,
+                        page=page,
+                        thresholds=run.thresholds or {},
+                        run_id=run_id,
+                        cell_id=cell.id,
+                    )
+                    row.status = comparison.get("status") or "FAIL"
+                    row.reason = comparison.get("reason")
+                    row.diff_screenshot_path = comparison.get("diff_screenshot_path")
+                    merged_metrics = dict(capture_metrics)
+                    merged_metrics.update(comparison.get("metrics") or {})
+                    row.metrics = merged_metrics
+                except Exception as exc:
+                    logger.exception(
+                        "cross-device compare failed: run=%s cell=%s page=%s", run_id, cell.id, page_key
+                    )
+                    row.status = "FAIL"
+                    row.reason = f"横向对比失败: {exc}"
+                row.baseline_screenshot_path = baseline_row.candidate_screenshot_path
+                row.baseline_xml_path = baseline_row.candidate_xml_path
+                row.baseline_activity = baseline_row.candidate_activity
+                row.updated_at = _now()
+                session.add(row)
+                session.commit()
+
+        # 收敛各 cell 终态（采集阶段结束时留 RUNNING，由此统一定级）
+        for cell in cells:
+            current = session.get(CompatibilityCell, cell.id)
+            if not current or str(current.status or "").upper() not in {"PENDING", "RUNNING"}:
+                continue
+            if cancelled:
+                current.status = "ABORTED"
+                current.current_stage = "已取消"
+            else:
+                page_rows = session.exec(
+                    select(CompatibilityPageResult).where(CompatibilityPageResult.cell_id == current.id)
+                ).all()
+                statuses = {str(item.status or "").upper() for item in page_rows}
+                if not page_rows or any(item in statuses for item in {"FAIL", "ERROR"}):
+                    current.status = "FAIL"
+                    if not page_rows:
+                        current.error_message = current.error_message or "未产生页面结果"
+                elif "WARNING" in statuses:
+                    current.status = "WARNING"
+                elif "PENDING" in statuses:
+                    current.status = "FAIL"
+                    current.error_message = current.error_message or "横向对比未完成"
+                else:
+                    current.status = "PASS"
+                current.current_stage = "完成"
+            current.finished_at = current.finished_at or _now()
+            session.add(current)
+        session.commit()
 
 
 @router.get("/page-sets", response_model=List[CompatPageSetRead])
@@ -1054,6 +1481,8 @@ def create_run(
         old_package_id=old_pkg.id if old_pkg else None,
         new_package_id=new_pkg.id,
         package_name=new_pkg.package_name,
+        compare_mode=payload.compare_mode,
+        baseline_device_serial=payload.baseline_device_serial,
         mode=payload.mode,
         env_id=payload.env_id,
         device_serials=payload.device_serials,
@@ -1078,6 +1507,10 @@ def create_run(
                 device_info=display,
                 os_version=device.os_version or device.android_version,
                 resolution=device.resolution,
+                is_baseline=(
+                    payload.compare_mode == "device"
+                    and device.serial == payload.baseline_device_serial
+                ),
                 status="PENDING",
             )
         )

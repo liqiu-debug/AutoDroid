@@ -101,6 +101,9 @@ def _migration_add_columns(cursor) -> None:
         ("testexecution", "device_serial", "VARCHAR"),
         ("testexecution", "platform", "VARCHAR"),
         ("testresult", "report_display", "JSON"),
+        ("compatibilityrun", "compare_mode", "VARCHAR DEFAULT 'version'"),
+        ("compatibilityrun", "baseline_device_serial", "VARCHAR"),
+        ("compatibilitycell", "is_baseline", "BOOLEAN DEFAULT 0"),
     ]
 
     for table, column, col_type in migrations:
@@ -244,6 +247,8 @@ def _migrate_compatibility_tables(cursor) -> None:
                 old_package_id INTEGER REFERENCES apppackage(id),
                 new_package_id INTEGER NOT NULL REFERENCES apppackage(id),
                 package_name VARCHAR DEFAULT '',
+                compare_mode VARCHAR DEFAULT 'version',
+                baseline_device_serial VARCHAR,
                 mode VARCHAR DEFAULT 'upgrade',
                 env_id INTEGER REFERENCES environment(id),
                 device_serials TEXT,
@@ -275,6 +280,7 @@ def _migrate_compatibility_tables(cursor) -> None:
                 device_info VARCHAR,
                 os_version VARCHAR,
                 resolution VARCHAR,
+                is_baseline BOOLEAN DEFAULT 0,
                 status VARCHAR DEFAULT 'PENDING',
                 current_stage VARCHAR,
                 old_install_status VARCHAR,
@@ -524,6 +530,8 @@ def _run_migrations_with_conn(conn) -> None:
         ("20260710_009_scenario_folders", _migrate_scenario_folders),
         # 复用 _migration_add_columns（幂等按列检查），为已应用过 001 的库补 retry_count 列
         ("20260711_010_testcasestep_retry_count", _migration_add_columns),
+        # 复用 _migration_add_columns，为已有库补兼容性机型对比列（compare_mode/baseline_device_serial/is_baseline）
+        ("20260713_011_compatibility_compare_mode", _migration_add_columns),
     ]
 
     for version, migration_func in migration_plan:

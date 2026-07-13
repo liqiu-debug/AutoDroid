@@ -252,6 +252,8 @@ class CompatibilityRun(SQLModel, table=True):
     old_package_id: Optional[int] = Field(default=None, foreign_key="apppackage.id", index=True)
     new_package_id: int = Field(foreign_key="apppackage.id", index=True)
     package_name: str = Field(default="", index=True)
+    compare_mode: str = Field(default="version", index=True)  # version（同设备新旧对比）| device（跨设备横向对比）
+    baseline_device_serial: Optional[str] = Field(default=None)  # device 模式下的基准设备
     mode: str = Field(default="upgrade")  # upgrade | clean
     env_id: Optional[int] = Field(default=None, foreign_key="environment.id")
     device_serials: List[str] = Field(default=[], sa_column=Column(PydanticListType(str)))
@@ -278,6 +280,7 @@ class CompatibilityCell(SQLModel, table=True):
     device_info: Optional[str] = None
     os_version: Optional[str] = None
     resolution: Optional[str] = None
+    is_baseline: bool = Field(default=False)  # device 模式下该设备是否为横向对比基准
     status: str = Field(default="PENDING", index=True)
     current_stage: Optional[str] = None
     old_install_status: Optional[str] = None
