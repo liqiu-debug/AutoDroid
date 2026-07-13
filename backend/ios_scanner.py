@@ -115,6 +115,9 @@ class IOSDeviceScanner:
             udid: str = dev_info.udid if hasattr(dev_info, "udid") else str(dev_info)
             try:
                 info = self._fetch_device_info(udid)
+                info["connection_type"] = self._normalize_conn_type(
+                    getattr(dev_info, "conn_type", None)
+                )
                 devices.append(info)
             except Exception as exc:
                 logger.warning("采集设备 %s 信息失败，跳过: %s", udid, exc)
@@ -219,6 +222,12 @@ class IOSDeviceScanner:
         }
 
     @staticmethod
+    def _normalize_conn_type(raw: Any) -> Optional[str]:
+        """将 tidevice 的 conn_type 归一化为 'usb' / 'network'，未知值返回 None。"""
+        value = str(raw or "").strip().lower()
+        return value if value in ("usb", "network") else None
+
+    @staticmethod
     def translate_model(product_type: str) -> str:
         """
         将 Apple 内部型号标识翻译为用户友好的名称。
@@ -244,3 +253,22 @@ def get_ios_devices() -> List[Dict[str, Any]]:
 def check_ios_wda(udid: str, port: Optional[int] = None) -> Dict[str, Any]:
     """模块级快捷方法：检查指定设备的 WDA 状态。"""
     return _scanner.check_wda_status(udid, port)
+
+def get_usbmux_connection_type(udid: str) -> Optional[str]:
+    """
+    实时查询指定设备当前的 usbmux 连接方式。
+
+    Returns:
+        'usb' / 'network'；设备不在线或查询失败时返回 None。
+    """
+    device_id = str(udid or "").strip()
+    if not device_id:
+        return None
+    try:
+        for dev_info in Usbmux().device_list():
+            if str(getattr(dev_info, "udid", "") or "").strip() != device_id:
+                continue
+            return IOSDeviceScanner._normalize_conn_type(getattr(dev_info, "conn_type", None))
+    except Exception as exc:
+        logger.warning("查询设备 %s usbmux 连接方式失败: %s", device_id, exc)
+    return None

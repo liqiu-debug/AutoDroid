@@ -86,6 +86,7 @@ def _migration_add_columns(cursor) -> None:
         ("device", "market_name", "VARCHAR(100)"),
         ("device", "platform", "VARCHAR DEFAULT 'android'"),
         ("device", "os_version", "VARCHAR DEFAULT ''"),
+        ("device", "connection_type", "VARCHAR"),
         ("testscenario", "updater_id", "INTEGER REFERENCES user(id)"),
         ("testscenario", "last_run_duration", "INTEGER"),
         ("testscenario", "last_report_id", "VARCHAR"),

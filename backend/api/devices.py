@@ -9,6 +9,7 @@ import base64
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
@@ -18,16 +19,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from backend.database import get_session
 from backend.device_sorting import sort_devices_for_display
-from backend.feature_flags import get_setting_value
-from backend.models import Device, TestExecution
+from backend.feature_flags import delete_setting_value, get_setting_value, set_setting_value
+from backend.models import Device, SystemSetting, TestExecution
 from backend.paths import project_path
-from backend.schemas import DeviceRead, DeviceSyncResponse, DeviceRenameRequest
+from backend.schemas import (
+    DeviceRead,
+    DeviceRenameRequest,
+    DeviceSyncResponse,
+    DeviceWirelessEnableRequest,
+)
 from backend.api.deps import get_current_user
 from backend.wda_port_manager import wda_relay_manager
 
@@ -501,6 +508,29 @@ def _build_ios_wda_launch_command(session: Session, udid: str) -> Dict[str, Any]
             "bundle_source": "resolved",
         }
 
+    # iOS 17+ 上 tidevice xctest 已不可用；仅 WiFi 配对（无线）时 tidevice 也无法可靠拉起。
+    # 这两种场景优先 xcodebuild（支持网络设备）；未配置工程时按场景给出明确指引或回退。
+    if platform.system().lower() == "darwin":
+        major_version = _resolve_ios_major_version(session, udid)
+        network_only = _get_live_usbmux_conn_type(udid) == "network"
+        if network_only or (major_version is not None and major_version >= 17):
+            try:
+                return _build_ios_wda_xcodebuild_command(session, udid)
+            except Exception as exc:
+                if network_only:
+                    raise RuntimeError(
+                        "P3008_WIRELESS_WDA_START_UNAVAILABLE: 无线（仅 WiFi 配对）状态下"
+                        "无法通过 tidevice 启动 WDA，且未找到可用的 WebDriverAgent 工程。"
+                        "请插线后重试，或配置 ios_wda_xcodeproj_path / ios_wda_launch_cmd。"
+                        f"原因: {exc}"
+                    ) from exc
+                logger.info(
+                    "iOS %s 优先 xcodebuild 启动不可用，回退 tidevice: udid=%s error=%s",
+                    major_version,
+                    udid,
+                    exc,
+                )
+
     return _build_ios_wda_tidevice_command(session, udid)
 
 
@@ -970,6 +1000,96 @@ def _capture_ios_screenshot_bytes(serial: str, wda_url: str) -> bytes:
             logger.warning("iOS 截图后断开驱动失败: serial=%s error=%s", serial, exc)
 
 
+# ==================== iOS 无线模式工具 ====================
+
+_WIRELESS_HOST_PATTERN = re.compile(r"^[0-9A-Za-z.-]+$")
+_WIRELESS_WDA_URL_PREFIX = "ios_wda_url."
+
+
+def _is_safe_wireless_host(host: str) -> bool:
+    return bool(_WIRELESS_HOST_PATTERN.match(str(host or "").strip()))
+
+
+def _fetch_ios_device_ip_from_wda(wda_url: str) -> Optional[str]:
+    """从 WDA /status 响应中读取设备 WiFi IP（value.ios.ip）。"""
+    base = str(wda_url or "").strip()
+    if not base:
+        return None
+    import requests
+
+    try:
+        resp = requests.get(f"{base.rstrip('/')}/status", timeout=5)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        ip = str((((data.get("value") or {}).get("ios") or {}).get("ip")) or "").strip()
+        return ip or None
+    except Exception as exc:
+        logger.warning("从 WDA 读取设备 IP 失败: url=%s error=%s", base, exc)
+        return None
+
+
+def _get_wireless_url_map(session: Session) -> Dict[str, str]:
+    """
+    收集已配置为无线直连的设备映射：ios_wda_url.{serial} 且 host 非本机。
+
+    仅识别 scoped 配置（启用无线写入的形态）；全局/映射表配置属于高级手动场景，
+    不参与无线徽标与在线判定。
+    """
+    result: Dict[str, str] = {}
+    try:
+        settings = session.exec(
+            select(SystemSetting).where(SystemSetting.key.startswith(_WIRELESS_WDA_URL_PREFIX))
+        ).all()
+    except Exception as exc:
+        logger.warning("读取无线 WDA 配置失败: %s", exc)
+        return result
+
+    for setting in settings:
+        serial = str(setting.key or "")[len(_WIRELESS_WDA_URL_PREFIX):].strip()
+        url = str(setting.value or "").strip()
+        if not serial or not url:
+            continue
+        try:
+            host = (urlparse(url).hostname or "").strip().lower()
+        except Exception:
+            continue
+        if host and host not in ("127.0.0.1", "localhost"):
+            result[serial] = url
+    return result
+
+
+def _build_device_reads(session: Session, devices: List[Device]) -> List[DeviceRead]:
+    """ORM Device -> DeviceRead，并补充 wireless_enabled 计算字段。"""
+    wireless_map = _get_wireless_url_map(session)
+    payloads: List[DeviceRead] = []
+    for device in devices:
+        payload = DeviceRead.model_validate(device)
+        payload.wireless_enabled = device.serial in wireless_map
+        payloads.append(payload)
+    return payloads
+
+
+def _resolve_ios_major_version(session: Session, udid: str) -> Optional[int]:
+    device = session.exec(select(Device).where(Device.serial == udid)).first()
+    raw = str(getattr(device, "os_version", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw.split(".")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _get_live_usbmux_conn_type(udid: str) -> Optional[str]:
+    try:
+        from backend.ios_scanner import get_usbmux_connection_type
+
+        return get_usbmux_connection_type(udid)
+    except Exception as exc:
+        logger.warning("查询 usbmux 连接方式失败: udid=%s error=%s", udid, exc)
+        return None
+
+
 # ==================== API 端点 ====================
 
 
@@ -1018,14 +1138,20 @@ async def list_devices(
 
     if refresh_ios_wda:
         status_updated = False
+        wireless_map = _get_wireless_url_map(session)
         for device in devices:
             platform = str(getattr(device, "platform", "android") or "android").strip().lower()
             if platform != "ios":
                 continue
-            if str(device.status or "").strip().upper() == "OFFLINE":
+            is_offline = str(device.status or "").strip().upper() == "OFFLINE"
+            if is_offline and device.serial not in wireless_map:
                 continue
             wda_result = _check_ios_wda_health(session, device.serial)
-            target_status = _resolve_ios_device_status(device.status, bool(wda_result.get("healthy")))
+            healthy = bool(wda_result.get("healthy"))
+            if is_offline and not healthy:
+                # 无线设备直连仍不可达：保持 OFFLINE，不转 WDA_DOWN
+                continue
+            target_status = _resolve_ios_device_status(device.status, healthy)
             if target_status != device.status:
                 device.status = target_status
                 device.updated_at = datetime.now()
@@ -1035,8 +1161,8 @@ async def list_devices(
         if status_updated:
             session.commit()
             devices = sort_devices_for_display(session.exec(select(Device)).all())
-    
-    return devices
+
+    return _build_device_reads(session, devices)
 
 
 @router.put("/{serial}/name", response_model=DeviceRead)
@@ -1125,6 +1251,146 @@ def check_ios_wda(serial: str, session: Session = Depends(get_session)):
 def list_wda_relays():
     """查看当前 WDA relay 端口映射状态（运维诊断接口）。"""
     return {"items": wda_relay_manager.list_relays()}
+
+
+@router.post("/{serial}/wireless/enable")
+def enable_ios_wireless(
+    serial: str,
+    req: Optional[DeviceWirelessEnableRequest] = None,
+    session: Session = Depends(get_session),
+    current_user=Depends(get_current_user),
+):
+    """
+    启用 iOS 无线模式：读取手机 WiFi IP，校验直连可达后写入 ios_wda_url.{serial}。
+
+    前置条件：WDA 当前健康（通常先插线「启动WDA」）；校验失败不落库。
+    """
+    device = session.exec(select(Device).where(Device.serial == serial)).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if str(device.platform or "android").strip().lower() != "ios":
+        raise HTTPException(
+            status_code=400,
+            detail="P3003_WIRELESS_IOS_ONLY: 无线模式仅适用于 iOS 设备。",
+        )
+
+    req = req or DeviceWirelessEnableRequest()
+    try:
+        port = int(req.port)
+    except (TypeError, ValueError):
+        port = 0
+    if not (0 < port < 65536):
+        raise HTTPException(
+            status_code=400,
+            detail=f"P3007_WIRELESS_INVALID_PARAM: 非法 WDA 端口 {req.port!r}",
+        )
+    manual_ip = str(req.ip or "").strip()
+    if manual_ip and not _is_safe_wireless_host(manual_ip):
+        raise HTTPException(
+            status_code=400,
+            detail=f"P3007_WIRELESS_INVALID_PARAM: 非法 IP/主机名 {manual_ip!r}",
+        )
+
+    health = _check_ios_wda_health(session, serial)
+    if not health.get("healthy"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "P3004_WIRELESS_WDA_NOT_READY: WDA 未运行，无法启用无线模式。"
+                "请先插线执行「启动WDA」，成功后再启用无线。"
+                f"原因: {health.get('error')}"
+            ),
+        )
+
+    device_ip = manual_ip or _fetch_ios_device_ip_from_wda(str(health.get("wda_url") or "")) or ""
+    if not device_ip:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "P3005_WIRELESS_IP_UNAVAILABLE: 无法从 WDA 获取设备 IP"
+                "（手机可能未连接 WiFi 或开启了 VPN）。"
+                f"可在请求体中手动指定 ip，或直接配置 ios_wda_url.{serial}。"
+            ),
+        )
+
+    candidate = f"http://{device_ip}:{port}"
+    try:
+        from backend.cross_platform_execution import check_wda_health
+
+        check_wda_health(candidate)
+        _probe_ios_wda_actionability(candidate)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"P3006_WIRELESS_DIRECT_UNREACHABLE: 直连 {candidate} 失败："
+                "请确认电脑与手机在同一局域网、路由器未开启 AP 隔离。"
+                f"原因: {exc}"
+            ),
+        ) from exc
+
+    set_setting_value(
+        session,
+        f"{_WIRELESS_WDA_URL_PREFIX}{serial}",
+        candidate,
+        description="iOS 无线模式直连地址（启用无线自动写入）",
+    )
+    try:
+        wda_relay_manager.stop_relay(serial)
+    except Exception as exc:
+        logger.warning("回收设备 %s 旧 WDA relay 失败: %s", serial, exc)
+
+    device.status = _resolve_ios_device_status(device.status, True)
+    device.updated_at = datetime.now()
+    session.add(device)
+    session.commit()
+
+    logger.info("iOS 无线模式已启用: serial=%s wda_url=%s", serial, candidate)
+    return {
+        "serial": serial,
+        "platform": "ios",
+        "wireless_enabled": True,
+        "device_ip": device_ip,
+        "wda_url": candidate,
+        "status": device.status,
+    }
+
+
+@router.post("/{serial}/wireless/disable")
+def disable_ios_wireless(
+    serial: str,
+    session: Session = Depends(get_session),
+    current_user=Depends(get_current_user),
+):
+    """关闭 iOS 无线模式：删除 ios_wda_url.{serial}，回归默认本地 relay 策略（幂等）。"""
+    device = session.exec(select(Device).where(Device.serial == serial)).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="设备不存在")
+    if str(device.platform or "android").strip().lower() != "ios":
+        raise HTTPException(
+            status_code=400,
+            detail="P3003_WIRELESS_IOS_ONLY: 无线模式仅适用于 iOS 设备。",
+        )
+
+    removed = delete_setting_value(session, f"{_WIRELESS_WDA_URL_PREFIX}{serial}")
+    health = _check_ios_wda_health(session, serial)
+    healthy = bool(health.get("healthy"))
+    device.status = _resolve_ios_device_status(device.status, healthy)
+    device.updated_at = datetime.now()
+    session.add(device)
+    session.commit()
+
+    logger.info("iOS 无线模式已关闭: serial=%s removed=%s wda_healthy=%s", serial, removed, healthy)
+    return {
+        "serial": serial,
+        "platform": "ios",
+        "wireless_enabled": False,
+        "removed": removed,
+        "wda_healthy": healthy,
+        "wda_url": health.get("wda_url"),
+        "status": device.status,
+        "error": health.get("error"),
+    }
 
 
 @router.post("/sync", response_model=DeviceSyncResponse)
@@ -1246,6 +1512,7 @@ async def sync_devices(
                 existing.brand = "APPLE"
                 existing.os_version = ios_dev["os_version"]
                 existing.market_name = ios_dev["name"]
+                existing.connection_type = ios_dev.get("connection_type")
                 existing.status = _resolve_ios_device_status(existing.status, wda_healthy)
                 existing.updated_at = datetime.now()
                 session.add(existing)
@@ -1257,6 +1524,7 @@ async def sync_devices(
                     brand="APPLE",
                     os_version=ios_dev["os_version"],
                     market_name=ios_dev["name"],
+                    connection_type=ios_dev.get("connection_type"),
                     status=_resolve_ios_device_status(None, wda_healthy),
                 )
                 session.add(device)
@@ -1266,11 +1534,28 @@ async def sync_devices(
     except Exception as e:
         logger.warning(f"iOS 设备扫描失败（不影响 Android 结果）: {e}")
 
-    # 将不在物理列表中的设备标记为 OFFLINE
+    # 将不在物理列表中的设备标记为 OFFLINE（无线 iOS 设备先经直连 WDA 探测判定）
     all_online = set(online_serials) | set(ios_online_serials)
+    wireless_map = _get_wireless_url_map(session)
     all_db_devices = session.exec(select(Device)).all()
     for db_dev in all_db_devices:
-        if db_dev.serial not in all_online and db_dev.status != "OFFLINE":
+        if db_dev.serial in all_online:
+            continue
+        is_ios = str(db_dev.platform or "android").strip().lower() == "ios"
+        if (
+            is_ios
+            and db_dev.serial in wireless_map
+            and _is_ios_wda_healthy(session, db_dev.serial)
+        ):
+            # usbmux 看不到但无线 WDA 可达：视为无线在线
+            target_status = _resolve_ios_device_status(db_dev.status, True)
+            if target_status != db_dev.status:
+                db_dev.status = target_status
+                db_dev.updated_at = datetime.now()
+                session.add(db_dev)
+            all_online.add(db_dev.serial)
+            continue
+        if db_dev.status != "OFFLINE":
             db_dev.status = "OFFLINE"
             db_dev.updated_at = datetime.now()
             session.add(db_dev)
@@ -1285,7 +1570,7 @@ async def sync_devices(
         synced=synced_count,
         online=len(all_online),
         offline=total_offline,
-        devices=all_devices,
+        devices=_build_device_reads(session, all_devices),
     )
 
 

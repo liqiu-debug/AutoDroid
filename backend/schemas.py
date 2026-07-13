@@ -553,6 +553,8 @@ class DeviceRead(BaseModel):
     os_version: str = ""
     resolution: str = ""
     status: str = "IDLE"
+    connection_type: Optional[str] = None  # iOS: usb | network
+    wireless_enabled: bool = False  # iOS: 是否已配置无线直连 WDA 地址
     custom_name: Optional[str] = None
     market_name: Optional[str] = None
     created_at: Any
@@ -560,6 +562,11 @@ class DeviceRead(BaseModel):
 
     class Config:
         from_attributes = True
+
+class DeviceWirelessEnableRequest(BaseModel):
+    """启用 iOS 无线模式的可选参数：手动指定 IP / 设备端 WDA 端口。"""
+    ip: Optional[str] = None
+    port: int = 8100
 
 class DeviceRenameRequest(BaseModel):
     custom_name: str

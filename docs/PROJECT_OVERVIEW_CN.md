@@ -31,7 +31,7 @@ AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 | 场景编排 | 多用例串联、别名、变量上下文跨用例传递 | `backend/api/scenarios.py` |
 | 并发运行 | 场景多设备并发批次执行，设备级预检过滤 | `backend/api/scenarios.py` `_schedule_concurrent_runs` |
 | 调度中心 | DAILY/WEEKLY/INTERVAL/ONCE 定时策略，支持 UI 场景与 Fastbot 任务 | `backend/scheduler_service.py`、`backend/api/tasks.py` |
-| 设备中心 | ADB+tidevice 一键同步、解锁、重启、截图、WDA 检测 | `backend/api/devices.py` |
+| 设备中心 | ADB+tidevice 一键同步、解锁、重启、截图、WDA 检测、iOS 一键无线（WiFi 直连 WDA） | `backend/api/devices.py` |
 | 流媒体 | Scrcpy H.264 WebSocket 推流、触控转发、多客户端广播 | `backend/device_stream/manager.py` |
 | 报告中心 | 执行列表、详情、下载，DB 数据兜底生成 HTML 报告 | `backend/api/reports.py`、`backend/report_generator.py` |
 | 运行大盘 | KPI、趋势、状态分布、失败 Top、告警、即将执行任务 | `backend/api/reports.py` `/api/reports/dashboard/overview` |
@@ -177,6 +177,7 @@ Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAUL
 - `P2002_ADB_ANDROID_ONLY`
 - `P3001_FASTBOT_ANDROID_ONLY`
 - `P3002_WDA_IOS_ONLY`
+- `P3003~P3008_WIRELESS_*`（iOS 无线模式相关，见 `docs/IOS_WDA_OPS.md` §3.5）
 
 ### 5.7 场景级预检与设备过滤
 
@@ -198,6 +199,7 @@ Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAUL
 | 场景并发执行 | 支持 | 支持 | 设备级预检过滤 |
 | Fastbot 探索 | 支持 | 不支持 | `P3001_FASTBOT_ANDROID_ONLY` |
 | WDA 检测 | 不适用 | 支持 | `POST /devices/{serial}/wda/check` |
+| 无线连接（免数据线） | 手动支持（无线 adb，见 `docs/ANDROID_WIRELESS_ADB.md`） | 支持（一键） | iOS 一键启用 WiFi 直连 WDA，`POST /devices/{serial}/wireless/enable`，详见 `docs/IOS_WDA_OPS.md` §3.5 |
 
 结论：当前产品形态是“Android 实时/静态录制 + iOS 静态录制 + Android/iOS 执行”。
 

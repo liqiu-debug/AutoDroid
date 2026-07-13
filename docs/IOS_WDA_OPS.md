@@ -9,7 +9,7 @@
 - Python 依赖：`requests`、`tidevice`、`facebook-wda`。
 - 设备侧：iOS 设备已信任主机，WebDriverAgent 已可启动。
 - 服务侧：`ios_execution` 开关开启。
-- 启动策略：默认优先使用 `tidevice xctest` 拉起设备上已安装的 WDA；仅在 macOS 下检测到 runner 缺失或 bundle id 不匹配时，才回退 `xcodebuild` 做首次安装/修复。
+- 启动策略：默认优先使用 `tidevice xctest` 拉起设备上已安装的 WDA；仅在 macOS 下检测到 runner 缺失或 bundle id 不匹配时，才回退 `xcodebuild` 做首次安装/修复。两种情况会直接优先 `xcodebuild`：设备 iOS ≥ 17（`tidevice xctest` 已不可用），或设备仅以 WiFi 配对可见（无线，tidevice 无法可靠拉起；此时若未配置 Xcode 工程会以 `P3008` 快速失败并提示插线）。
 - 等待策略：`tidevice` 启动默认短等待；`xcodebuild` 首次编译/安装默认会自动扩展到更长等待窗口，避免 WDA 实际已启动但 `check` 接口过早返回失败。如需调整，可配置 `ios_wda_xcodebuild_start_retry_attempts`。
 
 ## 3. 健康检查入口
@@ -20,6 +20,66 @@
   - `BUSY`: 执行中
   - `OFFLINE`: 离线
   - `WDA_DOWN`: WDA 不可用
+
+## 3.5 无线模式（WiFi 直连 WDA）
+
+iOS 设备一旦与主机完成 WiFi 配对，即使拔掉数据线也会出现在设备列表（usbmux 会枚举
+network 设备）。但默认 WDA 地址走本地 relay（USB 式端口转发），无线状态下 relay 无法
+建立、且手机上的 WDA 未启动，因此会显示 `WDA_DOWN`。
+
+无线模式的原理：把该设备的 WDA 地址固定为手机 IP 直连（写入 `ios_wda_url.{serial}`），
+之后执行、预检、截图、实时画面（MJPEG）全链路都走 `http://{手机IP}:8100`，无需数据线。
+
+### 3.5.1 一键启用流程（推荐）
+
+1. **插线**，在设备中心点「启动WDA」，等状态变为 `IDLE`（WDA 已在手机上运行）。
+   - iOS 17+：`tidevice xctest` 已不可用，系统会优先用 `xcodebuild` 启动 WDA，需配置
+     `ios_wda_xcodeproj_path` / `ios_wda_xcworkspace_path`（或依赖 Appium 自带的
+     WebDriverAgent 自动发现，详见 §4 与 §5）。
+2. 点「启用无线」。系统读取手机 WiFi IP（来自 WDA `/status` 的 `value.ios.ip`），
+   校验 `http://{手机IP}:8100` 直连可达后写入配置。
+3. **拔线**。此后正常执行/同步/看画面即可；卡片显示 `📶 无线` 徽标。
+
+对应端点：
+
+- `POST /devices/{serial}/wireless/enable`
+  - 请求体（可选）：`{"ip": "192.168.1.23", "port": 8100}`；不传 `ip` 时自动从 WDA 读取。
+  - 成功：`{serial, wireless_enabled: true, device_ip, wda_url, status}`。
+  - 失败（不落库）：`400`，`detail` 前缀见下表。
+- `POST /devices/{serial}/wireless/disable`
+  - 删除 `ios_wda_url.{serial}`，回归默认本地 relay；`{serial, wireless_enabled: false, ...}`。
+
+| 错误码 | 含义 | 处理 |
+| --- | --- | --- |
+| `P3003_WIRELESS_IOS_ONLY` | 非 iOS 设备 | 无线模式仅适用于 iOS |
+| `P3004_WIRELESS_WDA_NOT_READY` | WDA 未运行 | 先插线「启动WDA」再启用 |
+| `P3005_WIRELESS_IP_UNAVAILABLE` | 取不到手机 IP | 手机未连 WiFi / 开了 VPN；可在请求体手填 `ip` |
+| `P3006_WIRELESS_DIRECT_UNREACHABLE` | 直连不可达 | 确认电脑与手机同一局域网、路由器未开 AP 隔离 |
+| `P3007_WIRELESS_INVALID_PARAM` | IP/端口非法 | 检查请求体 |
+| `P3008_WIRELESS_WDA_START_UNAVAILABLE` | 无线下无法启动 WDA | 仅 WiFi 配对时无法用 tidevice 启动 WDA，请插线重试或配置 Xcode 工程 |
+
+### 3.5.2 手动配置（等价物 / 无前端时）
+
+```
+POST /api/settings/
+[{"key": "ios_wda_url.<UDID>", "value": "http://<手机IP>:8100"}]
+```
+
+回滚 = 关闭无线 = 删除该 setting。
+
+### 3.5.3 约束与排障
+
+- **同一局域网**：电脑与手机需在同一子网，路由器不能开 AP/客户端隔离。
+- **WDA 会被系统回收**：锁屏、内存压力、长时间后台都可能让 WDA 退出；无线状态下**无法
+  远程重启 WDA**，需插线重新「启动WDA」并重新「启用无线」。建议保持屏幕常亮、关闭自动锁屏。
+- **手机 IP 变化需重新启用**：DHCP 续租/换网会改 IP，导致直连失效。建议在路由器为设备
+  绑定固定 IP。
+- **VPN 干扰取 IP**：手机开 VPN 时 `value.ios.ip` 可能是隧道地址，导致直连失败，可手动
+  指定局域网 IP。
+- **同步与在线判定**：无线设备即使不在 usbmux 扫描结果，只要直连 WDA 健康即保持在线；
+  直连不可达则标记 `OFFLINE`（不会误报 `WDA_DOWN`）。`GET /devices/?refresh_ios_wda=true`
+  会对已启用无线的 OFFLINE 设备重试直连、健康则自动恢复 `IDLE`。
+- **安全**：WDA 端口无鉴权，启用无线等于把 WDA 暴露在局域网内，请仅在可信网络使用。
 
 ## 4. WDA URL 与端口策略
 
