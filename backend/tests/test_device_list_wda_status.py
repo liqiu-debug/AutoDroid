@@ -4,6 +4,7 @@ from unittest.mock import patch
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from backend.api.devices import list_devices
+from backend.feature_flags import set_setting_value
 from backend.models import Device
 
 
@@ -81,6 +82,55 @@ class DeviceListWdaStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0].status, "IDLE")
         health_mock.assert_not_called()
+
+    async def test_list_devices_refresh_recovers_offline_wireless_device_when_healthy(self):
+        self._add_device("ios-1", "ios", status="OFFLINE")
+        set_setting_value(self.session, "ios_wda_url.ios-1", "http://192.168.1.23:8100")
+
+        with patch(
+            "backend.api.devices._run_adb_command",
+            return_value=b"List of devices attached\n\n",
+        ), patch(
+            "backend.api.devices._check_ios_wda_health",
+            return_value={"healthy": True, "wda_url": "http://192.168.1.23:8100", "error": None},
+        ):
+            payload = await list_devices(refresh_ios_wda=True, session=self.session)
+
+        self.assertEqual(payload[0].status, "IDLE")
+        self.assertTrue(payload[0].wireless_enabled)
+
+        device = self.session.exec(select(Device).where(Device.serial == "ios-1")).first()
+        self.assertEqual(device.status, "IDLE")
+
+    async def test_list_devices_refresh_keeps_offline_wireless_device_when_unhealthy(self):
+        self._add_device("ios-1", "ios", status="OFFLINE")
+        set_setting_value(self.session, "ios_wda_url.ios-1", "http://192.168.1.23:8100")
+
+        with patch(
+            "backend.api.devices._run_adb_command",
+            return_value=b"List of devices attached\n\n",
+        ), patch(
+            "backend.api.devices._check_ios_wda_health",
+            return_value={"healthy": False, "wda_url": "http://192.168.1.23:8100", "error": "unreachable"},
+        ):
+            payload = await list_devices(refresh_ios_wda=True, session=self.session)
+
+        # 无线直连仍不可达：保持 OFFLINE 而不是 WDA_DOWN
+        self.assertEqual(payload[0].status, "OFFLINE")
+
+    async def test_list_devices_refresh_still_skips_offline_non_wireless_device(self):
+        self._add_device("ios-1", "ios", status="OFFLINE")
+
+        with patch(
+            "backend.api.devices._run_adb_command",
+            return_value=b"List of devices attached\n\n",
+        ), patch(
+            "backend.api.devices._check_ios_wda_health",
+        ) as health_mock:
+            payload = await list_devices(refresh_ios_wda=True, session=self.session)
+
+        health_mock.assert_not_called()
+        self.assertEqual(payload[0].status, "OFFLINE")
 
     async def test_list_devices_orders_wda_down_after_idle(self):
         self._add_device("ios-busy", "ios", status="BUSY")

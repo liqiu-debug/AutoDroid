@@ -45,6 +45,34 @@ def get_setting_value(session: Session, key: str) -> Optional[str]:
     return setting.value if setting else None
 
 
+def set_setting_value(
+    session: Session,
+    key: str,
+    value: str,
+    description: Optional[str] = None,
+) -> None:
+    """Upsert 单条 SystemSetting。"""
+    setting = session.exec(select(SystemSetting).where(SystemSetting.key == key)).first()
+    if setting:
+        setting.value = value
+        if description:
+            setting.description = description
+        session.add(setting)
+    else:
+        session.add(SystemSetting(key=key, value=value, description=description))
+    session.commit()
+
+
+def delete_setting_value(session: Session, key: str) -> bool:
+    """删除单条 SystemSetting；存在并删除返回 True，不存在返回 False（幂等）。"""
+    setting = session.exec(select(SystemSetting).where(SystemSetting.key == key)).first()
+    if not setting:
+        return False
+    session.delete(setting)
+    session.commit()
+    return True
+
+
 def is_flag_enabled(session: Session, key: str, default=_UNSET) -> bool:
     """Read a feature flag with per-key defaults.
 

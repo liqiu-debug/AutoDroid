@@ -189,6 +189,7 @@ class Device(SQLModel, table=True):
     os_version: str = Field(default="")        # 跨平台统一版本号
     resolution: str = Field(default="")
     status: str = Field(default="IDLE")  # IDLE, BUSY, OFFLINE, WDA_DOWN
+    connection_type: Optional[str] = Field(default=None)  # iOS: 最近一次同步的 usbmux 连接方式 usb | network
     custom_name: Optional[str] = Field(default=None)  # 用户自定义设备名称
     market_name: Optional[str] = Field(default=None)  # 设备市场型号
     created_at: datetime = Field(default_factory=datetime.now)

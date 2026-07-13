@@ -216,11 +216,101 @@ class IOSWdaStartupTests(unittest.TestCase):
 
     def test_build_launch_command_prefers_tidevice_on_macos(self):
         with patch("backend.api.devices.platform.system", return_value="Darwin"), patch(
+            "backend.api.devices._get_live_usbmux_conn_type", return_value="usb"
+        ), patch(
             "backend.api.devices._build_ios_wda_tidevice_command",
             return_value={"command": ["tidevice"], "command_source": "tidevice"},
         ) as tidevice_mock:
             payload = _build_ios_wda_launch_command(self.session, "ios-1")
         tidevice_mock.assert_called_once_with(self.session, "ios-1")
+        self.assertEqual(payload["command_source"], "tidevice")
+
+    def test_build_launch_command_prefers_xcodebuild_on_ios17(self):
+        device = self._add_device("ios-17", "ios")
+        device.os_version = "17.5.1"
+        self.session.add(device)
+        self.session.commit()
+
+        with patch("backend.api.devices.platform.system", return_value="Darwin"), patch(
+            "backend.api.devices._get_live_usbmux_conn_type", return_value="usb"
+        ), patch(
+            "backend.api.devices._build_ios_wda_xcodebuild_command",
+            return_value={"command": ["xcodebuild", "test"], "command_source": "xcodebuild"},
+        ) as xcodebuild_mock, patch(
+            "backend.api.devices._build_ios_wda_tidevice_command"
+        ) as tidevice_mock:
+            payload = _build_ios_wda_launch_command(self.session, "ios-17")
+
+        xcodebuild_mock.assert_called_once_with(self.session, "ios-17")
+        tidevice_mock.assert_not_called()
+        self.assertEqual(payload["command_source"], "xcodebuild")
+
+    def test_build_launch_command_prefers_xcodebuild_when_network_only(self):
+        self._add_device("ios-wifi", "ios")  # 无 os_version，触发条件来自 network conn_type
+
+        with patch("backend.api.devices.platform.system", return_value="Darwin"), patch(
+            "backend.api.devices._get_live_usbmux_conn_type", return_value="network"
+        ), patch(
+            "backend.api.devices._build_ios_wda_xcodebuild_command",
+            return_value={"command": ["xcodebuild", "test"], "command_source": "xcodebuild"},
+        ):
+            payload = _build_ios_wda_launch_command(self.session, "ios-wifi")
+
+        self.assertEqual(payload["command_source"], "xcodebuild")
+
+    def test_build_launch_command_falls_back_to_tidevice_when_xcodebuild_unavailable_on_ios17_usb(self):
+        device = self._add_device("ios-17", "ios")
+        device.os_version = "17.0"
+        self.session.add(device)
+        self.session.commit()
+
+        with patch("backend.api.devices.platform.system", return_value="Darwin"), patch(
+            "backend.api.devices._get_live_usbmux_conn_type", return_value="usb"
+        ), patch(
+            "backend.api.devices._build_ios_wda_xcodebuild_command",
+            side_effect=RuntimeError("未找到 WebDriverAgent 工程"),
+        ), patch(
+            "backend.api.devices._build_ios_wda_tidevice_command",
+            return_value={"command": ["tidevice"], "command_source": "tidevice"},
+        ) as tidevice_mock:
+            payload = _build_ios_wda_launch_command(self.session, "ios-17")
+
+        tidevice_mock.assert_called_once_with(self.session, "ios-17")
+        self.assertEqual(payload["command_source"], "tidevice")
+
+    def test_build_launch_command_fails_fast_for_network_only_without_xcodebuild(self):
+        self._add_device("ios-wifi", "ios")
+
+        with patch("backend.api.devices.platform.system", return_value="Darwin"), patch(
+            "backend.api.devices._get_live_usbmux_conn_type", return_value="network"
+        ), patch(
+            "backend.api.devices._build_ios_wda_xcodebuild_command",
+            side_effect=RuntimeError("未找到 WebDriverAgent 工程"),
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                _build_ios_wda_launch_command(self.session, "ios-wifi")
+
+        message = str(context.exception)
+        self.assertIn("P3008_WIRELESS_WDA_START_UNAVAILABLE", message)
+        self.assertIn("插线", message)
+
+    def test_build_launch_command_keeps_tidevice_for_older_ios_usb(self):
+        device = self._add_device("ios-16", "ios")
+        device.os_version = "16.7.2"
+        self.session.add(device)
+        self.session.commit()
+
+        with patch("backend.api.devices.platform.system", return_value="Darwin"), patch(
+            "backend.api.devices._get_live_usbmux_conn_type", return_value="usb"
+        ), patch(
+            "backend.api.devices._build_ios_wda_xcodebuild_command"
+        ) as xcodebuild_mock, patch(
+            "backend.api.devices._build_ios_wda_tidevice_command",
+            return_value={"command": ["tidevice"], "command_source": "tidevice"},
+        ):
+            payload = _build_ios_wda_launch_command(self.session, "ios-16")
+
+        xcodebuild_mock.assert_not_called()
         self.assertEqual(payload["command_source"], "tidevice")
 
     def test_build_launch_command_uses_custom_override_first(self):
