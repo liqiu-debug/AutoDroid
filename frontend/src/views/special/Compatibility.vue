@@ -23,10 +23,12 @@ const loading = reactive({
 
 const form = reactive({
   name: '',
+  compare_mode: 'version',
   old_package_id: CURRENT_BASELINE_VALUE,
   new_package_id: '',
   page_set_id: '',
   device_serials: [],
+  baseline_device_serial: '',
   mode: 'upgrade',
   env_id: null,
   pixel_diff_ratio_warn: 0.03,
@@ -34,11 +36,13 @@ const form = reactive({
   xml_diff_ratio_warn: 0.35,
 })
 
+const isDeviceCompare = computed(() => form.compare_mode === 'device')
 const isCurrentBaseline = computed(() => form.old_package_id === CURRENT_BASELINE_VALUE)
 const oldPackage = computed(() => (
   isCurrentBaseline.value ? null : packages.value.find(item => item.id === form.old_package_id)
 ))
 const newPackageOptions = computed(() => {
+  if (isDeviceCompare.value) return packages.value
   if (isCurrentBaseline.value) return packages.value
   if (!oldPackage.value?.package_name) return packages.value
   return packages.value.filter(item => (
@@ -56,6 +60,10 @@ function buildDefaultRunName() {
   const newPkg = packages.value.find(item => item.id === form.new_package_id)
   if (!newPkg || form.name) return
   const targetVersion = newPkg.version_name || newPkg.version_code
+  if (isDeviceCompare.value) {
+    form.name = `机型对比 ${newPkg.app_name || newPkg.package_name} ${targetVersion || ''}`.trim()
+    return
+  }
   if (isCurrentBaseline.value) {
     form.name = `当前版本 -> ${newPkg.app_name || newPkg.package_name} ${targetVersion || ''}`.trim()
     return
@@ -73,6 +81,23 @@ watch(() => form.old_package_id, () => {
 })
 
 watch(() => form.new_package_id, buildDefaultRunName)
+
+watch(() => form.compare_mode, (mode) => {
+  if (mode === 'device') {
+    form.mode = 'clean'
+    if (!form.baseline_device_serial && form.device_serials.length) {
+      form.baseline_device_serial = form.device_serials[0]
+    }
+  }
+  buildDefaultRunName()
+})
+
+watch(() => form.device_serials, (serials) => {
+  if (!isDeviceCompare.value) return
+  if (!serials.includes(form.baseline_device_serial)) {
+    form.baseline_device_serial = serials[0] || ''
+  }
+}, { deep: true })
 
 const formatPackage = (pkg) => {
   if (!pkg) return '-'
@@ -136,20 +161,24 @@ const refreshAll = async () => {
 }
 
 const submitRun = async () => {
-  if (!isCurrentBaseline.value && !form.old_package_id) return ElMessage.warning('请选择旧版 APK')
-  if (!form.new_package_id) return ElMessage.warning('请选择新版 APK')
+  if (!isDeviceCompare.value && !isCurrentBaseline.value && !form.old_package_id) return ElMessage.warning('请选择旧版 APK')
+  if (!form.new_package_id) return ElMessage.warning(isDeviceCompare.value ? '请选择测试 APK' : '请选择新版 APK')
   if (!form.page_set_id) return ElMessage.warning('请选择页面合集')
   if (!form.device_serials.length) return ElMessage.warning('请选择测试设备')
+  if (isDeviceCompare.value && form.device_serials.length < 2) return ElMessage.warning('机型对比至少需要选择 2 台设备')
+  if (isDeviceCompare.value && !form.baseline_device_serial) return ElMessage.warning('请选择基准设备')
   if (!form.name.trim()) return ElMessage.warning('请输入任务名称')
 
   loading.submitting = true
   try {
     const payload = {
       name: form.name.trim(),
-      old_package_id: isCurrentBaseline.value ? null : form.old_package_id,
+      compare_mode: form.compare_mode,
+      old_package_id: (isDeviceCompare.value || isCurrentBaseline.value) ? null : form.old_package_id,
       new_package_id: form.new_package_id,
       page_set_id: form.page_set_id,
       device_serials: form.device_serials,
+      baseline_device_serial: isDeviceCompare.value ? form.baseline_device_serial : null,
       mode: form.mode,
       env_id: form.env_id || null,
       thresholds: {
@@ -202,6 +231,15 @@ onActivated(refreshAll)
             <el-form-item label="任务名称">
               <el-input v-model="form.name" clearable />
             </el-form-item>
+            <el-form-item label="对比维度">
+              <el-segmented
+                v-model="form.compare_mode"
+                :options="[
+                  { label: '版本对比', value: 'version' },
+                  { label: '机型对比', value: 'device' },
+                ]"
+              />
+            </el-form-item>
             <el-form-item label="执行模式">
               <el-segmented
                 v-model="form.mode"
@@ -219,7 +257,7 @@ onActivated(refreshAll)
           </div>
 
           <div class="form-grid">
-            <el-form-item label="旧版 APK">
+            <el-form-item v-if="!isDeviceCompare" label="旧版 APK">
               <el-select v-model="form.old_package_id" filterable placeholder="选择旧版本" class="wide-control">
                 <el-option label="当前版本" :value="CURRENT_BASELINE_VALUE">
                   <span>当前版本</span>
@@ -236,8 +274,8 @@ onActivated(refreshAll)
                 </el-option>
               </el-select>
             </el-form-item>
-            <el-form-item label="新版 APK">
-              <el-select v-model="form.new_package_id" filterable placeholder="选择新版本" class="wide-control">
+            <el-form-item :label="isDeviceCompare ? '测试 APK' : '新版 APK'">
+              <el-select v-model="form.new_package_id" filterable :placeholder="isDeviceCompare ? '选择测试版本' : '选择新版本'" class="wide-control">
                 <el-option
                   v-for="pkg in newPackageOptions"
                   :key="pkg.id"
@@ -251,28 +289,43 @@ onActivated(refreshAll)
             </el-form-item>
           </div>
 
-          <el-form-item label="测试设备">
-            <el-select
-              v-model="form.device_serials"
-              multiple
-              filterable
-              collapse-tags
-              collapse-tags-tooltip
-              placeholder="选择 Android 设备"
-              class="wide-control"
-            >
-              <el-option
-                v-for="device in androidDevices"
-                :key="device.serial"
-                :label="formatDevice(device.serial)"
-                :value="device.serial"
-                :disabled="device.status !== 'IDLE'"
+          <div class="form-grid">
+            <el-form-item label="测试设备">
+              <el-select
+                v-model="form.device_serials"
+                multiple
+                filterable
+                collapse-tags
+                collapse-tags-tooltip
+                :placeholder="isDeviceCompare ? '选择至少 2 台 Android 设备' : '选择 Android 设备'"
+                class="wide-control"
               >
-                <span>{{ formatDevice(device.serial) }}</span>
-                <span class="option-meta">{{ device.serial }} / {{ device.status }}</span>
-              </el-option>
-            </el-select>
-          </el-form-item>
+                <el-option
+                  v-for="device in androidDevices"
+                  :key="device.serial"
+                  :label="formatDevice(device.serial)"
+                  :value="device.serial"
+                  :disabled="device.status !== 'IDLE'"
+                >
+                  <span>{{ formatDevice(device.serial) }}</span>
+                  <span class="option-meta">{{ device.serial }} / {{ device.status }}</span>
+                </el-option>
+              </el-select>
+            </el-form-item>
+            <el-form-item v-if="isDeviceCompare" label="基准设备">
+              <el-select v-model="form.baseline_device_serial" filterable placeholder="其余设备与其横向对比" class="wide-control">
+                <el-option
+                  v-for="serial in form.device_serials"
+                  :key="serial"
+                  :label="formatDevice(serial)"
+                  :value="serial"
+                >
+                  <span>{{ formatDevice(serial) }}</span>
+                  <span class="option-meta">{{ serial }}</span>
+                </el-option>
+              </el-select>
+            </el-form-item>
+          </div>
 
           <el-form-item label="页面合集">
             <div class="page-set-row">
@@ -298,6 +351,9 @@ onActivated(refreshAll)
             <el-form-item label="XML差异">
               <el-input-number v-model="form.xml_diff_ratio_warn" :min="0" :max="1" :step="0.05" />
             </el-form-item>
+          </div>
+          <div v-if="isDeviceCompare" class="mode-hint">
+            机型对比以结构语义为主（Crash / 必需文本 / Activity / XML 结构）；像素与 SSIM 仅在两台设备分辨率相同时参与判定，跨分辨率仅展示指标。
           </div>
         </el-form>
       </el-card>
@@ -438,6 +494,16 @@ onActivated(refreshAll)
   gap: 0 16px;
   padding-top: 8px;
   border-top: 1px solid #ebeef5;
+}
+
+.mode-hint {
+  margin-top: -6px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: #f4f4f5;
+  color: #909399;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .wide-control,

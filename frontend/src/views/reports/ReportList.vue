@@ -901,7 +901,10 @@ onUnmounted(() => {
                         <el-table-column prop="id" label="ID" width="64" align="center" />
                         <el-table-column label="任务" min-width="220">
                             <template #default="{ row }">
-                                <div class="run-name">{{ row.name }}</div>
+                                <div class="run-name">
+                                    {{ row.name }}
+                                    <el-tag v-if="row.compare_mode === 'device'" size="small" type="warning" effect="plain">机型对比</el-tag>
+                                </div>
                                 <div class="muted-text">{{ row.package_name }}</div>
                             </template>
                         </el-table-column>
