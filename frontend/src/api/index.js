@@ -433,6 +433,12 @@ export default {
     checkDeviceWda(serial) {
         return api.post(`/devices/${serial}/wda/check`)
     },
+    enableDeviceWireless(serial, payload = {}) {
+        return api.post(`/devices/${serial}/wireless/enable`, payload)
+    },
+    disableDeviceWireless(serial) {
+        return api.post(`/devices/${serial}/wireless/disable`)
+    },
     renameDevice(serial, customName) {
         return api.put(`/devices/${serial}/name`, { custom_name: customName })
     },

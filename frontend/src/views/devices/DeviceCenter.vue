@@ -1,7 +1,7 @@
 <script setup>
 import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose } from '@element-plus/icons-vue'
+import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection } from '@element-plus/icons-vue'
 import api from '@/api'
 import { useClientMode } from '@/composables/useClientMode'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
@@ -13,6 +13,7 @@ const devices = ref([])
 const loading = ref(false)
 const syncLoading = ref(false)
 const wdaCheckingSerial = ref('')
+const wirelessLoadingSerial = ref('')
 const deleteLoadingSerial = ref('')
 const stopLoadingSerial = ref('')
 
@@ -139,6 +140,14 @@ const handleReboot = async (device) => {
 
 const isDeviceOffline = (device) => String(device?.status || '').trim().toUpperCase() === 'OFFLINE'
 
+/** iOS 连接方式徽标：无线直连 > WiFi 已配对（usbmux network）> USB */
+const connectionBadge = (device) => {
+  if (!device || device.platform !== 'ios') return null
+  if (device.wireless_enabled) return { label: '📶 无线', type: 'success' }
+  if (device.connection_type === 'network') return { label: '📶 WiFi已配对', type: 'info' }
+  return { label: '🔌 USB', type: 'info' }
+}
+
 /** 删除离线设备 */
 const handleDeleteDevice = async (device) => {
   if (!isDeviceOffline(device)) return
@@ -183,6 +192,38 @@ const handleCheckWda = async (device) => {
     ElMessage.error('WDA 启动失败：' + (e.response?.data?.detail || e.message))
   } finally {
     wdaCheckingSerial.value = ''
+  }
+}
+
+/** 启用 iOS 无线模式：读取手机 IP 改走 WiFi 直连，成功后可拔线使用 */
+const handleEnableWireless = async (device) => {
+  if (!device || device.platform !== 'ios') return
+  wirelessLoadingSerial.value = device.serial
+  try {
+    const { data } = await api.enableDeviceWireless(device.serial)
+    device.status = data.status || device.status
+    device.wireless_enabled = true
+    ElMessage.success(`已启用无线模式（${data.device_ip}），现在可以拔掉数据线`)
+  } catch (e) {
+    ElMessage.error('启用无线失败：' + (e.response?.data?.detail || e.message))
+  } finally {
+    wirelessLoadingSerial.value = ''
+  }
+}
+
+/** 关闭 iOS 无线模式：删除直连配置，恢复 USB 连接策略 */
+const handleDisableWireless = async (device) => {
+  if (!device || device.platform !== 'ios') return
+  wirelessLoadingSerial.value = device.serial
+  try {
+    const { data } = await api.disableDeviceWireless(device.serial)
+    device.status = data.status || device.status
+    device.wireless_enabled = false
+    ElMessage.success('已关闭无线模式，恢复 USB 连接策略')
+  } catch (e) {
+    ElMessage.error('关闭无线失败：' + (e.response?.data?.detail || e.message))
+  } finally {
+    wirelessLoadingSerial.value = ''
   }
 }
 
@@ -270,9 +311,14 @@ onBeforeUnmount(() => {
             <strong>{{ device.custom_name || device.market_name || device.model || device.serial }}</strong>
             <span>{{ device.platform === 'ios' ? 'iOS' : 'Android' }} {{ device.os_version || device.android_version || '—' }}</span>
           </div>
-          <el-tag :type="statusTagType(device.status)" size="small" effect="dark" round>
-            {{ statusLabel(device.status) }}
-          </el-tag>
+          <div class="mobile-device-tags">
+            <el-tag v-if="connectionBadge(device)" :type="connectionBadge(device).type" size="small" effect="plain" round>
+              {{ connectionBadge(device).label }}
+            </el-tag>
+            <el-tag :type="statusTagType(device.status)" size="small" effect="dark" round>
+              {{ statusLabel(device.status) }}
+            </el-tag>
+          </div>
         </header>
 
         <div class="mobile-device-facts">
@@ -291,7 +337,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" class="mobile-ios-hint">
-          WDA 未就绪，请先启动 WDA 后再执行。
+          WDA 未就绪：请插线点「启动WDA」；无线使用请在 WDA 正常后点「启用无线」再拔线。
         </div>
 
         <div class="mobile-device-actions">
@@ -312,6 +358,28 @@ onBeforeUnmount(() => {
             :disabled="device.status === 'OFFLINE' || device.status === 'BUSY'"
           >
             启动WDA
+          </el-button>
+          <el-button
+            v-if="device.platform === 'ios' && !device.wireless_enabled"
+            type="success"
+            plain
+            :icon="Connection"
+            @click="handleEnableWireless(device)"
+            :loading="wirelessLoadingSerial === device.serial"
+            :disabled="device.status === 'OFFLINE' || device.status === 'BUSY'"
+          >
+            启用无线
+          </el-button>
+          <el-button
+            v-if="device.platform === 'ios' && device.wireless_enabled"
+            type="warning"
+            plain
+            :icon="Connection"
+            @click="handleDisableWireless(device)"
+            :loading="wirelessLoadingSerial === device.serial"
+            :disabled="device.status === 'BUSY'"
+          >
+            关闭无线
           </el-button>
           <el-button
             type="danger"
@@ -412,9 +480,14 @@ onBeforeUnmount(() => {
                 <span v-if="device.custom_name && device.market_name && device.market_name !== device.custom_name" class="device-model-sub">{{ device.market_name }}</span>
                 <span v-else-if="!device.custom_name && device.market_name && device.market_name !== device.model" class="device-model-sub">{{ device.model }}</span>
               </div>
-              <el-tag :type="statusTagType(device.status)" size="small" effect="dark" round>
-                {{ statusLabel(device.status) }}
-              </el-tag>
+              <div class="card-header-tags">
+                <el-tag v-if="connectionBadge(device)" :type="connectionBadge(device).type" size="small" effect="plain" round>
+                  {{ connectionBadge(device).label }}
+                </el-tag>
+                <el-tag :type="statusTagType(device.status)" size="small" effect="dark" round>
+                  {{ statusLabel(device.status) }}
+                </el-tag>
+              </div>
             </div>
           </template>
 
@@ -437,7 +510,7 @@ onBeforeUnmount(() => {
               <span class="info-value">{{ device.resolution || '—' }}</span>
             </div>
             <div v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" class="ios-hint down">
-              <span>WDA 未就绪：请先启动 WebDriverAgent，设备才可用于执行。</span>
+              <span>WDA 未就绪：请插线点「启动WDA」；无线使用请在 WDA 正常后点「启用无线」再拔线。</span>
             </div>
           </div>
 
@@ -480,6 +553,28 @@ onBeforeUnmount(() => {
               :disabled="device.status === 'OFFLINE' || device.status === 'BUSY'"
             >
               启动WDA
+            </el-button>
+            <el-button
+              v-if="device.platform === 'ios' && !device.wireless_enabled"
+              type="success"
+              link
+              :icon="Connection"
+              @click="handleEnableWireless(device)"
+              :loading="wirelessLoadingSerial === device.serial"
+              :disabled="device.status === 'OFFLINE' || device.status === 'BUSY'"
+            >
+              启用无线
+            </el-button>
+            <el-button
+              v-if="device.platform === 'ios' && device.wireless_enabled"
+              type="warning"
+              link
+              :icon="Connection"
+              @click="handleDisableWireless(device)"
+              :loading="wirelessLoadingSerial === device.serial"
+              :disabled="device.status === 'BUSY'"
+            >
+              关闭无线
             </el-button>
             <el-button
               type="danger"
@@ -581,6 +676,14 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.card-header-tags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
 .card-header-left {
@@ -817,6 +920,14 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+}
+
+.mobile-device-tags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
 .mobile-device-title-wrap {
