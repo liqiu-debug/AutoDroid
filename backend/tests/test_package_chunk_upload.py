@@ -30,6 +30,16 @@ class PackageChunkUploadTests(unittest.IsolatedAsyncioTestCase):
                     "version_code": "100",
                 },
             ),
+            patch(
+                "backend.api.packages.parse_ipa_info",
+                return_value={
+                    "app_name": "Demo iOS",
+                    "package_name": "com.example.demo.ios",
+                    "version_name": "2.0.0",
+                    "version_code": "200",
+                    "signing_type": "adhoc",
+                },
+            ),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -75,7 +85,7 @@ class PackageChunkUploadTests(unittest.IsolatedAsyncioTestCase):
         packages.cancel_package_upload(response.upload_id, current_user=self.user)
         self.assertFalse(session_dir.exists())
 
-    def test_create_session_rejects_non_apk(self):
+    def test_create_session_rejects_unsupported_extension(self):
         with self.assertRaises(HTTPException) as context:
             packages.create_package_upload_session(
                 self._payload(filename="demo.zip"),
@@ -83,7 +93,30 @@ class PackageChunkUploadTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(context.exception.status_code, 400)
-        self.assertEqual(context.exception.detail, "仅支持 .apk 文件")
+        self.assertEqual(context.exception.detail, "仅支持 .apk 或 .ipa 文件")
+
+    async def test_upload_ipa_chunk_and_complete(self):
+        data = b"fake-ipa"
+        response = packages.create_package_upload_session(
+            self._payload(filename="demo.ipa", file_size=len(data)),
+            current_user=self.user,
+        )
+        await packages.upload_package_chunk(
+            response.upload_id,
+            0,
+            self._upload_file(data),
+            current_user=self.user,
+        )
+        result = packages.complete_package_upload(
+            response.upload_id,
+            session=self.session,
+            current_user=self.user,
+        )
+
+        self.assertEqual(result.platform, "ios")
+        self.assertEqual(result.package_name, "com.example.demo.ios")
+        package = self.session.get(AppPackage, result.id)
+        self.assertTrue(package.file_path.endswith(".ipa"))
 
     async def test_upload_multiple_chunks_and_complete(self):
         data = b"a" * packages.PACKAGE_UPLOAD_CHUNK_SIZE + b"tail"

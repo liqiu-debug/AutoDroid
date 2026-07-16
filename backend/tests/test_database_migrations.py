@@ -57,6 +57,15 @@ class DatabaseMigrationsTests(unittest.TestCase):
                 id INTEGER PRIMARY KEY
             );
 
+            CREATE TABLE apppackage (
+                id INTEGER PRIMARY KEY,
+                app_name VARCHAR,
+                package_name VARCHAR,
+                file_path VARCHAR
+            );
+            INSERT INTO apppackage(id, app_name, package_name, file_path)
+            VALUES (1, 'Legacy', 'com.example.legacy', 'uploads/apps/legacy.apk');
+
             CREATE TABLE fastbotreport (
                 id INTEGER PRIMARY KEY,
                 task_id INTEGER,
@@ -102,6 +111,13 @@ class DatabaseMigrationsTests(unittest.TestCase):
 
         testresult_cols = {c[1] for c in self._table_columns("testresult")}
         self.assertIn("report_display", testresult_cols)
+
+        apppackage_cols = {c[1] for c in self._table_columns("apppackage")}
+        self.assertIn("platform", apppackage_cols)
+        package_platform = self.conn.execute(
+            "SELECT platform FROM apppackage WHERE id = 1"
+        ).fetchone()[0]
+        self.assertEqual(package_platform, "android")
 
         fastbotreport_cols = {c[1] for c in self._table_columns("fastbotreport")}
         self.assertIn("jank_data", fastbotreport_cols)
@@ -150,7 +166,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 11)
+        self.assertEqual(len(rows), 12)
 
         # Re-run should be no-op and keep same version records.
         _run_migrations_with_conn(self.conn)

@@ -219,8 +219,9 @@ class GlobalVariable(SQLModel, table=True):
 class AppPackage(SQLModel, table=True):
     """APP 安装包管理"""
     id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(default="android", index=True)  # "android" | "ios"
     app_name: str = Field(default="Unknown")         # 应用名称
-    package_name: str = Field(default="", index=True) # 包名
+    package_name: str = Field(default="", index=True) # Android 包名 / iOS Bundle ID
     version_name: str = Field(default="")             # 版本号
     version_code: str = Field(default="")             # 构建号
     file_path: str = Field(default="")                # 项目内相对存储路径

@@ -476,7 +476,7 @@ export default {
         return `/api/packages/${id}/download`
     },
     installPackage(id, serial) {
-        return api.post(`/packages/${id}/install`, { serial }, { timeout: 120000 })
+        return api.post(`/packages/${id}/install`, { serial }, { timeout: 480000 })
     },
 
     // Environments (全局变量库)

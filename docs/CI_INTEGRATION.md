@@ -13,7 +13,7 @@
 
 | 操作 | API Token | 说明 |
 | --- | --- | --- |
-| 上传 APK（`POST /api/packages/upload`、分片上传） | ✅ | |
+| 上传 APK/IPA（`POST /api/packages/upload`、分片上传） | ✅ | |
 | 触发场景执行（`POST /api/scenarios/{id}/run`） | ✅ | |
 | 中止执行（`POST /api/runs/cancel`） | ✅ | |
 | 查询报告 / 批次结果（`GET /api/reports/executions`） | ✅ | |
@@ -110,7 +110,7 @@ echo "== 回归通过 =="
 
 要点说明：
 
-- **上传**：`POST /api/packages/upload` 为 multipart 表单，字段名 `file`，仅接受 `.apk`；同包名旧版本自动标记为非最新。超大 APK 建议走分片上传：`POST /api/packages/upload-sessions`（body：`filename`/`file_size`/`chunk_size`/`total_chunks`）→ 逐片 `POST /api/packages/upload-sessions/{upload_id}/chunks/{index}` → `POST /api/packages/upload-sessions/{upload_id}/complete`。
+- **上传**：`POST /api/packages/upload` 为 multipart 表单，字段名 `file`，接受 `.apk` 和 Ad Hoc 签名的 `.ipa`；同平台、同包标识的旧版本自动标记为非最新。超大安装包建议走分片上传：`POST /api/packages/upload-sessions`（body：`filename`/`file_size`/`chunk_size`/`total_chunks`）→ 逐片 `POST /api/packages/upload-sessions/{upload_id}/chunks/{index}` → `POST /api/packages/upload-sessions/{upload_id}/complete`。
 - **触发**：`POST /api/scenarios/{id}/run`，body `{"device_serials": ["serial1", ...], "env_id": 可选}`。响应含 `batch_id`、`execution_ids` 与被预检拦截的设备列表 `blocked_prechecks`；全部设备被拦截时返回 400（或限流时 429）。
 - **轮询**：`GET /api/reports/executions?batch_id=<batch_id>`，`items[].status` 取值 `RUNNING / PASS / FAIL / WARNING / ERROR / ABORTED`。
 - **预检**（可选）：触发前可用 `GET /api/scenarios/{id}/precheck?device_serial=xxx` 与 `GET /api/devices/`（看 `status` 是否 `IDLE`）先挑选可用设备。
@@ -193,6 +193,50 @@ pipeline {
 ```
 
 GitLab CI 同理：把 Token 配置为 Masked/Protected CI Variable，`script` 段调用同一个脚本即可。
+
+### Jenkins + 蒲公英 iOS 制品
+
+蒲公英的 iOS 安装入口属于手机端 OTA，不能替代 AutoDroid 向指定测试机推送。Jenkins 应把**同一份 Ad Hoc IPA**同时交给两个系统：蒲公英继续用于人工内测下载，AutoDroid 保存本地制品并通过当前 Mac 的 `devicectl` 安装到已配对 iPhone。
+
+```groovy
+environment {
+    AUTODROID_URL   = 'http://autodroid.example.com:8000'
+    AUTODROID_TOKEN = credentials('autodroid-token')
+    PGYER_API_KEY   = credentials('pgyer-api-key')
+    IPA_PATH        = 'build/export/YourApp.ipa'
+}
+
+stages {
+    stage('Build Ad Hoc IPA') {
+        steps {
+            sh './ci/export_adhoc_ipa.sh "$IPA_PATH"'
+        }
+    }
+    stage('Publish IPA') {
+        steps {
+            sh '''
+                set -euo pipefail
+
+                # 保留现有蒲公英上传脚本/插件，并等待其发布成功。
+                ./ci/upload_to_pgyer.sh "$IPA_PATH" "$PGYER_API_KEY"
+
+                # 将同一制品交给 AutoDroid；失败时让流水线失败，避免商城缺包。
+                curl --fail --silent --show-error \
+                    -H "Authorization: Bearer $AUTODROID_TOKEN" \
+                    -F "file=@$IPA_PATH" \
+                    "$AUTODROID_URL/api/packages/upload" | jq .
+            '''
+        }
+    }
+}
+```
+
+注意：
+
+- IPA 必须使用 Ad Hoc 导出，目标测试机 UDID 必须已写入 provisioning profile；App Store、Development 和 Enterprise/In-House 包会被 AutoDroid 拒绝。
+- iPhone 必须由运行 AutoDroid 后端的 Mac 配对并信任，iOS 16 起还需预先开启开发者模式；一期安装支持 iOS 17 及以上。
+- AutoDroid 不需要、也不会保存蒲公英 API Key；两个密钥分别保存在 Jenkins Credentials 中。
+- 若反向代理限制大文件请求，IPA 上传改用上文的 20 MiB 分片接口，不要从蒲公英页面抓取临时下载地址。
 
 ## 6. 安全建议
 
