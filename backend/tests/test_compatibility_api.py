@@ -101,6 +101,27 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("package_name", str(context.exception.detail))
 
+    def test_create_run_rejects_ios_package(self):
+        user = self._user()
+        ios_pkg = self._package("com.demo.ios", "2.0")
+        ios_pkg.platform = "ios"
+        self.session.add(ios_pkg)
+        self.session.commit()
+        page_set = self._case_and_page_set()
+        self._device()
+
+        payload = CompatibilityRunCreate(
+            name="compat-ios",
+            old_package_id=None,
+            new_package_id=ios_pkg.id,
+            page_set_id=page_set.id,
+            device_serials=["android-1"],
+        )
+        with self.assertRaises(HTTPException) as context:
+            create_run(payload, BackgroundTasks(), session=self.session, current_user=user)
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("仅支持 Android APK", str(context.exception.detail))
+
     def test_create_run_rejects_ios_device(self):
         user = self._user()
         old_pkg = self._package("com.demo.app", "1.0")

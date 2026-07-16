@@ -81,11 +81,12 @@ const beforeUpload = (file) => {
     ElMessage.warning('已有上传任务进行中')
     return false
   }
-  const isAPK = file.name.toLowerCase().endsWith('.apk')
-  if (!isAPK) {
-    ElMessage.warning('仅支持 .apk 文件')
+  const extension = file.name.toLowerCase().split('.').pop()
+  const supported = extension === 'apk' || extension === 'ipa'
+  if (!supported) {
+    ElMessage.warning('仅支持 .apk 或 .ipa 文件')
   }
-  return isAPK
+  return supported
 }
 
 const getErrorMessage = (error, fallback = '上传失败') => (
@@ -173,7 +174,7 @@ const uploadChunkWithRetry = async (uploadId, index, chunk, fileName) => {
   }
 }
 
-const uploadApkInChunks = async ({ file, onSuccess, onError }) => {
+const uploadPackageInChunks = async ({ file, onSuccess, onError }) => {
   resetUploadProgress()
   uploadDialogVisible.value = true
   uploadInProgress.value = true
@@ -209,7 +210,7 @@ const uploadApkInChunks = async ({ file, onSuccess, onError }) => {
     }
 
     uploadStatus.value = 'merging'
-    uploadStatusText.value = '正在合并解析 APK'
+    uploadStatusText.value = '正在合并并解析安装包'
     const { data: result } = await api.completePackageUpload(session.upload_id)
 
     uploadStatus.value = 'success'
@@ -245,7 +246,8 @@ const handleDownload = (row) => {
   // 通过动态 a 标签触发浏览器下载
   const link = document.createElement('a')
   link.href = `${url}?token=${token}`
-  link.download = `${row.app_name}_${row.version_name}.apk`
+  const extension = row.platform === 'ios' ? 'ipa' : 'apk'
+  link.download = `${row.app_name}_${row.version_name}.${extension}`
   link.target = '_blank'
   document.body.appendChild(link)
   link.click()
@@ -279,7 +281,8 @@ const openInstallDialog = async (row) => {
   deviceLoading.value = true
   try {
     const { data } = await api.getDeviceList()
-    deviceList.value = (data || []).filter(d => (d.platform || 'android') === 'android')
+    const targetPlatform = row.platform || 'android'
+    deviceList.value = (data || []).filter(d => (d.platform || 'android') === targetPlatform)
   } catch (e) {
     ElMessage.error('获取设备列表失败')
     deviceList.value = []
@@ -310,6 +313,21 @@ const handleInstall = async () => {
 const getDeviceDisplayName = (device) => (
   device?.custom_name || device?.market_name || device?.model || device?.serial || ''
 )
+
+const isDeviceInstallable = (device) => {
+  if (!device) return false
+  if ((installTarget.value?.platform || 'android') === 'ios') {
+    return device.status === 'IDLE' || device.status === 'WDA_DOWN'
+  }
+  return device.status === 'IDLE'
+}
+
+const getDeviceStatusText = (device) => {
+  if (device.status === 'IDLE') return '🟢 空闲'
+  if (device.status === 'BUSY') return '🔴 运行中'
+  if (device.status === 'WDA_DOWN') return '🟠 WDA异常（可安装）'
+  return '⚫ 离线'
+}
 
 /** 文件大小格式化 */
 const formatSize = (size) => {
@@ -355,23 +373,23 @@ onMounted(() => {
     <el-card class="upload-card" shadow="never">
       <el-upload
         action="/api/packages/upload-sessions"
-        :http-request="uploadApkInChunks"
+        :http-request="uploadPackageInChunks"
         :before-upload="beforeUpload"
         :show-file-list="false"
         :disabled="uploadInProgress"
-        accept=".apk"
+        accept=".apk,.ipa"
         drag
         name="file"
       >
         <el-icon class="upload-icon"><UploadFilled /></el-icon>
-        <div class="upload-text">将 APK 文件拖到此处，或 <em>点击上传</em></div>
-        <div class="upload-tip">仅支持 .apk 格式文件</div>
+        <div class="upload-text">将 APK 或 IPA 文件拖到此处，或 <em>点击上传</em></div>
+        <div class="upload-tip">支持 Android .apk 与 Ad Hoc 签名的 iOS .ipa</div>
       </el-upload>
     </el-card>
 
     <el-dialog
       v-model="uploadDialogVisible"
-      title="APK 上传"
+      title="安装包上传"
       width="460px"
       :show-close="uploadDialogCanClose"
       :close-on-click-modal="uploadDialogCanClose"
@@ -416,13 +434,19 @@ onMounted(() => {
         v-loading="loading"
         stripe
         style="width: 100%;"
-        empty-text="暂无安装包，请上传 APK 文件"
+        empty-text="暂无安装包，请上传 APK 或 IPA 文件"
       >
         <!-- 应用名称 + 最新标签 -->
         <el-table-column label="应用名称" min-width="180">
           <template #default="{ row }">
             <div class="app-name-cell">
               <span class="app-name">{{ row.app_name }}</span>
+              <el-tag
+                :type="row.platform === 'ios' ? 'primary' : 'info'"
+                size="small"
+                effect="plain"
+                round
+              >{{ row.platform === 'ios' ? 'iOS' : 'Android' }}</el-tag>
               <el-tag
                 v-if="row.is_latest"
                 type="success"
@@ -435,7 +459,7 @@ onMounted(() => {
         </el-table-column>
 
         <!-- 包名 -->
-        <el-table-column label="包名" prop="package_name" min-width="220">
+        <el-table-column label="包名 / Bundle ID" prop="package_name" min-width="220">
           <template #default="{ row }">
             <span class="mono-text">{{ row.package_name || '—' }}</span>
           </template>
@@ -497,7 +521,7 @@ onMounted(() => {
     <!-- 安装到设备弹窗 -->
     <el-dialog
       v-model="installDialogVisible"
-      title="推送到指定设备"
+      :title="installTarget?.platform === 'ios' ? '安装 IPA 到指定 iPhone' : '推送到指定设备'"
       width="480px"
       align-center
       destroy-on-close
@@ -505,6 +529,14 @@ onMounted(() => {
       <div v-if="installTarget" style="margin-bottom: 16px; color: #606266;">
         即将安装：<strong>{{ installTarget.app_name }}</strong> v{{ installTarget.version_name }}
       </div>
+      <el-alert
+        v-if="installTarget?.platform === 'ios'"
+        title="目标 iPhone 需已配对并信任当前 Mac、开启开发者模式，且 UDID 已包含在 Ad Hoc 描述文件中。"
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 16px;"
+      />
       <el-form label-width="80px">
         <el-form-item label="目标设备">
           <el-select
@@ -518,11 +550,11 @@ onMounted(() => {
               :key="d.serial"
               :value="d.serial"
               :label="getDeviceDisplayName(d)"
-              :disabled="d.status !== 'IDLE'"
+              :disabled="!isDeviceInstallable(d)"
             >
               <span>{{ getDeviceDisplayName(d) }}</span>
               <span style="float: right; color: #909399; font-size: 12px;">
-                {{ d.status === 'IDLE' ? '🟢 空闲' : d.status === 'BUSY' ? '🔴 运行中' : d.status === 'WDA_DOWN' ? '🟠 WDA异常' : '⚫ 离线' }}
+                {{ getDeviceStatusText(d) }}
               </span>
             </el-option>
           </el-select>

@@ -582,6 +582,7 @@ class DeviceSyncResponse(BaseModel):
 
 class AppPackageRead(BaseModel):
     id: int
+    platform: str = "android"
     app_name: str = "Unknown"
     package_name: str = ""
     version_name: str = ""

@@ -1,7 +1,7 @@
 """
 APP 安装包管理 API
 
-提供 APK 文件的上传、解析、列表查询、下载和删除功能。
+提供 APK/IPA 文件的上传、解析、列表查询、下载、删除和设备安装功能。
 """
 import os
 import shlex
@@ -11,7 +11,9 @@ import asyncio
 import re
 import json
 import shutil
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,11 +23,18 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select, col, func
 
 from backend.database import get_session
+from backend.execution_limiter import get_execution_limiter
 from backend.models import AppPackage, Device, User
 from backend.paths import project_path, project_relative_path, resolve_project_path
 from backend.schemas import AppPackageRead, PaginatedAppPackageRead
 from backend.api.deps import get_current_user
 from backend.utils.apk_parser import parse_apk_info
+from backend.utils.ipa_parser import (
+    IpaParseError,
+    extract_app_bundle,
+    parse_ipa_info,
+    validate_ipa_for_device,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,8 @@ CHUNK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 PACKAGE_UPLOAD_CHUNK_SIZE = 20 * 1024 * 1024
 UPLOAD_SESSION_TTL_SECONDS = 24 * 60 * 60
 UPLOAD_READ_SIZE = 1024 * 1024
+SUPPORTED_PACKAGE_EXTENSIONS = {".apk": "android", ".ipa": "ios"}
+IOS_INSTALL_TIMEOUT_SECONDS = 300
 
 
 class PackageUploadSessionCreate(BaseModel):
@@ -142,10 +153,16 @@ def _expected_total_chunks(file_size: int, chunk_size: int) -> int:
     return (file_size + chunk_size - 1) // chunk_size
 
 
+def _package_extension(filename: str) -> str:
+    extension = Path(str(filename or "")).suffix.lower()
+    if extension not in SUPPORTED_PACKAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持 .apk 或 .ipa 文件")
+    return extension
+
+
 def _validate_upload_session_payload(payload: PackageUploadSessionCreate) -> str:
     filename = os.path.basename((payload.filename or "").strip())
-    if not filename.lower().endswith(".apk"):
-        raise HTTPException(status_code=400, detail="仅支持 .apk 文件")
+    _package_extension(filename)
     if payload.file_size <= 0:
         raise HTTPException(status_code=400, detail="文件大小必须大于 0")
     if payload.chunk_size != PACKAGE_UPLOAD_CHUNK_SIZE:
@@ -180,11 +197,21 @@ def _record_uploaded_package(
     session: Session,
     current_user: User,
 ) -> AppPackage:
-    apk_info = parse_apk_info(str(saved_path))
+    extension = _package_extension(saved_path.name)
+    package_platform = SUPPORTED_PACKAGE_EXTENSIONS[extension]
+    try:
+        package_info = (
+            parse_apk_info(str(saved_path))
+            if package_platform == "android"
+            else parse_ipa_info(str(saved_path))
+        )
+    except IpaParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if apk_info.get("package_name"):
+    if package_info.get("package_name"):
         stmt = select(AppPackage).where(
-            AppPackage.package_name == apk_info["package_name"],
+            AppPackage.platform == package_platform,
+            AppPackage.package_name == package_info["package_name"],
             AppPackage.is_latest == True  # noqa: E712
         )
         old_packages = session.exec(stmt).all()
@@ -193,10 +220,11 @@ def _record_uploaded_package(
             session.add(pkg)
 
     new_package = AppPackage(
-        app_name=apk_info.get("app_name", "Unknown"),
-        package_name=apk_info.get("package_name", ""),
-        version_name=apk_info.get("version_name", ""),
-        version_code=apk_info.get("version_code", ""),
+        platform=package_platform,
+        app_name=package_info.get("app_name", "Unknown"),
+        package_name=package_info.get("package_name", ""),
+        version_name=package_info.get("version_name", ""),
+        version_code=package_info.get("version_code", ""),
         file_path=project_relative_path(saved_path, anchors=("uploads/apps",)),
         file_size=round(file_size_bytes / (1024 * 1024), 2),
         is_latest=True,
@@ -208,8 +236,11 @@ def _record_uploaded_package(
     session.refresh(new_package)
 
     logger.info(
-        f"APK 上传成功: {apk_info.get('app_name')} "
-        f"({apk_info.get('package_name')}) v{apk_info.get('version_name')}"
+        "%s 上传成功: %s (%s) v%s",
+        extension.upper().lstrip("."),
+        package_info.get("app_name"),
+        package_info.get("package_name"),
+        package_info.get("version_name"),
     )
     return new_package
 
@@ -259,6 +290,8 @@ async def install_app_package_to_device(
     pkg = session.get(AppPackage, package_id)
     if not pkg:
         raise HTTPException(status_code=404, detail="安装包不存在")
+    if str(pkg.platform or "android").strip().lower() != "android":
+        raise HTTPException(status_code=400, detail="安装包不是 Android APK")
 
     file_path = _resolve_package_file_path(pkg.file_path)
     if not file_path.exists():
@@ -319,6 +352,8 @@ async def install_app_package_to_device(
         "success": True,
         "msg": f"{pkg.app_name} v{pkg.version_name} 安装成功",
         "package_id": pkg.id,
+        "platform": "android",
+        "installer": "adb",
         "package_name": pkg.package_name,
         "version_name": pkg.version_name,
         "version_code": pkg.version_code,
@@ -327,38 +362,369 @@ async def install_app_package_to_device(
     }
 
 
-@router.post("/upload", response_model=AppPackageRead, summary="上传 APK 文件")
+async def _run_process(args: List[str], timeout: float) -> Dict[str, Any]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"命令不存在: {args[0]}") from exc
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.communicate()
+        raise RuntimeError("命令执行超时") from exc
+    return {
+        "returncode": int(process.returncode or 0),
+        "stdout": stdout.decode("utf-8", errors="replace"),
+        "stderr": stderr.decode("utf-8", errors="replace"),
+    }
+
+
+async def _run_blocking(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args))
+
+
+def _load_devicectl_json(path: Path) -> Dict[str, Any]:
+    try:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logger.warning("读取 devicectl JSON 失败 %s: %s", path, exc)
+    return {}
+
+
+def _find_bundle_record(value: Any, bundle_id: str) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        identifiers = (
+            value.get("bundleIdentifier"),
+            value.get("bundleID"),
+            value.get("bundleId"),
+            value.get("identifier"),
+        )
+        if bundle_id in {str(item) for item in identifiers if item is not None}:
+            return value
+        for item in value.values():
+            found = _find_bundle_record(item, bundle_id)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_bundle_record(item, bundle_id)
+            if found:
+                return found
+    return None
+
+
+def _installed_version_matches(record: Dict[str, Any], pkg: AppPackage) -> bool:
+    marketing_version = next(
+        (
+            str(record.get(key))
+            for key in ("version", "shortVersionString", "marketingVersion")
+            if record.get(key) not in (None, "")
+        ),
+        "",
+    )
+    build_version = next(
+        (
+            str(record.get(key))
+            for key in ("bundleVersion", "buildVersion")
+            if record.get(key) not in (None, "")
+        ),
+        "",
+    )
+    if marketing_version and pkg.version_name and marketing_version != str(pkg.version_name):
+        return False
+    if build_version and pkg.version_code and build_version != str(pkg.version_code):
+        return False
+    return True
+
+
+def _devicectl_error_detail(result: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    combined = "\n".join(
+        [
+            str(result.get("stderr") or ""),
+            str(result.get("stdout") or ""),
+            json.dumps(payload, ensure_ascii=False),
+        ]
+    ).strip()
+    lowered = combined.lower()
+    if "developer mode" in lowered:
+        return "设备未开启开发者模式，请在 iPhone 设置中开启后重试"
+    if "locked" in lowered or "passcode" in lowered:
+        return "设备处于锁定状态，请解锁 iPhone 后重试"
+    if "provision" in lowered or "applicationverificationfailed" in lowered or "signature" in lowered:
+        return "IPA 签名或描述文件校验失败，请检查证书、Bundle ID 和目标 UDID"
+    if "not connected" in lowered or "failed to connect" in lowered or "device not found" in lowered:
+        return "目标 iPhone 不可达，请确认设备已连接、配对并信任当前 Mac"
+    compact = re.sub(r"\s+", " ", combined).strip()
+    return compact[-600:] if compact else "devicectl 未返回具体错误"
+
+
+async def install_ios_app_package_to_device(
+    *,
+    session: Session,
+    package_id: int,
+    serial: str,
+    require_available: bool = True,
+) -> dict:
+    """Install an uploaded Ad Hoc IPA on a paired iOS 17+ device with devicectl."""
+    pkg = session.get(AppPackage, package_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail="安装包不存在")
+    if str(pkg.platform or "android").strip().lower() != "ios":
+        raise HTTPException(status_code=400, detail="安装包不是 iOS IPA")
+
+    file_path = _resolve_package_file_path(pkg.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="IPA 文件已被删除")
+
+    device = session.exec(select(Device).where(Device.serial == serial)).first()
+    if not device:
+        raise HTTPException(status_code=404, detail=f"设备 {serial} 不存在")
+    if str(device.platform or "android").strip().lower() != "ios":
+        raise HTTPException(status_code=400, detail="iOS IPA 只能安装到 iOS 设备")
+
+    status = str(device.status or "OFFLINE").strip().upper()
+    if require_available and status not in {"IDLE", "WDA_DOWN"}:
+        raise HTTPException(status_code=409, detail=f"设备 {device.model} 当前状态为 {status}，无法安装")
+
+    version_match = re.match(r"\s*(\d+)", str(device.os_version or ""))
+    if version_match and int(version_match.group(1)) < 17:
+        raise HTTPException(status_code=400, detail="iOS 一键安装一期仅支持 iOS 17 及以上设备")
+
+    try:
+        metadata = await _run_blocking(
+            validate_ipa_for_device,
+            str(file_path),
+            serial,
+            str(device.os_version or ""),
+        )
+    except IpaParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        tool_check = await _run_process(["xcrun", "--find", "devicectl"], timeout=20)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="当前 Mac 未安装或未启用 Xcode devicectl，请检查 xcode-select 配置",
+        ) from exc
+    if tool_check["returncode"] != 0:
+        raise HTTPException(
+            status_code=503,
+            detail="当前 Mac 未安装或未启用 Xcode devicectl，请检查 xcode-select 配置",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="autodroid-ipa-") as temp_dir:
+        temp_path = Path(temp_dir)
+        try:
+            app_path = await _run_blocking(extract_app_bundle, str(file_path), temp_path / "app")
+        except IpaParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        install_json_path = temp_path / "install-result.json"
+        try:
+            install_result = await _run_process(
+                [
+                    "xcrun",
+                    "devicectl",
+                    "device",
+                    "install",
+                    "app",
+                    "--device",
+                    serial,
+                    "--timeout",
+                    str(IOS_INSTALL_TIMEOUT_SECONDS),
+                    "--json-output",
+                    str(install_json_path),
+                    str(app_path),
+                ],
+                timeout=IOS_INSTALL_TIMEOUT_SECONDS + 30,
+            )
+        except RuntimeError as exc:
+            if "超时" in str(exc):
+                raise HTTPException(status_code=504, detail="iOS 安装超时，请检查设备连接后重试") from exc
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        install_payload = _load_devicectl_json(install_json_path)
+        if install_result["returncode"] != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"iOS 安装失败: {_devicectl_error_detail(install_result, install_payload)}",
+            )
+
+        verify_json_path = temp_path / "verify-result.json"
+        try:
+            verify_result = await _run_process(
+                [
+                    "xcrun",
+                    "devicectl",
+                    "device",
+                    "info",
+                    "apps",
+                    "--device",
+                    serial,
+                    "--bundle-id",
+                    str(pkg.package_name),
+                    "--timeout",
+                    "60",
+                    "--json-output",
+                    str(verify_json_path),
+                ],
+                timeout=90,
+            )
+        except RuntimeError as exc:
+            status_code = 504 if "超时" in str(exc) else 500
+            raise HTTPException(status_code=status_code, detail=f"iOS 安装后核验失败: {exc}") from exc
+        verify_payload = _load_devicectl_json(verify_json_path)
+        installed_record = _find_bundle_record(verify_payload, str(pkg.package_name))
+        if (
+            verify_result["returncode"] != 0
+            or not installed_record
+            or not _installed_version_matches(installed_record, pkg)
+        ):
+            raise HTTPException(status_code=500, detail="devicectl 已执行安装，但未能在设备上核验应用版本")
+
+    return {
+        "success": True,
+        "msg": f"{pkg.app_name} v{pkg.version_name} 安装成功",
+        "package_id": pkg.id,
+        "platform": "ios",
+        "installer": "devicectl",
+        "package_name": pkg.package_name,
+        "version_name": pkg.version_name,
+        "version_code": pkg.version_code,
+        "output": "devicectl install and verification succeeded",
+        "retried_after_uninstall": False,
+        "signing_type": metadata.get("signing_type"),
+    }
+
+
+async def install_managed_package_to_device(
+    *,
+    session: Session,
+    package_id: int,
+    serial: str,
+    current_user: User,
+) -> dict:
+    """Acquire the shared device lease and dispatch installation by platform."""
+    pkg = session.get(AppPackage, package_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail="安装包不存在")
+    device = session.exec(select(Device).where(Device.serial == serial)).first()
+    if not device:
+        raise HTTPException(status_code=404, detail=f"设备 {serial} 不存在")
+
+    package_platform = str(pkg.platform or "android").strip().lower()
+    device_platform = str(device.platform or "android").strip().lower()
+    if package_platform != device_platform:
+        raise HTTPException(
+            status_code=400,
+            detail=f"安装包平台 {package_platform} 与设备平台 {device_platform} 不匹配",
+        )
+
+    original_status = str(device.status or "OFFLINE").strip().upper()
+    allowed_statuses = {"IDLE", "WDA_DOWN"} if package_platform == "ios" else {"IDLE"}
+    if original_status not in allowed_statuses:
+        raise HTTPException(status_code=409, detail=f"设备 {device.model} 当前状态为 {original_status}，无法安装")
+
+    limiter = get_execution_limiter()
+    task_id = f"package-install:{uuid.uuid4().hex}"
+    try:
+        lease = limiter.acquire_lease(
+            user_id=int(current_user.id or 0),
+            device_serial=serial,
+            task_id=task_id,
+            timeout=0.0,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        session.refresh(device)
+        latest_status = str(device.status or "OFFLINE").strip().upper()
+        if latest_status not in allowed_statuses:
+            raise HTTPException(status_code=409, detail=f"设备 {device.model} 当前状态为 {latest_status}，无法安装")
+        original_status = latest_status
+        device.status = "BUSY"
+        device.updated_at = datetime.now()
+        session.add(device)
+        session.commit()
+
+        if package_platform == "ios":
+            return await install_ios_app_package_to_device(
+                session=session,
+                package_id=package_id,
+                serial=serial,
+                require_available=False,
+            )
+        return await install_app_package_to_device(
+            session=session,
+            package_id=package_id,
+            serial=serial,
+            require_idle=False,
+            uninstall_first=False,
+            allow_uninstall_retry=True,
+            allow_downgrade=True,
+        )
+    finally:
+        try:
+            session.rollback()
+            current_device = session.exec(select(Device).where(Device.serial == serial)).first()
+            if current_device and str(current_device.status or "").strip().upper() == "BUSY":
+                current_device.status = original_status
+                current_device.updated_at = datetime.now()
+                session.add(current_device)
+                session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("恢复安装设备状态失败: serial=%s", serial)
+        lease.release()
+
+
+@router.post("/upload", response_model=AppPackageRead, summary="上传 APK/IPA 文件")
 async def upload_package(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
-    接收 APK 文件，保存到本地并自动解析包名、版本号等元数据。
-    同一包名的旧版本会自动标记为非最新。
+    接收 APK/IPA 文件，保存到本地并自动解析包标识、版本号等元数据。
+    同平台、同标识的旧版本会自动标记为非最新。
     """
     # 1. 校验文件类型
-    if not file.filename or not file.filename.lower().endswith(".apk"):
-        raise HTTPException(status_code=400, detail="仅支持 .apk 文件")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+    ext = _package_extension(file.filename)
 
     # 2. 保存文件 (UUID 重命名防冲突)
-    ext = os.path.splitext(file.filename)[1]
     saved_name = f"{uuid.uuid4().hex}{ext}"
     saved_path = UPLOAD_DIR / saved_name
 
     file_size_bytes = await _write_upload_file(file, saved_path)
-    return _record_uploaded_package(
-        saved_path=saved_path,
-        file_size_bytes=file_size_bytes,
-        session=session,
-        current_user=current_user,
-    )
+    try:
+        return _record_uploaded_package(
+            saved_path=saved_path,
+            file_size_bytes=file_size_bytes,
+            session=session,
+            current_user=current_user,
+        )
+    except Exception:
+        _remove_path(saved_path)
+        raise
 
 
 @router.post(
     "/upload-sessions",
     response_model=PackageUploadSessionRead,
-    summary="创建 APK 分片上传会话",
+    summary="创建 APK/IPA 分片上传会话",
 )
 def create_package_upload_session(
     payload: PackageUploadSessionCreate,
@@ -399,7 +765,7 @@ def create_package_upload_session(
 @router.post(
     "/upload-sessions/{upload_id}/chunks/{index}",
     response_model=PackageChunkUploadRead,
-    summary="上传 APK 分片",
+    summary="上传安装包分片",
 )
 async def upload_package_chunk(
     upload_id: str,
@@ -456,7 +822,7 @@ async def upload_package_chunk(
 @router.post(
     "/upload-sessions/{upload_id}/complete",
     response_model=AppPackageRead,
-    summary="完成 APK 分片上传",
+    summary="完成安装包分片上传",
 )
 def complete_package_upload(
     upload_id: str,
@@ -490,7 +856,8 @@ def complete_package_upload(
     if total_bytes != file_size:
         raise HTTPException(status_code=400, detail="分片总大小与文件大小不匹配")
 
-    saved_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.apk"
+    extension = _package_extension(str(meta.get("filename") or ""))
+    saved_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{extension}"
     try:
         with open(saved_path, "wb") as output:
             for part_path in part_paths:
@@ -517,7 +884,7 @@ def complete_package_upload(
     return new_package
 
 
-@router.delete("/upload-sessions/{upload_id}", summary="取消 APK 分片上传")
+@router.delete("/upload-sessions/{upload_id}", summary="取消安装包分片上传")
 def cancel_package_upload(
     upload_id: str,
     current_user: User = Depends(get_current_user),
@@ -532,6 +899,7 @@ def list_packages(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     keyword: Optional[str] = Query(None, description="按应用名/包名搜索"),
+    platform: Optional[str] = Query(None, description="按 android/ios 平台过滤"),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
@@ -543,6 +911,12 @@ def list_packages(
             (col(AppPackage.app_name).contains(keyword))
             | (col(AppPackage.package_name).contains(keyword))
         )
+
+    if platform:
+        normalized_platform = str(platform).strip().lower()
+        if normalized_platform not in {"android", "ios"}:
+            raise HTTPException(status_code=400, detail="platform 仅支持 android 或 ios")
+        query = query.where(AppPackage.platform == normalized_platform)
 
     # 总数
     count_query = select(func.count()).select_from(query.subquery())
@@ -564,7 +938,7 @@ def download_package(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """根据 ID 下载 APK 文件。"""
+    """根据 ID 下载 APK 或 IPA 文件。"""
     pkg = session.get(AppPackage, package_id)
     if not pkg:
         raise HTTPException(status_code=404, detail="安装包不存在")
@@ -573,12 +947,20 @@ def download_package(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件已被删除")
 
-    # 生成有意义的下载文件名
-    download_name = f"{pkg.app_name}_{pkg.version_name}.apk"
+    package_platform = str(pkg.platform or "android").strip().lower()
+    extension = Path(pkg.file_path or "").suffix.lower()
+    if extension not in SUPPORTED_PACKAGE_EXTENSIONS:
+        extension = ".ipa" if package_platform == "ios" else ".apk"
+    download_name = f"{pkg.app_name}_{pkg.version_name}{extension}"
+    media_type = (
+        "application/octet-stream"
+        if extension == ".ipa"
+        else "application/vnd.android.package-archive"
+    )
     return FileResponse(
         path=str(file_path),
         filename=download_name,
-        media_type="application/vnd.android.package-archive",
+        media_type=media_type,
     )
 
 
@@ -601,12 +983,13 @@ def delete_package(
         except Exception as e:
             logger.warning(f"删除文件失败 {pkg.file_path}: {e}")
 
-    # 如果删除的是最新包，则将同包名的最近一个设为最新
+    # 如果删除的是最新包，则将同平台、同标识的最近一个设为最新
     if pkg.is_latest and pkg.package_name:
         next_latest = session.exec(
             select(AppPackage)
             .where(
                 AppPackage.package_name == pkg.package_name,
+                AppPackage.platform == str(pkg.platform or "android"),
                 AppPackage.id != pkg.id,
             )
             .order_by(col(AppPackage.upload_time).desc())
@@ -633,19 +1016,15 @@ async def install_package(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    通过 ADB 将 APK 推送安装到指定设备。
-    使用 -r (覆盖安装) -t (允许测试包) 参数。
-    """
+    """按安装包平台将 APK/IPA 推送到指定 Android/iOS 设备。"""
     try:
-        return await install_app_package_to_device(
+        return await install_managed_package_to_device(
             session=session,
             package_id=package_id,
             serial=req.serial,
-            require_idle=True,
-            uninstall_first=False,
-            allow_uninstall_retry=True,
-            allow_downgrade=True,
+            current_user=current_user,
         )
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -515,6 +515,25 @@ def _migrate_scenario_folders(cursor) -> None:
         logger.info("Migration: ALTER TABLE testscenario ADD COLUMN folder_id")
 
 
+def _migrate_app_package_platform(cursor) -> None:
+    """Add and backfill package platform for Android/iOS artifact dispatch."""
+    if not _table_exists(cursor, "apppackage"):
+        logger.warning("Migration skip: apppackage table not found when adding platform")
+        return
+
+    cursor.execute("PRAGMA table_info(apppackage)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if "platform" not in existing_cols:
+        cursor.execute("ALTER TABLE apppackage ADD COLUMN platform VARCHAR DEFAULT 'android'")
+        logger.info("Migration: ALTER TABLE apppackage ADD COLUMN platform")
+    cursor.execute(
+        "UPDATE apppackage SET platform = 'android' WHERE platform IS NULL OR TRIM(platform) = ''"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_apppackage_platform ON apppackage(platform)"
+    )
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     _ensure_schema_migration_table(cursor)
@@ -533,6 +552,7 @@ def _run_migrations_with_conn(conn) -> None:
         ("20260711_010_testcasestep_retry_count", _migration_add_columns),
         # 复用 _migration_add_columns，为已有库补兼容性机型对比列（compare_mode/baseline_device_serial/is_baseline）
         ("20260713_011_compatibility_compare_mode", _migration_add_columns),
+        ("20260716_012_apppackage_platform", _migrate_app_package_platform),
     ]
 
     for version, migration_func in migration_plan:

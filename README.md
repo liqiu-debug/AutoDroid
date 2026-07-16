@@ -9,6 +9,7 @@ AutoDroid 是一个面向 Android/iOS 的低代码 UI 自动化测试平台，�
 | 业务域 | 主要能力 |
 |---|---|
 | 设备中心 | Android/iOS 设备发现与同步、设备状态、截图、解锁、重启、iOS WDA 检查与启动 |
+| 安装包管理 | APK/Ad Hoc IPA 上传与版本管理，向已接入的 Android/iOS 设备一键安装 |
 | 可视化录制 | Android 实时投屏/静态截图录制；iOS 静态截图、元素审查、交互录制与单步调试 |
 | 用例管理 | 目录与标签、复制、变量、标准步骤模型、平台覆盖、执行前预检、运行中止 |
 | 场景编排 | 多用例串联、变量上下文传递、多设备并发、设备级预检过滤 |
@@ -47,7 +48,7 @@ flowchart TD
 | 前端 | Vue 3、Element Plus、Vite、Pinia、ECharts |
 | 后端 | Python、FastAPI、SQLModel、SQLite、APScheduler |
 | Android | ADB、uiautomator2、adbutils、Scrcpy |
-| iOS | tidevice、facebook-wda、WebDriverAgent |
+| iOS | tidevice、facebook-wda、WebDriverAgent、Xcode devicectl |
 | 图像与性能 | OpenCV、Pillow、Perfetto、framestats |
 | 实时通信 | WebSocket、H.264 视频流 |
 | 报告与通知 | Jinja2 HTML 报告、飞书机器人 Webhook |
@@ -57,6 +58,7 @@ flowchart TD
 | 能力 | Android | iOS | 说明 |
 |---|---|---|---|
 | 设备发现与管理 | 支持 | 支持 | iOS 状态包含 `WDA_DOWN` |
+| 安装包推送 | 支持 | 支持 | Android 使用 ADB；iOS 17+ 使用 devicectl，IPA 必须为包含设备 UDID 的 Ad Hoc 包 |
 | 静态截图录制 | 支持 | 支持 | iOS 通过 WDA 获取截图和页面层级，交互后刷新截图 |
 | 实时投屏录制 | 支持 | 暂不支持 | Scrcpy 实时画面与触控仅用于 Android |
 | 用例执行 | 支持 | 支持 | iOS 需开启执行开关且 WDA 健康 |

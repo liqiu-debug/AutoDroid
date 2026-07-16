@@ -228,6 +228,8 @@ def _validate_packages(session: Session, old_package_id: Optional[int], new_pack
     new_pkg = session.get(AppPackage, new_package_id)
     if not new_pkg:
         raise HTTPException(status_code=404, detail="新版安装包不存在")
+    if str(new_pkg.platform or "android").strip().lower() != "android":
+        raise HTTPException(status_code=400, detail="兼容性测试 v1 仅支持 Android APK")
     if not new_pkg.package_name:
         raise HTTPException(status_code=400, detail="安装包缺少包名，无法执行兼容性测试")
     if not _resolve_package_file_path(new_pkg.file_path).exists():
@@ -239,6 +241,8 @@ def _validate_packages(session: Session, old_package_id: Optional[int], new_pack
     old_pkg = session.get(AppPackage, old_package_id)
     if not old_pkg:
         raise HTTPException(status_code=404, detail="旧版安装包不存在")
+    if str(old_pkg.platform or "android").strip().lower() != "android":
+        raise HTTPException(status_code=400, detail="兼容性测试 v1 仅支持 Android APK")
     if not old_pkg.package_name:
         raise HTTPException(status_code=400, detail="旧版安装包缺少包名，无法执行兼容性测试")
     if old_pkg.package_name != new_pkg.package_name:

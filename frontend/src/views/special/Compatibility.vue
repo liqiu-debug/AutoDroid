@@ -117,7 +117,7 @@ const fetchPackages = async () => {
   const pageSize = 100
   const all = []
   for (let page = 1; page <= 20; page += 1) {
-    const { data } = await api.getPackages({ page, page_size: pageSize })
+    const { data } = await api.getPackages({ page, page_size: pageSize, platform: 'android' })
     const items = data.items || []
     all.push(...items)
     const totalCount = Number(data.total ?? all.length)
