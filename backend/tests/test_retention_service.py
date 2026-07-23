@@ -11,6 +11,11 @@ from backend.models import (
     CompatibilityRun,
     FastbotReport,
     FastbotTask,
+    InspectionBranchRun,
+    InspectionFault,
+    InspectionRun,
+    InspectionState,
+    InspectionTransition,
     SystemSetting,
     TestExecution,
     TestResult,
@@ -76,25 +81,102 @@ class RetentionCleanupTests(unittest.TestCase):
             session.add(CompatibilityCell(id=1, run_id=1, device_serial="d1"))
             session.add(CompatibilityPageResult(run_id=1, cell_id=1, page_key="home"))
             session.add(CompatibilityRun(id=2, name="old-pending", new_package_id=1, created_at=self.old, status="PENDING"))
+            session.add(
+                CompatibilityRun(
+                    id=3,
+                    name="recent-inspection-report",
+                    new_package_id=1,
+                    source_type="inspection",
+                    inspection_run_id=1,
+                    inspection_state_ids=[1],
+                    created_at=self.recent,
+                    status="PASS",
+                )
+            )
+
+            # 巡检：过期已完成（含完整状态图）/ 过期运行中
+            session.add(
+                InspectionRun(
+                    id=1,
+                    name="old-inspection",
+                    package_name="com.a",
+                    device_serial="d1",
+                    created_at=self.old,
+                    status="PASS",
+                )
+            )
+            session.add(
+                InspectionBranchRun(
+                    id=1,
+                    run_id=1,
+                    branch_key="guest",
+                    branch_name="未登录",
+                    status="PASS",
+                )
+            )
+            session.add(
+                InspectionState(
+                    id=1,
+                    run_id=1,
+                    branch_run_id=1,
+                    branch_key="guest",
+                    cluster_key="c",
+                    state_key="s",
+                )
+            )
+            session.add(
+                InspectionTransition(
+                    id=1,
+                    run_id=1,
+                    branch_run_id=1,
+                    from_state_id=1,
+                    action_type="click",
+                    action_key="a",
+                    status="PASS",
+                )
+            )
+            session.add(
+                InspectionFault(
+                    id=1,
+                    run_id=1,
+                    branch_run_id=1,
+                    state_id=1,
+                    fault_type="CRASH",
+                    signature="sig",
+                )
+            )
+            session.add(
+                InspectionRun(
+                    id=2,
+                    name="old-inspection-running",
+                    package_name="com.b",
+                    device_serial="d2",
+                    created_at=self.old,
+                    status="RUNNING",
+                )
+            )
             session.commit()
 
     def _cleanup(self, days=30):
         with patch.object(retention_service, "engine", self.engine), \
              patch("backend.api.reports._delete_execution_artifacts") as exec_artifacts, \
              patch("backend.api.fastbot._delete_fastbot_artifacts_dir") as fastbot_artifacts, \
-             patch("backend.api.compatibility._delete_run_artifacts") as compat_artifacts:
+             patch("backend.api.compatibility._delete_run_artifacts") as compat_artifacts, \
+             patch("backend.api.inspections._delete_inspection_run_artifacts") as inspection_artifacts:
             summary = cleanup_expired_reports(days, now=self.now)
-        return summary, exec_artifacts, fastbot_artifacts, compat_artifacts
+        return summary, exec_artifacts, fastbot_artifacts, compat_artifacts, inspection_artifacts
 
     def test_cleanup_deletes_only_expired_finished_records(self):
-        summary, exec_artifacts, fastbot_artifacts, compat_artifacts = self._cleanup()
+        summary, exec_artifacts, fastbot_artifacts, compat_artifacts, inspection_artifacts = self._cleanup()
 
         self.assertEqual(summary["executions"], 1)
         self.assertEqual(summary["fastbot_tasks"], 1)
         self.assertEqual(summary["compatibility_runs"], 1)
+        self.assertEqual(summary["inspection_runs"], 1)
         exec_artifacts.assert_called_once()
         fastbot_artifacts.assert_called_once_with(1)
         compat_artifacts.assert_called_once_with(1)
+        inspection_artifacts.assert_called_once_with(1)
 
         with Session(self.engine) as session:
             executions = session.exec(select(TestExecution)).all()
@@ -106,12 +188,22 @@ class RetentionCleanupTests(unittest.TestCase):
             self.assertEqual(session.exec(select(FastbotReport)).all(), [])
 
             runs = session.exec(select(CompatibilityRun)).all()
-            self.assertEqual({r.id for r in runs}, {2})
+            self.assertEqual({r.id for r in runs}, {2, 3})
+            copied_report = next(item for item in runs if item.id == 3)
+            self.assertIsNone(copied_report.inspection_run_id)
+            self.assertEqual(copied_report.inspection_state_ids, [1])
             self.assertEqual(session.exec(select(CompatibilityCell)).all(), [])
             self.assertEqual(session.exec(select(CompatibilityPageResult)).all(), [])
 
+            inspection_runs = session.exec(select(InspectionRun)).all()
+            self.assertEqual({r.id for r in inspection_runs}, {2})
+            self.assertEqual(session.exec(select(InspectionBranchRun)).all(), [])
+            self.assertEqual(session.exec(select(InspectionState)).all(), [])
+            self.assertEqual(session.exec(select(InspectionTransition)).all(), [])
+            self.assertEqual(session.exec(select(InspectionFault)).all(), [])
+
     def test_cleanup_disabled_when_days_not_positive(self):
-        summary, exec_artifacts, _, _ = self._cleanup(days=0)
+        summary, exec_artifacts, _, _, _ = self._cleanup(days=0)
 
         self.assertFalse(summary["enabled"])
         exec_artifacts.assert_not_called()
@@ -130,7 +222,8 @@ class RetentionCleanupTests(unittest.TestCase):
         with patch.object(retention_service, "engine", self.engine), \
              patch("backend.api.reports._delete_execution_artifacts"), \
              patch("backend.api.fastbot._delete_fastbot_artifacts_dir"), \
-             patch("backend.api.compatibility._delete_run_artifacts"):
+             patch("backend.api.compatibility._delete_run_artifacts"), \
+             patch("backend.api.inspections._delete_inspection_run_artifacts"):
             summary = run_retention_cleanup()
 
         self.assertTrue(summary["enabled"])

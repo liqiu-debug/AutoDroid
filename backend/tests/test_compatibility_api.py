@@ -4,15 +4,46 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
+from sqlalchemy import event
 from sqlmodel import SQLModel, Session, create_engine, select
 
-from backend.api.compatibility import compare_page_snapshots, compare_device_pages, create_run, delete_page_set, delete_run, get_run, list_runs, _execute_cell, _execute_run_async, _normalize_activity
+from backend.api.compatibility import (
+    _execute_cell,
+    _execute_cell_inspection_version_body,
+    _execute_run_async,
+    _abort_event_for_run,
+    _discard_abort_event,
+    _normalize_activity,
+    compare_device_pages,
+    compare_page_snapshots,
+    cancel_run,
+    create_run,
+    delete_page_set,
+    delete_run,
+    get_run,
+    list_runs,
+)
 from backend.api.packages import install_app_package_to_device
-from backend.models import AppPackage, CompatPageSet, CompatibilityCell, CompatibilityPageResult, CompatibilityRun, Device, TestCase, User
+from backend.artifact_store import AssetCapacityExceeded
+from backend.feature_flags import FLAG_MODEL_INSPECTION
+from backend.models import (
+    AppPackage,
+    CompatPageSet,
+    CompatibilityCell,
+    CompatibilityPageResult,
+    CompatibilityRun,
+    Device,
+    InspectionBranchRun,
+    InspectionRun,
+    InspectionState,
+    SystemSetting,
+    TestCase,
+    User,
+)
 from backend.paths import project_path
 from backend.schemas import CompatibilityRunCreate
 
@@ -23,8 +54,14 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
         SQLModel.metadata.create_all(self.engine)
         self.session = Session(self.engine)
         self.temp_files = []
+        self.capacity_patch = patch(
+            "backend.api.compatibility.ensure_asset_capacity_for_new_run",
+            return_value={"can_start": True},
+        )
+        self.capacity_mock = self.capacity_patch.start()
 
     def tearDown(self) -> None:
+        self.capacity_patch.stop()
         self.session.close()
         for path in self.temp_files:
             try:
@@ -81,6 +118,70 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
         self.session.commit()
         return device
 
+    def test_list_and_detail_batch_related_rows(self):
+        user = self._user()
+        page_set = self._case_and_page_set()
+        runs = []
+        for index in range(5):
+            run = CompatibilityRun(
+                name=f"batch-{index}",
+                page_set_id=page_set.id,
+                page_set_name=page_set.name,
+                page_set_snapshot=list(page_set.pages),
+                package_name="com.demo.app",
+                status="PASS",
+            )
+            self.session.add(run)
+            self.session.flush()
+            for cell_index in range(3):
+                cell = CompatibilityCell(
+                    run_id=run.id,
+                    device_serial=f"device-{index}-{cell_index}",
+                    status="PASS",
+                )
+                self.session.add(cell)
+                self.session.flush()
+                self.session.add(
+                    CompatibilityPageResult(
+                        run_id=run.id,
+                        cell_id=cell.id,
+                        page_key="home",
+                        page_name="Home",
+                        status="PASS",
+                    )
+                )
+            runs.append(run)
+        self.session.commit()
+
+        statements = []
+
+        def before_cursor_execute(*args):
+            statements.append(args[2])
+
+        event.listen(self.engine, "before_cursor_execute", before_cursor_execute)
+        try:
+            listed = list_runs(
+                limit=20,
+                session=self.session,
+                current_user=user,
+            )
+            list_query_count = len(statements)
+            statements.clear()
+            detailed = get_run(
+                runs[0].id,
+                session=self.session,
+                current_user=user,
+            )
+            detail_query_count = len(statements)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", before_cursor_execute)
+
+        self.assertEqual(len(listed.items), 5)
+        self.assertLessEqual(list_query_count, 3)
+        self.assertEqual(len(detailed.cells), 3)
+        self.assertEqual(sum(len(cell.pages) for cell in detailed.cells), 3)
+        self.assertLessEqual(detail_query_count, 4)
+
     def test_create_run_rejects_different_package_names(self):
         user = self._user()
         old_pkg = self._package("com.demo.old", "1.0")
@@ -100,6 +201,26 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
             create_run(payload, BackgroundTasks(), session=self.session, current_user=user)
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("package_name", str(context.exception.detail))
+
+    def test_create_run_rejects_critical_asset_storage(self):
+        self.capacity_mock.side_effect = AssetCapacityExceeded(
+            {"used_percent": 95.1, "can_start": False}
+        )
+        payload = CompatibilityRunCreate(
+            name="blocked",
+            new_package_id=1,
+            page_set_id=1,
+            device_serials=["android-1"],
+        )
+        with self.assertRaises(HTTPException) as context:
+            create_run(
+                payload,
+                BackgroundTasks(),
+                session=self.session,
+                current_user=User(username="tester", hashed_password="x"),
+            )
+        self.assertEqual(context.exception.status_code, 507)
+        self.assertEqual(context.exception.detail["storage"]["used_percent"], 95.1)
 
     def test_create_run_rejects_ios_package(self):
         user = self._user()
@@ -188,6 +309,204 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
         cells = self.session.exec(select(CompatibilityCell)).all()
         self.assertEqual(len(cells), 1)
         self.assertEqual(cells[0].device_serial, "android-1")
+
+    def test_snapshot_from_inspection_copies_sanitized_baseline_into_report(self):
+        user = self._user()
+        new_pkg = self._package("com.demo.app", "2.0")
+        self._device()
+        self.session.add(SystemSetting(key=FLAG_MODEL_INSPECTION, value="true"))
+        source_run = InspectionRun(
+            name="inspection source",
+            package_name="com.demo.app",
+            device_serial="android-1",
+            status="PASS",
+            profile_snapshot={
+                "branches": {
+                    "guest": {
+                        "name": "未登录",
+                        "prepare_case_id": 1,
+                        "entry_case_id": 1,
+                        "ready_assertion": {
+                            "selector": "首页",
+                            "by": "description",
+                        },
+                    }
+                },
+                "input_rules": [],
+                "sanitizer_rules": [],
+                "budgets": {"stable_wait_seconds": 5},
+            },
+        )
+        self.session.add(source_run)
+        self.session.flush()
+        branch = InspectionBranchRun(
+            run_id=source_run.id,
+            branch_key="guest",
+            branch_name="未登录",
+            status="PASS",
+        )
+        self.session.add(branch)
+        self.session.flush()
+        state = InspectionState(
+            run_id=source_run.id,
+            branch_run_id=branch.id,
+            branch_key="guest",
+            cluster_key="cluster-home",
+            state_key="state-home",
+            activity=".Home",
+            stable_status="STABLE",
+            locator_quality="DESCRIPTION",
+            selected_for_regression=True,
+            screenshot_path=(
+                f"inspection/{source_run.id}/guest/home/screenshot.png"
+            ),
+            xml_path=f"inspection/{source_run.id}/guest/home/hierarchy.xml",
+            first_path=[],
+        )
+        self.session.add(state)
+        self.session.commit()
+        self.session.refresh(state)
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            reports = Path(temp_root) / "reports"
+            source_dir = (
+                reports
+                / "inspection"
+                / str(source_run.id)
+                / "guest"
+                / "home"
+            )
+            source_dir.mkdir(parents=True)
+            (source_dir / "screenshot.png").write_bytes(b"sanitized-png")
+            (source_dir / "hierarchy.xml").write_text(
+                "<hierarchy/>",
+                encoding="utf-8",
+            )
+
+            def fake_project_path(*parts):
+                return Path(temp_root).joinpath(*parts)
+
+            tasks = BackgroundTasks()
+            with patch(
+                "backend.api.compatibility.project_path",
+                side_effect=fake_project_path,
+            ), patch(
+                "backend.inspection.engine.project_path",
+                side_effect=fake_project_path,
+            ):
+                created = create_run(
+                    CompatibilityRunCreate(
+                        name="inspection snapshot",
+                        old_package_id=None,
+                        new_package_id=new_pkg.id,
+                        source_type="inspection",
+                        inspection_run_id=source_run.id,
+                        inspection_state_ids=[state.id],
+                        device_serials=["android-1"],
+                        compare_mode="snapshot",
+                    ),
+                    tasks,
+                    session=self.session,
+                    current_user=user,
+                )
+
+            self.assertEqual(created.source_type, "inspection")
+            self.assertEqual(created.compare_mode, "snapshot")
+            self.assertEqual(created.inspection_state_ids, [state.id])
+            self.assertEqual(len(tasks.tasks), 1)
+            copied_page = created.page_set_snapshot[0]
+            copied_screenshot = reports / copied_page.baseline_screenshot_path
+            copied_xml = reports / copied_page.baseline_xml_path
+            self.assertEqual(copied_screenshot.read_bytes(), b"sanitized-png")
+            self.assertEqual(copied_xml.read_text(encoding="utf-8"), "<hierarchy/>")
+            self.assertIn(
+                f"compatibility/{created.id}/inspection_baseline",
+                copied_page.baseline_screenshot_path,
+            )
+
+    async def test_inspection_version_prepares_only_before_in_place_upgrade(self):
+        user = self._user()
+        old_pkg = self._package("com.demo.app", "1.0")
+        new_pkg = self._package("com.demo.app", "2.0")
+        device = self._device()
+        run = CompatibilityRun(
+            name="inspection version",
+            source_type="inspection",
+            inspection_run_id=11,
+            inspection_state_ids=[21],
+            old_package_id=old_pkg.id,
+            new_package_id=new_pkg.id,
+            package_name="com.demo.app",
+            compare_mode="version",
+            mode="upgrade",
+            device_serials=[device.serial],
+            status="RUNNING",
+            user_id=user.id,
+        )
+        self.session.add(run)
+        self.session.flush()
+        cell = CompatibilityCell(
+            run_id=run.id,
+            device_serial=device.serial,
+            status="RUNNING",
+        )
+        self.session.add(cell)
+        self.session.commit()
+        self.session.refresh(run)
+        self.session.refresh(cell)
+        page = {
+            "key": "guest-home",
+            "name": "未登录首页",
+            "inspection_state_id": 21,
+            "branch_key": "guest",
+            "branch_config": {
+                "prepare_case_id": 1,
+                "entry_case_id": 2,
+                "ready_assertion": {
+                    "selector": "首页",
+                    "by": "description",
+                },
+            },
+        }
+        install = AsyncMock()
+        prepare = Mock()
+        capture = AsyncMock(
+            side_effect=[
+                {"screenshot_path": "old.png", "xml_text": "<old/>"},
+                {"screenshot_path": "new.png", "xml_text": "<new/>"},
+            ]
+        )
+
+        with patch(
+            "backend.api.compatibility.install_app_package_to_device",
+            new=install,
+        ), patch(
+            "backend.api.compatibility._prepare_inspection_page_group",
+            new=prepare,
+        ), patch(
+            "backend.api.compatibility._run_page_capture",
+            new=capture,
+        ), patch(
+            "backend.api.compatibility._record_compare_result",
+        ):
+            await _execute_cell_inspection_version_body(
+                self.session,
+                run,
+                cell,
+                [page],
+                threading.Event(),
+                run.id,
+            )
+
+        self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(capture.await_count, 2)
+        self.assertEqual(install.await_count, 2)
+        old_call, new_call = install.await_args_list
+        self.assertEqual(old_call.kwargs["package_id"], old_pkg.id)
+        self.assertTrue(old_call.kwargs["uninstall_first"])
+        self.assertEqual(new_call.kwargs["package_id"], new_pkg.id)
+        self.assertFalse(new_call.kwargs["uninstall_first"])
+        self.assertFalse(new_call.kwargs["allow_uninstall_retry"])
 
     def test_delete_referenced_page_set_detaches_runs_and_preserves_report_snapshot(self):
         user = self._user()
@@ -309,6 +628,84 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context.exception.status_code, 400)
             self.assertTrue(report_dir.exists())
             self.assertIsNotNone(self.session.get(CompatibilityRun, created.id))
+
+    async def test_cancelled_pending_cell_cannot_be_resurrected_by_worker(self):
+        user = self._user()
+        old_pkg = self._package("com.demo.app", "1.0")
+        new_pkg = self._package("com.demo.app", "2.0")
+        page_set = self._case_and_page_set()
+        self._device()
+        created = create_run(
+            CompatibilityRunCreate(
+                name="cancel race",
+                old_package_id=old_pkg.id,
+                new_package_id=new_pkg.id,
+                page_set_id=page_set.id,
+                device_serials=["android-1"],
+            ),
+            BackgroundTasks(),
+            session=self.session,
+            current_user=user,
+        )
+        cell = self.session.exec(
+            select(CompatibilityCell).where(CompatibilityCell.run_id == created.id)
+        ).one()
+        event = _abort_event_for_run(created.id)
+        try:
+            response = cancel_run(created.id, session=self.session, current_user=user)
+            self.assertEqual(response["status"], "ABORTED")
+            with patch("backend.api.compatibility.engine", self.engine):
+                await _execute_cell(
+                    created.id,
+                    cell.id,
+                    [],
+                    event,
+                )
+            self.session.refresh(self.session.get(CompatibilityRun, created.id))
+            self.session.refresh(self.session.get(CompatibilityCell, cell.id))
+            self.assertEqual(
+                self.session.get(CompatibilityRun, created.id).status,
+                "ABORTED",
+            )
+            self.assertEqual(
+                self.session.get(CompatibilityCell, cell.id).status,
+                "ABORTED",
+            )
+        finally:
+            _discard_abort_event(created.id)
+
+    def test_delete_aborted_run_with_running_cell_is_rejected(self):
+        user = self._user()
+        old_pkg = self._package("com.demo.app", "1.0")
+        new_pkg = self._package("com.demo.app", "2.0")
+        page_set = self._case_and_page_set()
+        self._device()
+        created = create_run(
+            CompatibilityRunCreate(
+                name="aborted cleanup race",
+                old_package_id=old_pkg.id,
+                new_package_id=new_pkg.id,
+                page_set_id=page_set.id,
+                device_serials=["android-1"],
+            ),
+            BackgroundTasks(),
+            session=self.session,
+            current_user=user,
+        )
+        row = self.session.get(CompatibilityRun, created.id)
+        row.status = "ABORTED"
+        cell = self.session.exec(
+            select(CompatibilityCell).where(CompatibilityCell.run_id == created.id)
+        ).one()
+        cell.status = "RUNNING"
+        self.session.add(row)
+        self.session.add(cell)
+        self.session.commit()
+
+        with self.assertRaises(HTTPException) as context:
+            delete_run(created.id, session=self.session, current_user=user)
+        self.assertEqual(context.exception.status_code, 409)
+        self.assertIsNotNone(self.session.get(CompatibilityRun, created.id))
 
     def test_create_run_allows_current_installed_baseline(self):
         user = self._user()
@@ -594,6 +991,39 @@ class DeviceCompareSchemaTests(unittest.TestCase):
     def test_invalid_compare_mode_rejected(self):
         with self.assertRaises(ValidationError):
             CompatibilityRunCreate(**self._payload(compare_mode="matrix"))
+
+    def test_inspection_snapshot_rejects_old_package(self):
+        with self.assertRaises(ValidationError):
+            CompatibilityRunCreate(
+                name="巡检快照",
+                old_package_id=9,
+                new_package_id=1,
+                source_type="inspection",
+                inspection_run_id=8,
+                device_serials=["android-1"],
+                compare_mode="snapshot",
+            )
+
+    def test_inspection_version_requires_explicit_old_package_and_upgrade(self):
+        base = {
+            "name": "巡检版本",
+            "new_package_id": 2,
+            "source_type": "inspection",
+            "inspection_run_id": 8,
+            "device_serials": ["android-1"],
+            "compare_mode": "version",
+        }
+        with self.assertRaises(ValidationError):
+            CompatibilityRunCreate(**base)
+        with self.assertRaises(ValidationError):
+            CompatibilityRunCreate(**base, old_package_id=1, mode="clean")
+        payload = CompatibilityRunCreate(
+            **base,
+            old_package_id=1,
+            mode="upgrade",
+        )
+        self.assertEqual(payload.old_package_id, 1)
+        self.assertEqual(payload.mode, "upgrade")
 
 
 class NormalizeActivityTests(unittest.TestCase):
@@ -902,8 +1332,14 @@ class DeviceCompareCreateRunTests(unittest.TestCase):
         SQLModel.metadata.create_all(self.engine)
         self.session = Session(self.engine)
         self.temp_files = []
+        self.capacity_patch = patch(
+            "backend.api.compatibility.ensure_asset_capacity_for_new_run",
+            return_value={"can_start": True},
+        )
+        self.capacity_patch.start()
 
     def tearDown(self) -> None:
+        self.capacity_patch.stop()
         self.session.close()
         for path in self.temp_files:
             try:

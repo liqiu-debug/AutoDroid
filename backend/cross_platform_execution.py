@@ -7,7 +7,7 @@ import re
 import time
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlmodel import Session, select
 
@@ -1110,6 +1110,8 @@ def run_case_with_standard_runner(
     env_id: Optional[int] = None,
     variables_map: Optional[Dict[str, str]] = None,
     abort_event=None,
+    before_device_step: Optional[Callable[[str], None]] = None,
+    before_step: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Execute one case on target device with cross-platform runner.
@@ -1145,6 +1147,8 @@ def run_case_with_standard_runner(
         platform=platform,
         device_id=device_serial,
         abort_event=abort_event,
+        before_device_step=before_device_step,
+        before_step=before_step,
         **driver_kwargs,
     )
     try:

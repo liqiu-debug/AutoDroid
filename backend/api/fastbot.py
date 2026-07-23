@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from backend.database import get_session, engine
+from backend.device_execution_lease import DeviceExecutionLease
 from backend.device_sorting import sort_devices_for_display
 from backend.models import FastbotTask, FastbotReport, User, Device
 from backend.schemas import (
@@ -192,6 +193,13 @@ async def _get_online_devices() -> set:
 
 def _is_device_busy(serial: str) -> bool:
     return serial in _device_locks
+
+
+def _has_external_device_lease(device: Device) -> bool:
+    return bool(
+        str(device.status or "").strip().upper() != "IDLE"
+        or device.lease_task_id
+    )
 
 
 def _lock_device(serial: str, task_id: int):
@@ -540,7 +548,7 @@ async def start_fluency_session(
 
     _ensure_fastbot_android_device(device)
 
-    if _is_device_busy(data.device_serial):
+    if _is_device_busy(data.device_serial) or _has_external_device_lease(device):
         raise HTTPException(status_code=400, detail="设备正忙，请稍后再试")
 
     online_serials = await _get_online_devices()
@@ -808,7 +816,9 @@ async def run_startup_test(
 
     for serial in data.device_serials:
         _ensure_fastbot_android_device(devices_by_serial[serial])
-        if _is_device_busy(serial):
+        if _is_device_busy(serial) or _has_external_device_lease(
+            devices_by_serial[serial]
+        ):
             raise HTTPException(status_code=400, detail=f"设备正忙，请稍后再试: {serial}")
 
     online_serials = await _get_online_devices()
@@ -865,7 +875,7 @@ async def run_fastbot(
 
     _ensure_fastbot_android_device(device)
 
-    if _is_device_busy(data.device_serial):
+    if _is_device_busy(data.device_serial) or _has_external_device_lease(device):
         raise HTTPException(status_code=400, detail="设备正忙，请稍后再试")
 
     devices = device_manager.get_devices_list()
@@ -931,6 +941,7 @@ async def _execute_fastbot_async(
     from backend.fastbot.runner import run_fastbot_task
     from sqlmodel import Session as SQLSession
 
+    lease: Optional[DeviceExecutionLease] = None
     with SQLSession(engine) as session:
         task = session.get(FastbotTask, task_id)
         if not task:
@@ -941,6 +952,7 @@ async def _execute_fastbot_async(
         throt = task.throttle
         ign_crash = task.ignore_crashes
         cap_log = task.capture_log
+        executor_id = int(task.executor_id or 0)
         if not task.started_at:
             task.started_at = datetime.now()
         if task.status != "RUNNING":
@@ -948,15 +960,15 @@ async def _execute_fastbot_async(
         session.add(task)
         session.commit()
 
-        # ★ 更新 Device 表状态为 BUSY
-        device = session.exec(select(Device).where(Device.serial == serial)).first()
-        if device:
-            device.status = "BUSY"
-            device.updated_at = datetime.now()
-            session.add(device)
-            session.commit()
-
     try:
+        lease = await asyncio.to_thread(
+            DeviceExecutionLease.acquire,
+            user_id=executor_id,
+            serial=serial,
+            task_id=f"fastbot:{task_id}",
+            kind="fastbot",
+            check_legacy_fastbot=False,
+        )
         ew = event_weights or {}
         mo = monitor_options or {}
         result = await run_fastbot_task(
@@ -1013,18 +1025,12 @@ async def _execute_fastbot_async(
                 session.add(task)
                 session.commit()
     finally:
+        if lease:
+            try:
+                await asyncio.to_thread(lease.release)
+            except Exception:
+                logger.exception("Fastbot 设备租约释放失败: %s", serial)
         _unlock_device(serial)
-        # ★ 恢复 Device 表状态为 IDLE
-        try:
-            with SQLSession(engine) as session:
-                device = session.exec(select(Device).where(Device.serial == serial)).first()
-                if device and device.status == "BUSY":
-                    device.status = "IDLE"
-                    device.updated_at = datetime.now()
-                    session.add(device)
-                    session.commit()
-        except Exception:
-            pass
 
 
 def _execute_startup_batch_background(task_ids: List[int], config: Dict[str, Any]):
@@ -1051,6 +1057,7 @@ async def _execute_startup_task_async(
     from sqlmodel import Session as SQLSession
 
     serial = ""
+    lease: Optional[DeviceExecutionLease] = None
     try:
         with SQLSession(engine) as session:
             task = session.get(FastbotTask, task_id)
@@ -1058,18 +1065,21 @@ async def _execute_startup_task_async(
                 return
 
             serial = task.device_serial
+            executor_id = int(task.executor_id or 0)
             if not task.started_at:
                 task.started_at = datetime.now()
             task.status = "RUNNING"
             session.add(task)
-
-            device = session.exec(select(Device).where(Device.serial == serial)).first()
-            if device:
-                device.status = "BUSY"
-                device.updated_at = datetime.now()
-                session.add(device)
             session.commit()
 
+        lease = await asyncio.to_thread(
+            DeviceExecutionLease.acquire,
+            user_id=executor_id,
+            serial=serial,
+            task_id=f"fastbot-startup:{task_id}",
+            kind="fastbot",
+            check_legacy_fastbot=False,
+        )
         result = await run_startup_task(
             device_serial=serial,
             package_name=str(config.get("package_name") or ""),
@@ -1150,19 +1160,13 @@ async def _execute_startup_task_async(
                     ))
                 session.commit()
     finally:
+        if lease:
+            try:
+                await asyncio.to_thread(lease.release)
+            except Exception:
+                logger.exception("冷热启动设备租约释放失败: %s", serial)
         if serial:
             _unlock_device(serial)
-        try:
-            with SQLSession(engine) as session:
-                if serial:
-                    device = session.exec(select(Device).where(Device.serial == serial)).first()
-                    if device and device.status == "BUSY":
-                        device.status = "IDLE"
-                        device.updated_at = datetime.now()
-                        session.add(device)
-                        session.commit()
-        except Exception:
-            pass
         _startup_task_ids.discard(task_id)
 
 
@@ -1188,6 +1192,7 @@ async def _execute_fluency_async(task_id: int):
     runtime.ready_event.set()
 
     serial = runtime.device_serial
+    lease: Optional[DeviceExecutionLease] = None
     try:
         with SQLSession(engine) as session:
             task = session.get(FastbotTask, task_id)
@@ -1198,15 +1203,18 @@ async def _execute_fluency_async(task_id: int):
                 task.started_at = datetime.now()
             if task.status != "RUNNING":
                 task.status = "RUNNING"
+            executor_id = int(task.executor_id or 0)
             session.add(task)
-
-            device = session.exec(select(Device).where(Device.serial == serial)).first()
-            if device:
-                device.status = "BUSY"
-                device.updated_at = datetime.now()
-                session.add(device)
             session.commit()
 
+        lease = await asyncio.to_thread(
+            DeviceExecutionLease.acquire,
+            user_id=executor_id,
+            serial=serial,
+            task_id=f"fastbot-fluency:{task_id}",
+            kind="fastbot",
+            check_legacy_fastbot=False,
+        )
         result = await run_manual_fluency_session(
             device_serial=runtime.device_serial,
             package_name=runtime.package_name,
@@ -1260,16 +1268,11 @@ async def _execute_fluency_async(task_id: int):
                 session.add(task)
                 session.commit()
     finally:
+        if lease:
+            try:
+                await asyncio.to_thread(lease.release)
+            except Exception:
+                logger.exception("流畅度设备租约释放失败: %s", serial)
         _unlock_device(serial)
-        try:
-            with SQLSession(engine) as session:
-                device = session.exec(select(Device).where(Device.serial == serial)).first()
-                if device and device.status == "BUSY":
-                    device.status = "IDLE"
-                    device.updated_at = datetime.now()
-                    session.add(device)
-                    session.commit()
-        except Exception:
-            pass
         runtime.done_event.set()
         _fluency_runtimes.pop(task_id, None)

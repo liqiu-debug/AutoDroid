@@ -135,6 +135,16 @@ const routes = [
             component: () => import('@/views/special/Fastbot.vue')
           },
           {
+            path: 'inspection',
+            name: 'ModelInspection',
+            meta: {
+              title: '模型化智能巡检',
+              keepAlive: true,
+              featureFlag: 'model_inspection'
+            },
+            component: () => import('@/views/special/Inspection.vue')
+          },
+          {
             path: 'fastbot/report/:id',
             name: 'fastbot-report',
             meta: { title: 'Fastbot 报告', hidden: true },
@@ -200,6 +210,18 @@ const routes = [
             component: () => import('../views/reports/CompatibilityReportDetail.vue')
           },
           {
+            path: 'reports/inspection/:id',
+            name: 'inspection-report-detail',
+            meta: {
+              title: '智能巡检报告',
+              hidden: true,
+              mobileAvailable: true,
+              mobileTitle: '巡检报告',
+              featureFlag: 'model_inspection'
+            },
+            component: () => import('../views/reports/InspectionReportDetail.vue')
+          },
+          {
             path: 'reports/:id',
             name: 'report-detail',
             meta: { title: '报告详情', hidden: true, mobileAvailable: true, mobileTitle: '报告详情' },
@@ -222,7 +244,7 @@ const routes = [
           {
             path: 'notifications',
             name: 'notification-settings',
-            meta: { title: '通知设置', keepAlive: true },
+            meta: { title: '系统设置', keepAlive: true },
             component: () => import('../views/settings/NotificationSettings.vue')
           },
           {
@@ -260,6 +282,9 @@ router.beforeEach(async (to, from, next) => {
   const userStore = useUserStore()
   const token = localStorage.getItem('token')
   const requiresAdmin = to.matched.some(record => record.meta?.requiresAdmin)
+  const requiredFeature = to.matched
+    .map(record => record.meta?.featureFlag)
+    .find(Boolean)
 
   if (token && !userStore.token) {
     userStore.token = token
@@ -276,7 +301,8 @@ router.beforeEach(async (to, from, next) => {
       if (!userStore.userInfo) {
         try {
           await userStore.fetchUserInfo()
-          if (requiresAdmin && !userStore.isAdmin) {
+          if ((requiresAdmin && !userStore.isAdmin)
+            || (requiredFeature && !userStore.featureFlags?.[requiredFeature])) {
             next('/')
           } else {
             next()
@@ -286,7 +312,8 @@ router.beforeEach(async (to, from, next) => {
           next('/login')
         }
       } else {
-        if (requiresAdmin && !userStore.isAdmin) {
+        if ((requiresAdmin && !userStore.isAdmin)
+          || (requiredFeature && !userStore.featureFlags?.[requiredFeature])) {
           next('/')
         } else {
           next()

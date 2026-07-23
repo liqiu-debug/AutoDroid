@@ -3,8 +3,18 @@ import unittest
 from sqlmodel import Session, SQLModel, create_engine
 
 from backend.feature_flags import (
+    FLAG_COMPATIBILITY_INSTALLED_REPLAY,
+    FLAG_COMPATIBILITY_LEGACY_COMPARE_CREATION,
+    FLAG_CONTENT_ADDRESSED_ASSETS,
+    FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE,
+    FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
+    FLAG_INSPECTION_IDENTITY_V2,
+    FLAG_INSPECTION_SIMILARITY_CONVERGENCE,
+    FLAG_INSPECTION_VISUAL_HOME_ACTIONS,
     FLAG_IOS_EXECUTION,
+    FLAG_MODEL_INSPECTION,
     FLAG_NEW_STEP_MODEL,
+    FLAG_TIERED_ASSET_RETENTION,
     FLAG_WS_DISCONNECT_ABORT,
     is_flag_enabled,
 )
@@ -26,9 +36,40 @@ class FeatureFlagDefaultsTests(unittest.TestCase):
     def test_ios_and_ws_disconnect_flags_default_disabled(self):
         self.assertFalse(is_flag_enabled(self.session, FLAG_IOS_EXECUTION))
         self.assertFalse(is_flag_enabled(self.session, FLAG_WS_DISCONNECT_ABORT))
+        self.assertFalse(is_flag_enabled(self.session, FLAG_MODEL_INSPECTION))
 
     def test_unknown_flag_defaults_to_false(self):
         self.assertFalse(is_flag_enabled(self.session, "unknown_flag"))
+
+    def test_inspection_identity_and_family_coverage_default_enabled(self):
+        self.assertTrue(
+            is_flag_enabled(self.session, FLAG_INSPECTION_IDENTITY_V2)
+        )
+        self.assertTrue(
+            is_flag_enabled(
+                self.session,
+                FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE,
+            )
+        )
+        self.assertTrue(
+            is_flag_enabled(self.session, FLAG_COMPATIBILITY_INSTALLED_REPLAY)
+        )
+        self.assertFalse(
+            is_flag_enabled(
+                self.session,
+                FLAG_COMPATIBILITY_LEGACY_COMPARE_CREATION,
+            )
+        )
+
+    def test_destructive_inspection_rollout_flags_default_disabled(self):
+        for flag in (
+            FLAG_INSPECTION_SIMILARITY_CONVERGENCE,
+            FLAG_CONTENT_ADDRESSED_ASSETS,
+            FLAG_TIERED_ASSET_RETENTION,
+            FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
+            FLAG_INSPECTION_VISUAL_HOME_ACTIONS,
+        ):
+            self.assertFalse(is_flag_enabled(self.session, flag))
 
     def test_explicit_default_argument_still_wins_for_missing_setting(self):
         self.assertTrue(is_flag_enabled(self.session, "unknown_flag", default=True))

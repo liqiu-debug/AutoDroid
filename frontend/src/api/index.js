@@ -291,6 +291,12 @@ export default {
     getSettings() {
         return api.get('/settings/')
     },
+    getFeatureFlags() {
+        return api.get('/settings/feature-flags')
+    },
+    getAssetStorageStatus() {
+        return api.get('/assets/status')
+    },
     saveSettings(items) {
         return api.post('/settings/', items)
     },
@@ -392,14 +398,107 @@ export default {
     createCompatibilityRun(data) {
         return api.post('/compatibility/runs', data)
     },
+    preflightCompatibilityReplay(data) {
+        return api.post('/compatibility/replay-preflight', data, { timeout: 60000 })
+    },
     getCompatibilityRun(id) {
         return api.get(`/compatibility/runs/${id}`)
+    },
+    getCompatibilityPageDiff(runId, pageResultId) {
+        return api.get(`/compatibility/runs/${runId}/pages/${pageResultId}/diff`, {
+            timeout: 60000,
+        })
     },
     deleteCompatibilityRun(id) {
         return api.delete(`/compatibility/runs/${id}`)
     },
     cancelCompatibilityRun(id) {
         return api.post(`/compatibility/runs/${id}/cancel`)
+    },
+
+    // Model inspection
+    getInspectionProfiles() {
+        return api.get('/inspections/profiles')
+    },
+    createInspectionProfile(data) {
+        return api.post('/inspections/profiles', data)
+    },
+    updateInspectionProfile(id, data) {
+        return api.put(`/inspections/profiles/${id}`, data)
+    },
+    deleteInspectionProfile(id) {
+        return api.delete(`/inspections/profiles/${id}`)
+    },
+    createInspectionRun(data) {
+        return api.post('/inspections/runs', data)
+    },
+    getInspectionRuns(params) {
+        return api.get('/inspections/runs', { params })
+    },
+    getInspectionRun(id) {
+        return api.get(`/inspections/runs/${id}`)
+    },
+    deleteInspectionRun(id) {
+        return api.delete(`/inspections/runs/${id}`)
+    },
+    cancelInspectionRun(id) {
+        return api.post(`/inspections/runs/${id}/cancel`)
+    },
+    getInspectionGraph(id, params = {}) {
+        return api.get(`/inspections/runs/${id}/graph`, { params })
+    },
+    getInspectionFamilies(id, params = {}) {
+        return api.get(`/inspections/runs/${id}/families`, { params })
+    },
+    createInspectionLiveSession(id) {
+        return api.post(`/inspections/runs/${id}/live-session`)
+    },
+    getInspectionLive(id) {
+        return api.get(`/inspections/runs/${id}/live`)
+    },
+    getInspectionActionMap(id, stateId) {
+        return api.get(`/inspections/runs/${id}/states/${stateId}/action-map`)
+    },
+    getInspectionObservations(id, stateId, params = {}) {
+        return api.get(`/inspections/runs/${id}/states/${stateId}/observations`, { params })
+    },
+    updateInspectionRepresentative(id, stateId, observationId) {
+        return api.put(`/inspections/runs/${id}/states/${stateId}/representative-observation`, {
+            observation_id: observationId,
+        })
+    },
+    getInspectionLiveAsset(url, responseType = 'blob') {
+        const parsed = new URL(String(url || ''), window.location.origin)
+        if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith('/api/inspections/')) {
+            return Promise.reject(new Error('巡检实时资产地址无效'))
+        }
+        const requestPath = `${parsed.pathname.replace(/^\/api/, '')}${parsed.search}`
+        return api.get(requestPath, { responseType, timeout: 60000 })
+    },
+    updateInspectionSelection(id, stateIds, observationIds = []) {
+        return api.put(`/inspections/runs/${id}/regression-selection`, {
+            state_ids: stateIds,
+            observation_ids: observationIds,
+        })
+    },
+    getAsset(assetId, responseType = 'blob', options = {}) {
+        if (assetId === null || assetId === undefined || assetId === '') {
+            return Promise.reject(new Error('资产 ID 无效'))
+        }
+        const headers = { ...(options.headers || {}) }
+        if (options.range) headers.Range = options.range
+        return api.get(`/assets/${encodeURIComponent(String(assetId))}`, {
+            responseType,
+            timeout: options.timeout || 60000,
+            headers,
+        })
+    },
+    getInspectionAsset(id, path, responseType = 'text') {
+        return api.get(`/inspections/runs/${id}/assets`, {
+            params: { path },
+            responseType,
+            timeout: 60000,
+        })
     },
 
     // Log Analysis (AI 智能分析)

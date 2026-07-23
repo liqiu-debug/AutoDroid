@@ -13,7 +13,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 from backend.execution_errors import (
     E2006_OCR_NO_RESULT,
@@ -109,11 +109,18 @@ class TestCaseRunner:
         platform: str,
         device_id: str,
         abort_event: Optional[threading.Event] = None,
+        before_device_step: Optional[Callable[[str], None]] = None,
+        before_step: Optional[Callable[[str], None]] = None,
         **driver_kwargs: Any,
     ) -> None:
         self.platform = str(platform or "").strip().lower()
         self.device_id = device_id
         self.abort_event = abort_event
+        self.before_device_step = before_device_step
+        # Optional guard invoked for every logical case step, including sleep
+        # and platform-skipped steps.  Keep before_device_step's historical
+        # semantics (real device actions only) for existing callers.
+        self.before_step = before_step
         # AUTODROID_DRIVER_POOL=1 时按设备复用驱动连接（团队服务器推荐开启）
         self._driver_pool = get_execution_driver_pool() if is_driver_pool_enabled() else None
         if self._driver_pool is not None:
@@ -284,6 +291,8 @@ class TestCaseRunner:
             )
             return result
         except Exception as exc:
+            if step_context.get("before_device_step_exception") is exc:
+                raise
             error_code, suggestion = classify_exception(
                 exc,
                 platform=self.platform,
@@ -318,6 +327,9 @@ class TestCaseRunner:
         for index, step_data in enumerate(steps or [], start=1):
             step_action = str((step_data or {}).get("action") or "").strip().lower() or "unknown"
             step_desc = str((step_data or {}).get("description") or "").strip()
+
+            if self.before_step is not None:
+                self.before_step(step_action)
 
             if self.abort_event and self.abort_event.is_set():
                 result = self._build_abort_result(
@@ -543,6 +555,14 @@ class TestCaseRunner:
                     f"platform={self.platform}, action={action}",
                 )
             )
+
+        if action != "sleep" and self.before_device_step is not None:
+            try:
+                self.before_device_step(action)
+            except Exception as exc:
+                if step_context is not None:
+                    step_context["before_device_step_exception"] = exc
+                raise
 
         if action == "click":
             planned_click = getattr(self.driver, "click_with_fallback_plan", None)

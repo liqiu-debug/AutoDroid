@@ -115,6 +115,31 @@ class FastbotLogcatReplayTests(unittest.IsolatedAsyncioTestCase):
         replay_callback.assert_awaited_once()
         self.assertTrue(proc.terminated)
 
+    async def test_optional_event_sink_receives_fault_and_cannot_break_monitor(self):
+        proc = _FakeProc([
+            "04-02 10:00:00.000 E ActivityManager: ANR in com.example.app\n",
+        ])
+        crash_events = []
+        event_sink = AsyncMock(side_effect=RuntimeError("sink unavailable"))
+
+        with patch(
+            "backend.fastbot.logcat.asyncio.create_subprocess_shell",
+            new=AsyncMock(return_value=proc),
+        ):
+            await _monitor_logcat(
+                device_serial="device-sink",
+                package_name="com.example.app",
+                stop_event=asyncio.Event(),
+                crash_events=crash_events,
+                capture_log=False,
+                event_sink=event_sink,
+            )
+
+        self.assertEqual(len(crash_events), 1)
+        self.assertEqual(crash_events[0]["type"], "ANR")
+        event_sink.assert_awaited_once()
+        self.assertTrue(proc.terminated)
+
     async def test_run_fastbot_task_does_not_hang_when_monitor_shutdown_times_out(self):
         monkey_proc = _FakeMonkeyProc()
 
