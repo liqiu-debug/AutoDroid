@@ -1,6 +1,6 @@
 # CI 集成指南（API Token）
 
-本指南介绍如何让外部 CI 系统（Jenkins、GitLab CI、GitHub Actions 等）通过 **API Token** 调用 AutoDroid 接口，打通「App 代码合并 → 上传新包 → 自动触发回归场景 → 轮询结果 → 判定流水线成败」的完整链路。
+本指南介绍如何让外部 CI 系统（Jenkins、GitLab CI、GitHub Actions 等）通过 **API Token** 调用 AutoDroid 接口，打通「App 代码合并 -> 上传新包 -> 自动触发场景/巡检/兼容性任务 -> 轮询结果 -> 判定流水线成败」的完整链路。
 
 ## 1. API Token 是什么
 
@@ -20,6 +20,7 @@
 | 查询设备（`GET /api/devices/`）、执行预检（`GET /api/scenarios/{id}/precheck`） | ✅ | |
 | 巡检配置 / 触发 / 查询 / 取消（`/api/inspections/*`） | ✅ | 继承属主业务权限；需启用 `model_inspection` |
 | 用巡检稳定路径创建兼容性任务（`POST /api/compatibility/runs`） | ✅ | `source_type=inspection` |
+| 查询/下载内容寻址资产（`GET /api/assets/*`） | ✅ | 必须带 Authorization，不提供匿名路径 |
 | 用例 / 场景 / 任务等其他业务读写 | ✅ | 与属主账号权限一致 |
 | 管理接口（`/api/admin/*`） | ❌ 403 | 机器凭证禁止管理面 |
 | 修改密码（`PUT /api/auth/password`） | ❌ 403 | |
@@ -79,16 +80,16 @@ batch_id=$(echo "$run" | jq -r .batch_id)
 echo "    batch_id: $batch_id"
 echo "$run" | jq -r '.blocked_prechecks[]? | "    预检拦截: \(.device_serial) - \(.reason)"'
 
-# 3) 轮询批次结果，直到所有执行离开 RUNNING 状态
+# 3) 轮询批次结果，直到所有执行离开 PENDING/QUEUED/RUNNING 状态
 echo "==> 轮询批次结果"
 deadline=$(( $(date +%s) + POLL_TIMEOUT ))
 while true; do
   result=$(curl -sf "${auth[@]}" \
     "$AUTODROID_URL/api/reports/executions?batch_id=$batch_id&limit=100")
-  running=$(echo "$result" | jq '[.items[] | select(.status == "RUNNING")] | length')
+  active=$(echo "$result" | jq '[.items[] | select(.status == "PENDING" or .status == "QUEUED" or .status == "RUNNING")] | length')
   total=$(echo "$result" | jq '.total')
-  echo "    进度: $((total - running))/$total 完成"
-  [ "$running" -eq 0 ] && [ "$total" -gt 0 ] && break
+  echo "    进度: $((total - active))/$total 完成"
+  [ "$active" -eq 0 ] && [ "$total" -gt 0 ] && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
     echo "!! 轮询超时，主动中止批次"
     curl -sf "${auth[@]}" -H "Content-Type: application/json" \
@@ -113,8 +114,8 @@ echo "== 回归通过 =="
 要点说明：
 
 - **上传**：`POST /api/packages/upload` 为 multipart 表单，字段名 `file`，接受 `.apk` 和 Ad Hoc 签名的 `.ipa`；同平台、同包标识的旧版本自动标记为非最新。超大安装包建议走分片上传：`POST /api/packages/upload-sessions`（body：`filename`/`file_size`/`chunk_size`/`total_chunks`）→ 逐片 `POST /api/packages/upload-sessions/{upload_id}/chunks/{index}` → `POST /api/packages/upload-sessions/{upload_id}/complete`。
-- **触发**：`POST /api/scenarios/{id}/run`，body `{"device_serials": ["serial1", ...], "env_id": 可选}`。响应含 `batch_id`、`execution_ids` 与被预检拦截的设备列表 `blocked_prechecks`；全部设备被拦截时返回 400（或限流时 429）。
-- **轮询**：`GET /api/reports/executions?batch_id=<batch_id>`，`items[].status` 取值 `RUNNING / PASS / FAIL / WARNING / ERROR / ABORTED`。
+- **触发**：`POST /api/scenarios/{id}/run`，body `{"device_serials": ["serial1", ...], "env_id": 可选}`。响应含 `batch_id`、`execution_ids` 与被预检拦截的设备列表 `blocked_prechecks`；全部设备被拦截时返回 400。并发达到上限时后台任务进入 FIFO 队列，响应可包含 `queued/queue_position`，CI 应继续按 `batch_id` 轮询，而不是把排队当作失败。
+- **轮询**：`GET /api/reports/executions?batch_id=<batch_id>`，活动状态为 `PENDING / QUEUED / RUNNING`，终态为 `PASS / FAIL / WARNING / ERROR / ABORTED`。
 - **预检**（可选）：触发前可用 `GET /api/scenarios/{id}/precheck?device_serial=xxx` 与 `GET /api/devices/`（看 `status` 是否 `IDLE`）先挑选可用设备。
 - **中止**：`POST /api/runs/cancel`，body `{"kind": "scenario", "target_id": <场景ID>, "batch_id": "<批次>"}`，用于超时兜底。
 
@@ -176,8 +177,9 @@ Authorization 头，不能把资产 URL 当作匿名静态链接。取消使用�
 历史任务缺少版本标记时按 v1 返回，`hierarchy_role` 固定为空并继续使用旧构树逻辑，
 不会根据新关系字段重新解释历史报告。
 
-Graph schema v5 增加页面子类型、Frontier 优先级、页面族代表覆盖率和 Coverage Contract
-统计。灰度环境可分别开启 `inspection_coverage_scheduler_v2` 与
+当前 Graph schema v8 在层级 v2 基础上增加页面子类型、Frontier 优先级、Observation、
+页面族代表覆盖率、Coverage Contract 和冻结回放摘要。客户端应读取响应的 `schema_version`，
+不要把固定版本写死。灰度环境可分别开启 `inspection_coverage_scheduler_v2` 与
 `inspection_visual_home_actions`；后者依赖前者。覆盖调度器按页面族代表和动作组采样，
 滚动只新增 `VIEWPORT` Observation，不创建新的业务 State。历史任务不会重算。
 
@@ -210,6 +212,69 @@ Graph schema v5 增加页面子类型、Frontier 优先级、页面族代表覆�
 
 空的 `inspection_state_ids` 表示使用该巡检任务中人工勾选的全部稳定状态。创建任务时，
 路径、规则及脱敏基线文件会复制进兼容性报告目录，因此后续巡检报告清理不会改变历史判定。
+
+### 4.1 当前安装版本冻结路径回放
+
+该模式不上传或安装 APK。CI 先预检设备当前安装包和冻结路径，再把返回的两个摘要原样带入
+创建请求。预检与创建之间若包版本、签名或路径计划变化，创建会失败，CI 必须重新预检。
+
+```bash
+BRANCH_KEY="${INSPECTION_BRANCH_KEY:-guest}"
+
+preflight=$(curl -sf "${auth[@]}" -H "Content-Type: application/json" \
+  -d "{
+    \"inspection_run_id\": $inspection_run_id,
+    \"branch_key\": \"$BRANCH_KEY\",
+    \"device_serial\": \"$DEVICE_SERIAL\",
+    \"max_chains\": 20
+  }" \
+  "$AUTODROID_URL/api/compatibility/replay-preflight")
+
+blockers=$(echo "$preflight" | jq '.blockers | length')
+[ "$blockers" -eq 0 ] || {
+  echo "$preflight" | jq '.blockers'
+  exit 1
+}
+
+chain_ids=$(echo "$preflight" | jq '[.chains[] | select(.replay_eligibility != "NONE") | .chain_id]')
+[ "$(echo "$chain_ids" | jq 'length')" -gt 0 ] || {
+  echo "没有可执行的冻结路径"
+  exit 1
+}
+
+payload=$(jq -n \
+  --arg name "CI 当前版本回放 ${GIT_COMMIT:-manual}" \
+  --argjson run_id "$inspection_run_id" \
+  --arg branch "$BRANCH_KEY" \
+  --arg serial "$DEVICE_SERIAL" \
+  --arg plan "$(echo "$preflight" | jq -r .plan_digest)" \
+  --arg device "$(echo "$preflight" | jq -r .device_snapshot_digest)" \
+  --argjson chains "$chain_ids" \
+  '{
+    name: $name,
+    execution_mode: "installed_replay",
+    inspection_run_id: $run_id,
+    replay_branch_key: $branch,
+    selected_chain_ids: $chains,
+    plan_digest: $plan,
+    device_snapshot_digest: $device,
+    manual_install_confirmed: true,
+    duration_seconds: 3600,
+    device_serials: [$serial]
+  }')
+
+replay=$(curl -sf "${auth[@]}" -H "Content-Type: application/json" \
+  -d "$payload" "$AUTODROID_URL/api/compatibility/runs")
+replay_run_id=$(echo "$replay" | jq -r .id)
+```
+
+`manual_install_confirmed=true` 表示调用方已确认当前设备上的版本就是待测版本，不代表平台绕过
+包身份校验。结果继续通过 `GET /api/compatibility/runs/{id}` 轮询。路径可能是完整链路，也可能
+只允许执行到安全边界前缀；CI 应根据最终 `status` 和每条链路的 terminal outcome 判定。
+
+巡检或兼容性任务在所在文件系统达到内置 `95%` 硬容量阈值时会返回 HTTP `507`。流水线应查询
+`GET /api/assets/status` 并通知平台运维处理，不能把 507 当成产品回归失败。资产内容通过
+`GET /api/assets/{asset_id}` 下载，同样必须携带 API Token。
 
 ## 5. GitHub Actions 示例
 
@@ -342,3 +407,6 @@ stages {
 - **最小权限属主**：用普通角色（非 admin）账号创建 CI 用 Token。Token 天然无法访问管理面，但业务删除等权限仍随属主角色放大。
 - **关注最近使用**：列表页的「最近使用」时间（约 1 分钟粒度）可用于发现僵尸 Token（长期未用应吊销）与异常调用（非构建时段的使用）。
 - **网络层面**：生产部署建议 HTTPS 反向代理，避免 Token 在链路上明文传输。
+- **证据下载**：不要把带 Token 的资产请求 URL 输出到公开日志；资产端点支持 Range 和 ETag，重试时可复用缓存而无需复制凭证到临时静态目录。
+
+巡检、回放、Graph 版本和资产保留的完整运维说明见 [巡检、回放与证据资产指南](INSPECTION_REPLAY_ASSETS.md)。
