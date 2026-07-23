@@ -11,6 +11,25 @@ FLAG_NEW_STEP_MODEL = "new_step_model"
 FLAG_IOS_EXECUTION = "ios_execution"
 # WebSocket 客户端断开后立即中止对应执行（默认关闭，保持历史行为）
 FLAG_WS_DISCONNECT_ABORT = "ws_disconnect_abort"
+# Android 模型化智能巡检（默认关闭，真机验收后由系统设置开启）
+FLAG_MODEL_INSPECTION = "model_inspection"
+# Inspection graph/storage v2 rollout switches. These remain independently
+# reversible while the legacy state/path fields are still supported.
+FLAG_INSPECTION_IDENTITY_V2 = "inspection_identity_v2"
+# Temporary source compatibility for code written during the initial rollout.
+FLAG_INSPECTION_TSO_V2 = FLAG_INSPECTION_IDENTITY_V2
+FLAG_CONTENT_ADDRESSED_ASSETS = "content_addressed_assets"
+FLAG_TIERED_ASSET_RETENTION = "tiered_asset_retention"
+FLAG_INSPECTION_SIMILARITY_CONVERGENCE = "inspection_similarity_convergence"
+FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE = (
+    "inspection_exploration_family_convergence"
+)
+FLAG_INSPECTION_COVERAGE_SCHEDULER_V2 = "inspection_coverage_scheduler_v2"
+FLAG_INSPECTION_VISUAL_HOME_ACTIONS = "inspection_visual_home_actions"
+FLAG_COMPATIBILITY_INSTALLED_REPLAY = "compatibility_installed_replay"
+FLAG_COMPATIBILITY_LEGACY_COMPARE_CREATION = (
+    "compatibility_legacy_compare_creation"
+)
 
 # 各开关的默认值表：调用点不再各自硬编码 default。
 # 标准步骤模型已默认启用；在 SystemSetting 中显式写入 false 仍可关闭。
@@ -19,6 +38,19 @@ _FLAG_DEFAULTS = {
     FLAG_NEW_STEP_MODEL: True,
     FLAG_IOS_EXECUTION: False,
     FLAG_WS_DISCONNECT_ABORT: False,
+    FLAG_MODEL_INSPECTION: False,
+    # New inspections use instance-aware State identity and exploration
+    # families by default.  Operators can still write an explicit false value
+    # to roll either layer back independently.
+    FLAG_INSPECTION_IDENTITY_V2: True,
+    FLAG_CONTENT_ADDRESSED_ASSETS: False,
+    FLAG_TIERED_ASSET_RETENTION: False,
+    FLAG_INSPECTION_SIMILARITY_CONVERGENCE: False,
+    FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE: True,
+    FLAG_INSPECTION_COVERAGE_SCHEDULER_V2: False,
+    FLAG_INSPECTION_VISUAL_HOME_ACTIONS: False,
+    FLAG_COMPATIBILITY_INSTALLED_REPLAY: True,
+    FLAG_COMPATIBILITY_LEGACY_COMPARE_CREATION: False,
 }
 
 _UNSET = object()

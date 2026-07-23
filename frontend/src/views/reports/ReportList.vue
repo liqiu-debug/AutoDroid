@@ -1,21 +1,52 @@
 <script setup>
 import { ref, onActivated, onDeactivated, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Search, Refresh, Timer, Download, Delete, View, CircleClose, TrendCharts } from '@element-plus/icons-vue'
+import { Search, Refresh, Timer, Download, Delete, View, CircleClose, TrendCharts, MoreFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
 import { runStatusTagType } from '@/utils/statusMeta'
+import { useUserStore } from '@/stores/useUserStore'
+import { compatibilityExecutionMode, packageSnapshotLabel } from '@/utils/compatibilityReplay'
+import {
+    inspectionRunCoverage,
+    inspectionRunReplay,
+    inspectionRunStatusLabel,
+} from '@/utils/inspectionRunPresentation'
 import FlakyAnalysisDrawer from './FlakyAnalysisDrawer.vue'
 
 const router = useRouter()
 const route = useRoute()
 const { isMobileMode } = useClientMode()
+const userStore = useUserStore()
 
 // ========== 顶层 Tab ==========
-const resolveTab = (tab) => (['fastbot', 'startup', 'compatibility'].includes(tab) ? tab : 'ui')
-const activeTab = ref(resolveTab(route.query.tab))
+const resolveTab = (tab) => (['fastbot', 'startup', 'compatibility', 'inspection'].includes(tab) ? tab : 'ui')
+const inspectionEnabled = computed(() => userStore.featureFlags?.model_inspection === true)
+const resolveAvailableTab = tab => {
+    const resolved = resolveTab(tab)
+    return resolved === 'inspection' && !inspectionEnabled.value ? 'ui' : resolved
+}
+const activeTab = ref(resolveAvailableTab(route.query.tab))
+const syncReportTabQuery = tab => {
+    const queryTab = tab === 'ui' ? undefined : tab
+    if (String(route.query.tab || '') === String(queryTab || '')) return
+    router.replace({ query: { ...route.query, tab: queryTab } })
+}
+const mobileReportOptions = computed(() => [
+    { label: 'UI 自动化', value: 'ui' },
+    ...(inspectionEnabled.value ? [{ label: '智能巡检', value: 'inspection' }] : []),
+])
+const mobileReportTab = computed({
+    get: () => activeTab.value === 'inspection' && inspectionEnabled.value ? 'inspection' : 'ui',
+    set: (value) => {
+        const next = resolveAvailableTab(value)
+        activeTab.value = next
+        syncReportTabQuery(next)
+        handleTabChange(next)
+    },
+})
 
 // ========== UI 场景报告 ==========
 const loading = ref(false)
@@ -234,6 +265,14 @@ const compatibilityStatus = ref('all')
 const compatibilityPage = ref(1)
 const compatibilityPageSize = ref(20)
 const compatibilityTotal = ref(0)
+const inspectionLoading = ref(false)
+const inspectionRuns = ref([])
+const inspectionSearch = ref('')
+const inspectionStatus = ref('all')
+const inspectionPage = ref(1)
+const inspectionPageSize = ref(20)
+const inspectionTotal = ref(0)
+const inspectionDeletingId = ref(null)
 let fbPollTimer = null
 let pageActive = false
 
@@ -304,6 +343,65 @@ const handleCompatibilitySearch = () => { compatibilityPage.value = 1; fetchComp
 const handleCompatibilityPageChange = (val) => { compatibilityPage.value = val; fetchCompatibilityRuns() }
 const handleCompatibilitySizeChange = (val) => { compatibilityPageSize.value = val; compatibilityPage.value = 1; fetchCompatibilityRuns() }
 
+const fetchInspectionRuns = async () => {
+    if (!userStore.featureFlags?.model_inspection) return
+    inspectionLoading.value = true
+    try {
+        const params = { page: inspectionPage.value, page_size: inspectionPageSize.value }
+        if (inspectionSearch.value) params.keyword = inspectionSearch.value
+        if (inspectionStatus.value !== 'all') params.status = inspectionStatus.value
+        const { data } = await api.getInspectionRuns(params)
+        inspectionRuns.value = data.items || []
+        inspectionTotal.value = data.total || 0
+    } catch (err) {
+        console.error('获取巡检报告失败', err)
+        ElMessage.error(err.response?.data?.detail || '获取巡检报告失败')
+    } finally {
+        inspectionLoading.value = false
+    }
+}
+const handleInspectionSearch = () => { inspectionPage.value = 1; fetchInspectionRuns() }
+const handleInspectionPageChange = val => { inspectionPage.value = val; fetchInspectionRuns() }
+const handleInspectionSizeChange = val => { inspectionPageSize.value = val; inspectionPage.value = 1; fetchInspectionRuns() }
+const handleInspectionView = id => { router.push(`/execution/reports/inspection/${id}`) }
+const isInspectionRunActive = run => (
+    ['PENDING', 'RUNNING', 'QUEUED'].includes(String(run?.status || '').toUpperCase())
+    || run?.current_stage === '取消中'
+)
+const hasRunningInspectionRuns = computed(() => inspectionRuns.value.some(item => (
+    isInspectionRunActive(item)
+)))
+
+const handleInspectionDelete = async (row) => {
+    if (isInspectionRunActive(row)) {
+        ElMessage.warning('运行中的巡检任务不能删除，请先取消任务')
+        return
+    }
+    try {
+        await ElMessageBox.confirm(
+            `确定删除智能巡检报告「${row.name}」？相关截图、XML、日志和状态图数据也将被删除。`,
+            '删除确认',
+            { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+        )
+        inspectionDeletingId.value = row.id
+        await api.deleteInspectionRun(row.id)
+        ElMessage.success('智能巡检报告已删除')
+        if (inspectionPage.value > 1 && inspectionRuns.value.length === 1) {
+            inspectionPage.value -= 1
+        }
+        await fetchInspectionRuns()
+    } catch (err) {
+        if (!['cancel', 'close'].includes(err)) {
+            ElMessage.error(err.response?.data?.detail || '删除失败')
+        }
+    } finally {
+        inspectionDeletingId.value = null
+    }
+}
+const handleInspectionCommand = (command, row) => {
+    if (command === 'delete' && !isInspectionRunActive(row)) handleInspectionDelete(row)
+}
+
 const resolveDeviceForRow = (item) => {
     const dev = devicesMap.value[item.device_serial]
     if (dev) {
@@ -356,8 +454,24 @@ const handleCompatibilityDelete = async (row) => {
 }
 
 const getCompatibilityStatusText = (status) => String(status || 'PENDING').toUpperCase()
-const getCompatibilityMode = (mode) => mode === 'clean' ? '干净对比' : '升级兼容'
-const getCompatibilityPageCount = (run) => run.page_set?.pages?.length || run.total_pages || 0
+const isInstalledReplay = run => compatibilityExecutionMode(run) === 'installed_replay'
+const getCompatibilityMode = run => {
+    if (isInstalledReplay(run)) return '升级后回放'
+    return run?.mode === 'clean' ? '干净对比' : '升级兼容'
+}
+const getCompatibilitySource = run => {
+    if (isInstalledReplay(run)) {
+        return run.inspection_run_id ? `巡检 #${run.inspection_run_id} · ${run.replay_branch_key || '-'}` : '巡检来源已清理'
+    }
+    return run.page_set?.name || '-'
+}
+const getCompatibilityPackage = run => {
+    if (isInstalledReplay(run)) return packageSnapshotLabel(run.target_package_snapshot || {})
+    return run.package_name || '-'
+}
+const getCompatibilityPageCount = run => (
+    run.page_set?.pages?.length || run.total_chains || run.total_pages || 0
+)
 const hasRunningCompatibilityRuns = computed(() => (
     compatibilityRuns.value.some(item => isCompatibilityRunning(item.status))
 ))
@@ -400,7 +514,18 @@ const handleTabChange = (tab) => {
         fetchCompatibilityRuns()
         return
     }
+    if (tab === 'inspection') {
+        fetchInspectionRuns()
+        return
+    }
     fetchData()
+}
+
+const handleReportTabChange = tab => {
+    const next = resolveAvailableTab(tab)
+    if (activeTab.value !== next) activeTab.value = next
+    syncReportTabQuery(next)
+    handleTabChange(next)
 }
 
 const startFbPolling = () => {
@@ -409,6 +534,7 @@ const startFbPolling = () => {
         if (activeTab.value === 'fastbot') fetchFbTasks()
         if (activeTab.value === 'startup') fetchStartupTasks()
         if (activeTab.value === 'compatibility' && hasRunningCompatibilityRuns.value) fetchCompatibilityRuns()
+        if (activeTab.value === 'inspection' && hasRunningInspectionRuns.value) fetchInspectionRuns()
     }, 15000)
 }
 
@@ -436,12 +562,17 @@ const refreshReportCenter = () => {
     fetchFbTasks()
     fetchStartupTasks()
     fetchCompatibilityRuns()
+    fetchInspectionRuns()
 }
 
 watch(
     () => route.query.tab,
     (tab) => {
-        activeTab.value = resolveTab(tab)
+        const next = resolveAvailableTab(tab)
+        activeTab.value = next
+        if (String(tab || '') === 'inspection' && next !== 'inspection') {
+            syncReportTabQuery(next)
+        }
         if (pageActive && activeTab.value === 'fastbot' && fbTasks.value.length === 0) {
             fetchFbTasks()
         }
@@ -451,8 +582,28 @@ watch(
         if (pageActive && activeTab.value === 'compatibility' && compatibilityRuns.value.length === 0) {
             fetchCompatibilityRuns()
         }
+        if (pageActive && activeTab.value === 'inspection' && inspectionRuns.value.length === 0) {
+            fetchInspectionRuns()
+        }
     }
 )
+
+watch(inspectionEnabled, enabled => {
+    if (enabled) {
+        if (route.query.tab === 'inspection' && activeTab.value !== 'inspection') {
+            activeTab.value = 'inspection'
+            if (pageActive) handleTabChange('inspection')
+        }
+        return
+    }
+    if (activeTab.value !== 'inspection') {
+        if (route.query.tab === 'inspection') syncReportTabQuery('ui')
+        return
+    }
+    activeTab.value = 'ui'
+    syncReportTabQuery('ui')
+    if (pageActive) handleTabChange('ui')
+})
 
 onMounted(() => {
     refreshReportCenter()
@@ -475,8 +626,25 @@ onUnmounted(() => {
 
 <template>
     <div v-if="isMobileMode" class="mobile-report-page">
+        <el-segmented
+            v-if="mobileReportOptions.length > 1"
+            v-model="mobileReportTab"
+            :options="mobileReportOptions"
+            class="mobile-report-type"
+        />
         <div class="mobile-report-toolbar">
             <el-input
+                v-if="mobileReportTab === 'inspection'"
+                v-model="inspectionSearch"
+                placeholder="搜索巡检任务..."
+                :prefix-icon="Search"
+                clearable
+                class="mobile-search-input"
+                @keyup.enter="handleInspectionSearch"
+                @clear="handleInspectionSearch"
+            />
+            <el-input
+                v-else
                 v-model="searchQuery"
                 placeholder="搜索场景..."
                 :prefix-icon="Search"
@@ -485,17 +653,66 @@ onUnmounted(() => {
                 @keyup.enter="handleSearch"
                 @clear="handleSearch"
             />
-            <el-button :icon="Refresh" circle @click="fetchData" />
+            <el-button :icon="Refresh" circle @click="mobileReportTab === 'inspection' ? fetchInspectionRuns() : fetchData()" />
         </div>
 
-        <el-radio-group v-model="filterStatus" class="mobile-status-filter" @change="handleSearch">
+        <el-radio-group v-if="mobileReportTab === 'inspection'" v-model="inspectionStatus" class="mobile-status-filter" @change="handleInspectionSearch">
+            <el-radio-button value="all">全部</el-radio-button>
+            <el-radio-button value="pass">已完成</el-radio-button>
+            <el-radio-button value="warning">需关注</el-radio-button>
+            <el-radio-button value="fail">失败</el-radio-button>
+            <el-radio-button value="running">运行中</el-radio-button>
+        </el-radio-group>
+        <el-radio-group v-else v-model="filterStatus" class="mobile-status-filter" @change="handleSearch">
             <el-radio-button value="all">全部</el-radio-button>
             <el-radio-button value="pass">成功</el-radio-button>
             <el-radio-button value="warning">告警</el-radio-button>
             <el-radio-button value="fail">失败</el-radio-button>
         </el-radio-group>
 
-        <div class="mobile-report-list" v-loading="loading">
+        <div v-if="mobileReportTab === 'inspection'" class="mobile-report-list" v-loading="inspectionLoading">
+            <article
+                v-for="row in inspectionRuns"
+                :key="row.id"
+                class="mobile-report-card mobile-inspection-card"
+                @click="handleInspectionView(row.id)"
+            >
+                <header class="mobile-report-card-header">
+                    <div class="mobile-report-title">
+                        <strong>{{ row.name }}</strong>
+                        <span>{{ formatDate(row.started_at || row.created_at) }}</span>
+                    </div>
+                    <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">
+                        {{ inspectionRunStatusLabel(row) }}
+                    </el-tag>
+                </header>
+                <div class="mobile-inspection-metrics">
+                    <div>
+                        <span>覆盖</span>
+                        <strong>{{ inspectionRunCoverage(row).label }}</strong>
+                        <small>{{ inspectionRunCoverage(row).detail }}</small>
+                    </div>
+                    <div>
+                        <span>可回放</span>
+                        <strong>{{ inspectionRunReplay(row).label }}</strong>
+                        <small>{{ inspectionRunReplay(row).detail }}</small>
+                    </div>
+                </div>
+                <div class="mobile-inspection-actions">
+                    <el-button type="primary" link @click.stop="handleInspectionView(row.id)">查看报告</el-button>
+                    <el-button
+                        type="danger"
+                        link
+                        :disabled="isInspectionRunActive(row)"
+                        :loading="inspectionDeletingId === row.id"
+                        @click.stop="handleInspectionDelete(row)"
+                    >删除</el-button>
+                </div>
+            </article>
+            <el-empty v-if="!inspectionLoading && inspectionRuns.length === 0" description="暂无巡检报告" :image-size="90" />
+        </div>
+
+        <div v-else class="mobile-report-list" v-loading="loading">
             <article
                 v-for="group in executions"
                 :key="group.batch_id"
@@ -543,7 +760,17 @@ onUnmounted(() => {
             <el-empty v-if="!loading && executions.length === 0" description="暂无测试记录" :image-size="90" />
         </div>
 
-        <div class="mobile-pagination" v-if="totalRecords > 0">
+        <div class="mobile-pagination" v-if="mobileReportTab === 'inspection' && inspectionTotal > 0">
+            <el-pagination
+                v-model:current-page="inspectionPage"
+                :page-size="inspectionPageSize"
+                :background="true"
+                layout="prev, pager, next"
+                :total="inspectionTotal"
+                @current-change="handleInspectionPageChange"
+            />
+        </div>
+        <div class="mobile-pagination" v-else-if="mobileReportTab === 'ui' && totalRecords > 0">
             <el-pagination
                 v-model:current-page="currentPage"
                 :page-size="pageSize"
@@ -558,7 +785,7 @@ onUnmounted(() => {
     <div v-else class="report-container">
         <div class="content-wrapper">
             <!-- 顶层 Tab 切换 -->
-            <el-tabs v-model="activeTab" class="report-tabs" @tab-change="handleTabChange">
+            <el-tabs v-model="activeTab" class="report-tabs" @tab-change="handleReportTabChange">
                 <el-tab-pane label="UI 场景报告" name="ui">
                     <!-- UI 报告筛选栏 -->
                     <div class="list-header">
@@ -904,17 +1131,18 @@ onUnmounted(() => {
                                 <div class="run-name">
                                     {{ row.name }}
                                     <el-tag v-if="row.compare_mode === 'device'" size="small" type="warning" effect="plain">机型对比</el-tag>
+                                    <el-tag v-if="isInstalledReplay(row)" size="small" type="success" effect="plain">升级后回放</el-tag>
                                 </div>
-                                <div class="muted-text">{{ row.package_name }}</div>
+                                <div class="muted-text">{{ getCompatibilityPackage(row) }}</div>
                             </template>
                         </el-table-column>
-                        <el-table-column label="页面合集" min-width="150">
-                            <template #default="{ row }">{{ row.page_set?.name || '-' }}</template>
+                        <el-table-column label="来源" min-width="180">
+                            <template #default="{ row }">{{ getCompatibilitySource(row) }}</template>
                         </el-table-column>
                         <el-table-column label="模式" width="100" align="center">
-                            <template #default="{ row }">{{ getCompatibilityMode(row.mode) }}</template>
+                            <template #default="{ row }">{{ getCompatibilityMode(row) }}</template>
                         </el-table-column>
-                        <el-table-column label="设备/页面" width="100" align="center">
+                        <el-table-column label="设备/链路" width="100" align="center">
                             <template #default="{ row }">{{ row.total_cells }} / {{ getCompatibilityPageCount(row) }}</template>
                         </el-table-column>
                         <el-table-column label="结果" width="120" align="center">
@@ -966,6 +1194,118 @@ onUnmounted(() => {
                             :total="compatibilityTotal"
                             @size-change="handleCompatibilitySizeChange"
                             @current-change="handleCompatibilityPageChange"
+                        />
+                    </div>
+                </el-tab-pane>
+
+                <el-tab-pane
+                    v-if="userStore.featureFlags?.model_inspection"
+                    label="智能巡检报告"
+                    name="inspection"
+                >
+                    <div class="list-header">
+                        <div class="left-filters">
+                            <el-input
+                                v-model="inspectionSearch"
+                                placeholder="搜索巡检任务..."
+                                :prefix-icon="Search"
+                                clearable
+                                class="search-input"
+                                @keyup.enter="handleInspectionSearch"
+                                @clear="handleInspectionSearch"
+                            />
+                            <el-radio-group v-model="inspectionStatus" @change="handleInspectionSearch">
+                                <el-radio-button value="all">全部</el-radio-button>
+                                <el-radio-button value="pass">已完成</el-radio-button>
+                                <el-radio-button value="warning">需关注</el-radio-button>
+                                <el-radio-button value="fail">失败</el-radio-button>
+                                <el-radio-button value="running">运行中</el-radio-button>
+                            </el-radio-group>
+                        </div>
+                        <el-button :icon="Refresh" circle @click="fetchInspectionRuns" />
+                    </div>
+
+                    <div class="list-scroll-area" v-loading="inspectionLoading">
+                        <el-table
+                            :data="inspectionRuns"
+                            class="inspection-report-table"
+                            style="width: 100%"
+                            :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                            row-class-name="inspection-report-row"
+                            @row-click="row => handleInspectionView(row.id)"
+                        >
+                            <el-table-column label="任务" min-width="290">
+                                <template #default="{ row }">
+                                    <div class="inspection-task-cell">
+                                        <el-tooltip :content="row.name" placement="top-start">
+                                            <div class="run-name inspection-run-name">{{ row.name }}</div>
+                                        </el-tooltip>
+                                        <div class="muted-text inspection-run-package">{{ row.package_name || '-' }}</div>
+                                    </div>
+                                </template>
+                            </el-table-column>
+                            <el-table-column label="覆盖" width="180">
+                                <template #default="{ row }">
+                                    <div class="inspection-run-metric">
+                                        <strong>{{ inspectionRunCoverage(row).label }}</strong>
+                                        <el-tooltip :content="inspectionRunCoverage(row).detail" placement="top">
+                                            <span>{{ inspectionRunCoverage(row).detail }}</span>
+                                        </el-tooltip>
+                                    </div>
+                                </template>
+                            </el-table-column>
+                            <el-table-column label="可回放" width="190">
+                                <template #default="{ row }">
+                                    <div class="inspection-run-metric">
+                                        <strong>{{ inspectionRunReplay(row).label }}</strong>
+                                        <el-tooltip :content="inspectionRunReplay(row).detail" placement="top">
+                                            <span>{{ inspectionRunReplay(row).detail }}</span>
+                                        </el-tooltip>
+                                    </div>
+                                </template>
+                            </el-table-column>
+                            <el-table-column label="开始时间" width="150" align="center">
+                                <template #default="{ row }">{{ formatDate(row.started_at || row.created_at) }}</template>
+                            </el-table-column>
+                            <el-table-column label="状态" width="124" align="center">
+                                <template #default="{ row }">
+                                    <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">
+                                        {{ inspectionRunStatusLabel(row) }}
+                                    </el-tag>
+                                </template>
+                            </el-table-column>
+                            <el-table-column label="操作" width="88" fixed="right" align="center">
+                                <template #default="{ row }">
+                                    <el-tooltip content="查看报告" placement="top">
+                                        <el-button :icon="View" link type="primary" aria-label="查看报告" @click.stop="handleInspectionView(row.id)" />
+                                    </el-tooltip>
+                                    <el-dropdown
+                                        trigger="click"
+                                        @click.stop
+                                        @command="command => handleInspectionCommand(command, row)"
+                                    >
+                                        <el-button :icon="MoreFilled" link aria-label="更多操作" @click.stop />
+                                        <template #dropdown>
+                                            <el-dropdown-menu>
+                                                <el-dropdown-item command="delete" :disabled="isInspectionRunActive(row)">删除报告</el-dropdown-item>
+                                            </el-dropdown-menu>
+                                        </template>
+                                    </el-dropdown>
+                                </template>
+                            </el-table-column>
+                        </el-table>
+                    </div>
+
+                    <div class="pagination-footer" v-if="inspectionTotal > 0">
+                        <el-pagination
+                            v-model:current-page="inspectionPage"
+                            v-model:page-size="inspectionPageSize"
+                            :page-sizes="[10, 20, 50, 100]"
+                            :background="true"
+                            layout="total, sizes, prev, pager, next, jumper"
+                            :total="inspectionTotal"
+                            @size-change="handleInspectionSizeChange"
+                            @current-change="handleInspectionPageChange"
                         />
                     </div>
                 </el-tab-pane>
@@ -1131,6 +1471,54 @@ onUnmounted(() => {
     font-weight: 700;
 }
 
+.inspection-run-metric {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    line-height: 1.3;
+}
+
+.inspection-run-metric strong {
+    min-width: 0;
+    color: #303133;
+    font-size: 13px;
+}
+
+.inspection-run-metric span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    color: #909399;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.inspection-task-cell {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+}
+
+.inspection-task-cell > .el-tooltip,
+.inspection-task-cell > .inspection-run-package { max-width: 100%; min-width: 0; }
+.inspection-run-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inspection-run-package { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inspection-report-table :deep(.el-table__cell) { min-width: 0; }
+.inspection-report-table :deep(.el-table__fixed-right) { box-shadow: -4px 0 8px rgba(31, 35, 41, 0.06); }
+.list-scroll-area :deep(.inspection-report-row) { cursor: pointer; }
+
+@media (max-width: 1100px) {
+    .content-wrapper { padding: 14px; }
+    .list-header { align-items: stretch; gap: 10px; flex-wrap: wrap; }
+    .left-filters { min-width: 0; flex: 1 1 100%; gap: 10px; flex-wrap: wrap; }
+    .search-input { flex: 1 1 220px; width: auto; }
+    .pagination-footer { max-width: 100%; overflow-x: auto; padding-bottom: 2px; }
+}
+
 .pass { color: #67C23A; }
 .warn { color: #E6A23C; }
 .fail { color: #F56C6C; }
@@ -1148,6 +1536,12 @@ onUnmounted(() => {
     overflow: hidden;
 }
 
+.mobile-report-type {
+    width: 100%;
+    margin-bottom: 10px;
+    flex-shrink: 0;
+}
+
 .mobile-report-toolbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -1163,6 +1557,9 @@ onUnmounted(() => {
     margin-bottom: 10px;
     flex-shrink: 0;
     overflow-x: auto;
+    max-width: 100%;
+    padding-bottom: 2px;
+    white-space: nowrap;
 }
 
 .mobile-report-list {
@@ -1180,6 +1577,14 @@ onUnmounted(() => {
     background: #ffffff;
     padding: 14px;
 }
+
+.mobile-inspection-card { cursor: pointer; }
+.mobile-inspection-metrics { margin-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid #ebeef5; border-bottom: 1px solid #ebeef5; }
+.mobile-inspection-metrics > div { min-width: 0; padding: 10px 8px; display: flex; flex-direction: column; gap: 3px; }
+.mobile-inspection-metrics > div + div { border-left: 1px solid #ebeef5; }
+.mobile-inspection-metrics span, .mobile-inspection-metrics small { min-width: 0; overflow-wrap: anywhere; color: #909399; font-size: 11px; line-height: 1.4; }
+.mobile-inspection-metrics strong { color: #303133; font-size: 15px; }
+.mobile-inspection-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-top: 6px; }
 
 .mobile-report-card-header {
     display: flex;
@@ -1200,7 +1605,10 @@ onUnmounted(() => {
     color: #303133;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-height: 1.35;
 }
 
 .mobile-report-title span {
@@ -1258,5 +1666,10 @@ onUnmounted(() => {
     display: flex;
     justify-content: center;
     flex-shrink: 0;
+}
+
+@media (max-width: 460px) {
+    .mobile-inspection-metrics { grid-template-columns: minmax(0, 1fr); }
+    .mobile-inspection-metrics > div + div { border-top: 1px solid #ebeef5; border-left: 0; }
 }
 </style>

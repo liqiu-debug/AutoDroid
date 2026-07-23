@@ -4,6 +4,44 @@ from backend.locator_resolution import resolve_locator_candidates
 
 
 class LocatorResolutionTests(unittest.TestCase):
+    def test_android_args_candidates_are_ordered_before_legacy_locator(self):
+        step = {
+            "args": {
+                "locator_candidates": [
+                    {"selector": "购物车", "by": "description"},
+                    {"selector": "购物车", "by": "text"},
+                    {"selector": "//*[@text='购物车'][1]", "by": "xpath"},
+                ]
+            },
+            "selector": "legacy-id",
+            "selector_type": "ID",
+            "platform_overrides": {},
+        }
+        self.assertEqual(
+            resolve_locator_candidates(step, platform="android"),
+            [
+                {"selector": "购物车", "by": "description"},
+                {"selector": "购物车", "by": "text"},
+                {"selector": "//*[@text='购物车'][1]", "by": "xpath"},
+            ],
+        )
+
+    def test_explicit_android_override_precedes_args_candidates(self):
+        step = {
+            "args": {
+                "locator_candidates": [
+                    {"selector": "购物车", "by": "description"},
+                ]
+            },
+            "platform_overrides": {
+                "android": {"selector": "显式定位", "by": "text"},
+            },
+        }
+        self.assertEqual(
+            resolve_locator_candidates(step, platform="android"),
+            [{"selector": "显式定位", "by": "text"}],
+        )
+
     def test_ios_direct_override_kept_for_short_id(self):
         step = {
             "platform_overrides": {

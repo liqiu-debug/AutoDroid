@@ -1,20 +1,34 @@
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { computed, ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Delete, Search, Refresh, Edit, Timer, Calendar, Clock } from '@element-plus/icons-vue'
+import { Plus, Delete, Search, Refresh, Edit } from '@element-plus/icons-vue'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useRemoteSearch } from '@/composables/useRemoteSearch'
+import { useUserStore } from '@/stores/useUserStore'
+import { scheduledTaskExecution } from '@/utils/scheduledTaskPresentation'
 
 // ---- 数据 ----
 const tasks = ref([])
 const devices = ref([])
 const environments = ref([])
+const inspectionProfiles = ref([])
+const androidPackages = ref([])
 const loading = ref(false)
 const searchQuery = ref('')
 const currentPage = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
+const userStore = useUserStore()
+const canUseInspection = computed(() => Boolean(userStore.featureFlags?.model_inspection))
+const taskRows = computed(() => tasks.value.map(task => ({
+    ...task,
+    _execution: scheduledTaskExecution(task, {
+        environments: environments.value,
+        inspectionProfiles: inspectionProfiles.value,
+        packages: androidPackages.value,
+    }),
+})))
 
 // 场景选择器：远程搜索，避免场景超量时静默截断
 const {
@@ -35,7 +49,7 @@ const editingId = ref(null)
 
 const form = reactive({
     name: '',
-    task_type: 'ui',  // ui | fastbot
+    task_type: 'ui',  // ui | fastbot | inspection
     scenario_id: null,
     device_serials: [],
     env_id: null,
@@ -57,6 +71,10 @@ const form = reactive({
     fb_duration_min: 30,
     fb_throttle: 500,
     fb_ignore_crashes: false,
+    // 模型化巡检专属
+    inspection_profile_id: null,
+    inspection_package_id: null,
+    inspection_branches: ['guest', 'authenticated'],
 })
 
 // ---- 方法 ----
@@ -118,6 +136,46 @@ const fetchEnvironments = async () => {
     }
 }
 
+const fetchAllAndroidPackages = async () => {
+    const all = []
+    const pageSize = 100
+    for (let page = 1; page <= 20; page += 1) {
+        const { data } = await api.getPackages({
+            page,
+            page_size: pageSize,
+            platform: 'android',
+        })
+        const items = data.items || []
+        all.push(...items)
+        if (all.length >= Number(data.total ?? all.length) || items.length < pageSize) break
+    }
+    return all
+}
+
+const fetchInspectionProfiles = async () => {
+    if (!canUseInspection.value) return
+    try {
+        const { data } = await api.getInspectionProfiles()
+        inspectionProfiles.value = data || []
+    } catch (err) {
+        console.error('获取巡检配置失败', err)
+    }
+}
+
+const fetchInspectionOptions = async () => {
+    if (!canUseInspection.value) return
+    try {
+        const [profileResponse, packageItems] = await Promise.all([
+            api.getInspectionProfiles(),
+            fetchAllAndroidPackages(),
+        ])
+        inspectionProfiles.value = profileResponse.data || []
+        androidPackages.value = packageItems
+    } catch (err) {
+        console.error('获取巡检定时任务选项失败', err)
+    }
+}
+
 const resetForm = () => {
     form.name = ''
     form.task_type = 'ui'
@@ -136,6 +194,9 @@ const resetForm = () => {
     form.fb_duration_min = 30
     form.fb_throttle = 500
     form.fb_ignore_crashes = false
+    form.inspection_profile_id = null
+    form.inspection_package_id = null
+    form.inspection_branches = ['guest', 'authenticated']
     editingId.value = null
 }
 
@@ -143,6 +204,10 @@ const handleCreate = () => {
     resetForm()
     dialogTitle.value = '新建定时任务'
     dialogVisible.value = true
+}
+
+const handleTaskTypeChange = value => {
+    if (value === 'inspection') fetchInspectionOptions()
 }
 
 const handleEdit = (row) => {
@@ -164,6 +229,13 @@ const handleEdit = (row) => {
         form.fb_duration_min = Math.round((config.fb_duration || 1800) / 60)
         form.fb_throttle = config.fb_throttle || 500
         form.fb_ignore_crashes = config.fb_ignore_crashes || false
+    } else if (config._task_type === 'inspection') {
+        form.task_type = 'inspection'
+        form.scenario_id = null
+        form.inspection_profile_id = config.inspection_profile_id || null
+        form.inspection_package_id = config.inspection_package_id || null
+        form.inspection_branches = config.inspection_branches || ['guest', 'authenticated']
+        fetchInspectionOptions()
     } else {
         form.task_type = 'ui'
     }
@@ -186,7 +258,7 @@ const handleEdit = (row) => {
 const buildPayload = () => {
     const payload = {
         name: form.name,
-        scenario_id: form.scenario_id,
+        scenario_id: form.task_type === 'ui' ? form.scenario_id : null,
         device_serials: form.device_serials,
         strategy: form.strategy,
         strategy_config: {},
@@ -217,6 +289,11 @@ const buildPayload = () => {
         if (form.env_id) {
             payload.strategy_config.env_id = form.env_id
         }
+    } else if (form.task_type === 'inspection') {
+        payload.strategy_config.inspection_profile_id = form.inspection_profile_id
+        payload.strategy_config.inspection_package_id = form.inspection_package_id || null
+        payload.strategy_config.inspection_branches = [...form.inspection_branches]
+        payload.enable_notification = false
     }
 
     return payload
@@ -228,6 +305,9 @@ const handleSubmit = async () => {
     if (form.task_type === 'ui' && (!form.device_serials || form.device_serials.length === 0)) return ElMessage.warning('UI 任务必须选择执行设备')
     if (form.task_type === 'fastbot' && !form.fb_package_name) return ElMessage.warning('请输入目标包名')
     if (form.task_type === 'fastbot' && (!form.device_serials || form.device_serials.length === 0)) return ElMessage.warning('智能探索任务必须选择执行设备')
+    if (form.task_type === 'inspection' && !form.inspection_profile_id) return ElMessage.warning('请选择巡检配置')
+    if (form.task_type === 'inspection' && form.inspection_branches.length === 0) return ElMessage.warning('至少选择一条巡检业务线')
+    if (form.task_type === 'inspection' && form.device_serials.length !== 1) return ElMessage.warning('巡检定时任务必须显式选择 1 台 Android 设备')
     if (form.strategy === 'WEEKLY' && form.weekly_days.length === 0) {
         return ElMessage.warning('请至少选择一天')
     }
@@ -280,22 +360,6 @@ const formatTime = (t) => {
     return dayjs(t).format('MM-DD HH:mm')
 }
 
-const getTaskTypeLabel = (row) => {
-    try {
-        const config = row.strategy_config || {}
-        return config._task_type === 'fastbot' ? '智能探索' : 'UI自动化'
-    } catch { return 'UI自动化' }
-}
-
-const getEnvName = (row) => {
-    try {
-        const envId = row.strategy_config?.env_id
-        if (!envId) return '-'
-        const env = environments.value.find(e => e.id === envId)
-        return env ? env.name : `[环境已删除 ID:${envId}]`
-    } catch { return '-' }
-}
-
 const weekDayOptions = [
     { label: '一', value: 0 },
     { label: '二', value: 1 },
@@ -310,6 +374,7 @@ onMounted(() => {
     fetchTasks()
     fetchDevices()
     fetchEnvironments()
+    fetchInspectionProfiles()
 })
 </script>
 
@@ -334,38 +399,34 @@ onMounted(() => {
                 </div>
             </div>
 
-            <el-table
-                :data="tasks"
-                v-loading="loading"
-                style="width: 100%"
-                height="calc(100vh - 220px)"
-                :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
-            >
-                <el-table-column prop="id" label="ID" width="60" align="center" />
-
-                <el-table-column label="任务名称" min-width="160">
+            <div class="table-scroll-region">
+                <el-table
+                    :data="taskRows"
+                    v-loading="loading"
+                    style="width: 100%"
+                    height="100%"
+                    :header-cell-style="{ background: '#f5f7fa', color: '#606266' }"
+                >
+                <el-table-column label="任务" min-width="180">
                     <template #default="{ row }">
-                        <span class="task-name" @click="handleEdit(row)">{{ row.name }}</span>
+                        <div class="task-cell">
+                            <span class="task-name" @click="handleEdit(row)">{{ row.name }}</span>
+                            <span class="task-device-count">{{ row.device_serials?.length || 0 }} 台设备</span>
+                        </div>
                     </template>
                 </el-table-column>
 
-                <el-table-column label="任务类型" width="110" align="center">
+                <el-table-column label="执行内容" min-width="260">
                     <template #default="{ row }">
-                        <el-tag size="small" :type="getTaskTypeLabel(row) === '智能探索' ? 'warning' : ''" effect="plain">
-                            {{ getTaskTypeLabel(row) }}
-                        </el-tag>
-                    </template>
-                </el-table-column>
-
-                <el-table-column label="执行目标" min-width="140">
-                    <template #default="{ row }">
-                        <span>{{ row.scenario_name }}</span>
-                    </template>
-                </el-table-column>
-
-                <el-table-column label="运行环境" min-width="100">
-                    <template #default="{ row }">
-                        <span class="text-gray">{{ getEnvName(row) }}</span>
+                        <div class="execution-cell">
+                            <el-tag size="small" :type="row._execution.tagType" effect="plain">
+                                {{ row._execution.typeLabel }}
+                            </el-tag>
+                            <div class="execution-copy">
+                                <strong>{{ row._execution.title }}</strong>
+                                <span v-if="row._execution.detail">{{ row._execution.detail }}</span>
+                            </div>
+                        </div>
                     </template>
                 </el-table-column>
 
@@ -401,7 +462,8 @@ onMounted(() => {
                         </el-tooltip>
                     </template>
                 </el-table-column>
-            </el-table>
+                </el-table>
+            </div>
 
             <div class="pagination-footer" v-if="total > 0">
                 <el-pagination
@@ -418,16 +480,25 @@ onMounted(() => {
         </div>
 
         <!-- 新建/编辑弹窗 -->
-        <el-dialog v-model="dialogVisible" :title="dialogTitle" width="560px" destroy-on-close>
+        <el-dialog
+            v-model="dialogVisible"
+            :title="dialogTitle"
+            width="560px"
+            class="task-editor-dialog"
+            destroy-on-close
+            align-center
+        >
+            <div class="task-dialog-scroll">
             <el-form label-width="90px" class="task-form">
                 <el-form-item label="任务名称">
                     <el-input v-model="form.name" placeholder="例如：每日回归测试" />
                 </el-form-item>
 
                 <el-form-item label="任务类型">
-                    <el-radio-group v-model="form.task_type">
+                    <el-radio-group v-model="form.task_type" @change="handleTaskTypeChange">
                         <el-radio-button value="ui">UI 自动化</el-radio-button>
                         <el-radio-button value="fastbot">智能探索</el-radio-button>
+                        <el-radio-button v-if="canUseInspection" value="inspection">智能巡检</el-radio-button>
                     </el-radio-group>
                 </el-form-item>
 
@@ -474,11 +545,53 @@ onMounted(() => {
                     </el-form-item>
                 </template>
 
+                <template v-if="form.task_type === 'inspection'">
+                    <el-form-item label="巡检配置">
+                        <el-select
+                            v-model="form.inspection_profile_id"
+                            filterable
+                            placeholder="选择巡检配置"
+                            style="width: 100%"
+                            @focus="fetchInspectionOptions"
+                        >
+                            <el-option
+                                v-for="profile in inspectionProfiles"
+                                :key="profile.id"
+                                :label="`${profile.name} · ${profile.package_name}`"
+                                :value="profile.id"
+                            />
+                        </el-select>
+                    </el-form-item>
+                    <el-form-item label="业务线">
+                        <el-checkbox-group v-model="form.inspection_branches">
+                            <el-checkbox value="guest">未登录</el-checkbox>
+                            <el-checkbox value="authenticated">已登录</el-checkbox>
+                        </el-checkbox-group>
+                    </el-form-item>
+                    <el-form-item label="安装包">
+                        <el-select
+                            v-model="form.inspection_package_id"
+                            clearable
+                            filterable
+                            placeholder="不安装，使用设备当前版本"
+                            style="width: 100%"
+                        >
+                            <el-option
+                                v-for="pkg in androidPackages"
+                                :key="pkg.id"
+                                :label="`${pkg.app_name || pkg.package_name} ${pkg.version_name || pkg.version_code || ''}`"
+                                :value="pkg.id"
+                            />
+                        </el-select>
+                    </el-form-item>
+                </template>
+
                 <el-form-item label="执行设备">
                     <el-select
                         v-model="form.device_serials"
                         placeholder="请选择运行设备"
                         multiple
+                        :multiple-limit="form.task_type === 'inspection' ? 1 : 0"
                         collapse-tags
                         clearable
                         style="width: 100%"
@@ -489,6 +602,7 @@ onMounted(() => {
                             :key="d.serial"
                             :label="d.custom_name || d.market_name || d.model || d.serial"
                             :value="d.serial"
+                            :disabled="form.task_type === 'inspection' && String(d.platform || 'android').toLowerCase() !== 'android'"
                         />
                     </el-select>
                 </el-form-item>
@@ -579,7 +693,7 @@ onMounted(() => {
                     />
                 </el-form-item>
 
-                <el-form-item label="飞书通知">
+                <el-form-item v-if="form.task_type !== 'inspection'" label="飞书通知">
                     <el-switch
                         v-model="form.enable_notification"
                         active-text="执行后发送通知"
@@ -587,6 +701,7 @@ onMounted(() => {
                     />
                 </el-form-item>
             </el-form>
+            </div>
 
             <template #footer>
                 <el-button @click="dialogVisible = false">取消</el-button>
@@ -613,6 +728,12 @@ onMounted(() => {
     overflow: hidden;
     display: flex;
     flex-direction: column;
+}
+
+.table-scroll-region {
+    flex: 1;
+    min-height: 160px;
+    overflow: hidden;
 }
 
 .toolbar {
@@ -643,6 +764,41 @@ onMounted(() => {
     text-decoration: underline;
 }
 
+.task-cell, .execution-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.task-device-count, .execution-copy span {
+    color: #909399;
+    font-size: 12px;
+}
+
+.execution-cell {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.execution-cell :deep(.el-tag) {
+    flex-shrink: 0;
+}
+
+.execution-copy strong, .execution-copy span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.execution-copy strong {
+    color: #303133;
+    font-size: 13px;
+    font-weight: 600;
+}
+
 .schedule-text {
     font-size: 13px;
     color: #303133;
@@ -658,7 +814,14 @@ onMounted(() => {
 }
 
 .task-form {
-    padding: 10px 20px 0 0;
+    padding: 10px 20px 0;
+}
+
+.task-dialog-scroll {
+    width: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .unit-label {
@@ -668,5 +831,49 @@ onMounted(() => {
 
 .week-checkbox .el-checkbox-button {
     margin-bottom: 0;
+}
+
+:global(.task-editor-dialog) {
+    max-width: calc(100vw - 24px);
+    max-height: calc(100dvh - 24px);
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+:global(.task-editor-dialog .el-dialog__header),
+:global(.task-editor-dialog .el-dialog__footer) {
+    flex-shrink: 0;
+}
+
+:global(.task-editor-dialog .el-dialog__body) {
+    min-height: 0;
+    padding: 0;
+    display: flex;
+    overflow: hidden;
+}
+
+:global(.task-editor-dialog .el-dialog__footer) {
+    position: sticky;
+    z-index: 1;
+    bottom: 0;
+    padding-top: 12px;
+    border-top: 1px solid #ebeef5;
+    background: #fff;
+}
+
+@media (max-width: 760px) {
+    .content-wrapper { margin: 6px; padding: 12px; }
+    .toolbar, .left-tools { align-items: stretch; }
+    .left-tools { flex: 1 1 100%; }
+    .search-input { min-width: 0; width: 100%; }
+    .pagination-footer { overflow-x: auto; justify-content: flex-start; }
+    .task-form { padding-right: 12px; }
+}
+
+@media (max-height: 620px) {
+    :global(.task-editor-dialog) { max-height: calc(100dvh - 12px); }
+    :global(.task-editor-dialog .el-dialog__header) { padding-top: 12px; padding-bottom: 10px; }
+    :global(.task-editor-dialog .el-dialog__footer) { padding-top: 8px; padding-bottom: 8px; }
 }
 </style>

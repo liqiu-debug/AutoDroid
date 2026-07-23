@@ -1,7 +1,8 @@
 """崩溃/ANR 检测：logcat 流式监控与快照抓取。"""
-import re
 import asyncio
+import inspect
 import logging
+import re
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, List, Optional
 
@@ -28,6 +29,7 @@ async def _monitor_logcat(
     abort_on_crash: bool = False,
     abort_event: Optional[asyncio.Event] = None,
     replay_callback: Optional[Callable[[str, str], Awaitable[Optional[Dict]]]] = None,
+    event_sink: Optional[Callable[[Dict], object]] = None,
 ):
     """子协程：持续读取 logcat 流，只抓取目标包名相关的崩溃/ANR。
 
@@ -37,6 +39,17 @@ async def _monitor_logcat(
     - 同类事件在冷却期(10s)内不重复计数
     - abort_on_crash=True 时，检测到崩溃后触发 abort_event 通知主协程终止 Monkey
     """
+    async def dispatch_event(event: Dict) -> None:
+        if not event_sink:
+            return
+        try:
+            result = event_sink(dict(event))
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            # An optional caller sink must never disable Fastbot's own monitor.
+            logger.warning("Crash/ANR event sink failed and was ignored: %s", exc)
+
     proc = await asyncio.create_subprocess_shell(
         f"adb -s {device_serial} logcat -v time *:E",
         stdout=asyncio.subprocess.PIPE,
@@ -94,6 +107,7 @@ async def _monitor_logcat(
                                 "error": str(exc),
                             }
                     crash_events.append(event)
+                    await dispatch_event(event)
                     logger.warning(f"检测到 ANR ({package_name}): {line.strip()[:200]}")
                     if abort_on_crash and abort_event:
                         logger.warning(f"容错策略=立即停止，触发终止")
@@ -139,6 +153,7 @@ async def _monitor_logcat(
                                         "error": str(exc),
                                     }
                             crash_events.append(event)
+                            await dispatch_event(event)
                             logger.warning(f"检测到 CRASH ({package_name}): {pending_lines[0].strip()[:200]}")
                             if abort_on_crash and abort_event:
                                 logger.warning(f"容错策略=立即停止，触发终止")

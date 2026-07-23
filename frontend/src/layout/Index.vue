@@ -15,7 +15,9 @@ const router = useRouter()
 const userStore = useUserStore()
 
 const canShowRoute = (routeRecord) => {
-  return !routeRecord.meta?.requiresAdmin || userStore.isAdmin
+  if (routeRecord.meta?.requiresAdmin && !userStore.isAdmin) return false
+  const featureFlag = routeRecord.meta?.featureFlag
+  return !featureFlag || userStore.featureFlags?.[featureFlag] === true
 }
 const { isMobileMode } = useClientMode()
 

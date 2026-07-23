@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from sqlmodel import SQLModel, Field, Column
-from sqlalchemy import Integer, JSON
+from sqlalchemy import Index, Integer, JSON, UniqueConstraint
 from .schemas import TestCaseBase, Step, Variable
 from .json_type import PydanticListType
 
@@ -189,6 +189,10 @@ class Device(SQLModel, table=True):
     os_version: str = Field(default="")        # 跨平台统一版本号
     resolution: str = Field(default="")
     status: str = Field(default="IDLE")  # IDLE, BUSY, OFFLINE, WDA_DOWN
+    # 新执行链路使用 owner-safe 设备租约；历史调用方可继续留空。
+    lease_task_id: Optional[str] = Field(default=None, index=True)
+    lease_kind: Optional[str] = None
+    lease_acquired_at: Optional[datetime] = None
     connection_type: Optional[str] = Field(default=None)  # iOS: 最近一次同步的 usbmux 连接方式 usb | network
     custom_name: Optional[str] = Field(default=None)  # 用户自定义设备名称
     market_name: Optional[str] = Field(default=None)  # 设备市场型号
@@ -251,12 +255,44 @@ class CompatibilityRun(SQLModel, table=True):
     page_set_id: Optional[int] = Field(default=None, foreign_key="compatpageset.id", index=True)
     page_set_name: Optional[str] = None
     page_set_snapshot: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    source_type: str = Field(default="page_set", index=True)
+    inspection_run_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionrun.id",
+        index=True,
+    )
+    inspection_state_ids: List[int] = Field(
+        default=[],
+        sa_column=Column(PydanticListType(int)),
+    )
+    inspection_observation_ids: List[int] = Field(
+        default=[],
+        sa_column=Column(PydanticListType(int)),
+    )
     old_package_id: Optional[int] = Field(default=None, foreign_key="apppackage.id", index=True)
-    new_package_id: int = Field(foreign_key="apppackage.id", index=True)
+    new_package_id: Optional[int] = Field(
+        default=None,
+        foreign_key="apppackage.id",
+        index=True,
+    )
     package_name: str = Field(default="", index=True)
-    compare_mode: str = Field(default="version", index=True)  # version（同设备新旧对比）| device（跨设备横向对比）
+    execution_mode: str = Field(default="COMPARISON", index=True)
+    replay_branch_key: Optional[str] = Field(default=None, index=True)
+    replay_plan_version: Optional[int] = None
+    replay_plan_digest: Optional[str] = Field(default=None, index=True)
+    replay_duration_seconds: int = Field(default=3600)
+    source_package_snapshot: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    target_package_snapshot: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    manual_install_confirmed_at: Optional[datetime] = None
+    compare_mode: Optional[str] = Field(default=None, index=True)  # snapshot | version | device
     baseline_device_serial: Optional[str] = Field(default=None)  # device 模式下的基准设备
-    mode: str = Field(default="upgrade")  # upgrade | clean
+    mode: Optional[str] = Field(default=None)  # upgrade | clean
     env_id: Optional[int] = Field(default=None, foreign_key="environment.id")
     device_serials: List[str] = Field(default=[], sa_column=Column(PydanticListType(str)))
     thresholds: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
@@ -287,6 +323,11 @@ class CompatibilityCell(SQLModel, table=True):
     current_stage: Optional[str] = None
     old_install_status: Optional[str] = None
     new_install_status: Optional[str] = None
+    preflight_at: Optional[datetime] = None
+    installed_package_snapshot: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
     error_message: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -299,6 +340,24 @@ class CompatibilityPageResult(SQLModel, table=True):
     cell_id: int = Field(foreign_key="compatibilitycell.id", index=True)
     page_key: str = Field(default="")
     page_name: str = Field(default="")
+    path_key: Optional[str] = Field(default=None, index=True)
+    source_state_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionstate.id",
+        index=True,
+    )
+    source_observation_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionobservation.id",
+        index=True,
+    )
+    evidence_level: Optional[str] = Field(default=None, index=True)
+    failure_type: Optional[str] = Field(default=None, index=True)
+    failed_step_index: Optional[int] = None
+    replay_trace: List[Dict[str, Any]] = Field(
+        default=[],
+        sa_column=Column(JSON, default=[]),
+    )
     case_id: Optional[int] = Field(default=None, foreign_key="testcase.id")
     status: str = Field(default="PENDING", index=True)
     reason: Optional[str] = None
@@ -308,11 +367,602 @@ class CompatibilityPageResult(SQLModel, table=True):
     diff_screenshot_path: Optional[str] = None
     baseline_xml_path: Optional[str] = None
     candidate_xml_path: Optional[str] = None
+    baseline_screenshot_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    candidate_screenshot_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    diff_screenshot_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    baseline_xml_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    candidate_xml_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
     baseline_ocr_text: Optional[str] = None
     candidate_ocr_text: Optional[str] = None
     baseline_activity: Optional[str] = None
     candidate_activity: Optional[str] = None
     metrics: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionProfile(SQLModel, table=True):
+    """模型化智能巡检的可复用配置。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    package_name: str = Field(index=True)
+    branches: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    input_rules: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    safety_rules: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    sanitizer_rules: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    dynamic_text_patterns: List[str] = Field(
+        default=[],
+        sa_column=Column(PydanticListType(str)),
+    )
+    budgets: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    monitor_options: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id", index=True)
+    updater_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionRun(SQLModel, table=True):
+    """一次 Android 模型化巡检任务。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    profile_id: Optional[int] = Field(default=None, foreign_key="inspectionprofile.id", index=True)
+    package_name: str = Field(index=True)
+    package_id: Optional[int] = Field(default=None, foreign_key="apppackage.id", index=True)
+    package_source: str = Field(default="installed")
+    profile_snapshot: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    device_serial: str = Field(index=True)
+    selected_branches: List[str] = Field(
+        default=["guest", "authenticated"],
+        sa_column=Column(PydanticListType(str)),
+    )
+    status: str = Field(default="PENDING", index=True)
+    current_stage: Optional[str] = None
+    stop_reason: Optional[str] = None
+    total_branches: int = Field(default=0)
+    total_clusters: int = Field(default=0)
+    total_states: int = Field(default=0)
+    total_transitions: int = Field(default=0)
+    blocked_count: int = Field(default=0)
+    stable_count: int = Field(default=0)
+    fault_count: int = Field(default=0)
+    error_message: Optional[str] = None
+    executor_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    executor_name: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class InspectionBranchRun(SQLModel, table=True):
+    """巡检任务中的单条登录态业务线。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_key: str = Field(index=True)
+    branch_name: str
+    status: str = Field(default="PENDING", index=True)
+    current_stage: Optional[str] = None
+    root_state_id: Optional[int] = Field(default=None, index=True)
+    stop_reason: Optional[str] = None
+    state_count: int = Field(default=0)
+    transition_count: int = Field(default=0)
+    blocked_count: int = Field(default=0)
+    stable_count: int = Field(default=0)
+    fault_count: int = Field(default=0)
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class InspectionPageTemplate(SQLModel, table=True):
+    """Versioned, exact structural identity shared by inspection states."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "package_name",
+            "fingerprint_version",
+            "template_key",
+            name="uq_inspectionpagetemplate_identity",
+        ),
+        Index(
+            "ix_inspectionpagetemplate_package_activity",
+            "package_name",
+            "activity",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    package_name: str = Field(index=True)
+    activity: Optional[str] = Field(default=None, index=True)
+    activity_family: Optional[str] = Field(default=None, index=True)
+    page_role: str = Field(default="UNKNOWN", index=True)
+    is_modal: bool = Field(default=False)
+    fingerprint_version: int = Field(default=1, index=True)
+    template_key: str = Field(index=True)
+    structure_signature: List[str] = Field(
+        default=[], sa_column=Column(JSON, default=[])
+    )
+    action_signature: List[str] = Field(
+        default=[], sa_column=Column(JSON, default=[])
+    )
+    anchor_signature: List[str] = Field(
+        default=[], sa_column=Column(JSON, default=[])
+    )
+    control_state_signature: List[str] = Field(
+        default=[], sa_column=Column(JSON, default=[])
+    )
+    risk_signature: List[str] = Field(
+        default=[], sa_column=Column(JSON, default=[])
+    )
+    observation_count: int = Field(default=0)
+    first_seen_at: datetime = Field(default_factory=datetime.now)
+    last_seen_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionExplorationFamily(SQLModel, table=True):
+    """Run-scoped logical page family used to converge repeated instances."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "branch_run_id",
+            "fingerprint_version",
+            "family_key",
+            name="uq_inspectionfamily_branch_version_key",
+        ),
+        Index(
+            "ix_inspectionfamily_run_branch",
+            "run_id",
+            "branch_run_id",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_run_id: int = Field(foreign_key="inspectionbranchrun.id", index=True)
+    family_key: str = Field(index=True)
+    fingerprint_version: int = Field(default=1, index=True)
+    page_role: str = Field(default="UNKNOWN", index=True)
+    activity_family: Optional[str] = Field(default=None, index=True)
+    representative_state_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionstate.id",
+        index=True,
+    )
+    signature: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    member_count: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionState(SQLModel, table=True):
+    """巡检状态图节点；截图/XML 仅保存报告相对路径。"""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "branch_run_id",
+            "semantic_key",
+            "instance_anchor",
+            name="uq_inspectionstate_branch_semantic_instance",
+        ),
+        Index(
+            "ix_inspectionstate_run_template",
+            "run_id",
+            "template_id",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_run_id: int = Field(foreign_key="inspectionbranchrun.id", index=True)
+    branch_key: str = Field(index=True)
+    cluster_key: str = Field(index=True)
+    state_key: str = Field(index=True)
+    template_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionpagetemplate.id",
+        index=True,
+    )
+    semantic_key: Optional[str] = Field(default=None, index=True)
+    identity_version: int = Field(default=1, index=True)
+    instance_anchor: Optional[str] = Field(default=None, index=True)
+    exploration_family_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionexplorationfamily.id",
+        index=True,
+    )
+    family_match_confidence: Optional[float] = None
+    family_match_evidence: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    exploration_mode: str = Field(default="INDEPENDENT", index=True)
+    page_subtype: str = Field(default="UNKNOWN", index=True)
+    coverage_status: str = Field(default="DISCOVERED", index=True)
+    frontier_priority: int = Field(default=700, index=True)
+    frontier_reason: Optional[str] = None
+    expansion_status: str = Field(default="DISCOVERED", index=True)
+    pending_action_count: int = Field(default=0)
+    last_action_cursor: Optional[int] = None
+    recovery_retry_count: int = Field(default=0)
+    expansion_completed_at: Optional[datetime] = None
+    representative_observation_id: Optional[int] = Field(default=None, index=True)
+    observation_count: int = Field(default=0)
+    last_observed_at: Optional[datetime] = None
+    queued_at: Optional[datetime] = None
+    expanded_at: Optional[datetime] = None
+    activity: Optional[str] = None
+    foreground_package: Optional[str] = None
+    depth: int = Field(default=0)
+    parent_state_id: Optional[int] = Field(default=None, index=True)
+    incoming_transition_id: Optional[int] = Field(default=None, index=True)
+    screenshot_path: Optional[str] = None
+    thumbnail_path: Optional[str] = None
+    xml_path: Optional[str] = None
+    screenshot_sha: Optional[str] = None
+    perceptual_hash: Optional[str] = None
+    stable_status: str = Field(default="UNVERIFIED", index=True)
+    selected_for_regression: bool = Field(default=False)
+    locator_quality: str = Field(default="UNKNOWN")
+    is_dynamic: bool = Field(default=False)
+    is_opaque: bool = Field(default=False)
+    visit_count: int = Field(default=1)
+    first_path: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionTransition(SQLModel, table=True):
+    """状态图边，同时保存被安全策略拦截、无效果和执行失败动作。"""
+
+    __table_args__ = (
+        Index(
+            "ix_inspectiontransition_branch_sequence",
+            "branch_run_id",
+            "sequence",
+        ),
+        Index(
+            "ix_inspectiontransition_run_topology",
+            "run_id",
+            "topology_type",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_run_id: int = Field(foreign_key="inspectionbranchrun.id", index=True)
+    from_state_id: int = Field(foreign_key="inspectionstate.id", index=True)
+    to_state_id: Optional[int] = Field(default=None, foreign_key="inspectionstate.id", index=True)
+    sequence: int = Field(default=0)
+    action_type: str = Field(index=True)
+    action_key: str = Field(index=True)
+    locator_candidates: List[Dict[str, Any]] = Field(default=[], sa_column=Column(JSON, default=[]))
+    target_meta: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    relation_type: Optional[str] = None
+    relation_confidence: Optional[float] = None
+    topology_type: Optional[str] = Field(default=None, index=True)
+    action_role_key: Optional[str] = Field(default=None, index=True)
+    action_role: Optional[str] = None
+    execution_disposition: str = Field(default="EXECUTED", index=True)
+    failure_type: Optional[str] = Field(default=None, index=True)
+    coverage_source_transition_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectiontransition.id",
+        index=True,
+    )
+    coverage_contract_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectioncoveragecontract.id",
+        index=True,
+    )
+    action_group_key: Optional[str] = Field(default=None, index=True)
+    sampling_disposition: Optional[str] = Field(default=None, index=True)
+    visual_locator_evidence: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    recovery_attempt_count: int = Field(default=0)
+    source_observation_id: Optional[int] = Field(default=None, index=True)
+    target_observation_id: Optional[int] = Field(default=None, index=True)
+    traversal_count: int = Field(default=1)
+    target_was_existing: bool = Field(default=False)
+    status: str = Field(default="PENDING", index=True)
+    risk_type: Optional[str] = None
+    reason: Optional[str] = None
+    coordinate_only: bool = Field(default=False)
+    replayable: bool = Field(default=True)
+    duration_ms: float = Field(default=0.0)
+    input_rule_id: Optional[str] = None
+    input_variable_key: Optional[str] = None
+    input_length: Optional[int] = None
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class InspectionFamilyActionCoverage(SQLModel, table=True):
+    """Per-family action-role frontier and bounded execution history."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "family_id",
+            "action_role_key",
+            name="uq_inspectionfamilycoverage_family_role",
+        ),
+        Index(
+            "ix_inspectionfamilycoverage_family_status",
+            "family_id",
+            "status",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    family_id: int = Field(
+        foreign_key="inspectionexplorationfamily.id",
+        index=True,
+    )
+    action_role_key: str = Field(index=True)
+    action_role: Optional[str] = None
+    status: str = Field(default="PENDING", index=True)
+    source_state_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionstate.id",
+        index=True,
+    )
+    source_transition_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectiontransition.id",
+        index=True,
+    )
+    attempt_count: int = Field(default=0)
+    max_attempts: int = Field(default=2)
+    last_error: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionCoverageContract(SQLModel, table=True):
+    """Auditable, run-scoped evidence for representative action reuse."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "branch_run_id",
+            "contract_key",
+            name="uq_inspectioncoveragecontract_branch_key",
+        ),
+        Index(
+            "ix_inspectioncoveragecontract_run_status",
+            "run_id",
+            "status",
+        ),
+        Index(
+            "ix_inspectioncoveragecontract_source_action",
+            "source_family_id",
+            "action_group_key",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_run_id: int = Field(foreign_key="inspectionbranchrun.id", index=True)
+    contract_key: str = Field(index=True)
+    scope: str = Field(default="FAMILY_ACTION", index=True)
+    source_family_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionexplorationfamily.id",
+        index=True,
+    )
+    source_page_subtype: str = Field(default="UNKNOWN", index=True)
+    action_group_key: str = Field(index=True)
+    action_role: Optional[str] = None
+    target_family_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionexplorationfamily.id",
+        index=True,
+    )
+    target_page_role: Optional[str] = Field(default=None, index=True)
+    status: str = Field(default="PENDING", index=True)
+    required_samples: int = Field(default=2)
+    success_count: int = Field(default=0)
+    failure_count: int = Field(default=0)
+    source_instance_anchors: List[str] = Field(
+        default=[],
+        sa_column=Column(JSON, default=[]),
+    )
+    sample_transition_ids: List[int] = Field(
+        default=[],
+        sa_column=Column(JSON, default=[]),
+    )
+    risk_signature: Optional[str] = None
+    control_signature: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class StoredAsset(SQLModel, table=True):
+    """Immutable content-addressed report asset metadata."""
+
+    __table_args__ = (
+        UniqueConstraint("blob_sha256", name="uq_storedasset_blob_sha256"),
+        UniqueConstraint("storage_key", name="uq_storedasset_storage_key"),
+        Index(
+            "ix_storedasset_logical_media_encoding",
+            "logical_sha256",
+            "media_type",
+            "content_encoding",
+        ),
+    )
+
+    id: str = Field(primary_key=True)
+    logical_sha256: str = Field(index=True)
+    blob_sha256: str = Field(index=True)
+    media_type: str = Field(default="application/octet-stream", index=True)
+    encoding: Optional[str] = Field(default=None, index=True)
+    content_encoding: Optional[str] = None
+    storage_key: str
+    byte_size: int = Field(default=0)
+    width: Optional[int] = None
+    height: Optional[int] = None
+    original_width: Optional[int] = None
+    original_height: Optional[int] = None
+    scale: float = Field(default=1.0)
+    status: str = Field(default="ACTIVE", index=True)
+    integrity_status: str = Field(default="VERIFIED", index=True)
+    last_verified_at: Optional[datetime] = None
+    orphaned_at: Optional[datetime] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class AssetReference(SQLModel, table=True):
+    """Owner-scoped lifecycle reference to an immutable stored asset."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_type",
+            "owner_id",
+            "role",
+            name="uq_assetreference_owner_role",
+        ),
+        Index(
+            "ix_assetreference_retention_expiry",
+            "retention_class",
+            "expires_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    asset_id: str = Field(foreign_key="storedasset.id", index=True)
+    owner_type: str = Field(index=True)
+    owner_id: int = Field(index=True)
+    role: str = Field(index=True)
+    retention_class: str = Field(default="HOT", index=True)
+    expires_at: Optional[datetime] = Field(default=None, index=True)
+    pinned_reason: Optional[str] = None
+    released_at: Optional[datetime] = Field(default=None, index=True)
+    grace_until: Optional[datetime] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class InspectionObservation(SQLModel, table=True):
+    """One concrete capture mapped to a logical inspection state/template."""
+
+    __table_args__ = (
+        Index(
+            "ix_inspectionobservation_run_sequence",
+            "run_id",
+            "sequence",
+        ),
+        Index(
+            "ix_inspectionobservation_state_captured",
+            "state_id",
+            "captured_at",
+        ),
+        Index(
+            "ix_inspectionobservation_template_match",
+            "template_id",
+            "match_confidence",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_run_id: int = Field(foreign_key="inspectionbranchrun.id", index=True)
+    state_id: int = Field(foreign_key="inspectionstate.id", index=True)
+    template_id: Optional[int] = Field(
+        default=None,
+        foreign_key="inspectionpagetemplate.id",
+        index=True,
+    )
+    transition_id: Optional[int] = Field(default=None, index=True)
+    sequence: int = Field(default=0)
+    capture_kind: str = Field(default="DISCOVERY", index=True)
+    package_name: Optional[str] = None
+    activity: Optional[str] = None
+    exact_cluster_key: str = Field(default="", index=True)
+    exact_replay_key: str = Field(default="", index=True)
+    exact_state_key: str = Field(default="", index=True)
+    screenshot_sha: Optional[str] = None
+    screenshot_phash: Optional[str] = None
+    perceptual_hash: Optional[str] = None
+    stable_by: Optional[str] = None
+    screenshot_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    xml_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    thumbnail_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    action_map_asset_id: Optional[str] = Field(
+        default=None,
+        foreign_key="storedasset.id",
+        index=True,
+    )
+    asset_status: str = Field(default="AVAILABLE", index=True)
+    is_representative: bool = Field(default=False, index=True)
+    retention_class: str = Field(default="HOT", index=True)
+    retained_until: Optional[datetime] = Field(default=None, index=True)
+    original_width: Optional[int] = None
+    original_height: Optional[int] = None
+    match_confidence: Optional[float] = None
+    match_evidence: Dict[str, Any] = Field(
+        default={},
+        sa_column=Column(JSON, default={}),
+    )
+    metadata_only: bool = Field(default=False)
+    captured_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class InspectionFault(SQLModel, table=True):
+    """巡检期间捕获并聚类后的应用/设备故障。"""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="inspectionrun.id", index=True)
+    branch_run_id: Optional[int] = Field(default=None, foreign_key="inspectionbranchrun.id", index=True)
+    state_id: Optional[int] = Field(default=None, foreign_key="inspectionstate.id", index=True)
+    transition_id: Optional[int] = Field(default=None, foreign_key="inspectiontransition.id", index=True)
+    fault_type: str = Field(index=True)
+    signature: str = Field(index=True)
+    summary: Optional[str] = None
+    full_log_path: Optional[str] = None
+    screenshot_path: Optional[str] = None
+    xml_path: Optional[str] = None
+    replay_path: Optional[str] = None
+    trace_path: Optional[str] = None
+    details: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
+    occurrence_count: int = Field(default=1)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
 

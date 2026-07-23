@@ -70,6 +70,8 @@ from backend.api import log_analysis
 from backend.api import devices
 from backend.api import packages
 from backend.api import compatibility
+from backend.api import inspections
+from backend.api import assets
 from backend.api import environments
 from backend.api import ai
 from backend.api import limiter
@@ -104,6 +106,7 @@ def _register_http_routers(
     target.include_router(devices.router, prefix="/devices", tags=["devices"], include_in_schema=include_in_schema)
     target.include_router(packages.router, prefix="/packages", tags=["packages"], include_in_schema=include_in_schema)
     target.include_router(compatibility.router, prefix="/compatibility", tags=["compatibility"], include_in_schema=include_in_schema)
+    target.include_router(inspections.router, prefix="/inspections", tags=["inspections"], include_in_schema=include_in_schema)
     target.include_router(environments.router, prefix="/environments", tags=["environments"], include_in_schema=include_in_schema)
     target.include_router(limiter.router, prefix="/limiter", tags=["limiter"], include_in_schema=include_in_schema)
     if ai_prefix:
@@ -112,6 +115,10 @@ def _register_http_routers(
 
 _register_http_routers(api_router, include_in_schema=True, ai_prefix="/ai", reports_prefix="/reports")
 _register_http_routers(app, include_in_schema=False, ai_prefix=None, include_settings_alias=True, reports_prefix="/reports")
+
+# Content-addressed evidence is intentionally available only under the
+# authenticated canonical API prefix; no unauthenticated legacy alias.
+api_router.include_router(assets.router, prefix="/assets", tags=["assets"])
 
 api_router.include_router(
     stream_rest_router,
@@ -308,6 +315,9 @@ app.include_router(recording.router)
 
 # WebSocket 实时执行（/ws/run/{case_id}）
 app.include_router(ws_run.router)
+
+# 智能巡检只读实时事件与视频（短期票据认证）
+app.include_router(inspections.ws_router)
 
 # SPA 兜底路由必须最后挂载（含 /{full_path:path} 通配）
 app.include_router(spa.router)

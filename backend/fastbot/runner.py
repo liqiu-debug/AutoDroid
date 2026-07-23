@@ -8,6 +8,7 @@
 """
 import asyncio
 import logging
+import os
 from typing import Dict, List, Optional
 
 from backend.fastbot.adb import ADB_MONITOR_COMMAND_TIMEOUT_SECONDS, _adb_shell
@@ -67,6 +68,9 @@ async def run_fastbot_task(
     pct_motion: int = 30,
     pct_syskeys: int = 5,
     pct_majornav: int = 15,
+    report_dir_override: Optional[str] = None,
+    report_run_id: Optional[str] = None,
+    crash_event_sink=None,
 ) -> Dict:
     """
     主执行函数：启动 Monkey 主进程 + 性能/崩溃监控子协程。
@@ -91,7 +95,14 @@ async def run_fastbot_task(
     perfetto_state: Optional[PerfettoSessionState] = None
     continuous_perfetto_state: Optional[PerfettoSessionState] = None
     trace_capture_tasks: List[asyncio.Task] = []
-    report_dir = _build_fastbot_report_dir(task_id) if (enable_jank_frame_monitor or enable_local_replay) else ""
+    report_dir = ""
+    if enable_jank_frame_monitor or enable_local_replay:
+        report_dir = (
+            str(report_dir_override)
+            if report_dir_override
+            else _build_fastbot_report_dir(task_id, run_id=report_run_id)
+        )
+        os.makedirs(report_dir, exist_ok=True)
     local_replay_started = False
 
     if enable_local_replay and report_dir:
@@ -160,11 +171,24 @@ async def run_fastbot_task(
                 perfetto_state=perfetto_state,
             )
         ))
+    logcat_kwargs = {
+        "abort_on_crash": should_abort,
+        "abort_event": abort_event,
+        "replay_callback": _capture_local_replay if local_replay_started else None,
+    }
+    # Keep the historical call contract byte-for-byte compatible when no
+    # external sink is requested.  Existing integrations commonly replace the
+    # monitor with a callable that predates the optional event_sink keyword.
+    if crash_event_sink is not None:
+        logcat_kwargs["event_sink"] = crash_event_sink
     logcat_task = asyncio.create_task(
         _monitor_logcat(
-            device_serial, package_name, stop_event, crash_events, capture_log,
-            abort_on_crash=should_abort, abort_event=abort_event,
-            replay_callback=_capture_local_replay if local_replay_started else None,
+            device_serial,
+            package_name,
+            stop_event,
+            crash_events,
+            capture_log,
+            **logcat_kwargs,
         )
     )
     monitor_tasks.append(logcat_task)

@@ -684,6 +684,96 @@ class StepRetryTests(unittest.TestCase):
         self.assertIsNone(result["error"])
         self.assertEqual(runner.driver.click_attempts, 3)
 
+    def test_device_step_hook_runs_once_per_real_retry_attempt(self):
+        actions = []
+        runner = self._make_runner(
+            click_failures_before_success=2,
+            before_device_step=actions.append,
+        )
+        try:
+            result = runner.run_step(self._flaky_click_step(retry_count=2))
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(actions, ["click", "click", "click"])
+
+    def test_device_step_hook_exception_propagates_before_driver_call(self):
+        class StepBudgetExceeded(RuntimeError):
+            pass
+
+        actions = []
+
+        def reject(action):
+            actions.append(action)
+            raise StepBudgetExceeded("step budget exhausted")
+
+        runner = self._make_runner(before_device_step=reject)
+        try:
+            with self.assertRaisesRegex(
+                StepBudgetExceeded,
+                "step budget exhausted",
+            ):
+                runner.run_step(self._flaky_click_step())
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(actions, ["click"])
+        self.assertEqual(runner.driver.click_attempts, 0)
+
+    def test_device_step_hook_ignores_platform_skip_and_sleep(self):
+        actions = []
+        runner = self._make_runner(before_device_step=actions.append)
+        try:
+            skipped = runner.run_step(
+                {
+                    "action": "click",
+                    "platform_overrides": {
+                        "android": {"selector": "ok", "by": "id"}
+                    },
+                    "execute_on": ["ios"],
+                }
+            )
+            slept = runner.run_step(
+                {
+                    "action": "sleep",
+                    "args": {"seconds": 0},
+                    "execute_on": ["android"],
+                }
+            )
+        finally:
+            runner.disconnect()
+
+        self.assertEqual(skipped["status"], "SKIP")
+        self.assertEqual(slept["status"], "PASS")
+        self.assertEqual(actions, [])
+
+    def test_logical_step_hook_includes_sleep_and_platform_skip(self):
+        actions = []
+        runner = self._make_runner(before_step=actions.append)
+        try:
+            result = runner.run_all(
+                [
+                    {
+                        "action": "sleep",
+                        "args": {"seconds": 0},
+                        "execute_on": ["android"],
+                    },
+                    {
+                        "action": "click",
+                        "platform_overrides": {
+                            "android": {"selector": "ignored", "by": "id"}
+                        },
+                        "execute_on": ["ios"],
+                    },
+                ]
+            )
+        finally:
+            runner.disconnect()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(actions, ["sleep", "click"])
+
     def test_retry_exhausted_keeps_last_attempt_error(self):
         runner = self._make_runner(click_failures_before_success=99)
         try:

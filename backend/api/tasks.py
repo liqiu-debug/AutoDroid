@@ -12,7 +12,18 @@ from sqlmodel import Session, col, func, select
 from datetime import datetime
 
 from backend.database import get_session
-from backend.models import ScheduledTask, TestScenario, User
+from backend.feature_flags import (
+    FLAG_MODEL_INSPECTION,
+    is_flag_enabled,
+)
+from backend.models import (
+    AppPackage,
+    Device,
+    InspectionProfile,
+    ScheduledTask,
+    TestScenario,
+    User,
+)
 from backend.schemas import (
     PaginatedScheduledTaskRead,
     ScheduledTaskCreate,
@@ -27,8 +38,98 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _task_type(config: dict) -> str:
+    value = str((config or {}).get("_task_type") or "ui").strip().lower()
+    if value not in {"ui", "fastbot", "inspection"}:
+        raise HTTPException(status_code=400, detail=f"不支持的定时任务类型: {value}")
+    return value
+
+
+def _validate_scheduled_target(
+    *,
+    session: Session,
+    scenario_id: Optional[int],
+    device_serials: List[str],
+    config: dict,
+) -> Optional[TestScenario]:
+    """Validate the target-specific part of a scheduled task.
+
+    Inspection schedules deliberately require one explicit Android device.  The
+    device is not reserved at schedule creation time; the execution-time atomic
+    lease remains the source of truth.
+    """
+    task_type = _task_type(config)
+    if task_type == "ui":
+        if scenario_id is None:
+            raise HTTPException(status_code=400, detail="UI 定时任务必须选择场景")
+        scenario = session.get(TestScenario, scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="场景不存在")
+        return scenario
+
+    if task_type == "inspection":
+        if not is_flag_enabled(session, FLAG_MODEL_INSPECTION):
+            raise HTTPException(
+                status_code=404,
+                detail="模型化智能巡检尚未启用（Feature Flag: model_inspection）",
+            )
+        if len(device_serials) != 1:
+            raise HTTPException(status_code=400, detail="巡检定时任务必须显式选择 1 台设备")
+        device = session.exec(
+            select(Device).where(Device.serial == device_serials[0])
+        ).first()
+        if device is None:
+            raise HTTPException(status_code=404, detail="巡检设备不存在")
+        if str(device.platform or "android").lower() != "android":
+            raise HTTPException(status_code=400, detail="智能巡检首期仅支持 Android")
+
+        try:
+            profile_id = int(config.get("inspection_profile_id") or 0)
+        except (TypeError, ValueError):
+            profile_id = 0
+        profile = session.get(InspectionProfile, profile_id) if profile_id else None
+        if profile is None:
+            raise HTTPException(status_code=404, detail="巡检配置不存在")
+
+        branches = list(config.get("inspection_branches") or ["guest", "authenticated"])
+        normalized = []
+        for item in branches:
+            key = str(item or "").strip().lower()
+            if key not in {"guest", "authenticated"}:
+                raise HTTPException(status_code=400, detail=f"不支持的巡检业务线: {key}")
+            if key not in normalized:
+                normalized.append(key)
+        if not normalized:
+            raise HTTPException(status_code=400, detail="巡检定时任务至少选择一条业务线")
+        missing = [key for key in normalized if key not in (profile.branches or {})]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"巡检配置缺少业务线: {', '.join(missing)}",
+            )
+        config["inspection_branches"] = normalized
+
+        package_id = config.get("inspection_package_id")
+        if package_id not in (None, ""):
+            try:
+                package = session.get(AppPackage, int(package_id))
+            except (TypeError, ValueError):
+                package = None
+            if package is None:
+                raise HTTPException(status_code=404, detail="巡检安装包不存在")
+            if str(package.platform or "android").lower() != "android":
+                raise HTTPException(status_code=400, detail="巡检安装包必须为 Android")
+            if package.package_name and package.package_name != profile.package_name:
+                raise HTTPException(status_code=400, detail="安装包包名与巡检配置不一致")
+        return None
+
+    # Fastbot validation stays backward compatible, while new UI always supplies
+    # an explicit device.
+    return None
+
+
 def _run_scheduled_scenario(task_id: int):
-    """调度器回调：根据任务类型执行 UI 场景或 Fastbot 探索"""
+    """调度器回调：根据任务类型执行 UI 场景、Fastbot 或模型化巡检。"""
     from backend.api.scenarios import (
         _summarize_precheck_failure,
         execute_scenario_batch_background,
@@ -59,7 +160,7 @@ def _run_scheduled_scenario(task_id: int):
                 config = json.loads(task.strategy_config)
             except (json.JSONDecodeError, TypeError):
                 config = {}
-        task_type = config.get("_task_type", "ui")
+        task_type = str(config.get("_task_type") or "ui").strip().lower()
         env_id = config.get("env_id")
 
         # UI 场景任务：执行前按设备做预检，过滤明显不可执行设备。
@@ -97,11 +198,24 @@ def _run_scheduled_scenario(task_id: int):
                         }
                     )
 
-    task_type = config.get("_task_type", "ui")
+    task_type = str(config.get("_task_type") or "ui").strip().lower()
 
     if task_type == "fastbot":
         fb_device_serial = device_serials[0] if device_serials else None
         _run_scheduled_fastbot(config, task_name, fb_device_serial, enable_notification)
+    elif task_type == "inspection":
+        if len(device_serials) != 1:
+            logger.error(
+                "[定时任务] 巡检任务 #%s 必须显式配置且只能配置 1 台设备",
+                task_id,
+            )
+            return
+        _run_scheduled_inspection(
+            config=config,
+            task_name=task_name,
+            device_serial=device_serials[0],
+            executor_id=task.user_id,
+        )
     else:
         if scenario_id is None:
             logger.error(f"[定时任务] UI 任务 #{task_id} 缺少 scenario_id")
@@ -189,6 +303,122 @@ def _run_scheduled_scenario(task_id: int):
                         )
             except Exception as e:
                 logger.error(f"[定时任务] 发送通知失败: {e}")
+
+
+def _run_scheduled_inspection(
+    *,
+    config: dict,
+    task_name: str,
+    device_serial: str,
+    executor_id: Optional[int],
+) -> Optional[int]:
+    """Create an immutable inspection run snapshot and execute it synchronously."""
+    from backend.database import engine
+    from backend.inspection.engine import execute_inspection_run
+    from backend.inspection.runtime import abort_event_for_run
+    from backend.models import InspectionBranchRun, InspectionRun
+    from sqlmodel import Session as SQLSession
+
+    with SQLSession(engine) as session:
+        if not is_flag_enabled(session, FLAG_MODEL_INSPECTION):
+            logger.error("[定时任务] 模型化智能巡检 Feature Flag 未开启")
+            return None
+        try:
+            profile_id = int(config.get("inspection_profile_id") or 0)
+        except (TypeError, ValueError):
+            profile_id = 0
+        profile = session.get(InspectionProfile, profile_id) if profile_id else None
+        device = session.exec(select(Device).where(Device.serial == device_serial)).first()
+        if profile is None or device is None:
+            logger.error(
+                "[定时任务] 巡检目标无效: profile=%s device=%s",
+                profile_id,
+                device_serial,
+            )
+            return None
+        if str(device.platform or "android").lower() != "android":
+            logger.error("[定时任务] 巡检设备不是 Android: %s", device_serial)
+            return None
+
+        selected_branches = []
+        for item in list(
+            config.get("inspection_branches") or ["guest", "authenticated"]
+        ):
+            key = str(item or "").strip().lower()
+            if key in {"guest", "authenticated"} and key not in selected_branches:
+                selected_branches.append(key)
+        selected_branches = [
+            key for key in selected_branches if key in (profile.branches or {})
+        ]
+        if not selected_branches:
+            logger.error("[定时任务] 巡检任务没有可执行业务线: profile=%s", profile_id)
+            return None
+
+        package_id = config.get("inspection_package_id")
+        try:
+            package_id = int(package_id) if package_id not in (None, "") else None
+        except (TypeError, ValueError):
+            logger.error("[定时任务] 巡检安装包 ID 非法: %r", package_id)
+            return None
+        if package_id is not None:
+            package = session.get(AppPackage, package_id)
+            if (
+                package is None
+                or str(package.platform or "android").lower() != "android"
+                or (
+                    package.package_name
+                    and package.package_name != profile.package_name
+                )
+            ):
+                logger.error("[定时任务] 巡检安装包与配置不匹配: %s", package_id)
+                return None
+
+        snapshot = {
+            "name": profile.name,
+            "package_name": profile.package_name,
+            "branches": profile.branches or {},
+            "input_rules": profile.input_rules or [],
+            "safety_rules": profile.safety_rules or [],
+            "sanitizer_rules": profile.sanitizer_rules or [],
+            "dynamic_text_patterns": profile.dynamic_text_patterns or [],
+            "budgets": profile.budgets or {},
+            "monitor_options": profile.monitor_options or {},
+            "selected_branches": selected_branches,
+            "graph_hierarchy_version": 2,
+        }
+        run = InspectionRun(
+            name=f"定时任务: {task_name}",
+            profile_id=profile.id,
+            package_name=profile.package_name,
+            package_id=package_id,
+            package_source="package" if package_id is not None else "installed",
+            profile_snapshot=snapshot,
+            device_serial=device_serial,
+            selected_branches=selected_branches,
+            status="PENDING",
+            current_stage="等待设备租约",
+            total_branches=len(selected_branches),
+            executor_id=executor_id,
+            executor_name=f"定时任务: {task_name}",
+        )
+        session.add(run)
+        session.flush()
+        for branch_key in selected_branches:
+            branch = dict((profile.branches or {}).get(branch_key) or {})
+            session.add(
+                InspectionBranchRun(
+                    run_id=run.id,
+                    branch_key=branch_key,
+                    branch_name=str(branch.get("name") or branch_key),
+                )
+            )
+        session.commit()
+        session.refresh(run)
+        run_id = int(run.id)
+
+    logger.info("[定时任务] 开始模型化巡检: task=%s run=%s", task_name, run_id)
+    execute_inspection_run(run_id, abort_event_for_run(run_id))
+    return run_id
 
 
 def _run_scheduled_fastbot(config: dict, task_name: str, device_serial: str, enable_notification: bool):
@@ -323,6 +553,32 @@ def _task_to_read(task: ScheduledTask, scenario_name: str = "") -> dict:
     }
 
 
+def _scheduled_target_name(
+    session: Session,
+    task: ScheduledTask,
+    config: Optional[dict] = None,
+) -> str:
+    if config is None:
+        try:
+            config = json.loads(task.strategy_config or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+    task_type = str((config or {}).get("_task_type") or "ui").strip().lower()
+    if task_type == "inspection":
+        profile_id = (config or {}).get("inspection_profile_id")
+        try:
+            profile = session.get(InspectionProfile, int(profile_id))
+        except (TypeError, ValueError):
+            profile = None
+        return f"模型化巡检 · {profile.name}" if profile else "模型化巡检"
+    if task_type == "fastbot":
+        return "智能探索"
+    if task.scenario_id is None:
+        return "未知场景"
+    scenario = session.get(TestScenario, task.scenario_id)
+    return scenario.name if scenario else "未知场景"
+
+
 @router.get("/", response_model=PaginatedScheduledTaskRead)
 def list_tasks(
     skip: int = 0,
@@ -352,11 +608,7 @@ def list_tasks(
 
     result = []
     for task in tasks:
-        scenario_name = "智能探索"
-        if task.scenario_id is not None:
-            scenario = session.get(TestScenario, task.scenario_id)
-            scenario_name = scenario.name if scenario else "未知场景"
-        result.append(_task_to_read(task, scenario_name))
+        result.append(_task_to_read(task, _scheduled_target_name(session, task)))
     return PaginatedScheduledTaskRead(total=total, items=result)
 
 
@@ -367,18 +619,25 @@ def create_task(
     current_user: User = Depends(deps.get_current_user),
 ):
     """创建定时任务"""
-    scenario = None
-    if data.scenario_id is not None:
-        scenario = session.get(TestScenario, data.scenario_id)
-        if not scenario:
-            raise HTTPException(status_code=404, detail="场景不存在")
+    config = dict(data.strategy_config or {})
+    device_serials = list(dict.fromkeys(
+        str(item or "").strip() for item in data.device_serials if str(item or "").strip()
+    ))
+    task_type = _task_type(config)
+    scenario = _validate_scheduled_target(
+        session=session,
+        scenario_id=data.scenario_id,
+        device_serials=device_serials,
+        config=config,
+    )
+    scenario_id = data.scenario_id if task_type == "ui" else None
 
     task = ScheduledTask(
         name=data.name,
-        scenario_id=data.scenario_id,
-        device_serial=",".join(data.device_serials) if data.device_serials else None,
+        scenario_id=scenario_id,
+        device_serial=",".join(device_serials) if device_serials else None,
         strategy=data.strategy.value,
-        strategy_config=json.dumps(data.strategy_config),
+        strategy_config=json.dumps(config),
         is_active=True,
         enable_notification=data.enable_notification,
         user_id=current_user.id,
@@ -393,14 +652,17 @@ def create_task(
     next_run = scheduler.add_task(
         task_id=task.id,
         strategy=task.strategy,
-        config=data.strategy_config,
+        config=config,
         job_func=_run_scheduled_scenario,
     )
     task.next_run_time = next_run
     session.add(task)
     session.commit()
 
-    return _task_to_read(task, scenario.name if scenario else "智能探索")
+    return _task_to_read(
+        task,
+        scenario.name if scenario else _scheduled_target_name(session, task, config),
+    )
 
 
 @router.put("/{task_id}", response_model=ScheduledTaskRead)
@@ -415,19 +677,46 @@ def update_task(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
+    try:
+        current_config = json.loads(task.strategy_config or "{}")
+    except (json.JSONDecodeError, TypeError):
+        current_config = {}
+    config = (
+        dict(data.strategy_config)
+        if data.strategy_config is not None
+        else dict(current_config)
+    )
+    if data.device_serials is not None:
+        device_serials = list(dict.fromkeys(
+            str(item or "").strip()
+            for item in data.device_serials
+            if str(item or "").strip()
+        ))
+    else:
+        device_serials = [
+            item.strip()
+            for item in (task.device_serial or "").split(",")
+            if item.strip()
+        ]
+    task_type = _task_type(config)
+    scenario_id = data.scenario_id if data.scenario_id is not None else task.scenario_id
+    if task_type != "ui":
+        scenario_id = None
+    scenario = _validate_scheduled_target(
+        session=session,
+        scenario_id=scenario_id,
+        device_serials=device_serials,
+        config=config,
+    )
+
     if data.name is not None:
         task.name = data.name
-    if data.scenario_id is not None:
-        scenario = session.get(TestScenario, data.scenario_id)
-        if not scenario:
-            raise HTTPException(status_code=404, detail="场景不存在")
-        task.scenario_id = data.scenario_id
+    task.scenario_id = scenario_id
     if data.device_serials is not None:
-        task.device_serial = ",".join(data.device_serials) if data.device_serials else None
+        task.device_serial = ",".join(device_serials) if device_serials else None
     if data.strategy is not None:
         task.strategy = data.strategy.value
-    if data.strategy_config is not None:
-        task.strategy_config = json.dumps(data.strategy_config)
+    task.strategy_config = json.dumps(config)
     if data.enable_notification is not None:
         task.enable_notification = data.enable_notification
 
@@ -450,11 +739,10 @@ def update_task(
         session.add(task)
         session.commit()
 
-    scenario_name = "智能探索"
-    if task.scenario_id is not None:
-        scenario = session.get(TestScenario, task.scenario_id)
-        scenario_name = scenario.name if scenario else "未知场景"
-    return _task_to_read(task, scenario_name)
+    return _task_to_read(
+        task,
+        scenario.name if scenario else _scheduled_target_name(session, task, config),
+    )
 
 
 @router.patch("/{task_id}/toggle", response_model=ScheduledTaskRead)
@@ -489,11 +777,7 @@ def toggle_task(
     session.commit()
     session.refresh(task)
 
-    scenario_name = "智能探索"
-    if task.scenario_id is not None:
-        scenario = session.get(TestScenario, task.scenario_id)
-        scenario_name = scenario.name if scenario else "未知场景"
-    return _task_to_read(task, scenario_name)
+    return _task_to_read(task, _scheduled_target_name(session, task))
 
 
 @router.delete("/{task_id}")

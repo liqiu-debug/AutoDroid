@@ -18,6 +18,8 @@
 | 中止执行（`POST /api/runs/cancel`） | ✅ | |
 | 查询报告 / 批次结果（`GET /api/reports/executions`） | ✅ | |
 | 查询设备（`GET /api/devices/`）、执行预检（`GET /api/scenarios/{id}/precheck`） | ✅ | |
+| 巡检配置 / 触发 / 查询 / 取消（`/api/inspections/*`） | ✅ | 继承属主业务权限；需启用 `model_inspection` |
+| 用巡检稳定路径创建兼容性任务（`POST /api/compatibility/runs`） | ✅ | `source_type=inspection` |
 | 用例 / 场景 / 任务等其他业务读写 | ✅ | 与属主账号权限一致 |
 | 管理接口（`/api/admin/*`） | ❌ 403 | 机器凭证禁止管理面 |
 | 修改密码（`PUT /api/auth/password`） | ❌ 403 | |
@@ -116,7 +118,100 @@ echo "== 回归通过 =="
 - **预检**（可选）：触发前可用 `GET /api/scenarios/{id}/precheck?device_serial=xxx` 与 `GET /api/devices/`（看 `status` 是否 `IDLE`）先挑选可用设备。
 - **中止**：`POST /api/runs/cancel`，body `{"kind": "scenario", "target_id": <场景ID>, "batch_id": "<批次>"}`，用于超时兜底。
 
-## 4. GitHub Actions 示例
+## 4. 模型化智能巡检（Android）
+
+巡检接口同样接受 API Token。它只支持显式指定一台 Android 设备，且服务器必须先开启
+`model_inspection` Feature Flag。Profile 中保存未登录、已登录两条业务线，用例和环境 ID
+由平台配置管理，CI 不应硬编码这些内部依赖。
+
+```bash
+PROFILE_ID="${INSPECTION_PROFILE_ID:?缺少巡检 Profile ID}"
+DEVICE_SERIAL="${INSPECTION_DEVICE_SERIAL:?缺少巡检设备}"
+PACKAGE_ID="${AUTODROID_PACKAGE_ID:-null}" # 可使用上传接口响应中的 .id
+
+run=$(curl -sf "${auth[@]}" -H "Content-Type: application/json" \
+  -d "{
+    \"profile_id\": $PROFILE_ID,
+    \"name\": \"CI 模型巡检 ${GIT_COMMIT:-manual}\",
+    \"device_serial\": \"$DEVICE_SERIAL\",
+    \"package_id\": $PACKAGE_ID,
+    \"branches\": [\"guest\", \"authenticated\"]
+  }" \
+  "$AUTODROID_URL/api/inspections/runs")
+inspection_run_id=$(echo "$run" | jq -r .id)
+
+deadline=$(( $(date +%s) + 2400 ))
+while true; do
+  result=$(curl -sf "${auth[@]}" \
+    "$AUTODROID_URL/api/inspections/runs/$inspection_run_id")
+  status=$(echo "$result" | jq -r .status)
+  case "$status" in
+    PASS|WARNING|FAIL|ERROR|ABORTED) break ;;
+  esac
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    curl -sf -X POST "${auth[@]}" \
+      "$AUTODROID_URL/api/inspections/runs/$inspection_run_id/cancel" >/dev/null
+    echo "巡检超时并已请求取消"
+    exit 1
+  fi
+  sleep 15
+done
+
+echo "$result" | jq '{
+  id, status, total_states, total_transitions, blocked_count, stable_count, fault_count
+}'
+# CI 默认将 WARNING（预算停止/覆盖盲区）视为通过；可按项目门禁改为仅 PASS。
+[ "$status" = PASS ] || [ "$status" = WARNING ]
+```
+
+巡检报告可通过 `GET /api/inspections/runs/{id}/graph` 查询拓扑。报告资产接口要求同一
+Authorization 头，不能把资产 URL 当作匿名静态链接。取消使用巡检自己的
+`POST /api/inspections/runs/{id}/cancel`，不要调用仅支持 case/scenario 的通用取消接口。
+
+新巡检任务会在不可变的 `profile_snapshot` 中记录 `graph_hierarchy_version=2`，graph
+顶层通过 `hierarchy_version` 返回该协议版本。v2 graph link 会返回 `relation_type`
+（`SELF`、`VIEWPORT`、`PEER`、`CHILD`）和 `relation_confidence`；node 的
+`hierarchy_role` 为 `BRANCH_ROOT`、`PEER`、`PAGE`、`VIEWPORT` 或 `ORPHAN`。
+`depth` / `parent_state_id` 表示业务展示层级，真实设备回放仍以 `first_path` 为准。
+历史任务缺少版本标记时按 v1 返回，`hierarchy_role` 固定为空并继续使用旧构树逻辑，
+不会根据新关系字段重新解释历史报告。
+
+Graph schema v5 增加页面子类型、Frontier 优先级、页面族代表覆盖率和 Coverage Contract
+统计。灰度环境可分别开启 `inspection_coverage_scheduler_v2` 与
+`inspection_visual_home_actions`；后者依赖前者。覆盖调度器按页面族代表和动作组采样，
+滚动只新增 `VIEWPORT` Observation，不创建新的业务 State。历史任务不会重算。
+
+上线真机前可用历史资产做只读离线验收：
+
+```bash
+.venv/bin/python scripts/maintenance/replay_inspection_coverage.py 22 --strict
+```
+
+严格模式会检查商品动作不超过 5、滚动动作不超过 25、viewport State 为 0，以及附近
+门店不重复执行全局导航。
+
+若要把已勾选的稳定状态作为兼容性基线，创建兼容性任务时传：
+
+```json
+{
+  "name": "CI 巡检快照回归",
+  "source_type": "inspection",
+  "inspection_run_id": 123,
+  "inspection_state_ids": [],
+  "compare_mode": "snapshot",
+  "old_package_id": null,
+  "new_package_id": 456,
+  "page_set_id": null,
+  "device_serials": ["emulator-5554"],
+  "mode": "upgrade",
+  "thresholds": {}
+}
+```
+
+空的 `inspection_state_ids` 表示使用该巡检任务中人工勾选的全部稳定状态。创建任务时，
+路径、规则及脱敏基线文件会复制进兼容性报告目录，因此后续巡检报告清理不会改变历史判定。
+
+## 5. GitHub Actions 示例
 
 将 Token 存为仓库 Secret `AUTODROID_TOKEN`，服务地址存为 `AUTODROID_URL`（或 Variables）。
 
@@ -150,7 +245,7 @@ jobs:
             "$SCENARIO_ID" "$DEVICE_SERIALS"
 ```
 
-## 5. Jenkins Pipeline 示例
+## 6. Jenkins Pipeline 示例
 
 将 Token 存为 Jenkins 凭据（Secret text，ID：`autodroid-token`）。
 
@@ -238,7 +333,7 @@ stages {
 - AutoDroid 不需要、也不会保存蒲公英 API Key；两个密钥分别保存在 Jenkins Credentials 中。
 - 若反向代理限制大文件请求，IPA 上传改用上文的 20 MiB 分片接口，不要从蒲公英页面抓取临时下载地址。
 
-## 6. 安全建议
+## 7. 安全建议
 
 - **只放密钥管理**：Token 必须存入 CI 的密钥管理（Credentials / Secrets / Variables），严禁写入代码仓库、日志或构建产物。
 - **一系统一 Token**：为每个 CI 系统 / 用途创建独立 Token，便于按名称与前缀（列表页展示前 12 位）审计，泄露时可精准吊销、影响面最小。

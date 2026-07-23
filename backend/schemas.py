@@ -1,5 +1,6 @@
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 from enum import Enum
+import re
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.utils.variable_render import normalize_variable_placeholders
@@ -606,10 +607,21 @@ class PaginatedAppPackageRead(BaseModel):
 
 class CompatPageDefinition(BaseModel):
     name: str
-    case_id: int
+    case_id: Optional[int] = None
     settle_seconds: int = Field(default=2, ge=0, le=60)
     required_text: Optional[str] = None
     key: Optional[str] = None
+    inspection_state_id: Optional[int] = None
+    inspection_path: List[Dict[str, Any]] = Field(default_factory=list)
+    branch_key: Optional[str] = None
+    branch_config: Optional[Dict[str, Any]] = None
+    input_rules: List[Dict[str, Any]] = Field(default_factory=list)
+    sanitizer_rules: List[Dict[str, Any]] = Field(default_factory=list)
+    dynamic_text_patterns: List[str] = Field(default_factory=list)
+    stable_wait_seconds: float = 5.0
+    baseline_screenshot_path: Optional[str] = None
+    baseline_xml_path: Optional[str] = None
+    baseline_activity: Optional[str] = None
 
     @field_validator("name", mode="before")
     @classmethod
@@ -654,17 +666,860 @@ class CompatibilityThresholds(BaseModel):
     xml_diff_ratio_warn: float = Field(default=0.35, ge=0, le=1)
 
 
+class CompatibilityReplayChainRead(BaseModel):
+    chain_id: str
+    path_key: str
+    name: str
+    endpoint_state_id: int
+    source_observation_id: Optional[int] = None
+    display_index: Optional[int] = None
+    display_label: Optional[str] = None
+    page_name: Optional[str] = None
+    source_observation_index: Optional[int] = None
+    evidence_level: str
+    reachability_evidence: str = ""
+    replay_eligibility: str = ""
+    replay_scope: str = ""
+    terminal_outcome: str = "NONE"
+    boundary_evidence: str = "NOT_APPLICABLE"
+    prefix_path_key: Optional[str] = None
+    source_path_keys: List[str] = Field(default_factory=list)
+    terminal_boundaries: List[Dict[str, Any]] = Field(default_factory=list)
+    first_path: List[Dict[str, Any]] = Field(default_factory=list)
+    checkpoints: List[Dict[str, Any]] = Field(default_factory=list)
+    covered_roles: List[str] = Field(default_factory=list)
+    covered_subtypes: List[str] = Field(default_factory=list)
+    covered_family_ids: List[int] = Field(default_factory=list)
+    covered_family_keys: List[str] = Field(default_factory=list)
+    depth: int = 0
+
+    @model_validator(mode="after")
+    def fill_replay_v2_aliases(self):
+        if not self.reachability_evidence:
+            self.reachability_evidence = self.evidence_level
+        if not self.replay_scope:
+            self.replay_scope = {
+                "FULL": "FULL_PATH",
+                "SAFE_PREFIX": "PREFIX_TO_SAFETY_BOUNDARY",
+            }.get(str(self.replay_eligibility or "").upper(), "FULL_PATH")
+        if not self.replay_eligibility:
+            self.replay_eligibility = {
+                "FULL_PATH": "FULL",
+                "PREFIX_TO_SAFETY_BOUNDARY": "SAFE_PREFIX",
+            }.get(str(self.replay_scope or "").upper(), "NONE")
+        if self.terminal_outcome == "NONE" and self.terminal_boundaries:
+            outcomes = {
+                str(item.get("terminal_outcome") or "NONE").upper()
+                for item in self.terminal_boundaries
+            }
+            for outcome in (
+                "APP_FAULT",
+                "INFRA_FAULT",
+                "AUTOMATION_FAILED",
+                "LOCATOR_FAILED",
+                "SAFETY_BLOCKED",
+                "BUDGET_STOP",
+                "CANCELLED",
+            ):
+                if outcome in outcomes:
+                    self.terminal_outcome = outcome
+                    break
+        if not self.prefix_path_key:
+            self.prefix_path_key = self.path_key
+        return self
+
+
+class CompatibilityReplayIssue(BaseModel):
+    code: str
+    message: str
+
+
+class CompatibilityPackageSnapshot(BaseModel):
+    package_name: str = ""
+    version_name: Optional[str] = None
+    version_code: Optional[str] = None
+    first_install_time: Optional[str] = None
+    last_update_time: Optional[str] = None
+    signing_digest: Optional[str] = None
+    installed: bool = False
+    known: bool = False
+    source: Optional[str] = None
+    captured_at: Any = None
+
+
+class CompatibilityReplayPreflightRequest(BaseModel):
+    inspection_run_id: int = Field(gt=0)
+    branch_key: str
+    device_serial: str
+    max_chains: int = Field(default=20, ge=1, le=20)
+
+    @field_validator("branch_key", "device_serial", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value, info):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError(f"{info.field_name} must not be empty")
+        return text
+
+
+class CompatibilityReplayPreflightRead(BaseModel):
+    execution_mode: str = "installed_replay"
+    inspection_run_id: int
+    branch_key: str
+    package_name: str
+    source_package: CompatibilityPackageSnapshot
+    installed_package: CompatibilityPackageSnapshot
+    blockers: List[CompatibilityReplayIssue] = Field(default_factory=list)
+    warnings: List[CompatibilityReplayIssue] = Field(default_factory=list)
+    plan_digest: str = ""
+    device_snapshot_digest: str = ""
+    plan_version: int = 3
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    chains: List[CompatibilityReplayChainRead] = Field(default_factory=list)
+    available_prefixes: List[str] = Field(default_factory=list)
+    excluded: Any = Field(default_factory=dict)
+
+
+# ---- Model-based Android Inspection Schemas ----
+
+
+class InspectionReadyAssertion(BaseModel):
+    selector: str
+    by: str
+    timeout: int = Field(default=5, ge=1, le=60)
+
+    @field_validator("selector", mode="before")
+    @classmethod
+    def normalize_selector(cls, value):
+        selector = str(value or "").strip()
+        if not selector:
+            raise ValueError("ready assertion selector must not be empty")
+        return selector
+
+    @field_validator("by", mode="before")
+    @classmethod
+    def normalize_by(cls, value):
+        by = str(value or "").strip().lower()
+        if by not in {"description", "text", "xpath"}:
+            raise ValueError("ready assertion by must be description, text or xpath")
+        return by
+
+
+class InspectionBranchConfig(BaseModel):
+    name: str
+    prepare_case_id: int = Field(gt=0)
+    entry_case_id: int = Field(gt=0)
+    env_id: Optional[int] = None
+    ready_assertion: InspectionReadyAssertion
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        name = str(value or "").strip()
+        if not name:
+            raise ValueError("branch name must not be empty")
+        return name
+
+
+class InspectionInputRule(BaseModel):
+    id: str
+    content_desc_regex: Optional[str] = None
+    text_regex: Optional[str] = None
+    class_regex: Optional[str] = None
+    ancestor_regex: Optional[str] = None
+    value_source: str = "literal"
+    value: Optional[str] = None
+    variable_key: Optional[str] = None
+    allow_sensitive: bool = False
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def normalize_id(cls, value):
+        item_id = str(value or "").strip()
+        if not item_id:
+            raise ValueError("input rule id must not be empty")
+        return item_id
+
+    @field_validator("value_source", mode="before")
+    @classmethod
+    def normalize_source(cls, value):
+        source = str(value or "literal").strip().lower()
+        if source not in {"literal", "environment"}:
+            raise ValueError("value_source must be literal or environment")
+        return source
+
+    @model_validator(mode="after")
+    def validate_matcher_and_value(self):
+        patterns = [
+            self.content_desc_regex,
+            self.text_regex,
+            self.class_regex,
+            self.ancestor_regex,
+        ]
+        if not any(patterns):
+            raise ValueError("input rule requires at least one matcher")
+        for pattern in patterns:
+            if not pattern:
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid input rule regex: {pattern}: {exc}") from exc
+        if self.value_source == "literal" and self.value is None:
+            raise ValueError("literal input rule requires value")
+        if self.value_source == "environment" and not str(self.variable_key or "").strip():
+            raise ValueError("environment input rule requires variable_key")
+        return self
+
+
+class InspectionSafetyRule(BaseModel):
+    id: str
+    pattern: str
+    risk_type: str = "CUSTOM"
+    # Allow rules primarily admit system/permission surfaces. They can also
+    # identify a specific unlabeled target that is otherwise conservatively
+    # blocked by dangerous page context. Labeled destructive/payment targets
+    # remain hard stops because their direct match is evaluated first.
+    allow: bool = False
+
+    @model_validator(mode="after")
+    def validate_rule(self):
+        self.id = str(self.id or "").strip()
+        self.pattern = str(self.pattern or "").strip()
+        if not self.id or not self.pattern:
+            raise ValueError("safety rule id and pattern must not be empty")
+        try:
+            re.compile(self.pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"invalid safety rule regex: {self.pattern}: {exc}"
+            ) from exc
+        return self
+
+
+class InspectionSanitizerRule(BaseModel):
+    id: str
+    content_desc_regex: Optional[str] = None
+    text_regex: Optional[str] = None
+    class_regex: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_rule(self):
+        self.id = str(self.id or "").strip()
+        patterns = [
+            self.content_desc_regex,
+            self.text_regex,
+            self.class_regex,
+        ]
+        if not self.id:
+            raise ValueError("sanitizer rule id must not be empty")
+        if not any(patterns):
+            raise ValueError("sanitizer rule requires at least one matcher")
+        for pattern in patterns:
+            if not pattern:
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f"invalid sanitizer rule regex: {pattern}: {exc}"
+                ) from exc
+        return self
+
+
+class InspectionBudgets(BaseModel):
+    duration_seconds: int = Field(default=1800, ge=30, le=3600)
+    max_states: int = Field(default=200, ge=1, le=5000)
+    max_device_actions: int = Field(default=800, ge=1, le=50000)
+    max_actions: Optional[int] = Field(default=None, ge=1, le=50000)
+    max_depth: int = Field(default=12, ge=1, le=100)
+    max_scrolls_per_direction: int = Field(default=3, ge=0, le=20)
+    # Shared across all scrollable surfaces during a coverage-scheduler run.
+    # Large commerce apps need a higher ceiling than the historical hard-coded
+    # value of 25, while per-container repetitions remain bounded above.
+    max_coverage_scroll_actions: int = Field(default=50, ge=0, le=1000)
+    max_variants_per_cluster: int = Field(default=5, ge=1, le=50)
+    no_new_coverage_limit: int = Field(default=100, ge=1, le=5000)
+    no_new_state_limit: Optional[int] = Field(default=None, ge=1, le=5000)
+    max_observations: int = Field(default=400, ge=1, le=100000)
+    max_artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024 * 1024)
+    stable_wait_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+
+    @model_validator(mode="after")
+    def normalize_legacy_names(self):
+        fields_set = getattr(self, "model_fields_set", set())
+        if "max_actions" in fields_set and "max_device_actions" not in fields_set:
+            self.max_device_actions = int(self.max_actions)
+        if "no_new_state_limit" in fields_set and "no_new_coverage_limit" not in fields_set:
+            self.no_new_coverage_limit = int(self.no_new_state_limit)
+        # Keep serialized profile snapshots readable by one older release.
+        self.max_actions = self.max_device_actions
+        self.no_new_state_limit = self.no_new_coverage_limit
+        return self
+
+
+class InspectionMonitorOptions(BaseModel):
+    enable_performance_monitor: bool = True
+    enable_jank_frame_monitor: bool = False
+    enable_perfetto_trace: bool = False
+    enable_local_replay: bool = True
+    capture_log: bool = True
+
+
+class InspectionProfileCreate(BaseModel):
+    name: str
+    package_name: str
+    branches: Dict[str, InspectionBranchConfig]
+    input_rules: List[InspectionInputRule] = Field(default_factory=list)
+    safety_rules: List[InspectionSafetyRule] = Field(default_factory=list)
+    sanitizer_rules: List[InspectionSanitizerRule] = Field(default_factory=list)
+    dynamic_text_patterns: List[str] = Field(default_factory=list)
+    budgets: InspectionBudgets = Field(default_factory=InspectionBudgets)
+    monitor_options: InspectionMonitorOptions = Field(default_factory=InspectionMonitorOptions)
+
+    @field_validator("name", "package_name", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("value must not be empty")
+        return text
+
+    @model_validator(mode="after")
+    def validate_branches(self):
+        required = {"guest", "authenticated"}
+        if set(self.branches.keys()) != required:
+            raise ValueError("branches must contain exactly guest and authenticated")
+        for label, rules in (
+            ("input_rules", self.input_rules),
+            ("safety_rules", self.safety_rules),
+            ("sanitizer_rules", self.sanitizer_rules),
+        ):
+            ids = [str(item.id) for item in rules]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"{label} contains duplicate rule ids")
+        return self
+
+    @field_validator("dynamic_text_patterns", mode="before")
+    @classmethod
+    def normalize_dynamic_patterns(cls, value):
+        result = []
+        for item in list(value or []):
+            pattern = str(item or "").strip()
+            if not pattern:
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid dynamic text regex: {pattern}: {exc}") from exc
+            if pattern not in result:
+                result.append(pattern)
+        return result
+
+
+class InspectionProfileUpdate(InspectionProfileCreate):
+    pass
+
+
+class InspectionProfileRead(InspectionProfileCreate):
+    id: int
+    user_id: Optional[int] = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionRunCreate(BaseModel):
+    profile_id: int = Field(gt=0)
+    name: Optional[str] = None
+    device_serial: str
+    package_id: Optional[int] = None
+    branches: List[str] = Field(default_factory=lambda: ["guest", "authenticated"])
+    duration_seconds: Optional[int] = Field(default=None, ge=300, le=3600)
+
+    @field_validator("device_serial", mode="before")
+    @classmethod
+    def normalize_serial(cls, value):
+        serial = str(value or "").strip()
+        if not serial:
+            raise ValueError("device_serial must not be empty")
+        return serial
+
+    @field_validator("branches", mode="before")
+    @classmethod
+    def normalize_branches(cls, value):
+        source = list(value or ["guest", "authenticated"])
+        result = []
+        for item in source:
+            key = str(item or "").strip().lower()
+            if key not in {"guest", "authenticated"}:
+                raise ValueError(f"unsupported inspection branch: {key}")
+            if key not in result:
+                result.append(key)
+        if not result:
+            raise ValueError("branches must not be empty")
+        return result
+
+
+class InspectionSelectionUpdate(BaseModel):
+    state_ids: List[int] = Field(default_factory=list)
+    observation_ids: List[int] = Field(default_factory=list)
+
+    @field_validator("state_ids", "observation_ids", mode="before")
+    @classmethod
+    def normalize_ids(cls, value, info):
+        result = []
+        for item in list(value or []):
+            item_id = int(item)
+            if item_id <= 0:
+                raise ValueError(f"{info.field_name} must contain positive ids")
+            if item_id not in result:
+                result.append(item_id)
+        return result
+
+
+class InspectionRepresentativeUpdate(BaseModel):
+    observation_id: int = Field(gt=0)
+
+
+class InspectionPageTemplateRead(BaseModel):
+    id: int
+    package_name: str
+    activity: Optional[str] = None
+    activity_family: Optional[str] = None
+    page_role: str = "UNKNOWN"
+    is_modal: bool = False
+    fingerprint_version: int = 1
+    template_key: str
+    structure_signature: List[str] = Field(default_factory=list)
+    action_signature: List[str] = Field(default_factory=list)
+    anchor_signature: List[str] = Field(default_factory=list)
+    control_state_signature: List[str] = Field(default_factory=list)
+    risk_signature: List[str] = Field(default_factory=list)
+    observation_count: int = 0
+    first_seen_at: Any
+    last_seen_at: Any = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class StoredAssetRead(BaseModel):
+    id: str
+    logical_sha256: str
+    blob_sha256: str
+    media_type: str = "application/octet-stream"
+    encoding: Optional[str] = None
+    content_encoding: Optional[str] = None
+    storage_key: str
+    byte_size: int = 0
+    width: Optional[int] = None
+    height: Optional[int] = None
+    original_width: Optional[int] = None
+    original_height: Optional[int] = None
+    scale: float = 1.0
+    status: str = "ACTIVE"
+    integrity_status: str = "VERIFIED"
+    last_verified_at: Any = None
+    orphaned_at: Any = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class AssetReferenceRead(BaseModel):
+    id: int
+    asset_id: str
+    owner_type: str
+    owner_id: int
+    role: str
+    retention_class: str = "HOT"
+    expires_at: Any = None
+    pinned_reason: Optional[str] = None
+    released_at: Any = None
+    grace_until: Any = None
+    created_at: Any
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionObservationRead(BaseModel):
+    id: int
+    run_id: int
+    branch_run_id: int
+    state_id: int
+    template_id: Optional[int] = None
+    transition_id: Optional[int] = None
+    sequence: int = 0
+    capture_kind: str = "DISCOVERY"
+    package_name: Optional[str] = None
+    activity: Optional[str] = None
+    exact_cluster_key: str = ""
+    exact_replay_key: str = ""
+    exact_state_key: str = ""
+    screenshot_sha: Optional[str] = None
+    screenshot_phash: Optional[str] = None
+    perceptual_hash: Optional[str] = None
+    stable_by: Optional[str] = None
+    screenshot_asset_id: Optional[str] = None
+    xml_asset_id: Optional[str] = None
+    thumbnail_asset_id: Optional[str] = None
+    action_map_asset_id: Optional[str] = None
+    asset_status: str = "AVAILABLE"
+    is_representative: bool = False
+    retention_class: str = "HOT"
+    retained_until: Any = None
+    original_width: Optional[int] = None
+    original_height: Optional[int] = None
+    match_confidence: Optional[float] = None
+    match_evidence: Dict[str, Any] = Field(default_factory=dict)
+    metadata_only: bool = False
+    captured_at: Any
+    created_at: Any
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedInspectionObservationRead(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: List[InspectionObservationRead] = Field(default_factory=list)
+
+
+class InspectionReplayPathRead(CompatibilityReplayChainRead):
+    branch_key: str
+    branch_name: Optional[str] = None
+
+
+class PaginatedInspectionReplayPathRead(BaseModel):
+    schema_version: int = 3
+    run_id: int
+    branch_key: Optional[str] = None
+    total: int
+    page: int
+    page_size: int
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    items: List[InspectionReplayPathRead] = Field(default_factory=list)
+
+
+class InspectionStateRead(BaseModel):
+    id: int
+    display_index: Optional[int] = None
+    display_label: Optional[str] = None
+    page_title: Optional[str] = None
+    run_id: int
+    branch_run_id: int
+    branch_key: str
+    cluster_key: str
+    state_key: str
+    template_id: Optional[int] = None
+    semantic_key: Optional[str] = None
+    identity_version: int = 1
+    instance_anchor: Optional[str] = None
+    exploration_family_id: Optional[int] = None
+    family_match_confidence: Optional[float] = None
+    family_match_evidence: Dict[str, Any] = Field(default_factory=dict)
+    exploration_mode: str = "INDEPENDENT"
+    page_subtype: str = "UNKNOWN"
+    coverage_status: str = "DISCOVERED"
+    frontier_priority: int = 700
+    frontier_reason: Optional[str] = None
+    expansion_status: str = "DISCOVERED"
+    pending_action_count: int = 0
+    last_action_cursor: Optional[int] = None
+    recovery_retry_count: int = 0
+    expansion_completed_at: Any = None
+    representative_observation_id: Optional[int] = None
+    observation_count: int = 0
+    last_observed_at: Any = None
+    queued_at: Any = None
+    expanded_at: Any = None
+    activity: Optional[str] = None
+    foreground_package: Optional[str] = None
+    depth: int = 0
+    parent_state_id: Optional[int] = None
+    incoming_transition_id: Optional[int] = None
+    screenshot_path: Optional[str] = None
+    thumbnail_path: Optional[str] = None
+    xml_path: Optional[str] = None
+    screenshot_sha: Optional[str] = None
+    perceptual_hash: Optional[str] = None
+    stable_status: str = "UNVERIFIED"
+    reachability_evidence: str = "UNKNOWN"
+    replay_scope: str = "NONE"
+    replay_eligibility: str = "NONE"
+    terminal_outcome: str = "NONE"
+    boundary_evidence: List[str] = Field(default_factory=list)
+    terminal_boundaries: List[Dict[str, Any]] = Field(default_factory=list)
+    action_summary: Dict[str, Any] = Field(default_factory=dict)
+    selected_for_regression: bool = False
+    locator_quality: str = "UNKNOWN"
+    is_dynamic: bool = False
+    is_opaque: bool = False
+    visit_count: int = 1
+    first_path: List[Dict[str, Any]] = Field(default_factory=list)
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionTransitionRead(BaseModel):
+    id: int
+    run_id: int
+    branch_run_id: int
+    from_state_id: int
+    to_state_id: Optional[int] = None
+    sequence: int = 0
+    action_type: str
+    action_key: str
+    locator_candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    target_meta: Dict[str, Any] = Field(default_factory=dict)
+    relation_type: Optional[str] = None
+    relation_confidence: Optional[float] = None
+    topology_type: Optional[str] = None
+    action_role_key: Optional[str] = None
+    action_role: Optional[str] = None
+    execution_disposition: str = "EXECUTED"
+    failure_type: Optional[str] = None
+    coverage_source_transition_id: Optional[int] = None
+    coverage_contract_id: Optional[int] = None
+    action_group_key: Optional[str] = None
+    sampling_disposition: Optional[str] = None
+    visual_locator_evidence: Dict[str, Any] = Field(default_factory=dict)
+    recovery_attempt_count: int = 0
+    source_observation_id: Optional[int] = None
+    target_observation_id: Optional[int] = None
+    traversal_count: int = 1
+    target_was_existing: bool = False
+    status: str
+    risk_type: Optional[str] = None
+    reason: Optional[str] = None
+    coordinate_only: bool = False
+    replayable: bool = True
+    duration_ms: float = 0.0
+    input_rule_id: Optional[str] = None
+    input_variable_key: Optional[str] = None
+    input_length: Optional[int] = None
+    error_message: Optional[str] = None
+    created_at: Any
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionFaultRead(BaseModel):
+    id: int
+    run_id: int
+    branch_run_id: Optional[int] = None
+    state_id: Optional[int] = None
+    transition_id: Optional[int] = None
+    fault_type: str
+    signature: str
+    summary: Optional[str] = None
+    full_log_path: Optional[str] = None
+    screenshot_path: Optional[str] = None
+    xml_path: Optional[str] = None
+    replay_path: Optional[str] = None
+    trace_path: Optional[str] = None
+    full_log_asset_id: Optional[str] = None
+    screenshot_asset_id: Optional[str] = None
+    xml_asset_id: Optional[str] = None
+    replay_asset_id: Optional[str] = None
+    trace_asset_id: Optional[str] = None
+    details: Dict[str, Any] = Field(default_factory=dict)
+    occurrence_count: int = 1
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionBranchRunRead(BaseModel):
+    id: int
+    run_id: int
+    branch_key: str
+    branch_name: str
+    status: str
+    current_stage: Optional[str] = None
+    phase: Optional[str] = None
+    frontier: Dict[str, int] = Field(default_factory=dict)
+    root_state_id: Optional[int] = None
+    stop_reason: Optional[str] = None
+    state_count: int = 0
+    transition_count: int = 0
+    blocked_count: int = 0
+    stable_count: int = 0
+    fault_count: int = 0
+    error_message: Optional[str] = None
+    started_at: Any = None
+    finished_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionRunRead(BaseModel):
+    id: int
+    name: str
+    profile_id: Optional[int] = None
+    package_name: str
+    package_id: Optional[int] = None
+    package_source: str = "installed"
+    profile_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    device_serial: str
+    selected_branches: List[str] = Field(default_factory=list)
+    status: str
+    current_stage: Optional[str] = None
+    phase: Optional[str] = None
+    frontier: Dict[str, int] = Field(default_factory=dict)
+    effective_features: Dict[str, bool] = Field(default_factory=dict)
+    stop_reason: Optional[str] = None
+    total_branches: int = 0
+    total_clusters: int = 0
+    total_states: int = 0
+    total_transitions: int = 0
+    blocked_count: int = 0
+    stable_count: int = 0
+    fault_count: int = 0
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    summary_available: bool = False
+    summary_unavailable_reason: Optional[str] = None
+    replay_source_eligible: bool = False
+    replay_source_reason: Optional[str] = None
+    last_active_state_id: Optional[int] = None
+    last_observation_id: Optional[int] = None
+    error_message: Optional[str] = None
+    executor_name: Optional[str] = None
+    created_at: Any
+    started_at: Any = None
+    finished_at: Any = None
+    branches: List[InspectionBranchRunRead] = Field(default_factory=list)
+    faults: List[InspectionFaultRead] = Field(default_factory=list)
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedInspectionRunRead(BaseModel):
+    total: int
+    items: List[InspectionRunRead]
+
+
+class InspectionFamilyActionCoverageRead(BaseModel):
+    id: int
+    family_id: int
+    action_role_key: str
+    action_role: Optional[str] = None
+    status: str = "PENDING"
+    source_state_id: Optional[int] = None
+    source_transition_id: Optional[int] = None
+    attempt_count: int = 0
+    max_attempts: int = 2
+    last_error: Optional[str] = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionCoverageContractRead(BaseModel):
+    id: int
+    run_id: int
+    branch_run_id: int
+    contract_key: str
+    scope: str = "FAMILY_ACTION"
+    source_family_id: Optional[int] = None
+    source_page_subtype: str = "UNKNOWN"
+    action_group_key: str
+    action_role: Optional[str] = None
+    target_family_id: Optional[int] = None
+    target_page_role: Optional[str] = None
+    status: str = "PENDING"
+    required_samples: int = 2
+    success_count: int = 0
+    failure_count: int = 0
+    source_instance_anchors: List[str] = Field(default_factory=list)
+    sample_transition_ids: List[int] = Field(default_factory=list)
+    risk_signature: Optional[str] = None
+    control_signature: Optional[str] = None
+    last_error: Optional[str] = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionExplorationFamilyRead(BaseModel):
+    id: int
+    run_id: int
+    branch_run_id: int
+    family_key: str
+    fingerprint_version: int = 1
+    page_role: str = "UNKNOWN"
+    activity_family: Optional[str] = None
+    representative_state_id: Optional[int] = None
+    signature: Dict[str, Any] = Field(default_factory=dict)
+    member_count: int = 0
+    frontier: Dict[str, int] = Field(default_factory=dict)
+    action_coverage: List[InspectionFamilyActionCoverageRead] = Field(
+        default_factory=list
+    )
+    coverage_contracts: List[InspectionCoverageContractRead] = Field(
+        default_factory=list
+    )
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+
+class InspectionExplorationFamilyListRead(BaseModel):
+    schema_version: int = 8
+    run_id: int
+    phase: Optional[str] = None
+    frontier: Dict[str, int] = Field(default_factory=dict)
+    effective_features: Dict[str, bool] = Field(default_factory=dict)
+    items: List[InspectionExplorationFamilyRead] = Field(default_factory=list)
+
+
 class CompatibilityRunCreate(BaseModel):
     name: str
+    execution_mode: str = "comparison"
     old_package_id: Optional[int] = None
-    new_package_id: int
-    page_set_id: int
+    new_package_id: Optional[int] = None
+    page_set_id: Optional[int] = None
+    source_type: str = "page_set"
+    inspection_run_id: Optional[int] = None
+    inspection_state_ids: List[int] = Field(default_factory=list)
+    inspection_observation_ids: List[int] = Field(default_factory=list)
+    replay_branch_key: Optional[str] = None
+    selected_chain_ids: List[str] = Field(default_factory=list)
+    selected_path_ids: List[str] = Field(default_factory=list)
+    plan_digest: Optional[str] = None
+    device_snapshot_digest: Optional[str] = None
+    manual_install_confirmed: bool = False
+    duration_seconds: Optional[int] = Field(default=None, ge=300, le=3600)
     device_serials: List[str]
-    compare_mode: str = "version"
+    compare_mode: Optional[str] = None
     baseline_device_serial: Optional[str] = None
-    mode: str = "upgrade"
+    mode: Optional[str] = None
     env_id: Optional[int] = None
-    thresholds: CompatibilityThresholds = Field(default_factory=CompatibilityThresholds)
+    thresholds: Optional[CompatibilityThresholds] = None
 
     @field_validator("name", mode="before")
     @classmethod
@@ -674,10 +1529,20 @@ class CompatibilityRunCreate(BaseModel):
             raise ValueError("run name must not be empty")
         return text
 
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def normalize_execution_mode(cls, value):
+        mode = str(value or "comparison").strip().lower()
+        if mode not in {"comparison", "installed_replay"}:
+            raise ValueError("execution_mode must be comparison or installed_replay")
+        return mode
+
     @field_validator("mode", mode="before")
     @classmethod
     def normalize_mode(cls, value):
-        mode = str(value or "upgrade").strip().lower()
+        if value is None:
+            return None
+        mode = str(value).strip().lower()
         if mode not in {"upgrade", "clean"}:
             raise ValueError("mode must be upgrade or clean")
         return mode
@@ -685,10 +1550,59 @@ class CompatibilityRunCreate(BaseModel):
     @field_validator("compare_mode", mode="before")
     @classmethod
     def normalize_compare_mode(cls, value):
-        mode = str(value or "version").strip().lower()
-        if mode not in {"version", "device"}:
-            raise ValueError("compare_mode must be version or device")
+        if value is None:
+            return None
+        mode = str(value).strip().lower()
+        if mode not in {"snapshot", "version", "device"}:
+            raise ValueError("compare_mode must be snapshot, version or device")
         return mode
+
+    @field_validator("source_type", mode="before")
+    @classmethod
+    def normalize_source_type(cls, value):
+        source_type = str(value or "page_set").strip().lower()
+        if source_type not in {"page_set", "inspection"}:
+            raise ValueError("source_type must be page_set or inspection")
+        return source_type
+
+    @field_validator(
+        "inspection_state_ids",
+        "inspection_observation_ids",
+        mode="before",
+    )
+    @classmethod
+    def normalize_inspection_ids(cls, value, info):
+        result = []
+        for item in list(value or []):
+            item_id = int(item)
+            if item_id <= 0:
+                raise ValueError(f"{info.field_name} must contain positive ids")
+            if item_id not in result:
+                result.append(item_id)
+        return result
+
+    @field_validator("selected_chain_ids", "selected_path_ids", mode="before")
+    @classmethod
+    def normalize_chain_ids(cls, value):
+        result = []
+        for item in list(value or []):
+            chain_id = str(item or "").strip()
+            if not chain_id:
+                raise ValueError("selected_chain_ids must not contain blanks")
+            if chain_id not in result:
+                result.append(chain_id)
+        return result
+
+    @field_validator(
+        "replay_branch_key",
+        "plan_digest",
+        "device_snapshot_digest",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value):
+        text = str(value or "").strip()
+        return text or None
 
     @field_validator("baseline_device_serial", mode="before")
     @classmethod
@@ -713,6 +1627,70 @@ class CompatibilityRunCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_device_compare_mode(self):
+        if self.execution_mode == "installed_replay":
+            self.source_type = "inspection"
+            self.page_set_id = None
+            if self.inspection_run_id is None:
+                raise ValueError("installed replay requires inspection_run_id")
+            if not self.replay_branch_key:
+                raise ValueError("installed replay requires replay_branch_key")
+            if len(self.device_serials) != 1:
+                raise ValueError("installed replay requires exactly one device")
+            if not self.selected_chain_ids and not self.selected_path_ids:
+                raise ValueError(
+                    "installed replay requires selected_path_ids or selected_chain_ids"
+                )
+            if not self.plan_digest:
+                raise ValueError("installed replay requires plan_digest")
+            if not self.device_snapshot_digest:
+                raise ValueError("installed replay requires device_snapshot_digest")
+            if not self.manual_install_confirmed:
+                raise ValueError("installed replay requires manual_install_confirmed=true")
+            self.duration_seconds = self.duration_seconds or 3600
+            if self.old_package_id is not None or self.new_package_id is not None:
+                raise ValueError("installed replay does not accept APK package ids")
+            if self.compare_mode is not None or self.mode is not None:
+                raise ValueError("installed replay does not accept compare_mode or mode")
+            if self.thresholds is not None:
+                raise ValueError("installed replay does not accept comparison thresholds")
+            if self.inspection_state_ids or self.inspection_observation_ids:
+                raise ValueError("installed replay selects frozen chains, not states")
+            self.baseline_device_serial = None
+            return self
+
+        self.compare_mode = self.compare_mode or "version"
+        self.mode = self.mode or "upgrade"
+        self.thresholds = self.thresholds or CompatibilityThresholds()
+        if self.selected_chain_ids or self.selected_path_ids:
+            raise ValueError("comparison does not accept replay path ids")
+        if self.duration_seconds is not None:
+            raise ValueError("comparison does not accept duration_seconds")
+        if self.new_package_id is None:
+            raise ValueError("comparison requires new_package_id")
+        if self.source_type == "page_set":
+            if self.page_set_id is None:
+                raise ValueError("page_set source requires page_set_id")
+            if (
+                self.inspection_run_id is not None
+                or self.inspection_state_ids
+                or self.inspection_observation_ids
+            ):
+                raise ValueError("page_set source cannot include inspection ids")
+            if self.compare_mode == "snapshot":
+                raise ValueError("snapshot compare_mode requires inspection source")
+        else:
+            if self.inspection_run_id is None:
+                raise ValueError("inspection source requires inspection_run_id")
+            self.page_set_id = None
+            if self.compare_mode == "version":
+                if self.old_package_id is None:
+                    raise ValueError("巡检 Version 模式必须显式选择旧版 APK")
+                if self.mode != "upgrade":
+                    raise ValueError("巡检 Version 模式固定使用覆盖升级，不支持 clean")
+        if self.compare_mode == "snapshot":
+            if self.old_package_id is not None:
+                raise ValueError("snapshot 模式使用巡检快照作为基线，old_package_id 必须为空")
+            self.baseline_device_serial = None
         if self.compare_mode == "device":
             if self.old_package_id is not None:
                 raise ValueError("机型对比模式只需一个测试包，old_package_id 必须为空")
@@ -733,6 +1711,13 @@ class CompatibilityPageResultRead(BaseModel):
     cell_id: int
     page_key: str = ""
     page_name: str = ""
+    path_key: Optional[str] = None
+    source_state_id: Optional[int] = None
+    source_observation_id: Optional[int] = None
+    evidence_level: Optional[str] = None
+    failure_type: Optional[str] = None
+    failed_step_index: Optional[int] = None
+    replay_trace: List[Dict[str, Any]] = Field(default_factory=list)
     case_id: Optional[int] = None
     status: str = "PENDING"
     reason: Optional[str] = None
@@ -742,6 +1727,11 @@ class CompatibilityPageResultRead(BaseModel):
     diff_screenshot_path: Optional[str] = None
     baseline_xml_path: Optional[str] = None
     candidate_xml_path: Optional[str] = None
+    baseline_screenshot_asset_id: Optional[str] = None
+    candidate_screenshot_asset_id: Optional[str] = None
+    diff_screenshot_asset_id: Optional[str] = None
+    baseline_xml_asset_id: Optional[str] = None
+    candidate_xml_asset_id: Optional[str] = None
     baseline_activity: Optional[str] = None
     candidate_activity: Optional[str] = None
     metrics: Dict[str, Any] = Field(default_factory=dict)
@@ -764,6 +1754,8 @@ class CompatibilityCellRead(BaseModel):
     current_stage: Optional[str] = None
     old_install_status: Optional[str] = None
     new_install_status: Optional[str] = None
+    preflight_at: Any = None
+    installed_package_snapshot: Dict[str, Any] = Field(default_factory=dict)
     error_message: Optional[str] = None
     started_at: Any = None
     finished_at: Any = None
@@ -778,13 +1770,27 @@ class CompatibilityRunRead(BaseModel):
     name: str
     page_set_id: Optional[int] = None
     page_set_name: Optional[str] = None
-    page_set_snapshot: List[CompatPageDefinition] = Field(default_factory=list)
+    page_set_snapshot: List[
+        Union[CompatPageDefinition, CompatibilityReplayChainRead]
+    ] = Field(default_factory=list)
+    source_type: str = "page_set"
+    inspection_run_id: Optional[int] = None
+    inspection_state_ids: List[int] = Field(default_factory=list)
+    inspection_observation_ids: List[int] = Field(default_factory=list)
     old_package_id: Optional[int] = None
-    new_package_id: int
+    new_package_id: Optional[int] = None
     package_name: str = ""
-    compare_mode: str = "version"
+    execution_mode: str = "comparison"
+    replay_branch_key: Optional[str] = None
+    replay_plan_version: Optional[int] = None
+    replay_plan_digest: Optional[str] = None
+    duration_seconds: int = 3600
+    source_package_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    target_package_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    manual_install_confirmed_at: Any = None
+    compare_mode: Optional[str] = "version"
     baseline_device_serial: Optional[str] = None
-    mode: str = "upgrade"
+    mode: Optional[str] = "upgrade"
     env_id: Optional[int] = None
     device_serials: List[str] = Field(default_factory=list)
     thresholds: Dict[str, Any] = Field(default_factory=dict)

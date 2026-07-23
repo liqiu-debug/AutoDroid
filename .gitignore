@@ -45,6 +45,7 @@ frontend/.npm/
 # Local generated data and artifacts
 /uploads/
 /reports/
+/asset_store/
 /static/images/
 
 # Mobile packages
