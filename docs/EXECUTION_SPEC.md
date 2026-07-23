@@ -2,9 +2,10 @@
 
 ## 1. 边界定义
 
-- 录制：Android 支持实时投屏和静态截图录制；iOS 支持基于 WDA 的静态截图、层级解析、坐标交互与步骤录制，暂不支持实时投屏。
+- 录制：Android 支持 Scrcpy 实时投屏和静态截图录制；iOS 支持 WDA MJPEG 只读预览，并基于静态截图、层级解析、坐标交互完成步骤录制。
 - 执行：Android 与 iOS 统一走标准步骤模型。
 - 兼容：`case.steps`（legacy）保留，用于灰度期间兼容；执行优先读取 `TestCaseStep` 标准步骤表。
+- 巡检：模型化智能巡检只支持 Android。巡检动作由页面模型生成并冻结为路径，不直接写入 `TestCaseStep`；稳定路径进入兼容性回放前会再次做定位质量与安全边界校验。
 
 ## 2. 标准步骤模型
 
@@ -168,10 +169,22 @@
 - 步骤级：`PASS/SKIP/WARNING/FAIL`。
 - 用例级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。
 - 场景级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。
+- 调度/长任务级还可能出现 `PENDING/QUEUED/RUNNING/ERROR`；`QUEUED` 表示等待执行名额或设备租约，不应当作步骤失败。
 
-## 8. 推荐执行顺序
+## 8. 设备独占与中止
+
+- 用例和场景通过执行限流器排队；巡检与兼容性等长任务同时持有内存限流租约和数据库 owner 租约。
+- DB 租约字段记录 `lease_task_id`、`lease_kind` 和获取时间。释放时只有同一 owner 可以把设备恢复为 `IDLE`，避免旧任务结束时误解锁新任务。
+- 用户中止会设置对应的 `abort_event`；执行器应在步骤、退避、排队和长循环边界检查该事件。
+- 不要通过直接修改数据库状态解决 `BUSY`。应先使用业务取消接口；确认没有活跃 owner 后再使用设备解锁入口。
+
+## 9. 推荐执行顺序
 
 1. 读取标准步骤（无则 fallback 到 legacy JSON）。
 2. 变量渲染（环境变量 + 用例变量）。
 3. 按设备平台执行预检（动作/参数/定位器/WDA/app_key）。
-4. 按 `error_strategy` 执行并汇总报告。
+4. 获取执行名额和设备 owner 租约，进入 `RUNNING`。
+5. 按 `retry_count` 与 `error_strategy` 执行并汇总报告。
+6. 在 `finally` 中按 owner 释放租约并恢复设备状态。
+
+巡检生成动作、冻结路径和已安装版本回放的协议不属于标准 Case 步骤契约，详见 [巡检、回放与证据资产指南](INSPECTION_REPLAY_ASSETS.md)。

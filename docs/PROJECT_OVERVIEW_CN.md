@@ -1,14 +1,15 @@
-# AutoDroid-Pro 项目介绍（深度实现版）
+# AutoDroid 项目介绍（深度实现版）
 
 > 适用场景：项目立项介绍、技术方案评审、团队内部培训、对外能力宣讲。
 
 ## 1. 项目定位
 
-AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
+AutoDroid 是一个低代码 UI 自动化测试平台，核心模式是：
 
-- Android 实时投屏/静态截图录制，iOS WDA 静态截图录制（点击页面直接生成步骤）
+- Android 实时投屏/静态截图录制，iOS WDA MJPEG 预览与静态层级录制
 - 统一步骤模型（标准步骤 + 兼容 legacy）
 - Android / iOS 双端执行
+- Android 模型化巡检、兼容性回放和可审计证据资产
 - 多设备并发、定时调度、报告与通知闭环
 
 它解决的不是“单次脚本执行”，而是把 `录制 -> 编排 -> 预检 -> 执行 -> 报告 -> 运营` 全流程工程化。
@@ -20,22 +21,27 @@ AutoDroid-Pro 是一个低代码 UI 自动化测试平台，核心模式是：
 3. 执行前风险拦截：预检提前发现平台、定位器、变量、WDA、app 映射问题。  
 4. 运行稳定性提升：设备状态治理、WDA relay、执行后状态恢复、失败截图保留。  
 5. 可规模化运营：支持多设备并发、定时任务、飞书通知、运行大盘与告警。  
+6. 把探索转成回归资产：巡检生成页面拓扑和冻结路径，可继续用于版本、机型和当前安装版本验证。
 
 ## 3. 功能全景（产品能力）
 
 | 业务域 | 功能能力 | 关键实现 |
 |---|---|---|
 | 用例管理 | 用例 CRUD、复制、目录树组织、标签、变量 | `backend/api/cases.py`、`backend/api/folders.py` |
+| 安装包管理 | APK/Ad Hoc IPA 上传、分片上传、版本管理和设备安装 | `backend/api/packages.py` |
 | 录制编排 | Android 实时投屏/静态截图录制；iOS WDA 静态截图、元素审查、交互录制、步骤编辑与单步执行 | `backend/main.py` `/device/*` + `frontend/src/components/DeviceStage.vue` `StepBuilder.vue` |
 | 跨端执行 | 标准步骤下发 Android/iOS，容错策略控制流程 | `backend/drivers/cross_platform_runner.py`、`android_driver.py`、`ios_driver.py` |
 | 场景编排 | 多用例串联、别名、变量上下文跨用例传递 | `backend/api/scenarios.py` |
 | 并发运行 | 场景多设备并发批次执行，设备级预检过滤 | `backend/api/scenarios.py` `_schedule_concurrent_runs` |
-| 调度中心 | DAILY/WEEKLY/INTERVAL/ONCE 定时策略，支持 UI 场景与 Fastbot 任务 | `backend/scheduler_service.py`、`backend/api/tasks.py` |
+| 调度中心 | DAILY/WEEKLY/INTERVAL/ONCE 定时策略，支持 UI 场景、Fastbot 与巡检任务 | `backend/scheduler_service.py`、`backend/api/tasks.py` |
 | 设备中心 | ADB+tidevice 一键同步、解锁、重启、截图、WDA 检测、iOS 一键无线（WiFi 直连 WDA） | `backend/api/devices.py` |
 | 流媒体 | Scrcpy H.264 WebSocket 推流、触控转发、多客户端广播 | `backend/device_stream/manager.py` |
 | 报告中心 | 执行列表、详情、下载，DB 数据兜底生成 HTML 报告 | `backend/api/reports.py`、`backend/report_generator.py` |
 | 运行大盘 | KPI、趋势、状态分布、失败 Top、告警、即将执行任务 | `backend/api/reports.py` `/api/reports/dashboard/overview` |
 | 稳定性探索 | Fastbot 智能探索、性能曲线、Crash/ANR 统计 | `backend/api/fastbot.py`、`backend/fastbot_runner.py` |
+| 模型化智能巡检 | 页面身份/页面族、覆盖调度、安全边界、双业务线、实时拓扑与稳定路径 | `backend/api/inspections.py`、`backend/inspection/` |
+| 兼容性测试与回放 | 页面合集或巡检快照的版本/机型对比，当前安装版本冻结路径回放 | `backend/api/compatibility.py`、`backend/compatibility_replay.py` |
+| 证据资产 | 内容寻址、引用计数、鉴权读取、分层保留和容量水位 | `backend/artifact_store.py`、`backend/api/assets.py` |
 | AI 能力 | 自然语言生成步骤（NL2Step）、日志 AI 根因分析 | `backend/api/ai.py`、`backend/api/log_analysis.py` |
 | 配置与通知 | 系统配置中心、飞书测试报告卡片通知 | `backend/api/settings.py`、`backend/notification_service.py` |
 | 移动端适配 | 自动/PC/移动模式切换，提供概览、设备、用例/场景执行和报告查看 | `frontend/src/composables/useClientMode.js`、`frontend/src/layout/Index.vue` |
@@ -53,6 +59,10 @@ flowchart TD
     B --> G["流媒体<br/>Scrcpy H.264 / iOS MJPEG"]
     B --> H["调度与通知<br/>APScheduler + Feishu"]
     B --> I["报告与大盘<br/>SQLite + HTML Report + Dashboard API"]
+    B --> J["智能巡检<br/>Page Model + Coverage Scheduler"]
+    J --> K["兼容性快照 / 已安装版本回放"]
+    J --> L["内容寻址证据资产<br/>CAS + Reference + Retention"]
+    K --> L
 ```
 
 ### 技术栈
@@ -62,7 +72,7 @@ flowchart TD
 - Android 自动化：uiautomator2 + ADB  
 - iOS 自动化：facebook-wda + tidevice  
 - 图像/OCR：OpenCV + PaddleOCR（兼容封装）  
-- 实时通信：WebSocket（执行日志、Scrcpy 视频流）  
+- 实时通信：WebSocket（执行日志、Scrcpy H.264、WDA MJPEG、巡检实时快照）
 
 ### 移动端架构与边界
 
@@ -73,7 +83,7 @@ flowchart TD
 - 移动端使用独立页头和底部导航，主入口为概览、设备、用例、场景和报告。
 - 路由通过 `meta.mobileAvailable` 声明移动端可用性；未开放的页面统一展示 PC 模式提示。
 
-当前移动端聚焦查看和轻量执行：支持设备状态与常用运维、用例/场景发起执行、报告列表与详情查看；用例编辑、复杂场景编排、资产配置、调度和系统管理仍使用 PC 模式。
+当前移动端聚焦查看和轻量执行：支持设备状态与常用运维、用例/场景发起执行，以及 UI/巡检报告列表与详情查看；用例编辑、复杂场景编排、巡检配置、资产配置、调度和系统管理仍使用 PC 模式。
 
 ## 5. 核心实现机制（深度）
 
@@ -83,9 +93,23 @@ flowchart TD
 
 Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAULTS`，`SystemSetting` 可覆盖）：
 
-- `new_step_model`：标准步骤模型读写（默认开启，DB 显式 `false` 可临时回退）
-- `ios_execution`：是否允许 iOS 执行（默认关闭）
-- `ws_disconnect_abort`：执行 WebSocket 断开即中止（默认关闭）
+| 开关 | 默认值 | 说明 |
+|---|---:|---|
+| `new_step_model` | 开 | 标准步骤模型读写，DB 显式 `false` 可临时回退 |
+| `ios_execution` | 关 | 允许 iOS 执行 |
+| `ws_disconnect_abort` | 关 | 用例执行 WebSocket 断开即中止 |
+| `model_inspection` | 关 | Android 模型化智能巡检总开关 |
+| `inspection_identity_v2` | 开 | 巡检 Template/State/Observation 身份模型，依赖总开关 |
+| `inspection_exploration_family_convergence` | 开 | 同构页面族增量覆盖，依赖身份模型 |
+| `inspection_similarity_convergence` | 关 | 高置信相似状态收敛，依赖身份模型 |
+| `inspection_coverage_scheduler_v2` | 关 | 覆盖导向调度，依赖身份模型 |
+| `inspection_visual_home_actions` | 关 | 首页图片入口探测，依赖覆盖调度 |
+| `compatibility_installed_replay` | 开 | 当前安装版本冻结路径回放 |
+| `compatibility_legacy_compare_creation` | 关 | 旧兼容性创建流程临时回退 |
+| `content_addressed_assets` | 关 | 内容寻址证据双写 |
+| `tiered_asset_retention` | 关 | HOT/WARM/PINNED/COLD 分层保留，依赖资产双写 |
+
+设置 API 和前端会共同约束父子依赖；关闭父功能会同步关闭子开关。
 
 存量 `TestCase.steps`（legacy JSON）会在每次启动时幂等回填到 `TestCaseStep` 标准表（`backend/database.py::backfill_case_steps_to_standard`，单条失败跳过不阻塞启动）。
 
@@ -197,11 +221,13 @@ Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAUL
 | 实时投屏录制 | 支持 | 不支持 | Scrcpy 实时流仅支持 Android |
 | 用例执行 | 支持 | 支持（需开 `ios_execution` 且 WDA 健康） | 跨端 Runner 统一调度 |
 | 场景并发执行 | 支持 | 支持 | 设备级预检过滤 |
+| 实时设备画面 | Scrcpy 可交互 | WDA MJPEG 只读预览 | iOS 点击/框选仍使用静态截图和层级 |
 | Fastbot 探索 | 支持 | 不支持 | `P3001_FASTBOT_ANDROID_ONLY` |
+| 模型化智能巡检/路径回放 | 支持 | 不支持 | 单台设备独占执行，首期仅 Android |
 | WDA 检测 | 不适用 | 支持 | `POST /devices/{serial}/wda/check` |
 | 无线连接（免数据线） | 手动支持（无线 adb，见 `docs/ANDROID_WIRELESS_ADB.md`） | 支持（一键） | iOS 一键启用 WiFi 直连 WDA，`POST /devices/{serial}/wireless/enable`，详见 `docs/IOS_WDA_OPS.md` §3.5 |
 
-结论：当前产品形态是“Android 实时/静态录制 + iOS 静态录制 + Android/iOS 执行”。
+结论：当前产品形态是“Android 实时/静态录制 + iOS MJPEG 预览/静态层级录制 + Android/iOS 标准执行 + Android 专项巡检与兼容性回放”。
 
 ## 7. 设备管理与稳定性保障
 
@@ -239,9 +265,9 @@ WDA relay 由 `backend/wda_port_manager.py` 管理，端口范围 `8200-8299`，
 - Android 侧清理残留进程（Fastbot/Monkey/uiautomator2）
 - 回收设备状态，降低“设备卡 BUSY”概率
 
-## 8. Scrcpy 实时流媒体能力
+## 8. Android Scrcpy 与 iOS MJPEG
 
-Scrcpy 实时投屏当前仅支持 Android。iOS 录制使用 WDA 静态截图，设备交互完成后重新获取截图和页面层级，不建立实时视频流。
+Android 使用 Scrcpy H.264 实时画面和触控转发。iOS 使用 WDA MJPEG 提供近实时只读预览；元素审查、点击、框选和步骤录制仍在静态截图与页面层级上完成，确保交互坐标和定位器一致。
 
 设备流管理器 `backend/device_stream/manager.py` 负责：
 
@@ -257,6 +283,14 @@ API/WS：
 - `POST /devices/{serial}/touch`
 - `WS /ws/scrcpy/{serial}`
 
+iOS MJPEG 由独立 relay 管理，设备端默认端口 `9100`，本地 relay 使用 `9300-9399`：
+
+- `WS /ws/ios-mjpeg/{serial}`：完整 JPEG 二进制帧。
+- `GET /api/stream/ios-mjpeg/{serial}`：multipart 流。
+- `ios_mjpeg_port/framerate/quality`：全局或设备级 `SystemSetting`。
+
+详细启动、无线直连和故障处理见 `docs/IOS_WDA_OPS.md`。
+
 ## 9. 调度、通知与可观测性闭环
 
 ### 9.1 定时调度
@@ -265,10 +299,11 @@ API/WS：
 
 - `DAILY` / `WEEKLY` / `INTERVAL` / `ONCE`
 
-任务中心 `backend/api/tasks.py` 支持两类任务：
+任务中心 `backend/api/tasks.py` 支持三类任务：
 
 - UI 场景任务（执行前预检过滤设备）
 - Fastbot 任务（稳定性探索）
+- 模型化智能巡检任务（单 Profile、单 Android 设备、可选业务线与安装包）
 
 任务配置通过 `strategy_config` 承载扩展字段（如 `_task_type`、`env_id`、Fastbot 参数）。
 
@@ -287,6 +322,9 @@ API/WS：
 - 执行详情：`GET /api/reports/executions/{id}`
 - 下载报告：`GET /api/reports/executions/{id}/download`（支持 DB 回填生成 HTML）
 - 报告静态资源：`GET /api/report-assets/{path}`
+- 兼容性报告：`GET /api/compatibility/runs`
+- 巡检报告与 Graph：`GET /api/inspections/runs`、`GET /api/inspections/runs/{id}/graph`
+- 内容寻址资产：`GET /api/assets/status`、`GET /api/assets/{asset_id}`（仅鉴权 canonical API）
 
 Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
@@ -319,9 +357,31 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 - 可选“崩溃即停”
 - 汇总 `avg/max CPU`、`avg/max Mem`、`total_crashes`、`total_anrs`
 
-## 11. AI 能力
+## 11. 模型化智能巡检与兼容性回放
 
-### 11.1 NL2Step（自然语言生成步骤）
+巡检入口 `backend/api/inspections.py` 负责 Profile、Run、Graph、Observation、页面族、稳定路径选择和实时票据；执行核心位于 `backend/inspection/`：
+
+- `semantics.py`：从 UI XML、截图和 Activity 构建页面模型、动作角色和安全语义。
+- `engine.py`：双业务线准备、探索 Frontier、恢复导航、预算和结果状态。
+- `replay.py`：冻结稳定路径、检查定位质量和安全边界。
+- `live.py`：发布完整最新快照和短效单次 WebSocket 票据。
+- `monitor.py`：Crash/ANR、性能、卡顿和可选 Perfetto 证据。
+
+Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observation、Transition、ExplorationFamily 与 CoverageContract。历史报告按创建时的快照和版本解释，不用新算法重算。
+
+兼容性链路支持：
+
+- 页面合集的版本对比和机型横向对比。
+- 巡检稳定 State/Observation 的快照、版本和机型对比。
+- 当前安装版本的冻结路径回放：先 `POST /api/compatibility/replay-preflight`，再用摘要创建 `execution_mode=installed_replay` 任务。
+
+长任务通过 `backend/device_execution_lease.py` 同时持有内存限流租约和 DB owner 租约；释放时只有原 owner 可以恢复设备状态，避免并发任务互相解锁。
+
+证据在 `content_addressed_assets` 开启时双写到 `asset_store/`。`StoredAsset` 按内容哈希去重，`AssetReference` 按 owner/role 管理 HOT、WARM、PINNED、COLD 保留；兼容性冻结基线在源巡检清理后仍可独立读取。完整上线与回滚步骤见 `docs/INSPECTION_REPLAY_ASSETS.md`。
+
+## 12. AI 能力
+
+### 12.1 NL2Step（自然语言生成步骤）
 
 `backend/api/ai.py`：
 
@@ -331,7 +391,7 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
 前端入口：`StepBuilder.vue` 的 “AI 智能生成测试步骤”。
 
-### 11.2 日志 AI 根因分析
+### 12.2 日志 AI 根因分析
 
 `backend/api/log_analysis.py`：
 
@@ -341,9 +401,9 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 
 前端入口：`FastbotReportDetail.vue` 的日志弹窗中“一键 AI 分析”。
 
-## 12. 端到端典型流程
+## 13. 端到端典型流程
 
-### 12.1 用例流（录制 -> 执行 -> 报告）
+### 13.1 用例流（录制 -> 执行 -> 报告）
 
 1. 设备中心同步 Android 或 iOS 设备。
 2. 用例编辑页选择设备；Android 可使用实时投屏或静态截图，iOS 使用 WDA 静态截图，通过 `/device/interact` 录制生成步骤。
@@ -353,21 +413,29 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 6. 通过 WebSocket 或后台任务执行。  
 7. 生成 HTML 报告并在报告中心查看。  
 
-### 12.2 场景流（编排 -> 多设备并发）
+### 13.2 场景流（编排 -> 多设备并发）
 
 1. 场景中按顺序编排多个用例。  
 2. 每台目标设备先做场景预检。  
 3. 可执行设备进入并发批次，失败设备写入 `blocked_prechecks`。  
 4. 运行中保留步骤级结果与截图，完成后聚合场景报告。  
 
-### 12.3 定时流（任务 -> 通知）
+### 13.3 定时流（任务 -> 通知）
 
 1. 任务中心配置调度策略与设备。  
 2. 到点由 APScheduler 触发。  
 3. UI 任务先做预检过滤，再执行批次。  
 4. 执行完成后自动发送飞书卡片通知。  
 
-## 13. 数据模型（核心表）
+### 13.4 巡检流（发现 -> 审核 -> 回归）
+
+1. Profile 固化双业务线入口、安全/输入/脱敏规则和预算。
+2. 单台 Android 设备获取 owner-safe 租约并执行不可变 Run 快照。
+3. 引擎生成版本化 Graph、Observation、页面族覆盖和故障证据。
+4. 人工选择稳定 State/Observation，冻结回归路径并 PIN 证据。
+5. 兼容性任务以冻结来源执行快照/版本/机型对比，或回放设备当前安装版本。
+
+## 14. 数据模型（核心表）
 
 | 表 | 作用 |
 |---|---|
@@ -378,26 +446,36 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 | `Device` | 设备资产与实时状态 |
 | `ScheduledTask` | 定时任务配置 |
 | `FastbotTask` / `FastbotReport` | Fastbot 任务与报告 |
+| `CompatibilityRun` / `CompatibilityCell` / `CompatibilityPageResult` | 兼容性任务、设备单元和页面结果 |
+| `InspectionProfile` / `InspectionRun` / `InspectionBranchRun` | 巡检配置、任务快照和业务线执行 |
+| `InspectionPageTemplate` / `InspectionState` / `InspectionObservation` | 页面模板、业务节点和实际采集 |
+| `InspectionTransition` / `InspectionExplorationFamily` / `InspectionCoverageContract` | 动作拓扑、页面族和覆盖契约 |
+| `InspectionFault` | 巡检故障及证据 |
+| `StoredAsset` / `AssetReference` | 不可变内容寻址资产与 owner 引用 |
 | `Environment` / `GlobalVariable` | 环境变量库 |
 | `AppPackage` | 安装包资产 |
 | `SystemSetting` | 全局配置与 Feature Flag 存储 |
 
-## 14. 安全与权限机制
+## 15. 安全与权限机制
 
 - 认证：OAuth2 Password + JWT（Bearer）  
 - 鉴权：通过依赖注入校验当前用户  
 - 角色：支持 `admin/user`（用户管理接口受角色限制）  
 - 前端拦截：`401` 自动清理 token 并跳转登录  
+- 资产读取：CAS 只提供 `/api/assets/*` 鉴权端点，不提供匿名 legacy alias
+- 巡检实时票据：仅 JWT 可领取，短效且一次性消费，API Token 不进入 WebSocket URL
 
 > 生产部署建议：替换默认密钥与默认管理员初始密码，开启 HTTPS 与最小权限策略。
 
-## 15. 发布与运维建议（灰度顺序）
+## 16. 发布与运维建议（灰度顺序）
 
 建议按以下顺序灰度上线：
 
 1. `new_step_model` 默认开启，legacy 步骤在启动时自动回填标准表；如需临时回退可在 `SystemSetting` 显式写 `false`。  
 2. 跨端 Runner 已是唯一执行链路（原 `cross_platform_runner` 开关已移除），关注执行必须选择设备的交互变化。  
 3. 开启 `ios_execution`：WDA 运维稳定后逐步引入 iOS 执行。  
+4. 开启 `model_inspection`：先验证默认身份/页面族模型，再开启覆盖调度和视觉首页动作。
+5. 开启 `content_addressed_assets`：双写、回填、核对 `/api/assets/status` 后再开启 `tiered_asset_retention`。
 
 配套监控建议：
 
@@ -405,12 +483,15 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 - `WDA_DOWN` 设备占比与恢复时长
 - 任务逾期未触发数量
 - 连续失败场景 Top
+- 巡检覆盖、稳定路径比例、故障类型和预算停止原因
+- 资产水位、PINNED 字节数、可回收字节数和 507 拒绝次数
 
-## 16. 项目边界与当前形态总结
+## 17. 项目边界与当前形态总结
 
-- 当前明确定位：`Android 实时/静态录制 + iOS 静态录制 + Android/iOS 执行`。
-- iOS 已支持 WDA 静态截图录制，暂不支持实时投屏。
+- 当前明确定位：`Android 实时/静态录制 + iOS MJPEG 预览/静态层级录制 + Android/iOS 执行`。
+- iOS MJPEG 是只读预览；录制与定位仍依赖 WDA 静态截图和层级。
 - Fastbot 仅 Android 支持。  
+- 模型化智能巡检与兼容性路径回放首期仅 Android、单设备执行。
 - 跨端能力依赖标准步骤模型与预检，建议将预检作为运行前必经流程。  
 
 ---
@@ -427,5 +508,9 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 - 通知服务：`backend/notification_service.py`  
 - 报告与大盘：`backend/api/reports.py`  
 - Fastbot：`backend/api/fastbot.py`、`backend/fastbot_runner.py`  
+- 智能巡检：`backend/api/inspections.py`、`backend/inspection/`
+- 兼容性与回放：`backend/api/compatibility.py`、`backend/compatibility_replay.py`
+- 证据资产与保留：`backend/artifact_store.py`、`backend/api/assets.py`、`backend/retention_service.py`
+- 设备长任务租约：`backend/device_execution_lease.py`
 - AI：`backend/api/ai.py`、`backend/api/log_analysis.py`  
 - 前端核心：`frontend/src/components/DeviceStage.vue`、`StepBuilder.vue`、`LogConsole.vue`、`frontend/src/views/*`  

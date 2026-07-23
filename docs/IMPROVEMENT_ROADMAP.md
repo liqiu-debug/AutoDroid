@@ -62,7 +62,7 @@
 
 **现状依据**：`reports/`、失败截图、Fastbot 产物无限增长，团队服务器磁盘将持续膨胀；报告删除仅有手动入口。
 
-**已落地方案**：新增 `backend/retention_service.py`，每日 03:17 定时清理（启动时注册到 APScheduler）；保留天数由 `SystemSetting` 的 `report_retention_days` 控制（缺省/0 = 关闭，避免升级后静默删数据）。清理复用各业务 API 的产物删除逻辑（UI 执行、Fastbot、兼容性），进行中的记录不清理。
+**已落地方案**：新增 `backend/retention_service.py`，每日 03:17 定时清理（启动时注册到 APScheduler）；保留天数由 `SystemSetting` 的 `report_retention_days` 控制（缺省/0 = 关闭，避免升级后静默删数据）。清理复用各业务 API 的产物删除逻辑（UI 执行、Fastbot、兼容性、巡检），进行中的记录不清理。内容寻址资产开启后同时释放 owner 引用；兼容性已冻结的 PINNED 基线不依赖源巡检 Run 存活。
 
 **验收**：`backend/tests/test_retention_service.py` 覆盖配置解析、过期筛选与产物删除调用。
 
@@ -142,15 +142,41 @@
 
 **已落地方案**：`ApiToken` 模型（只存 sha256 哈希 + 展示前缀，明文仅创建时返回一次）；`adk_` 前缀在认证层与 JWT 分流，恒时比较、last_used 节流记录；机器凭证禁入 admin/设置写/改密/Token 管理（`get_current_user_no_token` 依赖，admin 路由一处上游替换全覆盖）；管理页 `/settings/tokens`（创建/列表/吊销，admin 可查全部）；补齐 `GET /reports/executions?batch_id=` CI 轮询过滤；`docs/CI_INTEGRATION.md` 含完整回归脚本与 GitHub Actions/Jenkins 示例。
 
+### ✅ P2.10 模型化智能巡检
+
+**已落地方案**：新增 Android 单设备巡检 Profile/Run/Branch 模型和 `backend/inspection/` 引擎；Profile 固化 guest/authenticated 双业务线入口、输入/安全/脱敏规则、动态文本、预算与监控。Graph schema v8 / hierarchy v2 区分 PageTemplate、State、Observation、Transition、ExplorationFamily 和 CoverageContract；支持页面族增量覆盖、Frontier 优先级、父页面恢复、实时只读画面、Crash/ANR/性能证据、稳定 State/Observation 人工选择和历史协议兼容。
+
+**灰度开关**：`model_inspection` 总开关默认关；身份模型与页面族收敛默认开但受总开关约束；覆盖调度、相似状态收敛和视觉首页动作独立灰度。
+
+**验收**：巡检 API、身份预算、增量导航、页面族、实时引擎、同伴页面恢复、回放与语义测试已覆盖；离线可运行 `replay_inspection_coverage.py` 和 `audit_haier_coverage.py`。
+
+### ✅ P2.11 巡检基线与兼容性路径回放
+
+**已落地方案**：兼容性来源扩展为 `page_set` 或 `inspection`，巡检稳定 State/Observation 可执行快照、版本和机型对比。新增 `execution_mode=installed_replay`：预检冻结包身份、路径计划和设备快照摘要，创建时防 TOCTOU 重校验；只允许一台 Android 设备、不接收 APK ID、不做安装，按完整路径或安全边界前缀回放当前版本。Trace 对输入值脱敏，终点结果区分业务故障、基础设施故障、自动化失败、安全阻断和预算停止。
+
+**验收**：`test_compatibility_replay_api.py`、`test_compatibility_assets.py`、前端 `compatibilityReplay.test.mjs` 覆盖计划冻结、摘要变化、结果呈现和资产归档。
+
+### ✅ P2.12 内容寻址证据资产与分层保留
+
+**已落地方案**：`StoredAsset` 按逻辑内容哈希去重，`AssetReference` 以 owner/role 管理引用；CAS 位于非公开 `asset_store/`，只通过鉴权 `/api/assets/{id}` 读取，支持 ETag、Range、完整性校验和 404/410 语义。默认双写保留 legacy 路径，维护脚本可幂等回填或从 CAS 反向物化。分层策略为 HOT 7 天、WARM 90 天、PINNED 不过期、COLD 元数据/缩略图，最后引用释放后保留 24 小时恢复窗口。
+
+**容量治理**：默认 low/high/critical 水位为 80/90/95%；`GET /api/assets/status` 提供各层字节数、可回收空间和 `can_start`，分层 GC 使用配置水位。新巡检和兼容性任务当前使用内置 95% 硬阈值返回 507。
+
+### ✅ P2.13 长任务设备租约与定时巡检
+
+**已落地方案**：`backend/device_execution_lease.py` 将 FIFO 限流租约与数据库设备 owner 租约组合，CAS 获取 `IDLE` 设备，释放时只允许同一 `lease_task_id` 恢复状态，消除巡检/兼容性长任务的状态竞争。定时任务新增 `inspection` 类型，保存 Profile、单台 Android 设备、业务线和可选安装包，在触发时创建不可变 Run 快照。
+
 ### ⬜ P2.9 报告端点认证收口（新增治理项）
 
 **现状依据**：P2.7 实施时发现 `GET /reports/executions` 等报告读取端点自基线起就无认证依赖，无凭证可读。内网风险可控，但与全站 JWT/Token 体系不一致。
 
 **建议方案**：报告读取端点统一挂 `get_current_user`；注意 HTML 报告静态资源（`/api/report-assets/`）与报告分享链路的兼容评估。
 
-### ⬜ P2.8 前端测试与渐进 TS
+### 🚧 P2.8 前端测试与渐进 TS
 
-vitest 覆盖 `stores/`、`composables/` 与关键工具函数；巨型组件拆分后对新模块渐进引入 TS（或 JSDoc 类型标注）。
+**已落地部分**：新增 72 个基于 Node test runner 的工具函数与 UI 契约测试，覆盖巡检思维导图/报告呈现、运行摘要、兼容性回放、报告列表、定时任务和系统设置；可运行 `node --test frontend/tests/*.test.mjs`。
+
+**剩余工作**：测试尚未接入 `.github/workflows/ci.yml`，也未引入 Vitest 组件挂载；`stores/`、`composables/` 和交互组件仍缺行为级覆盖，渐进 TS/JSDoc 类型治理尚未开始。
 
 ---
 
@@ -158,3 +184,5 @@ vitest 覆盖 `stores/`、`composables/` 与关键工具函数；巨型组件拆
 
 - `backend/tests` 中曾有 2 个与代码演进脱节的过期断言（录制等待时长、投屏重连状态），已随 P0.2 修复；后续行为变更需同步更新测试。
 - OCR（PaddleOCR）为可选依赖且不在 requirements 中，`utils/ocr_compat.py` 做了容错；若团队常用 OCR 步骤，建议固化安装说明。
+- `backend/inspection/engine.py`、`backend/inspection/semantics.py`、`backend/api/inspections.py` 和巡检报告页面已成为新的巨型模块；后续拆分必须先固化 Graph/实时快照/回放契约测试，避免把协议演进与代码移动混在同一批次。
+- 巡检覆盖调度、视觉首页动作、内容寻址资产和分层保留仍是灰度开关；正式默认开启前需要真机覆盖率、磁盘水位和回滚物化演练数据。

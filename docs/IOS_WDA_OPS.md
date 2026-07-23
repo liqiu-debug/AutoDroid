@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-用于保障 iOS 执行链路可用，覆盖 WDA 健康检查、端口映射、常见故障排查。
+用于保障 iOS 执行与 MJPEG 预览链路可用，覆盖 WDA 健康检查、端口映射、无线直连、实时画面和常见故障排查。
 
 ## 2. 依赖与前置
 
@@ -14,7 +14,7 @@
 
 ## 3. 健康检查入口
 
-- 单设备手动检测：`POST /devices/{serial}/wda/check`
+- 单设备手动检测：`POST /api/devices/{serial}/wda/check`（无 `/api` 的历史 alias 仍保留）
 - 设备状态字段：
   - `IDLE`: 可执行
   - `BUSY`: 执行中
@@ -42,11 +42,11 @@ network 设备）。但默认 WDA 地址走本地 relay（USB 式端口转发）
 
 对应端点：
 
-- `POST /devices/{serial}/wireless/enable`
+- `POST /api/devices/{serial}/wireless/enable`
   - 请求体（可选）：`{"ip": "192.168.1.23", "port": 8100}`；不传 `ip` 时自动从 WDA 读取。
   - 成功：`{serial, wireless_enabled: true, device_ip, wda_url, status}`。
   - 失败（不落库）：`400`，`detail` 前缀见下表。
-- `POST /devices/{serial}/wireless/disable`
+- `POST /api/devices/{serial}/wireless/disable`
   - 删除 `ios_wda_url.{serial}`，回归默认本地 relay；`{serial, wireless_enabled: false, ...}`。
 
 | 错误码 | 含义 | 处理 |
@@ -134,7 +134,7 @@ WDA 地址解析优先级：
 
 ## 6. MJPEG 实时画面
 
-基于 WDA 内置 MJPEG server（设备端默认端口 `9100`）提供 iOS 近实时画面流。
+基于 WDA 内置 MJPEG server（设备端默认端口 `9100`）提供 iOS 近实时画面流。前端把它作为只读预览层；点击、框选、元素审查和步骤录制仍使用静态截图与 WDA 页面层级，不能从 MJPEG 帧直接生成定位器。
 
 ### 6.1 端口与 relay 策略
 
@@ -189,3 +189,9 @@ WDA 地址解析优先级：
 1. 先灰度开启 `ios_execution`，观察失败率。
 2. 监控 `WDA_DOWN` 比例与平均恢复时间。
 3. 回滚时可仅关闭 `ios_execution`，Android 不受影响。
+
+## 8. 与智能巡检的边界
+
+模型化智能巡检和基于巡检路径的兼容性回放目前只支持 Android，不会占用 iOS WDA 或 MJPEG relay。iOS 继续通过标准用例/场景执行、静态层级录制和报告链路完成自动化；不要为 iOS 设备开启或伪造巡检 Profile。
+
+跨端标准动作见 [执行规范](EXECUTION_SPEC.md)，巡检与回放的 Android 专项边界见 [巡检、回放与证据资产指南](INSPECTION_REPLAY_ASSETS.md)。
