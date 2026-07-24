@@ -10,11 +10,36 @@ const source = await readFile(
 test('inspection report keeps three primary metrics and moves diagnostics behind disclosure', () => {
   const template = source.slice(source.indexOf('<template>'))
   const stats = template.slice(template.indexOf('class="stats"'), template.indexOf('class="running-summary"'))
-  assert.match(stats, /页面族覆盖/)
-  assert.match(stats, /可回放路径/)
-  assert.match(stats, /需关注问题/)
+  assert.match(stats, /核心旅程/)
+  assert.match(stats, /运行范围/)
+  assert.match(stats, /businessCoverage\.scopeSelected/)
+  assert.match(stats, /证据质量/)
+  assert.doesNotMatch(stats, /页面族覆盖/)
   assert.equal((stats.match(/<strong/g) || []).length, 3)
   assert.match(template, /<el-collapse-item name="diagnostics" title="运行诊断">/)
+  assert.match(source, /已发现页面族展开率/)
+  assert.match(source, /family\.ratio \* 1000\) \/ 10/)
+  assert.match(template, /label="核心旅程" name="coverage"/)
+  assert.match(template, /coverageBlindSpots/)
+  assert.match(template, /evidenceTransitions\(row\)/)
+  assert.match(template, /<em>页面<\/em>/)
+  assert.match(template, /<em>动作<\/em>/)
+})
+
+test('historical coverage without stage data does not render a misleading zero progress', () => {
+  assert.match(source, /row\.total_stages > 0/)
+  assert.match(source, /: '-'/)
+  assert.doesNotMatch(source, /row\.deepest_stage \|\| 0 }}\/{{ row\.total_stages \|\| 0/)
+})
+
+test('installed replay entry follows evidence availability with a legacy fallback', () => {
+  const replayGuard = source.slice(
+    source.indexOf('const replaySourceEligible'),
+    source.indexOf('const replaySourceReason'),
+  )
+  assert.match(replayGuard, /replay_evidence_available/)
+  assert.match(replayGuard, /replayEvidenceAvailable\.value/)
+  assert.match(replayGuard, /replaySourceEligible\.value/)
 })
 
 test('state snapshot shows user outcomes and keeps internal fields in technical details', () => {
@@ -63,4 +88,10 @@ test('diagnostic values can wrap without overflowing their grid cells', () => {
     source,
     /\.diagnostics-grid strong\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*normal;/,
   )
+})
+
+test('wrapped coverage blind spots cannot shrink into adjacent report sections', () => {
+  const style = source.match(/\.coverage-blind-spots\s*\{([^}]*)\}/)?.[1] || ''
+  assert.match(style, /flex:\s*none;/)
+  assert.match(style, /flex-wrap:\s*wrap;/)
 })

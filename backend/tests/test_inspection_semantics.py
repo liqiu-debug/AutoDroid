@@ -20,9 +20,12 @@ from backend.inspection.device import (
     wait_for_stable_page,
 )
 from backend.inspection.engine import (
+    PathDiverged,
     PersistedState,
     StateWork,
     _capture_matches_parent,
+    _coverage_endpoint_reverify_matches,
+    _business_goal_priority_override,
     _consecutive_scroll_repetitions,
     _environment_secret_values,
     _ensure_parent,
@@ -41,6 +44,7 @@ from backend.inspection.engine import (
     _verify_stable_paths,
 )
 from backend.inspection.sanitizer import InspectionArtifactSanitizer
+from backend.inspection.haier_business_coverage import CoverageGoalTracker
 from backend.inspection.semantics import (
     InspectionAction,
     build_page_model,
@@ -77,6 +81,33 @@ def _page(body: str) -> str:
 
 
 class InspectionSemanticsTests(unittest.TestCase):
+    def test_business_goal_priority_overrides_new_family_priority(self):
+        tracker = CoverageGoalTracker("authenticated")
+        tracker.refresh([], [])
+        action = Mock(
+            action_role="BUY_NOW",
+            target_meta={"content_desc": "立即购买", "text": ""},
+            risk_type=None,
+        )
+
+        priority, reason = _business_goal_priority_override(
+            tracker,
+            "PRODUCT_DETAIL",
+            [action],
+            200,
+            "NEW_FAMILY_REPRESENTATIVE",
+        )
+        already_higher, higher_reason = _business_goal_priority_override(
+            tracker,
+            "PRODUCT_DETAIL",
+            [action],
+            5,
+            "DIRECT_HANDOFF",
+        )
+
+        self.assertEqual((priority, reason), (10, "BUSINESS_COVERAGE_GOAL"))
+        self.assertEqual((already_higher, higher_reason), (5, "DIRECT_HANDOFF"))
+
     def test_description_is_preferred_without_resource_id(self):
         xml = _page(
             '<node class="android.widget.Button" content-desc="购物车" text="购物车" '
@@ -932,6 +963,8 @@ class InspectionSemanticsTests(unittest.TestCase):
                         state_key="root",
                         semantic_key="root",
                         instance_anchor="root",
+                        page_subtype="HOME",
+                        coverage_status="INCOMPLETE",
                         depth=0,
                         first_path=[],
                         representative_observation_id=101,
@@ -945,6 +978,8 @@ class InspectionSemanticsTests(unittest.TestCase):
                         state_key="middle",
                         semantic_key="middle",
                         instance_anchor="middle",
+                        page_subtype="PRODUCT_LIST",
+                        coverage_status="INCOMPLETE",
                         depth=1,
                         first_path=[step_one],
                         representative_observation_id=102,
@@ -958,6 +993,8 @@ class InspectionSemanticsTests(unittest.TestCase):
                         state_key="end",
                         semantic_key="end",
                         instance_anchor="end",
+                        page_subtype="CASHIER",
+                        coverage_status="INCOMPLETE",
                         depth=2,
                         first_path=[step_one, step_two],
                         representative_observation_id=103,
@@ -976,7 +1013,7 @@ class InspectionSemanticsTests(unittest.TestCase):
 
         with patch("backend.inspection.engine.engine", test_engine), patch(
             "backend.inspection.engine._replay_path", side_effect=replay_result
-        ), patch("backend.inspection.engine._pin_observation_assets") as pin:
+        ) as replay, patch("backend.inspection.engine._pin_observation_assets") as pin:
             count = _verify_stable_paths(
                 run_id=1,
                 branch_run_id=1,
@@ -990,6 +1027,7 @@ class InspectionSemanticsTests(unittest.TestCase):
                 stable_wait_seconds=0.1,
                 deadline=time.monotonic() + 10,
                 secret_values=[],
+                representative_only=True,
             )
 
         self.assertEqual(count, 3)
@@ -1002,11 +1040,331 @@ class InspectionSemanticsTests(unittest.TestCase):
             ["VERIFIED_TWICE", "STABLE", "STABLE"],
         )
         self.assertTrue(all(item.selected_for_regression for item in states))
+        self.assertEqual(replay.call_count, 2)
         self.assertEqual(
             {call.args[0] for call in pin.call_args_list},
             {101, 102, 103},
         )
         test_engine.dispose()
+
+    def test_business_coverage_endpoint_is_reverified_once_only(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        required_step = {
+            "action_type": "click",
+            "action_key": "open-required",
+            "expected_target_semantic_key": "required-end",
+            "replayable": True,
+        }
+        ordinary_step = {
+            "action_type": "click",
+            "action_key": "open-ordinary",
+            "expected_target_semantic_key": "ordinary-end",
+            "replayable": True,
+        }
+        with Session(test_engine) as session:
+            session.add_all(
+                [
+                    InspectionState(
+                        id=1,
+                        run_id=1,
+                        branch_run_id=1,
+                        branch_key="authenticated",
+                        cluster_key="required-end",
+                        state_key="required-end",
+                        semantic_key="required-end",
+                        coverage_status="INCOMPLETE",
+                        depth=1,
+                        first_path=[required_step],
+                    ),
+                    InspectionState(
+                        id=2,
+                        run_id=1,
+                        branch_run_id=1,
+                        branch_key="authenticated",
+                        cluster_key="ordinary-end",
+                        state_key="ordinary-end",
+                        semantic_key="ordinary-end",
+                        coverage_status="EXPLORED",
+                        depth=1,
+                        first_path=[ordinary_step],
+                    ),
+                ]
+            )
+            session.commit()
+
+        def replay_result(*_args, **kwargs):
+            key = kwargs["path"][-1]["expected_target_semantic_key"]
+            capture = Mock()
+            capture.model.semantic_key = key
+            capture.model.cluster_key = key
+            return capture, True
+
+        with patch("backend.inspection.engine.engine", test_engine), patch(
+            "backend.inspection.engine._replay_path", side_effect=replay_result
+        ) as replay:
+            count = _verify_stable_paths(
+                run_id=1,
+                branch_run_id=1,
+                device=Mock(),
+                branch_config={},
+                device_serial="android-1",
+                package_name="com.demo",
+                abort_event=threading.Event(),
+                input_rules=[],
+                dynamic_patterns=[],
+                stable_wait_seconds=0.1,
+                deadline=time.monotonic() + 10,
+                secret_values=[],
+                coverage_reverify_once=True,
+            )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(replay.call_count, 3)
+        with Session(test_engine) as session:
+            required = session.get(InspectionState, 1)
+            ordinary = session.get(InspectionState, 2)
+            self.assertEqual(required.stable_status, "REVERIFIED_ONCE")
+            self.assertFalse(required.selected_for_regression)
+            self.assertEqual(ordinary.stable_status, "STABLE")
+            self.assertTrue(ordinary.selected_for_regression)
+        test_engine.dispose()
+
+    def test_business_coverage_reverify_accepts_only_exact_dynamic_endpoint(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        required_step = {
+            "action_type": "click",
+            "action_key": "open-favorites",
+            "locator_candidates": [
+                {"by": "description", "selector": "商品收藏, 40"}
+            ],
+            "target_meta": {"content_desc": "商品收藏, 40"},
+            "expected_source_semantic_key": "profile",
+            "expected_target_semantic_key": "frozen-favorites",
+            "expected_source_signature": {"instance_anchor": "profile-instance"},
+            "expected_target_signature": {
+                "package": "com.demo",
+                "activity_family": "main",
+                "role": "LIST",
+                "page_subtype": "FAVORITES",
+                "content_anchor": "favorites-content",
+                "instance_anchor": "favorites-instance",
+            },
+            "replayable": True,
+        }
+        ordinary_step = {
+            **required_step,
+            "action_key": "open-ordinary",
+            "expected_target_semantic_key": "ordinary-end",
+        }
+        with Session(test_engine) as session:
+            session.add_all(
+                [
+                    InspectionState(
+                        id=1,
+                        run_id=1,
+                        branch_run_id=1,
+                        branch_key="authenticated",
+                        cluster_key="frozen-favorites",
+                        state_key="frozen-favorites",
+                        semantic_key="frozen-favorites",
+                        page_subtype="FAVORITES",
+                        coverage_status="INCOMPLETE",
+                        depth=1,
+                        first_path=[required_step],
+                    ),
+                    InspectionState(
+                        id=2,
+                        run_id=1,
+                        branch_run_id=1,
+                        branch_key="authenticated",
+                        cluster_key="ordinary-end",
+                        state_key="ordinary-end",
+                        semantic_key="ordinary-end",
+                        page_subtype="FAVORITES",
+                        coverage_status="EXPLORED",
+                        depth=1,
+                        first_path=[ordinary_step],
+                    ),
+                ]
+            )
+            session.commit()
+
+        model = Mock(
+            semantic_key="dynamic-favorites",
+            cluster_key="dynamic-favorites",
+            package_name="com.demo",
+            activity_family="main",
+            role="LIST",
+            page_subtype="FAVORITES",
+        )
+        capture = CapturedPage(
+            package_name="com.demo",
+            activity=".Main",
+            xml='<hierarchy><node text="商品收藏" /></hierarchy>',
+            screenshot_png=b"png",
+            screenshot_sha="sha",
+            perceptual_hash="phash",
+            model=model,
+            stable_by="timeout",
+        )
+        divergence = PathDiverged(
+            phase="target_template",
+            expected="frozen-template",
+            actual="animated-template",
+            step_index=0,
+        )
+
+        def anchor_for(_model, *, incoming_action=None, source_instance_anchor=None):
+            if incoming_action is not None and source_instance_anchor:
+                return "favorites-instance"
+            return "favorites-content"
+
+        with patch("backend.inspection.engine.engine", test_engine), patch(
+            "backend.inspection.engine._replay_path",
+            side_effect=divergence,
+        ) as replay, patch(
+            "backend.inspection.engine._budgeted_wait_for_stable_page",
+            return_value=capture,
+        ) as recapture, patch(
+            "backend.inspection.engine.derive_instance_anchor",
+            side_effect=anchor_for,
+        ):
+            count = _verify_stable_paths(
+                run_id=1,
+                branch_run_id=1,
+                device=Mock(),
+                branch_config={},
+                device_serial="android-1",
+                package_name="com.demo",
+                abort_event=threading.Event(),
+                input_rules=[],
+                dynamic_patterns=[],
+                stable_wait_seconds=0.1,
+                deadline=time.monotonic() + 10,
+                secret_values=[],
+                coverage_reverify_once=True,
+            )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(replay.call_count, 3)
+        recapture.assert_called_once()
+        with Session(test_engine) as session:
+            required = session.get(InspectionState, 1)
+            ordinary = session.get(InspectionState, 2)
+            self.assertEqual(required.stable_status, "REVERIFIED_ONCE")
+            self.assertFalse(required.selected_for_regression)
+            self.assertEqual(ordinary.stable_status, "UNSTABLE")
+        test_engine.dispose()
+
+    def test_dynamic_coverage_endpoint_rejects_unknown_or_wrong_identity(self):
+        model = Mock(
+            package_name="com.demo",
+            activity_family="main",
+            role="LIST",
+            page_subtype="UNKNOWN",
+        )
+        capture = CapturedPage(
+            package_name="com.demo",
+            activity=".Main",
+            xml="<hierarchy />",
+            screenshot_png=b"png",
+            screenshot_sha="sha",
+            perceptual_hash="phash",
+            model=model,
+            stable_by="timeout",
+        )
+        path = [
+            {
+                "action_type": "click",
+                "action_key": "open-favorites",
+                "target_meta": {},
+                "expected_source_signature": {
+                    "instance_anchor": "profile-instance"
+                },
+                "expected_target_signature": {
+                    "package": "com.demo",
+                    "activity_family": "main",
+                    "role": "LIST",
+                    "page_subtype": "FAVORITES",
+                    "content_anchor": "favorites-content",
+                    "instance_anchor": "favorites-instance",
+                },
+            }
+        ]
+        self.assertFalse(
+            _coverage_endpoint_reverify_matches(
+                capture,
+                path,
+                expected_page_subtype="FAVORITES",
+            )
+        )
+
+    def test_dynamic_favorites_reverify_allows_live_content_anchor_drift(self):
+        model = Mock(
+            package_name="com.demo",
+            activity_family="main",
+            role="LIST",
+            page_subtype="FAVORITES",
+        )
+        capture = CapturedPage(
+            package_name="com.demo",
+            activity=".Main",
+            xml='<hierarchy><node text="商品收藏" /></hierarchy>',
+            screenshot_png=b"png",
+            screenshot_sha="sha",
+            perceptual_hash="phash",
+            model=model,
+            stable_by="timeout",
+        )
+        path = [
+            {
+                "action_type": "click",
+                "action_key": "open-favorites",
+                "target_meta": {},
+                "expected_source_signature": {
+                    "instance_anchor": "profile-instance"
+                },
+                "expected_target_signature": {
+                    "package": "com.demo",
+                    "activity_family": "main",
+                    "role": "LIST",
+                    "page_subtype": "FAVORITES",
+                    "content_anchor": "stale-content-anchor",
+                    "instance_anchor": "stale-instance-anchor",
+                },
+            }
+        ]
+
+        with patch(
+            "backend.inspection.engine.derive_instance_anchor",
+            return_value="live-anchor",
+        ):
+            self.assertTrue(
+                _coverage_endpoint_reverify_matches(
+                    capture,
+                    path,
+                    expected_page_subtype="FAVORITES",
+                )
+            )
+
+        capture.xml = '<hierarchy><node text="个人中心" /></hierarchy>'
+        self.assertFalse(
+            _coverage_endpoint_reverify_matches(
+                capture,
+                path,
+                expected_page_subtype="FAVORITES",
+            )
+        )
 
     def test_external_overlay_does_not_add_back_and_scrolls_are_last(self):
         xml = (
@@ -2142,6 +2500,41 @@ class InspectionSemanticsTests(unittest.TestCase):
             "semantic-bounds",
         )
         device.click.assert_called_once_with(540, 2243)
+
+    def test_bounds_constrained_input_focuses_and_enters_authorized_text(self):
+        xml = _page(
+            '<node class="android.widget.EditText" clickable="true" '
+            'enabled="true" bounds="[311,135][885,184]"/>'
+        )
+        action = InspectionAction(
+            action_type="input",
+            action_key="fixed-search-input",
+            locator_candidates=[
+                {
+                    "selector": "(//node[@class='android.widget.EditText' and @bounds='[311,135][885,184]'])[1]",
+                    "by": "xpath",
+                    "expected_class": "android.widget.EditText",
+                    "bounds": [311, 135, 885, 184],
+                    "bounds_constrained": True,
+                }
+            ],
+            target_meta={"screen_size": [1080, 2412]},
+        )
+        device = Mock()
+        device.window_size.return_value = (1080, 2412)
+
+        self.assertEqual(
+            perform_action(
+                device,
+                action,
+                current_xml=xml,
+                input_value="冰箱",
+            ),
+            "semantic-bounds",
+        )
+        device.click.assert_called_once_with(598, 159)
+        device.clear_text.assert_called_once_with()
+        device.send_keys.assert_called_once_with("冰箱", clear=True)
 
     def test_coordinate_click_requires_discovery_grant_and_scales_once(self):
         action = InspectionAction(
@@ -3505,6 +3898,420 @@ class InspectionSemanticsTests(unittest.TestCase):
         )
         self.assertEqual(len({action.action_group_key for action in actions}), 1)
 
+    def test_haier_v2_search_keeps_fixed_input_and_submit_only(self):
+        xml = _page(
+            '<node class="android.widget.TextView" text="搜索历史" enabled="true" '
+            'bounds="[30,260][400,360]"/>'
+            '<node class="android.widget.EditText" text="" '
+            'clickable="true" enabled="true" focusable="true" focused="true" '
+            'bounds="[260,100][900,220]"/>'
+            '<node class="android.view.ViewGroup" content-desc="搜索" '
+            'clickable="true" enabled="true" bounds="[920,100][1070,220]"/>'
+            '<node class="android.view.ViewGroup" content-desc="热门冰箱" '
+            'clickable="true" enabled="true" bounds="[30,700][310,790]"/>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity=".Search",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2400),
+            coverage_scheduler_v2=True,
+            input_rules=[
+                {
+                    "id": "haier_v2_search_keyword",
+                    "class_regex": "EditText",
+                    "page_subtype_regex": "^SEARCH$",
+                    "value_source": "literal",
+                    "value": "冰箱",
+                }
+            ],
+        )
+
+        self.assertEqual(
+            [action.action_role for action in actions],
+            ["INPUT", "SEARCH_SUBMIT"],
+        )
+        self.assertEqual(actions[0].input_rule_id, "haier_v2_search_keyword")
+
+    def test_haier_populated_search_suggestions_remain_a_search_surface(self):
+        xml = _page(
+            '<node class="android.widget.EditText" text="冰箱" '
+            'clickable="true" enabled="true" focusable="true" focused="true" '
+            'bounds="[311,135][770,184]"/>'
+            '<node class="android.view.ViewGroup" content-desc="搜索" '
+            'clickable="true" enabled="true" bounds="[943,102][1045,217]"/>'
+            '<node class="android.view.ViewGroup" content-desc="海尔 冰箱" '
+            'clickable="true" enabled="true" bounds="[35,223][1045,350]"/>'
+            '<node class="android.view.ViewGroup" content-desc="冰箱 风冷 双门" '
+            'clickable="true" enabled="true" bounds="[35,352][1045,479]"/>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2412),
+            coverage_scheduler_v2=True,
+            input_rules=[
+                {
+                    "id": "haier_v2_search_keyword",
+                    "class_regex": "EditText",
+                    "page_subtype_regex": "^SEARCH$",
+                    "value_source": "literal",
+                    "value": "冰箱",
+                }
+            ],
+        )
+
+        self.assertEqual(page.page_subtype, "SEARCH")
+        self.assertEqual(
+            [action.action_role for action in actions],
+            ["INPUT", "SEARCH_SUBMIT"],
+        )
+
+    def test_haier_v2_search_input_survives_rotating_hot_word_anchor(self):
+        xml = _page(
+            '<node class="android.view.ViewGroup" content-desc="Hi新品" '
+            'clickable="true" enabled="true" bounds="[71,113][1009,205]">'
+            '<node class="android.widget.EditText" text="" clickable="true" '
+            'enabled="true" focusable="true" focused="true" '
+            'bounds="[311,135][885,184]"/>'
+            '</node>'
+            '<node class="android.widget.TextView" text="搜索历史" enabled="true" '
+            'bounds="[30,260][400,360]"/>'
+            '<node class="android.view.ViewGroup" content-desc="搜索" '
+            'clickable="true" enabled="true" bounds="[920,100][1070,220]"/>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity=".Search",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2412),
+            coverage_scheduler_v2=True,
+            input_rules=[
+                {
+                    "id": "haier_v2_search_keyword",
+                    "class_regex": "EditText",
+                    "page_subtype_regex": "^SEARCH$",
+                    "value_source": "literal",
+                    "value": "冰箱",
+                }
+            ],
+        )
+        input_action = next(action for action in actions if action.action_role == "INPUT")
+        bounds_candidate = input_action.locator_candidates[0]
+        self.assertTrue(bounds_candidate["bounds_constrained"])
+        self.assertNotIn("anchor", bounds_candidate)
+
+        fresh_xml = xml.replace("Hi新品", "卡萨帝新品")
+        fresh_page = build_page_model(
+            fresh_xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity=".Search",
+        )
+        self.assertEqual(page.semantic_key, fresh_page.semantic_key)
+        self.assertEqual(locator_match_count(fresh_xml, bounds_candidate), 1)
+        self.assertEqual(
+            locator_unique_bounds(fresh_xml, bounds_candidate),
+            (311, 135, 885, 184),
+        )
+
+    def test_haier_campaign_product_grid_is_a_product_list(self):
+        cards = []
+        products = (
+            "512升五门冰箱",
+            "法式四门510升冰箱",
+            "变频滚筒洗烘一体机",
+            "全自动变频滚筒洗衣机",
+            "60升无镁棒电热水器",
+            "净省电变频空调挂机",
+        )
+        for index, product in enumerate(products):
+            row, column = divmod(index, 3)
+            left = 35 + column * 345
+            top = 620 + row * 550
+            cards.append(
+                '<node class="android.view.ViewGroup" '
+                f'content-desc="{product}, 换新补贴, ¥{1598 + index * 200}.85" '
+                'clickable="true" enabled="true" '
+                f'bounds="[{left},{top}][{left + 321},{top + 530}]">'
+                f'<node class="android.widget.TextView" text="{product}" '
+                'enabled="true" '
+                f'bounds="[{left + 20},{top + 300}][{left + 290},{top + 380}]"/>'
+                '</node>'
+            )
+        page = build_page_model(
+            _page(
+                '<node class="android.view.ViewGroup" enabled="true" '
+                'bounds="[0,0][1080,2364]"/>'
+                + "".join(cards)
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2400),
+            coverage_scheduler_v2=True,
+        )
+
+        self.assertEqual(page.page_subtype, "PRODUCT_LIST")
+        self.assertEqual(page.role, "LIST")
+        item_actions = [
+            action
+            for action in actions
+            if action.action_role == "ITEM_OPEN:collection"
+        ]
+        self.assertTrue(item_actions)
+        self.assertTrue(all(action.replayable for action in item_actions))
+        first_card = next(
+            action
+            for action in item_actions
+            if action.target_meta["bounds"] == [35, 620, 356, 1150]
+        )
+        first_locator = first_card.locator_candidates[0]
+        self.assertTrue(first_locator["bounds_constrained"])
+        self.assertEqual(first_locator["expected_class"], "android.view.ViewGroup")
+        self.assertEqual(locator_match_count(page.xml, first_locator), 1)
+        self.assertEqual(
+            locator_unique_bounds(page.xml, first_locator),
+            (35, 620, 356, 1150),
+        )
+
+    def test_haier_keyword_results_are_not_a_catalog_category(self):
+        xml = _page(
+            '<node class="android.view.ViewGroup" content-desc="海尔 冰箱" '
+            'clickable="true" enabled="true" bounds="[162,114][895,206]"/>'
+            '<node class="android.view.ViewGroup" content-desc="综合" '
+            'clickable="true" enabled="true" bounds="[0,226][270,318]"/>'
+            '<node class="android.view.ViewGroup" content-desc="销量" '
+            'clickable="true" enabled="true" bounds="[270,226][540,318]"/>'
+            '<node class="android.view.ViewGroup" content-desc="价格" '
+            'clickable="true" enabled="true" bounds="[540,226][810,318]"/>'
+            '<node class="android.view.ViewGroup" content-desc="筛选" '
+            'clickable="true" enabled="true" bounds="[810,226][1080,318]"/>'
+            '<node class="android.view.ViewGroup" clickable="true" enabled="true" '
+            'bounds="[0,440][1080,960]">'
+            '<node class="android.widget.TextView" '
+            'text="海尔 三门203升 黑金净化风冷无霜冰箱" enabled="true" '
+            'bounds="[410,480][1030,600]"/>'
+            '<node class="android.widget.TextView" text="¥1125" enabled="true" '
+            'bounds="[410,700][600,780]"/>'
+            '<node class="android.widget.TextView" text="立即购买" enabled="true" '
+            'bounds="[760,800][1020,900]"/>'
+            '</node>'
+            '<node class="android.view.ViewGroup" clickable="true" enabled="true" '
+            'bounds="[0,980][1080,1500]">'
+            '<node class="android.widget.TextView" '
+            'text="海尔 对开门616升 变频风冷无霜冰箱" enabled="true" '
+            'bounds="[410,1020][1030,1140]"/>'
+            '<node class="android.widget.TextView" text="¥2499" enabled="true" '
+            'bounds="[410,1240][600,1320]"/>'
+            '<node class="android.widget.TextView" text="立即购买" enabled="true" '
+            'bounds="[760,1340][1020,1440]"/>'
+            '</node>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2412),
+            coverage_scheduler_v2=True,
+        )
+
+        self.assertEqual(page.page_subtype, "PRODUCT_LIST")
+        self.assertTrue(
+            any(action.action_role == "ITEM_OPEN:collection" for action in actions)
+        )
+
+    def test_haier_recent_search_surface_keeps_fixed_search_input(self):
+        xml = _page(
+            '<node class="android.widget.EditText" clickable="true" '
+            'enabled="true" bounds="[222,114][888,206]"/>'
+            '<node class="android.view.ViewGroup" content-desc="搜索" '
+            'clickable="true" enabled="true" bounds="[955,131][1045,189]"/>'
+            '<node class="android.widget.TextView" text="最近搜索" '
+            'enabled="true" bounds="[35,281][191,339]"/>'
+            '<node class="android.view.ViewGroup" content-desc="小厨宝" '
+            'clickable="true" enabled="true" bounds="[35,374][213,454]"/>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2400),
+            coverage_scheduler_v2=True,
+            input_rules=[
+                {
+                    "id": "haier_v2_search_keyword",
+                    "class_regex": "EditText",
+                    "page_subtype_regex": "^SEARCH$",
+                    "value_source": "literal",
+                    "value": "冰箱",
+                }
+            ],
+        )
+
+        self.assertEqual(page.page_subtype, "SEARCH")
+        input_action = next(action for action in actions if action.action_role == "INPUT")
+        self.assertEqual(input_action.input_rule_id, "haier_v2_search_keyword")
+        self.assertIsNone(input_action.risk_type)
+
+    def test_haier_category_hot_word_header_is_the_search_entry(self):
+        xml = _page(
+            '<node class="android.widget.TextView" text="分类" '
+            'enabled="true" bounds="[400,240][680,320]"/>'
+            '<node class="android.view.ViewGroup" content-desc="Hi新品" '
+            'clickable="true" enabled="true" bounds="[71,113][1009,205]"/>'
+            + "".join(
+                '<node class="android.view.ViewGroup" content-desc="{}" '
+                'clickable="true" enabled="true" bounds="[0,{}][253,{}]"/>'.format(
+                    label,
+                    384 + index * 144,
+                    528 + index * 144,
+                )
+                for index, label in enumerate(
+                    ("新品", "冰箱", "洗衣机", "空调", "热水器")
+                )
+            )
+            + '<node class="android.view.ViewGroup" enabled="true" '
+            'bounds="[253,384][1080,2100]"/>'
+            + '<node class="android.view.ViewGroup" content-desc="海尔" '
+            'clickable="true" enabled="true" bounds="[275,630][511,918]"/>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2412),
+            coverage_scheduler_v2=True,
+        )
+        header = next(
+            action
+            for action in actions
+            if action.target_meta["content_desc"] == "Hi新品"
+        )
+
+        self.assertEqual(page.page_subtype, "CATALOG_CATEGORY")
+        self.assertEqual(header.action_role, "COMMAND:SEARCH")
+        self.assertEqual(header.sample_policy, "PAGE_ONE")
+        self.assertTrue(header.locator_candidates[0]["bounds_constrained"])
+
+        changed = build_page_model(
+            xml.replace("Hi新品", "智家焕新"),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        self.assertEqual(page.semantic_key, changed.semantic_key)
+        self.assertEqual(
+            locator_match_count(changed.xml, header.locator_candidates[0]),
+            1,
+        )
+
+    def test_haier_checkout_benefit_prompt_keeps_direct_submit_only(self):
+        page = build_page_model(
+            _page(
+                '<node class="android.widget.TextView" text="权益选择提醒" '
+                'enabled="true" bounds="[320,840][760,960]"/>'
+                '<node class="android.widget.TextView" '
+                'text="此订单存在可选择的权益" enabled="true" '
+                'bounds="[250,980][830,1080]"/>'
+                '<node class="android.view.ViewGroup" content-desc="直接提交" '
+                'clickable="true" enabled="true" bounds="[180,1120][500,1260]"/>'
+                '<node class="android.view.ViewGroup" content-desc="选择权益" '
+                'clickable="true" enabled="true" bounds="[540,1120][900,1260]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2412),
+            coverage_scheduler_v2=True,
+        )
+
+        self.assertEqual(page.page_subtype, "CHECKOUT_CONFIRMATION")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].action_role, "PLACE_ORDER")
+        self.assertEqual(actions[0].target_meta["content_desc"], "直接提交")
+
+    def test_haier_order_tabs_identify_the_order_center(self):
+        page = build_page_model(
+            _page(
+                "".join(
+                    '<node class="android.view.ViewGroup" content-desc="{}" '
+                    'clickable="true" enabled="true" bounds="[{},220][{},340]"/>'.format(
+                        label,
+                        20 + index * 200,
+                        190 + index * 200,
+                    )
+                    for index, label in enumerate(
+                        ("全部", "待付款", "待发货", "待收货/验收", "待评价")
+                    )
+                )
+                + '<node class="android.view.ViewGroup" '
+                'content-desc="海尔自营, 等待付款, 去支付, 取消订单" '
+                'clickable="true" enabled="true" bounds="[40,420][1040,940]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+
+        self.assertEqual((page.role, page.page_subtype), ("ORDER", "ORDER"))
+
+    def test_haier_factory_extended_warranty_is_a_service_detail(self):
+        page = build_page_model(
+            _page(
+                '<node class="android.widget.TextView" text="海尔原厂延保" '
+                'enabled="true" bounds="[80,260][520,360]"/>'
+                '<node class="android.widget.TextView" '
+                'text="整机保修延长至10年" enabled="true" '
+                'bounds="[80,400][700,500]"/>'
+                '<node class="android.view.ViewGroup" content-desc="到货通知" '
+                'clickable="true" enabled="true" bounds="[700,2200][1040,2340]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+
+        self.assertEqual(page.page_subtype, "SERVICE_DETAIL")
+
+    def test_explicit_guest_login_boundary_is_auth_gate(self):
+        xml = _page(
+            '<node class="android.widget.TextView" text="请先登录" enabled="true" '
+            'bounds="[380,280][700,380]"/>'
+            '<node class="android.widget.EditText" content-desc="手机号" '
+            'clickable="true" enabled="true" bounds="[100,500][980,620]"/>'
+            '<node class="android.widget.EditText" content-desc="验证码" '
+            'clickable="true" enabled="true" bounds="[100,660][980,780]"/>'
+            '<node class="android.view.ViewGroup" content-desc="立即登录" '
+            'clickable="true" enabled="true" bounds="[100,840][980,960]"/>'
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity=".Login",
+        )
+
+        self.assertEqual(page.page_subtype, "AUTH_GATE")
+
     def test_appointment_list_only_keeps_destructive_blocked_edges(self):
         xml = _page(
             '<node class="android.widget.TextView" text="我的预约" enabled="true" '
@@ -3808,6 +4615,47 @@ class InspectionSemanticsTests(unittest.TestCase):
         )
         self.assertEqual([item.action_role for item in actions], ["BUY_NOW"])
 
+    def test_haier_price_cta_and_option_row_use_verified_bounds(self):
+        xml = _page(
+            '<node class="android.widget.TextView" text="商品详情" '
+            'enabled="true" bounds="[420,100][660,220]"/>'
+            '<node class="android.view.ViewGroup" '
+            'content-desc="已选, LEC5TP , ，1件 " clickable="true" '
+            'enabled="true" bounds="[35,2123][1045,2177]"/>'
+            '<node class="android.view.ViewGroup" content-desc="加入购物车" '
+            'clickable="true" enabled="true" bounds="[390,2222][707,2348]"/>'
+            '<node class="android.view.ViewGroup" content-desc="到手价, ¥288.15" '
+            'clickable="true" enabled="true" bounds="[731,2222][1048,2348]">'
+            '<node class="android.widget.TextView" text="到手价" '
+            'enabled="true" bounds="[840,2242][939,2286]"/>'
+            '<node class="android.widget.TextView" text="¥288.15" '
+            'enabled="true" bounds="[810,2286][970,2338]"/>'
+            "</node>"
+        )
+        page = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        actions = enumerate_actions(
+            page,
+            screen_size=(1080, 2412),
+            coverage_scheduler_v2=True,
+        )
+        by_role = {action.action_role: action for action in actions}
+
+        self.assertEqual(page.page_subtype, "PRODUCT_DETAIL")
+        self.assertIn("BUY_NOW", by_role)
+        self.assertIn("OPTION_SELECT", by_role)
+        for role, expected_bounds in (
+            ("OPTION_SELECT", (35, 2123, 1045, 2177)),
+            ("BUY_NOW", (731, 2222, 1048, 2348)),
+        ):
+            candidate = by_role[role].locator_candidates[0]
+            self.assertTrue(candidate["bounds_constrained"])
+            self.assertEqual(locator_match_count(xml, candidate), 1)
+            self.assertEqual(locator_unique_bounds(xml, candidate), expected_bounds)
+
     def test_store_list_groups_actions_and_blocks_phone(self):
         xml = _page(
             '<node class="android.widget.TextView" text="附近门店" enabled="true" '
@@ -4058,6 +4906,107 @@ class InspectionSemanticsTests(unittest.TestCase):
             derive_instance_anchor(second),
         )
         self.assertTrue(compare_exploration_families(first, second).equivalent)
+
+    def test_haier_community_article_is_a_distinct_coverage_endpoint(self):
+        page = build_page_model(
+            _page(
+                '<node class="android.widget.TextView" text="海尔商城" '
+                'enabled="true" bounds="[150,80][430,160]"/>'
+                '<node class="android.widget.TextView" text="官方" '
+                'enabled="true" bounds="[440,80][560,160]"/>'
+                '<node class="android.widget.TextView" text="精选" '
+                'enabled="true" bounds="[150,170][270,230]"/>'
+                '<node class="android.widget.TextView" text="06-30 09:08 · 山东" '
+                'enabled="true" bounds="[280,170][650,230]"/>'
+                '<node class="android.widget.TextView" text="参与话题，赢好礼" '
+                'enabled="true" bounds="[40,320][700,410]"/>'
+                '<node class="android.widget.EditText" content-desc="来说点什么..." '
+                'clickable="true" enabled="true" bounds="[40,2180][680,2300]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+
+        self.assertEqual(page.page_subtype, "COMMUNITY_DETAIL")
+
+    def test_haier_smart_life_benefits_requires_combined_coupon_signals(self):
+        xml = _page(
+            '<node class="android.widget.TextView" text="Smart life" '
+            'enabled="true" bounds="[80,260][420,360]"/>'
+            '<node class="android.widget.TextView" text="满减券" '
+            'enabled="true" bounds="[80,900][280,980]"/>'
+            '<node class="android.widget.TextView" text="新会员专享" '
+            'enabled="true" bounds="[80,1000][420,1080]"/>'
+            '<node class="android.view.ViewGroup" content-desc="去使用" '
+            'clickable="true" enabled="true" bounds="[700,900][980,1020]"/>'
+        )
+        haier = build_page_model(
+            xml,
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        unrelated_app = build_page_model(
+            xml,
+            package_name="com.demo",
+            activity=".MainActivity",
+        )
+
+        self.assertEqual(haier.page_subtype, "MEMBER_BENEFITS")
+        self.assertNotEqual(unrelated_app.page_subtype, "MEMBER_BENEFITS")
+
+    def test_haier_rights_hub_is_member_benefits(self):
+        page = build_page_model(
+            _page(
+                '<node class="android.widget.TextView" text="我的权益" '
+                'enabled="true" bounds="[400,80][680,180]"/>'
+                '<node class="android.widget.TextView" text="796积分" '
+                'enabled="true" bounds="[80,300][360,410]"/>'
+                '<node class="android.view.ViewGroup" content-desc="我的优惠券, 3" '
+                'clickable="true" enabled="true" bounds="[60,700][1020,840]"/>'
+                '<node class="android.view.ViewGroup" content-desc="生态权益, 0" '
+                'clickable="true" enabled="true" bounds="[60,1100][1020,1240]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+
+        self.assertEqual(page.page_subtype, "MEMBER_BENEFITS")
+
+    def test_haier_favorites_and_history_are_explicit_list_subtypes(self):
+        favorites = build_page_model(
+            _page(
+                '<node class="android.widget.TextView" text="商品收藏" '
+                'enabled="true" bounds="[400,80][680,180]"/>'
+                '<node class="android.view.ViewGroup" content-desc="管理" '
+                'clickable="true" enabled="true" bounds="[900,80][1060,180]"/>'
+                '<node class="android.view.ViewGroup" content-desc="全部(39)" '
+                'clickable="true" enabled="true" bounds="[40,220][260,340]"/>'
+                '<node class="android.view.ViewGroup" content-desc="Haier/海尔 冰箱" '
+                'clickable="true" enabled="true" bounds="[40,400][1040,800]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+        history = build_page_model(
+            _page(
+                '<node class="android.widget.TextView" text="历史浏览" '
+                'enabled="true" bounds="[400,80][680,180]"/>'
+                '<node class="android.view.ViewGroup" content-desc="商品浏览" '
+                'clickable="true" enabled="true" bounds="[80,220][320,340]"/>'
+                '<node class="android.view.ViewGroup" content-desc="线下门店" '
+                'clickable="true" enabled="true" bounds="[360,220][600,340]"/>'
+                '<node class="android.widget.TextView" text="今天" '
+                'enabled="true" bounds="[40,380][180,460]"/>'
+            ),
+            package_name="com.ehaier.zgq.shop.mall",
+            activity="com.ehaier.mall.MainActivity",
+        )
+
+        self.assertEqual((favorites.role, favorites.page_subtype), ("LIST", "FAVORITES"))
+        self.assertEqual(
+            (history.role, history.page_subtype),
+            ("LIST", "BROWSING_HISTORY"),
+        )
 
     def test_settings_and_address_pages_do_not_become_checkout(self):
         settings = build_page_model(

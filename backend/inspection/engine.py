@@ -51,6 +51,13 @@ from backend.inspection.device import (
     wait_for_stable_page,
 )
 from backend.inspection.live import inspection_live_registry
+from backend.inspection.haier_business_coverage import (
+    CoverageGoalTracker,
+    coverage_state_assignments,
+    evaluate_haier_business_coverage,
+    normalize_xml_evidence,
+)
+from backend.inspection.haier_coverage import StateEvidence, TransitionEvidence
 from backend.inspection.monitor import InspectionMonitorSession
 from backend.inspection.runtime import abort_event_for_run, discard_abort_event
 from backend.inspection.sanitizer import InspectionArtifactSanitizer
@@ -186,12 +193,13 @@ class BudgetExceeded(RuntimeError):
 class ExplorationBudgetExceeded(BudgetExceeded):
     """The exploration share ended while the task-wide reserve remains."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, exploration_percent: int = 90) -> None:
         super().__init__(code)
+        percent = max(0, min(100, int(exploration_percent)))
         self.reason = (
-            "探索阶段 90% 时间预算已用完"
+            f"探索阶段 {percent}% 时间预算已用完"
             if self.code == "DEADLINE"
-            else "探索阶段 90% 动作预算已用完"
+            else f"探索阶段 {percent}% 动作预算已用完"
             if self.code == "DEVICE_ACTIONS"
             else self.reason
         )
@@ -504,7 +512,7 @@ class BranchBudgetView:
 
 
 class ExplorationBudgetView:
-    """Hard 90% exploration share backed by the branch/task budget ledger."""
+    """Hard exploration share backed by the branch/task budget ledger."""
 
     def __init__(
         self,
@@ -512,10 +520,12 @@ class ExplorationBudgetView:
         *,
         deadline: float,
         max_device_actions: int,
+        exploration_percent: int = 90,
     ) -> None:
         self.guard = guard
         self.deadline = min(float(deadline), float(guard.deadline))
         self.max_device_actions = max(0, int(max_device_actions))
+        self.exploration_percent = max(0, min(100, int(exploration_percent)))
         self.device_actions = 0
         self._lock = threading.Lock()
 
@@ -525,7 +535,7 @@ class ExplorationBudgetView:
     def check_deadline(self) -> None:
         self.guard.check_deadline()
         if time.monotonic() >= self.deadline:
-            raise ExplorationBudgetExceeded("DEADLINE")
+            raise ExplorationBudgetExceeded("DEADLINE", self.exploration_percent)
 
     def remaining_seconds(self, requested: Optional[float] = None) -> float:
         self.check_deadline()
@@ -546,7 +556,9 @@ class ExplorationBudgetView:
             return
         with self._lock:
             if self.device_actions >= self.max_device_actions:
-                raise ExplorationBudgetExceeded("DEVICE_ACTIONS")
+                raise ExplorationBudgetExceeded(
+                    "DEVICE_ACTIONS", self.exploration_percent
+                )
             self.guard.before_device_interaction(operation, mutating=True)
             self.device_actions += 1
 
@@ -979,6 +991,7 @@ def _replay_model_expectation(
         "package": str(model.package_name or "").casefold(),
         "activity_family": str(model.activity_family or ""),
         "role": str(model.role or ""),
+        "page_subtype": str(model.page_subtype or "UNKNOWN"),
         "instance_anchor": str(
             instance_anchor or derive_instance_anchor(model) or ""
         ),
@@ -1047,6 +1060,75 @@ def _replay_signature_matches(
         and tuple(expected.get("action_tokens") or ()) == tuple(model.action_tokens)
         and tuple(expected.get("control_tokens") or ()) == tuple(model.control_tokens)
         and tuple(expected.get("risk_tokens") or ()) == tuple(model.risk_tokens)
+    )
+
+
+def _coverage_endpoint_reverify_matches(
+    capture: Optional[CapturedPage],
+    path: Sequence[Dict[str, Any]],
+    *,
+    expected_page_subtype: str,
+) -> bool:
+    """Accept a dynamic endpoint only when its frozen identity still matches.
+
+    Full regression replay deliberately requires stable structure, action and
+    control tokens. Business coverage only requires one real endpoint revisit,
+    so an animated count or carousel must not invalidate an otherwise exact
+    Haier page. This fallback is used only after strict replay reaches a target
+    whose dynamic tokens diverge.
+    """
+    if capture is None or not str(capture.xml or "").strip() or not path:
+        return False
+    payload = dict(path[-1])
+    expected = payload.get("expected_target_signature")
+    if not isinstance(expected, dict):
+        return False
+    subtype = str(capture.model.page_subtype or "UNKNOWN").upper()
+    frozen_subtype = str(
+        expected.get("page_subtype") or expected_page_subtype or "UNKNOWN"
+    ).upper()
+    if subtype in {"UNKNOWN", "OPAQUE"} or subtype != frozen_subtype:
+        return False
+    identity_matches = bool(
+        str(expected.get("package") or "").casefold()
+        == str(capture.model.package_name or "").casefold()
+        and str(expected.get("activity_family") or "")
+        == str(capture.model.activity_family or "")
+        and str(expected.get("role") or "") == str(capture.model.role or "")
+    )
+    if not identity_matches:
+        return False
+    # Haier's favorites count and product list are live data, so both content
+    # anchors can legitimately change between discovery and the reserved
+    # endpoint replay. The exact recorded action still has to land on the
+    # classified favorites page with its invariant title and readable XML.
+    if frozen_subtype == "FAVORITES":
+        return re.search(r"(?:商品收藏|我的收藏)", str(capture.xml or "")) is not None
+    expected_content_anchor = str(expected.get("content_anchor") or "")
+    expected_instance_anchor = str(expected.get("instance_anchor") or "")
+    if not expected_content_anchor or not expected_instance_anchor:
+        return False
+    source_signature = payload.get("expected_source_signature")
+    source_anchor = (
+        str(source_signature.get("instance_anchor") or "")
+        if isinstance(source_signature, dict)
+        else ""
+    )
+    try:
+        actual_content_anchor = str(derive_instance_anchor(capture.model) or "")
+        actual_instance_anchor = str(
+            derive_instance_anchor(
+                capture.model,
+                incoming_action=_deserialize_action(payload),
+                source_instance_anchor=source_anchor or None,
+            )
+            or ""
+        )
+    except Exception:
+        return False
+    return bool(
+        expected_content_anchor == actual_content_anchor
+        and expected_instance_anchor == actual_instance_anchor
     )
 
 
@@ -3786,6 +3868,24 @@ def _coverage_representative_priority(work: StateWork) -> int:
     return 200
 
 
+def _business_goal_priority_override(
+    goal_tracker: Optional[CoverageGoalTracker],
+    page_subtype: str,
+    actions: Sequence[InspectionAction],
+    priority: Optional[int],
+    reason: Optional[str],
+) -> Tuple[Optional[int], Optional[str]]:
+    """Keep unresolved manifest actions ahead of every exploration priority."""
+    if goal_tracker is None or not actions:
+        return priority, reason
+    goal_priority = goal_tracker.frontier_priority(page_subtype, actions)
+    if goal_priority is None or (
+        priority is not None and int(priority) <= int(goal_priority)
+    ):
+        return priority, reason
+    return int(goal_priority), "BUSINESS_COVERAGE_GOAL"
+
+
 def _pop_most_local(
     queue: Deque[StateWork],
     current_path: Optional[Sequence[Dict[str, Any]]],
@@ -4481,6 +4581,7 @@ def _verify_stable_paths(
     budget_guard: Optional[BudgetGuard] = None,
     max_paths: Optional[int] = None,
     representative_only: bool = False,
+    coverage_reverify_once: bool = False,
 ) -> int:
     with Session(engine) as session:
         states = session.exec(
@@ -4522,12 +4623,15 @@ def _verify_stable_paths(
                 state
                 for state in states
                 if state.depth == 0
+                or str(state.coverage_status or "").upper()
+                in {"REQUIRED_EVIDENCE", "INCOMPLETE"}
                 or (
                     int(state.id) in representative_ids
                     and str(state.expansion_status or "") == "EXPANDED"
                 )
             ]
             role_priority = {
+                "CASHIER": 0,
                 "CHECKOUT": 0,
                 "ORDER": 0,
                 "PRODUCT_DETAIL": 1,
@@ -4535,6 +4639,7 @@ def _verify_stable_paths(
                 "HOME": 4,
             }
             subtype_priority = {
+                "CASHIER": 0,
                 "CONSUMABLE_LIST": 2,
                 "PRODUCT_LIST": 2,
                 "SERVICE_LIST": 2,
@@ -4543,6 +4648,10 @@ def _verify_stable_paths(
             }
             states.sort(
                 key=lambda state: (
+                    0
+                    if str(state.coverage_status or "").upper()
+                    in {"REQUIRED_EVIDENCE", "INCOMPLETE"}
+                    else 1,
                     min(
                         role_priority.get(
                             str(
@@ -4554,6 +4663,7 @@ def _verify_stable_paths(
                         ),
                         subtype_priority.get(str(state.page_subtype or "UNKNOWN"), 5),
                     ),
+                    -len(state.first_path or []),
                     state.depth,
                     state.id,
                 )
@@ -4568,6 +4678,8 @@ def _verify_stable_paths(
                 state.representative_observation_id,
                 list(state.first_path or []),
                 state.depth,
+                str(state.coverage_status or ""),
+                str(state.page_subtype or "UNKNOWN"),
             )
             for state in states
         ]
@@ -4656,8 +4768,14 @@ def _verify_stable_paths(
         representative_observation_id,
         path,
         depth,
+        coverage_status,
+        page_subtype,
     ) in candidates:
         _check_abort(abort_event)
+        # A successful deep replay verifies its exact persisted prefixes too.
+        # Do not spend the reserve replaying those checkpoint states again.
+        if int(state_id) in verified_state_ids:
+            continue
         if budget_guard is not None:
             budget_guard.check_deadline()
         elif time.monotonic() >= deadline:
@@ -4710,6 +4828,12 @@ def _verify_stable_paths(
             for item in path
         ):
             continue
+        reverify_once = bool(
+            coverage_reverify_once
+            and str(coverage_status or "").upper()
+            in {"REQUIRED_EVIDENCE", "INCOMPLETE"}
+        )
+        coverage_endpoint_match = False
         try:
             first, first_unique = _replay_path(
                 device=device,
@@ -4727,43 +4851,77 @@ def _verify_stable_paths(
             )
         except PathDiverged:
             first, first_unique = None, False
-        if budget_guard is not None:
-            budget_guard.check_deadline()
-        elif time.monotonic() >= deadline:
-            break
-        try:
-            second, second_unique = _replay_path(
-                device=device,
-                path=path,
-                branch_config=branch_config,
-                device_serial=device_serial,
-                package_name=package_name,
-                abort_event=abort_event,
-                input_rules=input_rules,
-                dynamic_patterns=dynamic_patterns,
-                stable_wait_seconds=stable_wait_seconds,
-                secret_values=secret_values,
-                stage_callback=stage_callback,
-                budget_guard=budget_guard,
-            )
-        except PathDiverged:
-            second, second_unique = None, False
-        stable = bool(
+            if reverify_once:
+                try:
+                    if budget_guard is not None:
+                        budget_guard.before_device_interaction(
+                            "capture_dynamic_coverage_endpoint"
+                        )
+                    fallback_capture = _budgeted_wait_for_stable_page(
+                        device,
+                        budget_guard=budget_guard,
+                        expected_package=package_name,
+                        abort_event=abort_event,
+                        max_wait_seconds=stable_wait_seconds,
+                        dynamic_patterns=dynamic_patterns,
+                    )
+                    coverage_endpoint_match = _coverage_endpoint_reverify_matches(
+                        fallback_capture,
+                        path,
+                        expected_page_subtype=page_subtype,
+                    )
+                    if coverage_endpoint_match:
+                        first, first_unique = fallback_capture, True
+                except (InspectionAborted, BudgetExceeded):
+                    raise
+                except Exception:
+                    first, first_unique = None, False
+        first_matches = bool(
             first_unique
-            and second_unique
             and first is not None
-            and second is not None
             and (
-                _page_logical_key(first.model) == expected_semantic
-                if expected_semantic
-                else first.model.cluster_key == expected_cluster
-            )
-            and (
-                _page_logical_key(second.model) == expected_semantic
-                if expected_semantic
-                else second.model.cluster_key == expected_cluster
+                coverage_endpoint_match
+                or (
+                    _page_logical_key(first.model) == expected_semantic
+                    if expected_semantic
+                    else first.model.cluster_key == expected_cluster
+                )
             )
         )
+        if reverify_once:
+            stable = first_matches
+        else:
+            if budget_guard is not None:
+                budget_guard.check_deadline()
+            elif time.monotonic() >= deadline:
+                break
+            try:
+                second, second_unique = _replay_path(
+                    device=device,
+                    path=path,
+                    branch_config=branch_config,
+                    device_serial=device_serial,
+                    package_name=package_name,
+                    abort_event=abort_event,
+                    input_rules=input_rules,
+                    dynamic_patterns=dynamic_patterns,
+                    stable_wait_seconds=stable_wait_seconds,
+                    secret_values=secret_values,
+                    stage_callback=stage_callback,
+                    budget_guard=budget_guard,
+                )
+            except PathDiverged:
+                second, second_unique = None, False
+            stable = bool(
+                first_matches
+                and second_unique
+                and second is not None
+                and (
+                    _page_logical_key(second.model) == expected_semantic
+                    if expected_semantic
+                    else second.model.cluster_key == expected_cluster
+                )
+            )
         checkpoint_states = _checkpoint_states(path) if stable else []
         if stable and not checkpoint_states:
             checkpoint_states = [(int(state_id), representative_observation_id)]
@@ -4781,13 +4939,15 @@ def _verify_stable_paths(
                 if str(state.stable_status or "").upper() == "VIEWPORT":
                     continue
                 state.stable_status = (
-                    "VERIFIED_TWICE"
+                    "REVERIFIED_ONCE"
+                    if stable and reverify_once
+                    else "VERIFIED_TWICE"
                     if stable and not list(state.first_path or [])
                     else "STABLE"
                     if stable
                     else "UNSTABLE"
                 )
-                state.selected_for_regression = stable
+                state.selected_for_regression = bool(stable and not reverify_once)
                 state.updated_at = _now()
                 session.add(state)
             session.commit()
@@ -4835,6 +4995,24 @@ def _execute_branch(
     identity_v2, similarity_convergence = _identity_options(profile)
     coverage_scheduler, visual_home_actions = _coverage_scheduler_options(profile)
     coverage_scheduler = bool(identity_v2 and coverage_scheduler)
+    business_coverage_v2 = bool(
+        coverage_scheduler
+        and _profile_bool(
+            profile,
+            "inspection_business_coverage_v2",
+            "business_coverage_v2",
+        )
+        and isinstance(profile.get("coverage_manifest"), dict)
+        and profile.get("coverage_manifest")
+    )
+    goal_tracker = (
+        CoverageGoalTracker(
+            branch.branch_key,
+            manifest=dict(profile.get("coverage_manifest") or {}),
+        )
+        if business_coverage_v2
+        else None
+    )
     if coverage_scheduler:
         # Coverage runs should not spend most of their device budget waiting
         # on a long-tail animation. The stable-page sampler still requires a
@@ -4871,19 +5049,22 @@ def _execute_branch(
     screen_size = tuple(int(item) for item in device.window_size())
     guard.check_deadline()
     deadline = branch_guard.deadline
+    exploration_share = 0.85 if business_coverage_v2 else 0.90
+    exploration_percent = int(round(exploration_share * 100))
     exploration_started_at = time.monotonic()
     exploration_deadline = exploration_started_at + max(
         0.0,
-        (deadline - exploration_started_at) * 0.90,
+        (deadline - exploration_started_at) * exploration_share,
     )
     exploration_device_action_limit = max(
         0,
-        int(branch_guard.max_device_actions * 0.90),
+        int(branch_guard.max_device_actions * exploration_share),
     )
     guard = ExplorationBudgetView(
         branch_guard,
         deadline=exploration_deadline,
         max_device_actions=exploration_device_action_limit,
+        exploration_percent=exploration_percent,
     )
     hard_fault = False
     warning = False
@@ -4998,6 +5179,17 @@ def _execute_branch(
     def track_work(work: Optional[StateWork]) -> Optional[StateWork]:
         if work is None:
             return None
+        if goal_tracker is not None:
+            goal_tracker.observe_state(work.state_id, work.page_subtype)
+            if goal_tracker.state_is_required_candidate(work.page_subtype):
+                work.coverage_status = "REQUIRED_EVIDENCE"
+                with Session(engine) as session:
+                    state = session.get(InspectionState, int(work.state_id))
+                    if state is not None and state.coverage_status != "REQUIRED_EVIDENCE":
+                        state.coverage_status = "REQUIRED_EVIDENCE"
+                        state.updated_at = _now()
+                        session.add(state)
+                        session.commit()
         existing = tracked_work.get(work.state_id)
         if existing is not None:
             incoming_action_entries = [
@@ -5261,6 +5453,11 @@ def _execute_branch(
         reason: Optional[str] = None,
     ) -> bool:
         remaining = pending_actions(work, actions)
+        if goal_tracker is not None and remaining:
+            remaining = goal_tracker.prioritize_actions(
+                work.page_subtype,
+                remaining,
+            )
         if actions is not None and not remaining:
             return False
         if work.state_id in expanded_state_ids and not remaining:
@@ -5270,13 +5467,24 @@ def _execute_branch(
         )
         queued_work = (
             work
-            if actions is None and len(remaining) == len(work.actions)
+            if (
+                goal_tracker is None
+                and actions is None
+                and len(remaining) == len(work.actions)
+            )
             else replace(work, actions=remaining)
         )
         if coverage_scheduler:
             action_roles = {
                 str(item.action_role or "") for item in remaining
             }
+            priority, reason = _business_goal_priority_override(
+                goal_tracker,
+                work.page_subtype,
+                remaining,
+                priority,
+                reason,
+            )
             if priority is None:
                 if is_primary_entry_surface:
                     if work.state_id not in primary_entry_surface_started_ids:
@@ -5390,6 +5598,16 @@ def _execute_branch(
         create: bool = False,
     ) -> Optional[InspectionFamilyActionCoverage]:
         family_pair = _family_action_pair(work, action)
+        if goal_tracker is not None and goal_tracker.action_is_required(
+            work.page_subtype,
+            str(action.action_role or ""),
+            label=" ".join(
+                str((action.target_meta or {}).get(key) or "")
+                for key in ("content_desc", "text")
+            ),
+            risk_type=str(action.risk_type or ""),
+        ):
+            return None
         if (
             not family_convergence
             or family_pair is None
@@ -5741,6 +5959,18 @@ def _execute_branch(
         # cursor. It is not reusable business coverage and must always run.
         if _is_overlay_cleanup_action(action):
             return None
+        if goal_tracker is not None and goal_tracker.action_is_required(
+            work.page_subtype,
+            str(action.action_role or ""),
+            label=" ".join(
+                str((action.target_meta or {}).get(key) or "")
+                for key in ("content_desc", "text")
+            ),
+            risk_type=str(action.risk_type or ""),
+        ):
+            # Core journeys need their own Transition evidence. A family
+            # contract or representative sample cannot substitute for it.
+            return None
         group_signature = sampling_group_signature(work, action)
         role = str(action.action_role or "")
         contract = coverage_contract_for(
@@ -6025,6 +6255,23 @@ def _execute_branch(
             progress["blocked"] += 1
         work = tracked_work.get(int(payload.get("from_state_id") or 0))
         target_work = tracked_work.get(int(target_state_id or 0))
+        if goal_tracker is not None:
+            goal_tracker.observe_transition(
+                from_state_id=int(payload.get("from_state_id") or 0),
+                to_state_id=(int(target_state_id) if target_state_id is not None else None),
+                action_role=str(payload.get("action_role") or ""),
+                status=str(payload.get("status") or ""),
+                execution_disposition=str(
+                    payload.get("execution_disposition") or "EXECUTED"
+                ),
+                risk_type=str(payload.get("risk_type") or ""),
+                input_rule_id=str(payload.get("input_rule_id") or ""),
+                input_length=(
+                    int(payload.get("input_length"))
+                    if payload.get("input_length") is not None
+                    else None
+                ),
+            )
         current_action = _live_action(work, payload.get("action_key"))
         if current_action is None:
             current_action = {
@@ -6115,6 +6362,19 @@ def _execute_branch(
         """Switch to the task reserve before any verification interaction."""
         nonlocal guard
         guard = branch_guard
+        if business_coverage_v2:
+            try:
+                _mark_business_coverage_verification_candidates(
+                    run_id,
+                    branch_run_id,
+                )
+            except Exception:
+                logger.exception(
+                    "inspection business verification candidates failed: "
+                    "run=%s branch=%s",
+                    run_id,
+                    branch_run_id,
+                )
         publish_stage(
             "representative_verification" if coverage_scheduler else "verify",
             "代表验证" if coverage_scheduler else "验证稳定路径",
@@ -6133,8 +6393,9 @@ def _execute_branch(
             deadline=deadline,
             secret_values=secret_values,
             budget_guard=branch_guard,
-            max_paths=10 if coverage_scheduler else None,
+            max_paths=(24 if business_coverage_v2 else 10) if coverage_scheduler else None,
             representative_only=coverage_scheduler,
+            coverage_reverify_once=business_coverage_v2,
         )
         drain_monitor_events(next(iter(tracked_work), None))
         return verified
@@ -6212,11 +6473,15 @@ def _execute_branch(
         while True:
             exploration_limit_reason: Optional[str] = None
             if time.monotonic() >= exploration_deadline:
-                exploration_limit_reason = "探索阶段 90% 时间预算已用完"
+                exploration_limit_reason = (
+                    f"探索阶段 {exploration_percent}% 时间预算已用完"
+                )
             elif (
                 guard.device_actions >= exploration_device_action_limit
             ):
-                exploration_limit_reason = "探索阶段 90% 动作预算已用完"
+                exploration_limit_reason = (
+                    f"探索阶段 {exploration_percent}% 动作预算已用完"
+                )
             if exploration_limit_reason is not None:
                 warning = True
                 local_warning_reasons.append(exploration_limit_reason)
@@ -6230,7 +6495,8 @@ def _execute_branch(
                         action_status="BUDGET_NOT_REACHED",
                         state_status="BUDGET_SKIPPED",
                         reason=(
-                            f"{exploration_limit_reason}，保留最后 10% 用于验证代表路径"
+                            f"{exploration_limit_reason}，保留最后 "
+                            f"{100 - exploration_percent}% 用于验证核心终点"
                         ),
                     )
                 queue.clear()
@@ -6485,9 +6751,23 @@ def _execute_branch(
                 guard.check_deadline()
 
                 attempted_key = (_work_logical_key(parent), action.action_key)
+                required_coverage_boundary = bool(
+                    action.risk_type
+                    and goal_tracker is not None
+                    and goal_tracker.action_is_required(
+                        parent.page_subtype,
+                        str(action.action_role or ""),
+                        label=" ".join(
+                            str((action.target_meta or {}).get(key) or "")
+                            for key in ("content_desc", "text")
+                        ),
+                        risk_type=str(action.risk_type or ""),
+                    )
+                )
                 if (
                     attempted_key in attempted_actions
                     and not _is_overlay_cleanup_action(action)
+                    and not required_coverage_boundary
                 ):
                     reason = "同一逻辑页面动作已尝试，不再重复执行"
                     set_action_status(
@@ -8357,6 +8637,16 @@ def _execute_branch(
                 branch_run_id,
                 sorted(frontier_incomplete_ids),
             )
+            if business_coverage_v2:
+                try:
+                    verify_representative_paths()
+                except BudgetExceeded:
+                    logger.info(
+                        "inspection verification reserve exhausted after frontier "
+                        "failure: run=%s branch=%s",
+                        run_id,
+                        branch_run_id,
+                    )
             return BranchOutcome(
                 status="WARNING",
                 stop_reason=termination_reason,
@@ -8453,7 +8743,10 @@ def _execute_branch(
                 unfinished,
                 action_status="BUDGET_NOT_REACHED",
                 state_status="BUDGET_SKIPPED",
-                reason=f"{exc.reason}，保留最后 10% 用于验证代表路径",
+                reason=(
+                    f"{exc.reason}，保留最后 {100 - exploration_percent}% "
+                    "用于验证核心终点"
+                ),
             )
         transition_buffer.flush()
         active_budget_parent = None
@@ -8630,12 +8923,251 @@ def _execute_branch(
             secret_values[index] = ""
 
 
+def _read_state_xml_for_coverage(state: InspectionState) -> Optional[str]:
+    path_value = str(state.xml_path or "")
+    if not path_value:
+        return None
+    try:
+        target = resolve_inspection_asset(path_value, run_id=int(state.run_id))
+        if not target.is_file() or target.stat().st_size > 16 * 1024 * 1024:
+            return None
+        return normalize_xml_evidence(
+            target.read_text(encoding="utf-8", errors="replace")
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _coverage_manifest_for_evaluation(run: InspectionRun) -> Dict[str, Any]:
+    manifest = dict(run.coverage_manifest_snapshot or {})
+    if manifest and run.coverage_manifest_hash:
+        # The scalar column is immutable source-of-truth metadata. Replacing
+        # the embedded value makes content tampering visible to the evaluator.
+        manifest["hash"] = str(run.coverage_manifest_hash)
+    return manifest
+
+
+def _coverage_evidence_from_rows(
+    states: Sequence[InspectionState],
+    transitions: Sequence[InspectionTransition],
+    branch_keys: Dict[int, str],
+) -> Tuple[List[StateEvidence], List[TransitionEvidence]]:
+    state_evidence = [
+        StateEvidence(
+            id=int(state.id),
+            run_id=int(state.run_id),
+            branch_run_id=int(state.branch_run_id),
+            branch_key=str(state.branch_key or branch_keys.get(state.branch_run_id, "")),
+            page_subtype=str(state.page_subtype or "UNKNOWN"),
+            semantic_key=str(state.semantic_key or ""),
+            instance_anchor=str(state.instance_anchor or ""),
+            activity=str(state.activity or ""),
+            foreground_package=str(state.foreground_package or ""),
+            xml_path=str(state.xml_path or ""),
+            xml_text=_read_state_xml_for_coverage(state),
+            screenshot_path=str(state.screenshot_path or ""),
+            stable_status=str(state.stable_status or ""),
+            coverage_status=str(state.coverage_status or "DISCOVERED"),
+            expansion_status=str(state.expansion_status or "DISCOVERED"),
+            is_opaque=bool(state.is_opaque),
+            visit_count=int(state.visit_count or 0),
+        )
+        for state in states
+        if state.id is not None
+    ]
+    transition_evidence = [
+        TransitionEvidence(
+            id=int(edge.id),
+            run_id=int(edge.run_id),
+            branch_run_id=int(edge.branch_run_id),
+            from_state_id=int(edge.from_state_id),
+            to_state_id=(
+                int(edge.to_state_id) if edge.to_state_id is not None else None
+            ),
+            action_type=str(edge.action_type or ""),
+            action_key=str(edge.action_key or ""),
+            action_role=str(edge.action_role or ""),
+            execution_disposition=str(edge.execution_disposition or ""),
+            status=str(edge.status or ""),
+            failure_type=str(edge.failure_type or ""),
+            risk_type=str(edge.risk_type or ""),
+            reason=str(edge.reason or ""),
+            sampling_disposition=str(edge.sampling_disposition or ""),
+            input_rule_id=str(edge.input_rule_id or ""),
+            input_length=(
+                int(edge.input_length) if edge.input_length is not None else None
+            ),
+        )
+        for edge in transitions
+        if edge.id is not None
+    ]
+    return state_evidence, transition_evidence
+
+
+def _mark_business_coverage_verification_candidates(
+    run_id: int,
+    branch_run_id: int,
+) -> None:
+    """Prioritize reached core endpoints before consuming the 15% reserve."""
+    with Session(engine) as session:
+        run = session.get(InspectionRun, run_id)
+        branch = session.get(InspectionBranchRun, branch_run_id)
+        if run is None or branch is None or not run.coverage_manifest_id:
+            return
+        manifest = _coverage_manifest_for_evaluation(run)
+        if not manifest:
+            return
+        states = session.exec(
+            select(InspectionState).where(
+                InspectionState.run_id == run_id,
+                InspectionState.branch_run_id == branch_run_id,
+            )
+        ).all()
+        transitions = session.exec(
+            select(InspectionTransition).where(
+                InspectionTransition.run_id == run_id,
+                InspectionTransition.branch_run_id == branch_run_id,
+            )
+        ).all()
+        branch_keys = {int(branch_run_id): str(branch.branch_key)}
+        state_evidence, transition_evidence = _coverage_evidence_from_rows(
+            states,
+            transitions,
+            branch_keys,
+        )
+        assessment = evaluate_haier_business_coverage(
+            states=state_evidence,
+            transitions=transition_evidence,
+            selected_branches=[str(branch.branch_key)],
+            branch_run_keys=branch_keys,
+            branch_statuses={str(branch.branch_key): "RUNNING"},
+            manifest=manifest,
+        )
+        candidate_ids: set[int] = set()
+        for branch_result in assessment.get("branches") or []:
+            if str(branch_result.get("branch_key") or "") != str(branch.branch_key):
+                continue
+            for item in branch_result.get("items") or []:
+                if not item.get("required"):
+                    continue
+                evidence_ids = [
+                    int(value) for value in item.get("evidence_state_ids") or ()
+                ]
+                reached_endpoint = bool(
+                    evidence_ids
+                    and int(item.get("deepest_stage") or 0)
+                    >= int(item.get("total_stages") or 0)
+                )
+                if not reached_endpoint:
+                    continue
+                if str(item.get("key") or "") == "home_five_tabs":
+                    candidate_ids.update(evidence_ids)
+                else:
+                    candidate_ids.add(evidence_ids[-1])
+        now = _now()
+        for state in states:
+            if state.id is None:
+                continue
+            state.coverage_status = (
+                "INCOMPLETE" if int(state.id) in candidate_ids else "EXPLORED"
+            )
+            state.updated_at = now
+            session.add(state)
+        session.commit()
+
+
+def _persist_business_coverage_assessment(run_id: int) -> None:
+    """Evaluate one frozen manifest and write only its business verdict."""
+    with Session(engine) as session:
+        run = session.get(InspectionRun, run_id)
+        if run is None or not run.coverage_manifest_id:
+            return
+        manifest = _coverage_manifest_for_evaluation(run)
+        if not manifest:
+            run.coverage_verdict = "INCONCLUSIVE"
+            run.coverage_assessment = {
+                "schema_version": 2,
+                "coverage_verdict": "INCONCLUSIVE",
+                "selected_scope_verdict": "INCONCLUSIVE",
+                "full_app_verdict": "INCOMPLETE",
+                "blind_spots": [
+                    {
+                        "type": "MANIFEST_SNAPSHOT_MISSING",
+                        "severity": "HIGH",
+                        "message": "Run 缺少创建时冻结的覆盖清单",
+                    }
+                ],
+            }
+            run.coverage_evaluated_at = _now()
+            session.add(run)
+            session.commit()
+            return
+        branches = session.exec(
+            select(InspectionBranchRun).where(InspectionBranchRun.run_id == run_id)
+        ).all()
+        states = session.exec(
+            select(InspectionState).where(InspectionState.run_id == run_id)
+        ).all()
+        transitions = session.exec(
+            select(InspectionTransition).where(InspectionTransition.run_id == run_id)
+        ).all()
+        conflict_count = session.exec(
+            select(func.count(InspectionCoverageContract.id)).where(
+                InspectionCoverageContract.run_id == run_id,
+                InspectionCoverageContract.status == "CONFLICT",
+            )
+        ).one()
+        branch_keys = {
+            int(branch.id): str(branch.branch_key)
+            for branch in branches
+            if branch.id is not None
+        }
+        state_evidence, transition_evidence = _coverage_evidence_from_rows(
+            states,
+            transitions,
+            branch_keys,
+        )
+        evaluated_at = _now()
+        assessment = evaluate_haier_business_coverage(
+            states=state_evidence,
+            transitions=transition_evidence,
+            selected_branches=list(run.selected_branches or []),
+            branch_run_keys=branch_keys,
+            branch_statuses={branch.branch_key: branch.status for branch in branches},
+            branch_stop_reasons={
+                branch.branch_key: str(branch.stop_reason or "") for branch in branches
+            },
+            run_stop_reason=str(run.stop_reason or ""),
+            manifest=manifest,
+            contract_conflict_count=int(conflict_count or 0),
+            evaluated_at=evaluated_at,
+        )
+        assignments = coverage_state_assignments(
+            assessment,
+            (int(state.id) for state in states if state.id is not None),
+        )
+        for state in states:
+            if state.id is None:
+                continue
+            state.coverage_status = assignments.get(int(state.id), "EXPLORED")
+            state.updated_at = evaluated_at
+            session.add(state)
+        run.coverage_assessment = assessment
+        run.coverage_verdict = str(
+            assessment.get("coverage_verdict") or "INCONCLUSIVE"
+        )
+        run.coverage_evaluated_at = evaluated_at
+        session.add(run)
+        session.commit()
+
+
 def _update_run_summary(
     run_id: int,
     *,
     final_status: Optional[str] = None,
     stop_reason: Optional[str] = None,
 ) -> None:
+    evaluate_business_coverage = False
     with Session(engine) as session:
         run = session.get(InspectionRun, run_id)
         if run is None:
@@ -8674,8 +9206,11 @@ def _update_run_summary(
             if stop_reason:
                 run.stop_reason = stop_reason
             run.finished_at = _now()
+            evaluate_business_coverage = bool(run.coverage_manifest_id)
         session.add(run)
         session.commit()
+    if evaluate_business_coverage:
+        _persist_business_coverage_assessment(run_id)
 
 
 def _finish_active_branches(run_id: int, *, status: str, reason: str) -> None:

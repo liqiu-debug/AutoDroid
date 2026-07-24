@@ -32,6 +32,7 @@ from backend.device_execution_lease import legacy_fastbot_device_locked
 from backend.feature_flags import (
     FLAG_CONTENT_ADDRESSED_ASSETS,
     FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
+    FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
     FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE,
     FLAG_INSPECTION_IDENTITY_V2,
     FLAG_INSPECTION_SIMILARITY_CONVERGENCE,
@@ -44,6 +45,10 @@ from backend.feature_flags import (
 from backend.inspection.live import (
     inspection_live_registry,
     sanitize_action_map_payload,
+)
+from backend.inspection.haier_business_coverage import (
+    freeze_manifest,
+    haier_search_input_rule,
 )
 from backend.inspection.action_map import normalize_terminal_action_entries
 from backend.inspection.engine import (
@@ -164,12 +169,14 @@ _PAGE_TITLE_BY_SUBTYPE = {
     "HOME": "首页",
     "CATALOG_CATEGORY": "分类页",
     "COMMUNITY_FEED": "许愿池",
+    "COMMUNITY_DETAIL": "许愿池内容",
     "CART": "购物车",
     "PROFILE": "我的",
     "PRODUCT_DETAIL": "商品详情",
     "SERVICE_DETAIL": "服务详情",
     "PURCHASE_OPTIONS": "规格选择",
     "CHECKOUT": "确认订单",
+    "CHECKOUT_CONFIRMATION": "结算确认",
     "CASHIER": "海尔收银台",
     "ORDER": "订单",
     "ORDER_DETAIL": "订单详情",
@@ -178,6 +185,10 @@ _PAGE_TITLE_BY_SUBTYPE = {
     "SERVICE_LIST": "服务列表",
     "STORE_LIST": "附近门店",
     "STORE_DETAIL": "门店详情",
+    "AUTH_GATE": "登录门槛",
+    "MEMBER_BENEFITS": "会员权益",
+    "FAVORITES": "商品收藏",
+    "BROWSING_HISTORY": "历史浏览",
     "DIALOG": "弹窗",
     "OPAQUE": "不透明页面",
 }
@@ -196,6 +207,7 @@ _EFFECTIVE_FEATURE_FLAGS = {
     FLAG_INSPECTION_SIMILARITY_CONVERGENCE: (FLAG_INSPECTION_SIMILARITY_CONVERGENCE),
     FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE: (FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE),
     FLAG_INSPECTION_COVERAGE_SCHEDULER_V2: FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
+    FLAG_INSPECTION_BUSINESS_COVERAGE_V2: FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
     FLAG_INSPECTION_VISUAL_HOME_ACTIONS: FLAG_INSPECTION_VISUAL_HOME_ACTIONS,
     FLAG_CONTENT_ADDRESSED_ASSETS: FLAG_CONTENT_ADDRESSED_ASSETS,
     FLAG_TIERED_ASSET_RETENTION: FLAG_TIERED_ASSET_RETENTION,
@@ -1044,6 +1056,33 @@ def _run_read(
         faults=run_faults,
         replay_source_eligible=replay_source_eligible,
     )
+    exploration_coverage = dict(summary.get("family_coverage") or {})
+    if exploration_coverage:
+        summary["exploration_coverage"] = exploration_coverage
+    assessment = (
+        dict(row.coverage_assessment or {})
+        if isinstance(row.coverage_assessment, dict)
+        else {}
+    )
+    if assessment:
+        summary["business_coverage"] = {
+            **dict(assessment.get("summary") or {}),
+            "selected_scope_verdict": assessment.get("selected_scope_verdict"),
+            "full_app_verdict": assessment.get("full_app_verdict"),
+            "blind_spot_count": len(assessment.get("blind_spots") or []),
+            "manifest": dict(assessment.get("manifest") or {}),
+        }
+    replay_evidence_available = bool(
+        replay_source_eligible
+        and int(summary.get("replay_eligible_count") or 0) > 0
+    )
+    replay_default_eligible = bool(
+        replay_evidence_available
+        and str(row.status or "").upper() == "PASS"
+        and str(assessment.get("selected_scope_verdict") or "") == "COMPLETE"
+    )
+    summary["replay_evidence_available"] = replay_evidence_available
+    summary["replay_default_eligible"] = replay_default_eligible
     latest_observation = None
     if include_detail:
         latest_observation = session.exec(
@@ -1064,6 +1103,13 @@ def _run_read(
         profile_snapshot=row.profile_snapshot or {},
         device_serial=row.device_serial,
         selected_branches=row.selected_branches or [],
+        coverage_manifest_id=row.coverage_manifest_id,
+        coverage_manifest_version=row.coverage_manifest_version,
+        coverage_manifest_hash=row.coverage_manifest_hash,
+        coverage_manifest_snapshot=row.coverage_manifest_snapshot or {},
+        coverage_assessment=assessment,
+        coverage_verdict=row.coverage_verdict or "NOT_EVALUATED",
+        coverage_evaluated_at=row.coverage_evaluated_at,
         status=row.status,
         current_stage=row.current_stage,
         phase=row.current_stage,
@@ -1086,6 +1132,8 @@ def _run_read(
         summary_unavailable_reason=summary.get("summary_unavailable_reason"),
         replay_source_eligible=replay_source_eligible,
         replay_source_reason=replay_source_reason,
+        replay_evidence_available=replay_evidence_available,
+        replay_default_eligible=replay_default_eligible,
         last_active_state_id=(
             int(latest_observation.state_id)
             if latest_observation is not None
@@ -1299,6 +1347,19 @@ def create_run(
     profile_snapshot["graph_hierarchy_version"] = GRAPH_HIERARCHY_VERSION
     profile_snapshot["graph_schema_version"] = GRAPH_SCHEMA_VERSION
     effective_features = _current_effective_features(session)
+    coverage_manifest = None
+    if effective_features.get(FLAG_INSPECTION_BUSINESS_COVERAGE_V2, False):
+        coverage_manifest = freeze_manifest(profile.package_name, payload.branches)
+        if coverage_manifest is not None:
+            profile_snapshot["coverage_manifest"] = coverage_manifest
+            input_rules = [
+                dict(item)
+                for item in profile_snapshot.get("input_rules") or []
+                if isinstance(item, dict)
+                and str(item.get("id") or "") != haier_search_input_rule()["id"]
+            ]
+            input_rules.insert(0, haier_search_input_rule())
+            profile_snapshot["input_rules"] = input_rules
     profile_snapshot["effective_features"] = effective_features
     # Engine rollout readers consume top-level keys. Keep those values frozen
     # alongside the structured API snapshot.
@@ -1312,6 +1373,17 @@ def create_run(
         profile_snapshot=profile_snapshot,
         device_serial=payload.device_serial,
         selected_branches=list(payload.branches),
+        coverage_manifest_id=(
+            str(coverage_manifest.get("id")) if coverage_manifest else None
+        ),
+        coverage_manifest_version=(
+            str(coverage_manifest.get("version")) if coverage_manifest else None
+        ),
+        coverage_manifest_hash=(
+            str(coverage_manifest.get("hash")) if coverage_manifest else None
+        ),
+        coverage_manifest_snapshot=coverage_manifest or {},
+        coverage_verdict="PENDING" if coverage_manifest else "NOT_EVALUATED",
         status="PENDING",
         current_stage="等待设备租约",
         total_branches=len(payload.branches),
@@ -1457,6 +1529,41 @@ def get_run(
     if row is None:
         raise HTTPException(status_code=404, detail="巡检任务不存在")
     return _run_read(session, row, include_detail=True)
+
+
+@router.get("/runs/{run_id}/coverage")
+def get_run_coverage(
+    run_id: int,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_active_user),
+):
+    _ensure_enabled(session)
+    row = session.get(InspectionRun, run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="巡检任务不存在")
+    assessment = (
+        dict(row.coverage_assessment or {})
+        if isinstance(row.coverage_assessment, dict)
+        else {}
+    )
+    if not assessment:
+        return {
+            "available": False,
+            "run_id": run_id,
+            "coverage_verdict": row.coverage_verdict or "NOT_EVALUATED",
+            "reason": (
+                "RUN_NOT_FINISHED"
+                if str(row.status or "").upper() in ACTIVE_STATUSES
+                else "HISTORICAL_ASSESSMENT_NOT_BACKFILLED"
+            ),
+        }
+    return {
+        "available": True,
+        "run_id": run_id,
+        "coverage_verdict": row.coverage_verdict,
+        "coverage_evaluated_at": row.coverage_evaluated_at,
+        "assessment": assessment,
+    }
 
 
 @router.delete("/runs/{run_id}")
@@ -2117,6 +2224,28 @@ def get_run_graph(
         state_replay_semantics,
         summary_available=summary_available,
     )
+    assessment = (
+        dict(run.coverage_assessment or {})
+        if isinstance(run.coverage_assessment, dict)
+        else {}
+    )
+    assessment_summary = dict(assessment.get("summary") or {})
+    business_coverage = {
+        **assessment_summary,
+        "selected_scope_verdict": assessment.get("selected_scope_verdict"),
+        "full_app_verdict": assessment.get("full_app_verdict"),
+        "blind_spot_count": len(assessment.get("blind_spots") or []),
+        "manifest": dict(assessment.get("manifest") or {}),
+    } if assessment else {}
+    replay_evidence_available = bool(
+        replay_source_eligible
+        and int(replay_path_summary.get("replayable_count") or 0) > 0
+    )
+    replay_default_eligible = bool(
+        replay_evidence_available
+        and str(run.status or "").upper() == "PASS"
+        and str(assessment.get("selected_scope_verdict") or "") == "COMPLETE"
+    )
     summary = {
         "summary_available": summary_available,
         **(
@@ -2129,6 +2258,14 @@ def get_run_graph(
             "total": family_count,
             "ratio": round(family_coverage_ratio, 4),
         },
+        "exploration_coverage": {
+            "expanded": expanded_family_count,
+            "total": family_count,
+            "ratio": round(family_coverage_ratio, 4),
+        },
+        "business_coverage": business_coverage,
+        "replay_evidence_available": replay_evidence_available,
+        "replay_default_eligible": replay_default_eligible,
         "reached_pages": sum(
             1 for item in nodes
             if item.get("reachability_evidence") != "UNKNOWN"
@@ -2184,6 +2321,10 @@ def get_run_graph(
         ),
         "replay_source_eligible": replay_source_eligible,
         "replay_source_reason": replay_source_reason,
+        "replay_evidence_available": replay_evidence_available,
+        "replay_default_eligible": replay_default_eligible,
+        "coverage_verdict": run.coverage_verdict or "NOT_EVALUATED",
+        "coverage_assessment": assessment,
         "paths_included": include_paths is True,
         "replay_paths_url": (
             f"/api/inspections/runs/{run_id}/replay-paths"

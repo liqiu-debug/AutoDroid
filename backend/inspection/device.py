@@ -436,6 +436,16 @@ def perform_action(
     candidate = _unique_candidate(current_xml, action.locator_candidates)
     if candidate is None:
         raise LocatorAmbiguous("所有定位候选均非唯一或已漂移")
+
+    def send_authorized_input() -> None:
+        if input_value is None:
+            raise PermissionError("input value is not authorized")
+        try:
+            device.clear_text()
+        except Exception:
+            pass
+        device.send_keys(input_value, clear=True)
+
     if candidate.get("bounds_constrained"):
         bounds = _fresh_semantic_bounds(current_xml, candidate)
         if bounds is None:
@@ -453,8 +463,12 @@ def perform_action(
             # the ordinary locator path as a compatibility fallback; a real
             # uiautomator miss is still reported as LocatorDrift below.
             _click_candidate(device, candidate)
+            if action.action_type == "input":
+                send_authorized_input()
             return str(candidate.get("by") or "xpath")
         device.click(center_x, center_y)
+        if action.action_type == "input":
+            send_authorized_input()
         return "semantic-bounds"
     if (
         action.action_type == "click"
@@ -471,14 +485,8 @@ def perform_action(
         device.click((x1 + x2) // 2, (y1 + y2) // 2)
         return str(candidate.get("by") or "xpath")
     if action.action_type == "input":
-        if input_value is None:
-            raise PermissionError("input value is not authorized")
         _click_candidate(device, candidate)
-        try:
-            device.clear_text()
-        except Exception:
-            pass
-        device.send_keys(input_value, clear=True)
+        send_authorized_input()
     else:
         _click_candidate(device, candidate)
     return str(candidate.get("by") or "")

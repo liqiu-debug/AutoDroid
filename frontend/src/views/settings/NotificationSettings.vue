@@ -28,6 +28,7 @@ const form = ref({
   inspection_similarity_convergence: false,
   inspection_exploration_family_convergence: false,
   inspection_coverage_scheduler_v2: false,
+  inspection_business_coverage_v2: false,
   inspection_visual_home_actions: false,
   content_addressed_assets: false,
   tiered_asset_retention: false,
@@ -77,6 +78,7 @@ const loadSettings = async () => {
     form.value.inspection_similarity_convergence = flagRes.data?.inspection_similarity_convergence === true
     form.value.inspection_exploration_family_convergence = flagRes.data?.inspection_exploration_family_convergence === true
     form.value.inspection_coverage_scheduler_v2 = flagRes.data?.inspection_coverage_scheduler_v2 === true
+    form.value.inspection_business_coverage_v2 = flagRes.data?.inspection_business_coverage_v2 === true
     form.value.inspection_visual_home_actions = flagRes.data?.inspection_visual_home_actions === true
     if (!form.value.inspection_identity_v2) {
       form.value.inspection_similarity_convergence = false
@@ -120,6 +122,7 @@ const handleSave = async () => {
       { key: 'inspection_similarity_convergence', value: form.value.inspection_similarity_convergence ? 'true' : 'false', description: '巡检高置信相似状态收敛' },
       { key: 'inspection_exploration_family_convergence', value: form.value.inspection_exploration_family_convergence ? 'true' : 'false', description: '巡检同构页面族增量覆盖' },
       { key: 'inspection_coverage_scheduler_v2', value: form.value.inspection_coverage_scheduler_v2 ? 'true' : 'false', description: '巡检覆盖导向优先级调度器' },
+      { key: 'inspection_business_coverage_v2', value: form.value.inspection_business_coverage_v2 ? 'true' : 'false', description: '海尔商城版本化核心旅程覆盖评估' },
       { key: 'inspection_visual_home_actions', value: form.value.inspection_visual_home_actions ? 'true' : 'false', description: 'HOME 无语义图片入口探测' },
       { key: 'content_addressed_assets', value: form.value.content_addressed_assets ? 'true' : 'false', description: '内容寻址报告资产双写' },
       { key: 'tiered_asset_retention', value: form.value.tiered_asset_retention ? 'true' : 'false', description: '报告资产分层保留和清理' },
@@ -147,6 +150,7 @@ watch(() => form.value.inspection_identity_v2, enabled => {
 watch(() => form.value.model_inspection, enabled => {
   if (enabled) return
   form.value.inspection_identity_v2 = false
+  form.value.inspection_business_coverage_v2 = false
 })
 
 watch(() => form.value.inspection_coverage_scheduler_v2, enabled => {
@@ -452,6 +456,16 @@ onMounted(loadSettings)
                   <span>优先探索新页面并减少重复操作</span>
                 </div>
               </template>
+              <div class="feature-setting-row">
+                <div>
+                  <div class="feature-name">海尔核心旅程覆盖</div>
+                  <div class="feature-desc">冻结版本化业务清单并生成影子评估；开启覆盖优先调度后同时定向补齐缺失旅程。</div>
+                </div>
+                <div class="feature-control">
+                  <el-switch v-model="form.inspection_business_coverage_v2" :disabled="!form.model_inspection" />
+                  <span v-if="!form.model_inspection" class="dependency-reason">需先启用智能巡检</span>
+                </div>
+              </div>
               <div class="feature-setting-row">
                 <div>
                   <div class="feature-name">同类页面复用</div>

@@ -27,6 +27,7 @@ import {
   inspectionActionStatusMeta,
   inspectionAssetAvailabilityLabel,
   inspectionCaptureKindLabel,
+  inspectionCoverageItemReason,
   inspectionExecutionDispositionLabel,
   inspectionPageRoleLabel,
   inspectionReachabilityEvidence,
@@ -48,6 +49,20 @@ import {
   mergeInspectionLiveSnapshot,
   shouldClearInspectionActionOverlay,
 } from '../src/utils/inspectionPresentation.js'
+
+test('presents frozen v1 coverage reasons in report language', () => {
+  assert.equal(
+    inspectionCoverageItemReason({
+      detail: 'matching states do not form the required real transition chain',
+      reason_code: 'V1_EVIDENCE_MISSING',
+    }),
+    '候选页面未形成该旅程要求的真实 Transition 链',
+  )
+  assert.equal(
+    inspectionCoverageItemReason({ reason_code: 'ENDPOINT_NOT_REVERIFIED' }),
+    '终点未通过保留预算复验',
+  )
+})
 
 const state = (id, parent = null, incoming = null, branch = 'guest', overrides = {}) => ({
   id: String(id),
@@ -804,7 +819,13 @@ test('presents reachability separately from safe replay and summarizes four repo
   assert.equal(inspectionReachabilityEvidence(observed), 'OBSERVED_ONCE')
   assert.equal(inspectionReachabilityEvidence(verified), 'OBSERVED_ONCE')
   assert.equal(inspectionReachabilityEvidence({ ...verified, stable_status: 'VERIFIED_TWICE' }), 'VERIFIED_TWICE')
+  assert.equal(inspectionReachabilityEvidence({
+    ...verified,
+    stable_status: 'REVERIFIED_ONCE',
+    reachability_evidence: 'OBSERVED_ONCE',
+  }), 'REVERIFIED_ONCE')
   assert.equal(inspectionReachabilityLabel('OBSERVED_ONCE'), '已到达，待复验')
+  assert.equal(inspectionReachabilityLabel('REVERIFIED_ONCE'), '核心终点已复验一次')
   assert.equal(inspectionReplayEligibility(observed, []), 'SAFE_PREFIX')
   assert.equal(inspectionReplayEligibilityLabel('SAFE_PREFIX'), '可安全回放前缀')
   assert.equal(inspectionPageRoleLabel('PRODUCT_DETAIL'), '商品详情')
@@ -888,6 +909,31 @@ test('presents v7 replay scopes and plain-language capture details with v6 fallb
     defaultSelectionLimit: 4,
   })
   assert.equal(inspectionReportSummary({ graph: { summary_available: false } }).summaryAvailable, false)
+})
+
+test('reports selected business-line scope independently from coverage completeness', () => {
+  const summary = inspectionReportSummary({
+    graph: {
+      coverage_assessment: {
+        manifest: { id: 'haier-mall-v2' },
+        selected_branches: ['authenticated'],
+        selected_scope_verdict: 'PARTIAL',
+        full_app_verdict: 'INCOMPLETE',
+        summary: {
+          covered_required: 7,
+          total_required: 11,
+          scope_branches_selected: 1,
+          scope_branches_covered: 0,
+          scope_branches_total: 2,
+        },
+      },
+    },
+  })
+
+  assert.equal(summary.business.scopeSelected, 1)
+  assert.equal(summary.business.scopeComplete, 0)
+  assert.equal(summary.business.scopeTotal, 2)
+  assert.equal(summary.business.selectedScopeVerdict, 'PARTIAL')
 })
 
 test('selects the terminal review page from explicit activity or observation time, never max database id', () => {

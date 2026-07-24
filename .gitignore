@@ -46,7 +46,8 @@ frontend/.npm/
 /uploads/
 /reports/
 /asset_store/
-/static/images/
+/static/images/*
+!/static/images/haier_member_popup_close.png
 
 # Mobile packages
 *.apk

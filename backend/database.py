@@ -1401,6 +1401,45 @@ def _migrate_compatibility_installed_replay(cursor) -> None:
         )
 
 
+def _migrate_inspection_business_coverage_v2(cursor) -> None:
+    """Persist immutable manifests separately from execution health."""
+    _add_columns_if_present(
+        cursor,
+        "inspectionrun",
+        [
+            ("coverage_manifest_id", "VARCHAR"),
+            ("coverage_manifest_version", "VARCHAR"),
+            ("coverage_manifest_hash", "VARCHAR"),
+            ("coverage_manifest_snapshot", "JSON NOT NULL DEFAULT '{}'"),
+            ("coverage_assessment", "JSON NOT NULL DEFAULT '{}'"),
+            (
+                "coverage_verdict",
+                "VARCHAR NOT NULL DEFAULT 'NOT_EVALUATED'",
+            ),
+            ("coverage_evaluated_at", "TIMESTAMP"),
+        ],
+    )
+    _add_columns_if_present(
+        cursor,
+        "compatibilityrun",
+        [("source_coverage_snapshot", "JSON NOT NULL DEFAULT '{}'")],
+    )
+    if not _table_exists(cursor, "inspectionrun"):
+        return
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_inspectionrun_coverage_manifest_id "
+        "ON inspectionrun(coverage_manifest_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_inspectionrun_coverage_manifest_hash "
+        "ON inspectionrun(coverage_manifest_hash)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_inspectionrun_coverage_verdict "
+        "ON inspectionrun(coverage_verdict)"
+    )
+
+
 def _adopt_inspection_migration_aliases(cursor) -> None:
     """Map unreleased development migration names to their formal versions."""
     aliases = (
@@ -1495,6 +1534,10 @@ def _run_migrations_with_conn(conn) -> None:
             (
                 "20260722_024_compatibility_installed_replay",
                 _migrate_compatibility_installed_replay,
+            ),
+            (
+                "20260723_025_inspection_business_coverage_v2",
+                _migrate_inspection_business_coverage_v2,
             ),
         ]
 

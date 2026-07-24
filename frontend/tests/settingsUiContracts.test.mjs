@@ -23,6 +23,14 @@ test('settings opens only core experiments and closes retention with CAS', () =>
   assert.match(source, /需先启用报告资产去重/)
 })
 
+test('settings exposes Haier business coverage as an independent shadow flag', () => {
+  assert.match(source, /form\.value\.inspection_business_coverage_v2 = flagRes\.data\?\.inspection_business_coverage_v2 === true/)
+  assert.match(source, /key: 'inspection_business_coverage_v2'/)
+  assert.match(source, /v-model="form\.inspection_business_coverage_v2" :disabled="!form\.model_inspection"/)
+  assert.match(source, /海尔核心旅程覆盖/)
+  assert.doesNotMatch(source, /v-model="form\.inspection_business_coverage_v2" :disabled="!form\.inspection_coverage_scheduler_v2"/)
+})
+
 test('settings blocks saving partial defaults and lazily loads capacity details', () => {
   assert.match(source, /loadError\.value\s*=/)
   assert.match(source, /:disabled="Boolean\(loadError\)"/)

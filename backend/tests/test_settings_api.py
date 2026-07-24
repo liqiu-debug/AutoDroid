@@ -6,6 +6,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 from backend.api.settings import SettingItem, get_feature_flags, save_settings
 from backend.feature_flags import (
     FLAG_CONTENT_ADDRESSED_ASSETS,
+    FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
     FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
     FLAG_INSPECTION_IDENTITY_V2,
     FLAG_INSPECTION_VISUAL_HOME_ACTIONS,
@@ -75,6 +76,7 @@ class SettingsDependencyTests(unittest.TestCase):
 
         self.assertFalse(flags[FLAG_MODEL_INSPECTION])
         self.assertFalse(flags[FLAG_INSPECTION_IDENTITY_V2])
+        self.assertFalse(flags[FLAG_INSPECTION_BUSINESS_COVERAGE_V2])
         self.assertFalse(flags[FLAG_INSPECTION_COVERAGE_SCHEDULER_V2])
         self.assertFalse(flags[FLAG_INSPECTION_VISUAL_HOME_ACTIONS])
 
@@ -83,6 +85,10 @@ class SettingsDependencyTests(unittest.TestCase):
             [
                 SettingItem(key=FLAG_MODEL_INSPECTION, value="false"),
                 SettingItem(key=FLAG_INSPECTION_IDENTITY_V2, value="true"),
+                SettingItem(
+                    key=FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
+                    value="true",
+                ),
                 SettingItem(
                     key=FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
                     value="true",
@@ -99,6 +105,10 @@ class SettingsDependencyTests(unittest.TestCase):
         self.assertGreaterEqual(response["count"], 4)
         self.assertEqual(self._value(FLAG_MODEL_INSPECTION), "false")
         self.assertEqual(self._value(FLAG_INSPECTION_IDENTITY_V2), "false")
+        self.assertEqual(
+            self._value(FLAG_INSPECTION_BUSINESS_COVERAGE_V2),
+            "false",
+        )
         self.assertEqual(
             self._value(FLAG_INSPECTION_COVERAGE_SCHEDULER_V2),
             "false",

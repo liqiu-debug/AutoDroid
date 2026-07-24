@@ -17,7 +17,7 @@ AutoDroid 是一个面向 Android/iOS 的低代码 UI 自动化测试平台，�
 | 调度中心 | 单次、每天、每周、循环任务；支持 UI 场景、Fastbot 和模型化巡检任务 |
 | 智能稳定性 | Fastbot 探索、Crash/ANR、CPU/内存、framestats 卡顿检测、回放与 Trace 分析 |
 | 冷热启动专项 | ADB 启动计时、uiautomator2 首页就绪检查、慢启动 Perfetto 取证 |
-| 模型化智能巡检 | Android 双业务线自主探索、页面身份与页面族建模、安全边界、覆盖调度、实时拓扑和稳定回放路径 |
+| 模型化智能巡检 | Android 双业务线自主探索、页面身份与页面族建模、海尔商城版本化核心旅程、安全边界、覆盖调度、实时拓扑和稳定回放路径 |
 | 兼容性测试 | Android APK 版本/机型/巡检快照对比，以及基于巡检冻结路径的当前安装版本回放 |
 | 报告与大盘 | 用例、Fastbot、兼容性与巡检报告；内容寻址证据资产、失败截图、趋势与设备状态概览 |
 | AI 辅助 | 自然语言生成测试步骤、Fastbot 日志根因分析、OpenAI 兼容接口 |
@@ -224,7 +224,7 @@ npm run dev -- --host
 8. 在“专项测试 -> 冷热启动”中配置包名、启动模式、启动次数和首页就绪 locator，查看首页就绪 P90 与慢启动 Trace。
 9. 在“专项测试 -> 兼容性测试 -> 页面合集”中维护预设页面，每个页面引用已有用例作为进入脚本。
 10. 在“专项测试 -> 兼容性测试 -> 测试配置”中选择旧版 APK、新版 APK、Android 设备和页面合集，发起升级兼容或干净安装对比。
-11. 开启 `model_inspection` 后，在“专项测试 -> 模型化智能巡检”维护未登录/已登录业务线，运行巡检并在报告中审核稳定状态。
+11. 开启 `model_inspection` 后，在“专项测试 -> 模型化智能巡检”维护未登录/已登录业务线；海尔商城先开启 `inspection_business_coverage_v2` 观察影子评估，再开启 `inspection_coverage_scheduler_v2` 定向补齐核心旅程。
 12. 将审核后的巡检快照用于版本/机型兼容性对比，或对设备当前安装版本执行冻结路径回放。
 13. 在报告中心和运行大盘查看结果、失败截图、巡检拓扑、趋势和设备告警。
 
@@ -235,8 +235,12 @@ npm run dev -- --host
 - **页面建模**：将采集结果拆分为 Page Template、State、Observation 和 Transition，并以页面族聚合同构页面，避免重复遍历。
 - **安全探索**：付款、删除、提交等危险语义默认阻断；坐标动作、输入值和敏感截图受规则与脱敏约束。
 - **覆盖调度**：按页面族、动作角色和 Coverage Contract 选择下一步，滚动视口作为 Observation 保留，不挤占业务 State。
+- **可信业务覆盖**：海尔商城 Run 创建时冻结 `haier-mall-v2` 清单和哈希；固定使用“冰箱”完成真实搜索链，并分别判定所选业务线与全应用是否完整。
+- **双覆盖口径**：报告主指标“核心旅程”只接受同一业务线内的真实 Transition、可读 XML 和终点复验；“已发现页面族展开率”仅用于诊断开放式探索，不能证明未发现页面已经覆盖。
+- **证据结论**：旅程结果为 `COVERED / MISSING / INCONCLUSIVE / NOT_IN_SCOPE`。`run.status` 表示执行健康度，`coverage_verdict` 表示业务完整性，两者互不替代。
+- **运行预算**：海尔可信覆盖将前 85% 用于定向与开放式探索，最后 15% 复验核心终点。单业务线常规运行建议 60 分钟、深度探索建议 90 分钟；双业务线完整运行建议 120 分钟。
 - **实时报告**：运行时可查看只读设备画面、阶段、当前页面和动作覆盖；断开报告页不会中止巡检。
-- **稳定路径**：人工勾选稳定 State/Observation 后冻结为回放路径，可用作兼容性快照基线。
+- **稳定路径**：人工勾选稳定 State/Observation 后冻结为回放路径，可用作兼容性快照基线；部分或失败 Run 不允许空选择自动采用全部路径。
 - **已安装版本回放**：预检设备当前包版本和冻结计划，确认后只执行选中的安全链路，不上传或安装 APK。
 
 巡检默认关闭，启用顺序和 Graph v8、回放、资产保留的完整契约见 [巡检、回放与证据资产指南](docs/INSPECTION_REPLAY_ASSETS.md)。
@@ -289,6 +293,7 @@ npm run dev -- --host
 | `inspection_exploration_family_convergence` | 开启 | 同构页面族共享增量覆盖；依赖身份模型 |
 | `inspection_similarity_convergence` | 关闭 | 高置信相似状态收敛；依赖身份模型 |
 | `inspection_coverage_scheduler_v2` | 关闭 | 覆盖导向的优先级调度；依赖身份模型 |
+| `inspection_business_coverage_v2` | 关闭 | 海尔商城版本化核心旅程清单与影子评估；与覆盖调度同时开启时定向补齐 |
 | `inspection_visual_home_actions` | 关闭 | 探测首页无语义图片入口；依赖覆盖调度 |
 | `compatibility_installed_replay` | 开启 | 允许对当前安装版本执行巡检冻结路径 |
 | `compatibility_legacy_compare_creation` | 关闭 | 保留旧兼容性创建流程的临时回退入口 |
@@ -339,7 +344,7 @@ iOS WDA URL、设备映射、启动参数和故障处理见 [iOS WDA 运维手�
 - OpenAPI：`GET /docs`
 - 主要业务 API：`/api/auth`、`/api/cases`、`/api/scenarios`、`/api/devices`、`/api/tasks`、`/api/reports`、`/api/fastbot`
 - 冷热启动专项 API：`POST /api/fastbot/startup/run`、`GET /api/fastbot/startup/tasks`
-- 巡检 API：`/api/inspections/profiles`、`/api/inspections/runs`、`/api/inspections/runs/{id}/graph`
+- 巡检 API：`/api/inspections/profiles`、`/api/inspections/runs`、`/api/inspections/runs/{id}/graph`、`/api/inspections/runs/{id}/coverage`
 - 兼容性测试 API：`/api/compatibility/page-sets`、`/api/compatibility/runs`、`POST /api/compatibility/replay-preflight`
 - 鉴权证据资产：`GET /api/assets/status`、`GET /api/assets/{asset_id}`
 - CI 集成（API Token 机器凭证、上传包 → 触发回归 → 轮询结果）：见 [CI 集成指南](docs/CI_INTEGRATION.md)

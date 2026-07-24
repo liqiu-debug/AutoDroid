@@ -7,7 +7,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image
@@ -92,18 +92,18 @@ _SERVICE_DETAIL_OFFERING_RE = re.compile(
     r"延保(?:服务|套餐|卡|权益)?|延长保修(?:服务|套餐)?)"
     r"(?:套餐|服务卡)?|"
     r"(?:deep\s+clean(?:ing)?|home\s+service|extended\s+warranty)"
-    r"(?:\s+service)?"
+    r"(?:\s+service)?|海尔原厂延保"
     r")$",
     re.I,
 )
 _SERVICE_DETAIL_PROVIDER_RE = re.compile(
-    r"^(?:海尔服务|家生活服务|haier\s+service)$",
+    r"^(?:海尔服务|家生活服务|海尔原厂延保|haier\s+service)$",
     re.I,
 )
 _SERVICE_DETAIL_PROVIDER_OFFERING_RE = re.compile(
-    r"^(?:海尔服务|家生活服务|haier\s+service)\s+.{0,32}"
+    r"^(?:海尔原厂延保|(?:海尔服务|家生活服务|haier\s+service)\s+.{0,32}"
     r"(?:深度清洗|清洗服务|上门(?:清洗|维修|安装)?服务|"
-    r"延保|延长保修|deep\s+clean|home\s+service|extended\s+warranty)$",
+    r"延保|延长保修|deep\s+clean|home\s+service|extended\s+warranty))$",
     re.I,
 )
 _SERVICE_DETAIL_TERMS_RE = re.compile(
@@ -118,6 +118,10 @@ _SERVICE_DETAIL_ACTION_RE = re.compile(
 )
 _CONSUMABLE_LIST_RE = re.compile(r"滤芯|filter\s*(?:element|cartridge)", re.I)
 _PRODUCT_LIST_RE = re.compile(r"洗护清洁|洗衣液|清洁工具|护理剂", re.I)
+_HAIER_APPLIANCE_RE = re.compile(
+    r"冰箱|冷柜|洗衣机|洗烘|空调|热水器|净水|厨电|电视",
+    re.I,
+)
 _FILTER_PANEL_FACETS = {
     "商品",
     "价格",
@@ -261,6 +265,7 @@ _PROFILE_SURFACE_SIGNAL_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:家电安装|家电维修|进度查询|服务卡激活|收费标准|常见故障)$", re.I),
 )
 _COMMUNITY_FEED_DATE_RE = re.compile(r"\b\d{2}-\d{2}\s+\d{2}:\d{2}\b")
+_HAIER_MALL_PACKAGES = frozenset({"com.ehaier.zgq.shop.mall"})
 _SETTINGS_SIGNAL_RE = re.compile(
     r"账号与安全|账号关联|隐私设置|意见反馈|关于海尔商城|清除本地缓存|退出登录",
     re.I,
@@ -921,6 +926,53 @@ def _identity_nodes(
     return matching or list(nodes)
 
 
+def _coverage_identity_nodes(
+    nodes: Sequence[SemanticNode],
+    package_name: str,
+) -> List[SemanticNode]:
+    """Remove Haier's rotating search hint from identity, not from evidence."""
+    scoped = _identity_nodes(nodes, package_name)
+    if normalize_semantic_text(package_name).casefold() not in _HAIER_MALL_PACKAGES:
+        return scoped
+    page_width = max((node.bounds[2] for node in scoped if node.bounds), default=0)
+    page_height = max((node.bounds[3] for node in scoped if node.bounds), default=0)
+    if page_width <= 0 or page_height <= 0:
+        return scoped
+    has_catalog_sidebar = bool(_catalog_sidebar_members(scoped))
+    header_paths: list[Tuple[int, ...]] = []
+    for node in scoped:
+        if not node.visible or not node.clickable or node.bounds is None:
+            continue
+        left, top, right, bottom = node.bounds
+        header_geometry = bool(
+            left / page_width <= 0.10
+            and right / page_width >= 0.80
+            and top / page_height <= 0.08
+            and bottom / page_height <= 0.12
+            and (right - left) / page_width >= 0.70
+            and 0.025 <= (bottom - top) / page_height <= 0.08
+        )
+        has_editable_descendant = any(
+            candidate.editable
+            and len(candidate.path) > len(node.path)
+            and candidate.path[: len(node.path)] == node.path
+            for candidate in scoped
+        )
+        if header_geometry and (has_catalog_sidebar or has_editable_descendant):
+            header_paths.append(node.path)
+    if not header_paths:
+        return scoped
+    return [
+        replace(node, stable_desc="", stable_text="")
+        if any(
+            len(node.path) >= len(path) and node.path[: len(path)] == path
+            for path in header_paths
+        )
+        else node
+        for node in scoped
+    ]
+
+
 def _hash_payload(payload: Any) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -982,6 +1034,183 @@ def _is_community_feed_surface(nodes: Sequence[SemanticNode]) -> bool:
         1 for value in values if _COMMUNITY_FEED_DATE_RE.search(value)
     )
     return has_community_context and dated_entries >= 2
+
+
+def _is_haier_community_detail_surface(nodes: Sequence[SemanticNode]) -> bool:
+    values = [
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    ]
+    has_article_date = any(_COMMUNITY_FEED_DATE_RE.search(value) for value in values)
+    has_comment_composer = any(
+        re.fullmatch(r"来说点什么(?:\.{3}|…)?", value, re.I)
+        for value in values
+    )
+    article_signals = sum(
+        any(re.search(pattern, value, re.I) for value in values)
+        for pattern in (
+            r"^官方$",
+            r"^精选$|参与话题",
+            r"获奖信息|亲爱的海尔家人|许愿池.{0,12}伙伴",
+        )
+    )
+    return bool(has_article_date and has_comment_composer and article_signals >= 2)
+
+
+def _is_haier_member_benefits_surface(nodes: Sequence[SemanticNode]) -> bool:
+    values = [
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    ]
+    joined = " | ".join(values[:240])
+    smart_life_benefits = bool(
+        re.search(r"Smart\s*life", joined, re.I)
+        and re.search(r"满减券|会员礼包|会员专享", joined, re.I)
+        and re.search(r"去使用|立即领取", joined, re.I)
+    )
+    rights_hub = bool(
+        _top_visible_title(nodes, re.compile(r"我的权益", re.I))
+        and sum(
+            bool(re.search(pattern, joined, re.I))
+            for pattern in (r"积分", r"优惠券|卡包", r"生态权益|活动实物|购机赠礼")
+        )
+        >= 2
+    )
+    return smart_life_benefits or rights_hub
+
+
+def _is_haier_favorites_surface(nodes: Sequence[SemanticNode]) -> bool:
+    if not _top_visible_title(nodes, re.compile(r"(?:商品收藏|我的收藏)", re.I)):
+        return False
+    values = [
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    ]
+    joined = " | ".join(values[:240])
+    return bool(
+        re.search(r"管理", joined, re.I)
+        and re.search(r"全部\s*[（(]?\d*|有货\s*[（(]?\d*|Haier/海尔|Casarte/卡萨帝", joined, re.I)
+    )
+
+
+def _is_haier_browsing_history_surface(nodes: Sequence[SemanticNode]) -> bool:
+    if not _top_visible_title(nodes, re.compile(r"(?:历史浏览|浏览记录)", re.I)):
+        return False
+    values = [
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    ]
+    joined = " | ".join(values[:240])
+    return bool(
+        re.search(r"商品浏览|线下门店", joined, re.I)
+        and re.search(r"今天|管理", joined, re.I)
+    )
+
+
+def _is_haier_checkout_confirmation_surface(
+    nodes: Sequence[SemanticNode],
+) -> bool:
+    values = {
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    }
+    return all(
+        any(re.fullmatch(pattern, value, re.I) for value in values)
+        for pattern in (
+            r"权益选择提醒",
+            r"此订单存在可选择的权益",
+            r"直接提交",
+            r"选择权益",
+        )
+    )
+
+
+def _is_haier_order_center_surface(nodes: Sequence[SemanticNode]) -> bool:
+    values = {
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    }
+    order_tabs = {
+        pattern
+        for pattern in (
+            r"全部",
+            r"待付款",
+            r"待发货",
+            r"待收货(?:/验收)?",
+            r"待评价",
+            r"退款/售后",
+        )
+        if any(re.fullmatch(pattern, value, re.I) for value in values)
+    }
+    has_order_content = any(
+        re.search(
+            r"等待付款|去支付|取消订单|暂无待.{0,6}订单|售后申请|退款详情",
+            value,
+            re.I,
+        )
+        for value in values
+    )
+    return len(order_tabs) >= 4 and has_order_content
+
+
+def _is_haier_product_grid_surface(nodes: Sequence[SemanticNode]) -> bool:
+    """Recognize Haier campaign search results exposed as a compact product grid."""
+    page_width = max((node.bounds[2] for node in nodes if node.bounds), default=0)
+    page_height = max((node.bounds[3] for node in nodes if node.bounds), default=0)
+    if page_width <= 0 or page_height <= 0:
+        return False
+    cards = [
+        node
+        for node in nodes
+        if _is_haier_product_grid_card(node, (page_width, page_height))
+    ]
+    if len(cards) < 4:
+        return False
+    x_centers = sorted((item.bounds[0] + item.bounds[2]) / 2 for item in cards)
+    y_centers = sorted((item.bounds[1] + item.bounds[3]) / 2 for item in cards)
+    has_multiple_columns = x_centers[-1] - x_centers[0] >= page_width * 0.35
+    has_multiple_rows = y_centers[-1] - y_centers[0] >= page_height * 0.12
+    return has_multiple_columns and has_multiple_rows
+
+
+def _is_haier_product_grid_card(
+    node: SemanticNode,
+    screen_size: Tuple[int, int],
+) -> bool:
+    if (
+        not node.visible
+        or not node.enabled
+        or not node.clickable
+        or node.bounds is None
+    ):
+        return False
+    label = normalize_semantic_text(node.content_desc or node.text)
+    width_ratio = (node.bounds[2] - node.bounds[0]) / max(1, screen_size[0])
+    height_ratio = (node.bounds[3] - node.bounds[1]) / max(1, screen_size[1])
+    return bool(
+        0.20 <= width_ratio <= 0.45
+        and 0.12 <= height_ratio <= 0.35
+        and _MONEY_RE.search(label)
+        and _HAIER_APPLIANCE_RE.search(label)
+    )
 
 
 def _top_visible_title(nodes: Sequence[SemanticNode], pattern: re.Pattern[str]) -> bool:
@@ -1255,15 +1484,55 @@ def _is_service_detail_surface(nodes: Sequence[SemanticNode]) -> bool:
     return support_score >= 2
 
 
+def _is_auth_gate_surface(nodes: Sequence[SemanticNode]) -> bool:
+    """Recognize Haier's explicit guest boundary without matching profile CTAs."""
+    values = [
+        normalize_semantic_text(value)
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    ]
+    joined = " | ".join(values[:160])
+    if re.search(r"(?:请先登录|登录后(?:购买|查看|继续)|尚未登录|未登录)", joined, re.I):
+        return True
+    has_login_action = any(
+        node.visible
+        and node.enabled
+        and node.clickable
+        and re.fullmatch(
+            r"(?:登录|立即登录|登录/注册|验证码登录|密码登录|sign\s*in)",
+            normalize_semantic_text(node.content_desc or node.text),
+            re.I,
+        )
+        for node in nodes
+    )
+    credential_signals = sum(
+        bool(re.search(pattern, joined, re.I))
+        for pattern in (
+            r"手机号|手机号码|phone",
+            r"验证码|密码|verification\s*code|password",
+            r"用户协议|隐私政策|user\s+agreement|privacy",
+        )
+    )
+    return bool(has_login_action and credential_signals >= 2)
+
+
 def _infer_page_subtype(
     identity_nodes: Sequence[SemanticNode],
     *,
     role: str,
+    package_name: str = "",
 ) -> str:
     """Classify coverage-relevant list variants without using entry history."""
+    is_haier_mall = (
+        normalize_semantic_text(package_name).casefold() in _HAIER_MALL_PACKAGES
+    )
     if _is_filter_panel(identity_nodes):
         return "FILTER_PANEL"
-    if _is_search_surface(identity_nodes):
+    if _is_search_surface(identity_nodes) or (
+        is_haier_mall and _is_haier_search_query_surface(identity_nodes)
+    ):
         return "SEARCH"
     if _is_appointment_list(identity_nodes):
         return "APPOINTMENT_LIST"
@@ -1271,6 +1540,10 @@ def _infer_page_subtype(
     # cashier implementations expose a full-screen clickable background.
     if _is_cashier_surface(identity_nodes):
         return "CASHIER"
+    if _is_auth_gate_surface(identity_nodes):
+        return "AUTH_GATE"
+    if is_haier_mall and _is_haier_checkout_confirmation_surface(identity_nodes):
+        return "CHECKOUT_CONFIRMATION"
     # A bottom sheet keeps the accessibility nodes from the page underneath.
     # Classify the foreground surface first so store/checkout actions behind
     # the scrim cannot leak into the dialog action set.
@@ -1286,6 +1559,21 @@ def _infer_page_subtype(
         return "SERVICE_DETAIL"
     if _is_store_detail(identity_nodes):
         return "STORE_DETAIL"
+    if is_haier_mall:
+        if _is_haier_search_results_surface(identity_nodes):
+            return "PRODUCT_LIST"
+        if _is_haier_community_detail_surface(identity_nodes):
+            return "COMMUNITY_DETAIL"
+        if _is_haier_member_benefits_surface(identity_nodes):
+            return "MEMBER_BENEFITS"
+        if _is_haier_order_center_surface(identity_nodes):
+            return "ORDER"
+        if _is_haier_favorites_surface(identity_nodes):
+            return "FAVORITES"
+        if _is_haier_browsing_history_surface(identity_nodes):
+            return "BROWSING_HISTORY"
+        if role == "UNKNOWN" and _is_haier_product_grid_surface(identity_nodes):
+            return "PRODUCT_LIST"
     values = [
         normalize_semantic_text(value)
         for node in identity_nodes
@@ -1637,8 +1925,86 @@ def _is_search_surface(nodes: Sequence[SemanticNode]) -> bool:
         has_search_input
         and values.intersection({"搜索", "search"})
         and values.intersection(
-            {"搜索历史", "热门搜索", "history", "popular searches"}
+            {
+                "搜索历史",
+                "最近搜索",
+                "热门搜索",
+                "history",
+                "recent searches",
+                "popular searches",
+            }
         )
+    )
+
+
+def _is_haier_search_query_surface(nodes: Sequence[SemanticNode]) -> bool:
+    """Keep Haier's populated suggestion surface in the SEARCH state family."""
+    has_search_input = any(
+        node.visible and node.enabled and node.editable for node in nodes
+    )
+    has_submit = any(
+        node.visible
+        and node.enabled
+        and node.clickable
+        and re.fullmatch(
+            r"(?:搜索|search)",
+            normalize_semantic_text(node.content_desc or node.text),
+            re.I,
+        )
+        for node in nodes
+    )
+    return bool(has_search_input and has_submit)
+
+
+def _is_haier_search_results_surface(nodes: Sequence[SemanticNode]) -> bool:
+    """Distinguish Haier keyword results from the bottom-tab category page."""
+    page_width = max(
+        (node.bounds[2] for node in nodes if node.visible and node.bounds),
+        default=0,
+    )
+    page_height = max(
+        (node.bounds[3] for node in nodes if node.visible and node.bounds),
+        default=0,
+    )
+    if page_width <= 0 or page_height <= 0:
+        return False
+    if any(node.visible and node.editable for node in nodes):
+        return False
+    values = {
+        normalize_semantic_text(value).casefold()
+        for node in nodes
+        if node.visible
+        for value in (node.content_desc, node.text)
+        if normalize_semantic_text(value)
+    }
+    sort_labels = values.intersection(set(_SORT_LABELS))
+    has_filter = bool(values.intersection({"筛选", "filter"}))
+    has_query_header = any(
+        node.visible
+        and node.clickable
+        and node.bounds is not None
+        and node.bounds[1] <= page_height * 0.12
+        and (node.bounds[2] - node.bounds[0]) >= page_width * 0.45
+        and _HAIER_APPLIANCE_RE.search(
+            normalize_semantic_text(node.content_desc or node.text)
+        )
+        for node in nodes
+    )
+    price_count = sum(
+        1
+        for node in nodes
+        if node.visible
+        and any(
+            _MONEY_RE.search(normalize_semantic_text(value))
+            for value in (node.content_desc, node.text)
+            if normalize_semantic_text(value)
+        )
+    )
+    return bool(
+        len(sort_labels) >= 2
+        and has_filter
+        and has_query_header
+        and price_count >= 2
     )
 
 
@@ -1984,6 +2350,74 @@ def _is_horizontal_tab_member(
     )
 
 
+def _is_haier_catalog_search_entry(
+    page: PageModel,
+    node: SemanticNode,
+    screen_size: Tuple[int, int],
+) -> bool:
+    """Recognize the Haier category header search box despite its hot-word text."""
+    if (
+        normalize_semantic_text(page.package_name).casefold()
+        not in _HAIER_MALL_PACKAGES
+        or page.page_subtype != "CATALOG_CATEGORY"
+        or not node.clickable
+        or node.bounds is None
+    ):
+        return False
+    screen_width, screen_height = screen_size
+    if screen_width <= 0 or screen_height <= 0:
+        return False
+    left, top, right, bottom = node.bounds
+    width = (right - left) / screen_width
+    height = (bottom - top) / screen_height
+    return bool(
+        left / screen_width <= 0.10
+        and right / screen_width >= 0.80
+        and top / screen_height <= 0.08
+        and bottom / screen_height <= 0.12
+        and width >= 0.70
+        and 0.025 <= height <= 0.08
+    )
+
+
+def _is_haier_price_purchase_cta(
+    page: PageModel,
+    node: SemanticNode,
+    screen_size: Tuple[int, int],
+    label: str,
+) -> bool:
+    """Recognize Haier's price-labelled buy button in the bottom action bar."""
+    raw_label = normalize_semantic_text(node.content_desc or node.text or label)
+    if (
+        normalize_semantic_text(page.package_name).casefold()
+        not in _HAIER_MALL_PACKAGES
+        or (
+            page.role != "PRODUCT_DETAIL"
+            and page.page_subtype != "PURCHASE_OPTIONS"
+        )
+        or not node.clickable
+        or node.bounds is None
+        or not re.match(r"^到手价(?:\s*[,，])?", raw_label, re.I)
+        or not _MONEY_RE.search(raw_label)
+    ):
+        return False
+    screen_width, screen_height = screen_size
+    if screen_width <= 0 or screen_height <= 0:
+        return False
+    left, top, right, bottom = node.bounds
+    in_bottom_bar = bool(
+        top / screen_height >= 0.82
+        and bottom / screen_height >= 0.90
+        and right / screen_width >= 0.90
+    )
+    if not in_bottom_bar:
+        return False
+    return bool(
+        page.page_subtype == "PURCHASE_OPTIONS"
+        or left / screen_width >= 0.55
+    )
+
+
 def _action_role_for_node(
     page: PageModel,
     node: SemanticNode,
@@ -2006,6 +2440,16 @@ def _action_role_for_node(
     class_family = _class_family(node.class_name)
     product_role = (
         _product_detail_action_role(label)
+        or (
+            "BUY_NOW"
+            if _is_haier_price_purchase_cta(
+                page,
+                node,
+                screen_size,
+                label,
+            )
+            else None
+        )
         if (
             page.role == "PRODUCT_DETAIL"
             or page.page_subtype == "PURCHASE_OPTIONS"
@@ -2036,6 +2480,14 @@ def _action_role_for_node(
         # transition here; runtime payment blocking remains scoped to a
         # strongly anchored Haier cashier page in ``classify_risk``.
         role = "PLACE_ORDER"
+    elif (
+        page.page_subtype == "CHECKOUT_CONFIRMATION"
+        and action_type == "click"
+        and re.fullmatch(r"直接提交", primary_label or label, re.I)
+    ):
+        role = "PLACE_ORDER"
+    elif page.page_subtype == "CHECKOUT_CONFIRMATION" and action_type == "click":
+        role = "DIALOG_OPTION"
     elif page.page_subtype == "SEARCH" and action_type == "click":
         semantic_kind = _semantic_kind(primary_label or label)
         role = (
@@ -2071,6 +2523,20 @@ def _action_role_for_node(
             {"navigation": primary_label or label or navigation.get("member_key")}
         )
         role = f"NAV:{destination}"
+    elif action_type == "click" and _is_haier_catalog_search_entry(
+        page,
+        node,
+        screen_size,
+    ):
+        role = "COMMAND:SEARCH"
+    elif (
+        action_type == "click"
+        and normalize_semantic_text(page.package_name).casefold()
+        in _HAIER_MALL_PACKAGES
+        and page.page_subtype == "PRODUCT_LIST"
+        and _is_haier_product_grid_card(node, screen_size)
+    ):
+        role = "ITEM_OPEN:collection"
     elif action_type == "click" and _is_horizontal_tab_member(
         page,
         node,
@@ -2817,11 +3283,22 @@ def build_page_model(
         dynamic_patterns=dynamic_patterns,
         max_text_length=max_text_length,
     )
-    identity_nodes = _identity_nodes(nodes, package_name)
+    identity_nodes = _coverage_identity_nodes(nodes, package_name)
     role = _infer_page_role(identity_nodes, activity)
-    page_subtype = _infer_page_subtype(identity_nodes, role=role)
-    if page_subtype == "STORE_LIST":
+    page_subtype = _infer_page_subtype(
+        identity_nodes,
+        role=role,
+        package_name=package_name,
+    )
+    if page_subtype in {
+        "STORE_LIST",
+        "PRODUCT_LIST",
+        "FAVORITES",
+        "BROWSING_HISTORY",
+    }:
         role = "LIST"
+    elif page_subtype == "ORDER":
+        role = "ORDER"
     activity_family = _activity_family(activity)
     (
         template_tokens,
@@ -4048,6 +4525,26 @@ def _build_bounds_xpath(
     return f"(//{target_expr})[1]"
 
 
+def _direct_bounds_locator(node: SemanticNode) -> Optional[Dict[str, Any]]:
+    """Build a fresh-XML-validated locator independent of rotating labels."""
+    if node.bounds is None or len(node.bounds) != 4:
+        return None
+    x1, y1, x2, y2 = node.bounds
+    bounds_value = f"[{int(x1)},{int(y1)}][{int(x2)},{int(y2)}]"
+    return {
+        "selector": (
+            f"(//node[@class={_xpath_literal(node.class_name)} and "
+            f"@bounds={_xpath_literal(bounds_value)}])[1]"
+        ),
+        "by": "xpath",
+        "expected_class": node.class_name,
+        "target_description": None,
+        "target_text": None,
+        "bounds": list(node.bounds),
+        "bounds_constrained": True,
+    }
+
+
 def _compile_custom_patterns(
     safety_rules: Optional[Sequence[Dict[str, Any]]],
 ) -> List[Tuple[str, re.Pattern[str]]]:
@@ -4476,12 +4973,15 @@ def _match_input_rule(
     node: SemanticNode,
     ancestor_semantics: str,
     input_rules: Optional[Sequence[Dict[str, Any]]],
+    *,
+    page_subtype: str = "",
 ) -> Optional[Dict[str, Any]]:
     values = {
         "content_desc_regex": node.content_desc,
         "text_regex": node.text,
         "class_regex": node.class_name,
         "ancestor_regex": ancestor_semantics,
+        "page_subtype_regex": page_subtype,
     }
     for rule in input_rules or ():
         matched = True
@@ -4929,10 +5429,31 @@ def enumerate_actions(
         ):
             continue
         input_rule = (
-            _match_input_rule(node, ancestor_semantics, input_rules)
+            _match_input_rule(
+                node,
+                ancestor_semantics,
+                input_rules,
+                page_subtype=page.page_subtype,
+            )
             if action_type == "input"
             else None
         )
+        if (
+            action_type == "input"
+            and input_rule is not None
+            and str(input_rule.get("id") or "") == "haier_v2_search_keyword"
+            and normalize_semantic_text(page.package_name).casefold()
+            in _HAIER_MALL_PACKAGES
+            and page.page_subtype == "SEARCH"
+            and node.bounds is not None
+        ):
+            # The rotating hot word is the nearest labelled ancestor of the
+            # otherwise-unlabelled search field. Revalidate its exact current
+            # bounds in fresh XML so that label churn cannot break fixed input.
+            bounds_locator = _direct_bounds_locator(node)
+            if bounds_locator is not None:
+                locator_candidates = [bounds_locator, *locator_candidates]
+                coordinate_only = False
         if action_type == "input" and input_rule is None:
             risk_type = risk_type or "UNMAPPED_INPUT"
             blocked_reason = blocked_reason or "输入框未匹配允许的输入规则"
@@ -4955,6 +5476,45 @@ def enumerate_actions(
                 navigation=navigation,
                 direction=direction,
             )
+            if (
+                action_type == "click"
+                and action_role == "COMMAND:SEARCH"
+                and normalize_semantic_text(page.package_name).casefold()
+                in _HAIER_MALL_PACKAGES
+            ):
+                bounds_locator = _direct_bounds_locator(node)
+                if bounds_locator is not None:
+                    locator_candidates = [bounds_locator, *locator_candidates]
+                    coordinate_only = False
+            if (
+                action_type == "click"
+                and action_role == "ITEM_OPEN:collection"
+                and normalize_semantic_text(page.package_name).casefold()
+                in _HAIER_MALL_PACKAGES
+                and page.page_subtype == "PRODUCT_LIST"
+                and _is_haier_product_grid_card(node, resolved_screen_size)
+            ):
+                # Campaign result cards expose their full product title only on
+                # a non-clickable child. Validate the clickable card's current
+                # class and bounds in fresh XML, then click that verified card.
+                bounds_locator = _direct_bounds_locator(node)
+                if bounds_locator is not None:
+                    locator_candidates = [bounds_locator, *locator_candidates]
+                    coordinate_only = False
+            if (
+                action_type == "click"
+                and action_role in {"OPTION_SELECT", "BUY_NOW"}
+                and normalize_semantic_text(page.package_name).casefold()
+                in _HAIER_MALL_PACKAGES
+                and (
+                    page.role == "PRODUCT_DETAIL"
+                    or page.page_subtype == "PURCHASE_OPTIONS"
+                )
+            ):
+                bounds_locator = _direct_bounds_locator(node)
+                if bounds_locator is not None:
+                    locator_candidates = [bounds_locator, *locator_candidates]
+                    coordinate_only = False
             if visual_evidence is not None:
                 action_role = f"VISUAL_HOME:{_normalized_region(node, resolved_screen_size)}"
                 action_role_key = _hash_payload({"action_role": action_role})
@@ -5113,6 +5673,7 @@ def enumerate_actions(
         return [primary, cleanup]
     if coverage_scheduler_v2 and page.role == "PRODUCT_DETAIL":
         core_roles = {
+            "OPTION_SELECT",
             "BUY_NOW",
             "ADD_CART",
             "FAVORITE",
@@ -5126,15 +5687,41 @@ def enumerate_actions(
             if str(action.action_role or "").startswith("SCROLL:vertical:")
             or str(action.action_role or "") in core_roles
         ]
-    if coverage_scheduler_v2 and page.page_subtype == "SEARCH":
-        # Search history and hot terms describe one transition class. One
-        # successful suggestion is enough to reach the result surface; input,
-        # submit and scrolling only multiply volatile query states.
-        actions = [
+    if coverage_scheduler_v2 and page.page_subtype == "CHECKOUT_CONFIRMATION":
+        # The Haier checkout may ask whether optional benefits should be
+        # selected. Continue without changing benefits so the existing order
+        # can reach the cashier safety boundary deterministically.
+        return [
             action
             for action in actions
-            if str(action.action_role or "") == "SEARCH_SUGGESTION"
+            if str(action.action_role or "") == "PLACE_ORDER"
         ]
+    if coverage_scheduler_v2 and page.page_subtype == "SEARCH":
+        fixed_search_enabled = any(
+            str(rule.get("id") or "") == "haier_v2_search_keyword"
+            for rule in input_rules or ()
+            if isinstance(rule, dict)
+        )
+        if fixed_search_enabled:
+            # The v2 Haier contract requires auditable input and submit edges;
+            # a volatile hot-word click cannot stand in for that journey.
+            actions = [
+                action
+                for action in actions
+                if str(action.action_role or "") in {"INPUT", "SEARCH_SUBMIT"}
+            ]
+            actions.sort(
+                key=lambda action: (
+                    0 if str(action.action_role or "") == "INPUT" else 1
+                )
+            )
+        else:
+            # Legacy coverage keeps one representative suggestion.
+            actions = [
+                action
+                for action in actions
+                if str(action.action_role or "") == "SEARCH_SUGGESTION"
+            ]
     if coverage_scheduler_v2 and page.page_subtype == "APPOINTMENT_LIST":
         # Preserve destructive cancellation controls as explicit blocked
         # evidence, but never scroll or attempt to mutate existing bookings.
@@ -5283,6 +5870,15 @@ def _locator_matching_nodes(
     expected_descendant_text = normalize_semantic_text(
         candidate.get("target_descendant_text")
     )
+    expected_bounds: Optional[Tuple[int, int, int, int]] = None
+    if candidate.get("bounds_constrained"):
+        raw_bounds = candidate.get("bounds")
+        if not isinstance(raw_bounds, (list, tuple)) or len(raw_bounds) != 4:
+            return []
+        try:
+            expected_bounds = tuple(int(value) for value in raw_bounds)
+        except (TypeError, ValueError):
+            return []
     anchor_by = str(candidate.get("anchor_by") or "")
     anchor_value = str(candidate.get("anchor") or "")
     ordinal = int(candidate.get("ordinal") or 1)
@@ -5291,6 +5887,8 @@ def _locator_matching_nodes(
         if not eligible(node):
             continue
         if expected_class and node.class_name != expected_class:
+            continue
+        if expected_bounds is not None and node.bounds != expected_bounds:
             continue
         if expected_desc and node.content_desc != expected_desc:
             continue
