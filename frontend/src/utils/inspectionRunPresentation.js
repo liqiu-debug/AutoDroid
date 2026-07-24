@@ -56,7 +56,37 @@ export const inspectionRunStatusLabel = value => {
 
 export const inspectionRunCoverage = run => {
   const summary = run?.summary || {}
-  const coverage = run?.coverage || summary.coverage || summary.family_coverage || {}
+  const assessment = run?.coverage_assessment || {}
+  const business = summary.business_coverage || assessment.summary || {}
+  const businessTotal = firstNumber(business.total_required)
+  const businessCovered = firstNumber(business.covered_required)
+  if (businessTotal !== null && businessCovered !== null) {
+    const selectedVerdict = String(
+      business.selected_scope_verdict || assessment.selected_scope_verdict || '',
+    ).toUpperCase()
+    const fullVerdict = String(
+      business.full_app_verdict || assessment.full_app_verdict || '',
+    ).toUpperCase()
+    const ratio = firstNumber(business.weighted_coverage, business.required_ratio)
+    const percent = ratio === null
+      ? (businessTotal > 0 ? Math.round((businessCovered / businessTotal) * 100) : 0)
+      : Math.round(Math.max(0, Math.min(1, ratio)) * 1000) / 10
+    const selectedBranches = run?.selected_branches || assessment.selected_branches || []
+    const scopeLabel = selectedVerdict === 'COMPLETE'
+      ? (selectedBranches.length === 1 && selectedBranches[0] === 'authenticated'
+        ? '已登录范围完整'
+        : selectedBranches.length === 1 && selectedBranches[0] === 'guest'
+          ? '未登录范围完整'
+          : '所选范围完整')
+      : selectedVerdict === 'INCONCLUSIVE' ? '证据不足' : '部分覆盖'
+    return {
+      label: `${Math.max(0, businessCovered)}/${Math.max(0, businessTotal)}`,
+      detail: `核心旅程 · ${percent}% · ${scopeLabel}${fullVerdict && fullVerdict !== 'COMPLETE' ? ' · 全应用不完整' : ''}`,
+      percent,
+      source: 'business',
+    }
+  }
+  const coverage = run?.coverage || summary.coverage || summary.exploration_coverage || summary.family_coverage || {}
   const stats = run?.stats || {}
   const total = firstNumber(
     coverage.total,

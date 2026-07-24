@@ -56,6 +56,10 @@ import {
   inspectionAssetAvailabilityLabel,
   inspectionBoundaryEvidenceLabel,
   inspectionCaptureKindLabel,
+  inspectionCoverageItemReason,
+  inspectionCoverageItemStatusMeta,
+  inspectionCoverageVerdictLabel,
+  inspectionEvidenceQualityLabel,
   inspectionExecutionDispositionLabel,
   inspectionObservationOrdinal,
   inspectionPageDisplayName,
@@ -234,6 +238,33 @@ const reportSummary = computed(() => inspectionReportSummary({
   run: run.value || {},
   nodes: presentedNodes.value,
 }))
+const businessCoverage = computed(() => reportSummary.value.business || {})
+const coverageBranches = computed(() => businessCoverage.value.branches || [])
+const coverageBlindSpots = computed(() => businessCoverage.value.blindSpots || [])
+const coverageMetricClass = computed(() => (
+  businessCoverage.value.selectedScopeVerdict === 'COMPLETE' ? 'success'
+    : businessCoverage.value.selectedScopeVerdict === 'INCONCLUSIVE' ? 'warning' : 'danger'
+))
+const evidenceQualityClass = computed(() => ({
+  HIGH: 'success',
+  MEDIUM: 'warning',
+  LOW: 'danger',
+}[businessCoverage.value.evidenceQuality] || 'warning'))
+const evidenceStateNodes = item => (item?.evidence_state_ids || [])
+  .map(id => nodeByStateId.value.get(Number(id)))
+  .filter(Boolean)
+const transitionById = computed(() => new Map(
+  (graph.value.links || []).map(item => [Number(item.id), item]),
+))
+const evidenceTransitions = item => (item?.evidence_transition_ids || [])
+  .map(id => transitionById.value.get(Number(id)))
+  .filter(Boolean)
+const evidenceTransitionLabel = transition => (
+  Number.isFinite(Number(transition?.sequence)) ? `#${Number(transition.sequence)}` : '动作证据'
+)
+const openCoverageState = node => {
+  if (node) void openNode(node)
+}
 const attentionSummaryText = computed(() => {
   const issues = reportSummary.value.issues || {}
   const parts = [
@@ -244,15 +275,19 @@ const attentionSummaryText = computed(() => {
     .map(([label, count]) => `${label} ${count}`)
   return parts.length ? parts.join(' · ') : '没有需要人工处理的问题'
 })
-const canOpenInstalledReplay = computed(() => {
-  if (!run.value || !terminal(run.value.status)) return false
-  if (run.value.replay_source_eligible === false || graph.value.replay_source_eligible === false) return false
-  return !['CANCELLED', 'ABORTED'].includes(String(run.value.terminal_outcome || run.value.status || '').toUpperCase())
-})
 const replaySourceEligible = computed(() => (
   run.value?.replay_source_eligible !== false
   && graph.value?.replay_source_eligible !== false
 ))
+const replayEvidenceAvailable = computed(() => {
+  const explicit = run.value?.replay_evidence_available
+    ?? graph.value?.replay_evidence_available
+  return explicit === undefined ? replaySourceEligible.value : Boolean(explicit)
+})
+const canOpenInstalledReplay = computed(() => {
+  if (!run.value || !terminal(run.value.status) || !replayEvidenceAvailable.value) return false
+  return !['CANCELLED', 'ABORTED'].includes(String(run.value.terminal_outcome || run.value.status || '').toUpperCase())
+})
 const replaySourceReason = computed(() => (
   run.value?.replay_source_reason
   || graph.value?.replay_source_reason
@@ -303,6 +338,13 @@ const diagnostics = computed(() => {
   return [
     ['报告格式', `v${graphSchemaVersion.value}`],
     ['执行设备', run.value?.device_serial || '-'],
+    ['已发现页面族展开率', reportSummary.value.summaryAvailable
+      ? `${reportSummary.value.family.expanded}/${reportSummary.value.family.total} · ${Math.round(reportSummary.value.family.ratio * 1000) / 10}%`
+      : '旧版报告缺少指标'],
+    ['可回放路径', replaySourceEligible.value
+      ? `${reportSummary.value.replay.total}（完整 ${reportSummary.value.replay.full} / 安全前缀 ${reportSummary.value.replay.safePrefix}）`
+      : replaySourceReason.value],
+    ['需关注问题', `${reportSummary.value.attention} · ${attentionSummaryText.value}`],
     ['设备动作', stats.actual_device_actions ?? stats.transitions ?? 0],
     ['安全拦截', stats.blocked || 0],
     ['终态未执行', stats.terminal_unexecuted || 0],
@@ -674,7 +716,11 @@ const fetchData = async (quiet = false) => {
     selectedIds.value = (graph.value.nodes || []).filter(item => item.selected_for_regression).map(item => item.state_id)
     hydrateInitialPageThumbnails(graph.value.nodes || [])
     if (!initialTabResolved.value) {
-      activeTab.value = terminal(runResponse.data?.status) ? 'page-tree' : 'live'
+      activeTab.value = terminal(runResponse.data?.status)
+        ? ((runResponse.data?.coverage_assessment?.manifest || graphResponse.data?.coverage_assessment?.manifest)
+          ? 'coverage'
+          : 'page-tree')
+        : 'live'
       initialTabResolved.value = true
     }
     if (graphSchemaVersion.value >= 4 && typeof api.getInspectionFamilies === 'function') {
@@ -1457,28 +1503,34 @@ onBeforeUnmount(() => {
 
     <div v-if="run && terminal(run.status)" class="stats">
       <div>
-        <span>页面族覆盖</span>
-        <strong class="success">
-          {{ reportSummary.summaryAvailable ? `${reportSummary.family.expanded}/${reportSummary.family.total}` : '旧版报告' }}
+        <span>核心旅程</span>
+        <strong :class="coverageMetricClass">
+          {{ businessCoverage.available ? `${businessCoverage.covered}/${businessCoverage.total}` : '未评估' }}
         </strong>
-        <small>{{ reportSummary.summaryAvailable ? `${Math.round(reportSummary.family.ratio * 100)}%` : '缺少页面族指标' }}</small>
+        <small v-if="businessCoverage.available">
+          {{ Math.round((businessCoverage.origin === 'BACKFILLED_V1' ? businessCoverage.weightedRatio : businessCoverage.ratio) * 1000) / 10 }}% · {{ inspectionCoverageVerdictLabel(businessCoverage.selectedScopeVerdict) }}
+        </small>
+        <small v-else>当前报告没有冻结的业务覆盖清单</small>
+      </div>
+      <div>
+        <span>运行范围</span>
+        <strong :class="businessCoverage.scopeSelected === businessCoverage.scopeTotal ? 'success' : 'danger'">
+          {{ businessCoverage.available ? `${businessCoverage.scopeSelected}/${businessCoverage.scopeTotal}` : '-' }}
+        </strong>
+        <small v-if="businessCoverage.available">
+          所选范围{{ inspectionCoverageVerdictLabel(businessCoverage.selectedScopeVerdict) }} · 全应用{{ inspectionCoverageVerdictLabel(businessCoverage.fullAppVerdict) }}
+        </small>
+        <small v-else>未区分 guest / authenticated 业务线</small>
       </div>
       <div>
         <span class="metric-label">
-          可回放路径
-          <el-tooltip content="安全拦截路径只回放到危险动作之前，并核对边界控件，不会执行危险动作" placement="top">
-            <el-icon aria-label="回放范围说明"><InfoFilled /></el-icon>
+          证据质量
+          <el-tooltip content="综合 XML 可读性、终点复验、未知页面和覆盖契约冲突" placement="top">
+            <el-icon aria-label="证据质量说明"><InfoFilled /></el-icon>
           </el-tooltip>
         </span>
-        <strong :class="replaySourceEligible ? 'success' : 'danger'">{{ reportSummary.summaryAvailable && replaySourceEligible ? reportSummary.replay.total : '-' }}</strong>
-        <small v-if="!replaySourceEligible">暂不可回放：{{ replaySourceReason }}</small>
-        <small v-else-if="reportSummary.summaryAvailable">完整 {{ reportSummary.replay.full }} · 前缀 {{ reportSummary.replay.safePrefix }} · 已复验 {{ reportSummary.replay.verified }}</small>
-        <small v-else>旧版报告无法生成安全回放计划</small>
-      </div>
-      <div>
-        <span>需关注问题</span>
-        <strong :class="reportSummary.attention ? 'danger' : 'success'">{{ reportSummary.attention }}</strong>
-        <small>{{ attentionSummaryText }}</small>
+        <strong :class="evidenceQualityClass">{{ inspectionEvidenceQualityLabel(businessCoverage.evidenceQuality) }}</strong>
+        <small>{{ coverageBlindSpots.length ? `${coverageBlindSpots.length} 个显著盲区` : '未发现显著证据盲区' }}</small>
       </div>
     </div>
     <div v-else class="running-summary" aria-label="巡检实时进度">
@@ -1487,6 +1539,12 @@ onBeforeUnmount(() => {
       <span>{{ currentReportAction }}</span>
       <span v-if="frontierCounts.pending !== null">待执行 {{ frontierCounts.pending }}</span>
       <span v-if="run?.elapsed_seconds !== undefined">{{ Math.round(run.elapsed_seconds / 60) }} / {{ Math.round((run.duration_seconds || 0) / 60) }} 分钟</span>
+    </div>
+    <div v-if="run && terminal(run.status) && coverageBlindSpots.length" class="coverage-blind-spots" role="alert">
+      <strong>覆盖盲区</strong>
+      <span v-for="(spot, index) in coverageBlindSpots" :key="`${spot.type}-${spot.branch_key || ''}-${index}`">
+        {{ spot.message || spot.type }}<template v-if="spot.count">（{{ spot.count }}）</template>
+      </span>
     </div>
     <el-collapse v-model="diagnosticPanels" class="diagnostic-collapse">
       <el-collapse-item name="diagnostics" title="运行诊断">
@@ -1515,6 +1573,74 @@ onBeforeUnmount(() => {
           @state-select="liveStateId = $event"
           @terminal="fetchData(true)"
         />
+      </el-tab-pane>
+
+      <el-tab-pane v-if="businessCoverage.available" label="核心旅程" name="coverage">
+        <div class="coverage-tab">
+          <div class="coverage-manifest-line">
+            <span>{{ businessCoverage.manifest?.id || '覆盖清单' }} · v{{ businessCoverage.manifest?.version || '-' }}</span>
+            <el-tooltip :content="businessCoverage.manifest?.hash || '-'" placement="top">
+              <code>{{ businessCoverage.manifest?.hash ? businessCoverage.manifest.hash.slice(0, 12) : '-' }}</code>
+            </el-tooltip>
+            <el-tag v-if="businessCoverage.origin === 'BACKFILLED_V1'" type="info" effect="plain">历史 v1 回填</el-tag>
+          </div>
+          <section v-for="branch in coverageBranches" :key="branch.branch_key" class="coverage-branch">
+            <header>
+              <h3>{{ branchDisplayLabel(branch.branch_key) }}</h3>
+              <el-tag :type="branch.verdict === 'COMPLETE' ? 'success' : branch.verdict === 'NOT_IN_SCOPE' ? 'info' : branch.verdict === 'INCONCLUSIVE' ? 'warning' : 'danger'" effect="plain">
+                {{ inspectionCoverageVerdictLabel(branch.verdict) }}
+              </el-tag>
+              <span v-if="branch.selected">必达 {{ branch.covered_required }}/{{ branch.total_required }}</span>
+              <span v-else>本次未运行</span>
+            </header>
+            <el-table v-if="branch.selected" :data="branch.items || []" size="small" table-layout="fixed">
+              <el-table-column prop="label" label="旅程" min-width="180">
+                <template #default="{ row }">
+                  <span>{{ row.label }}</span>
+                  <el-tag v-if="!row.required" size="small" type="info" effect="plain">可选</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="结果" width="104">
+                <template #default="{ row }">
+                  <el-tag size="small" :type="inspectionCoverageItemStatusMeta(row.status).type" effect="plain">
+                    {{ inspectionCoverageItemStatusMeta(row.status).label }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="进度" width="88" align="center">
+                <template #default="{ row }">
+                  {{ row.total_stages > 0 ? `${row.deepest_stage || 0}/${row.total_stages}` : '-' }}
+                </template>
+              </el-table-column>
+              <el-table-column label="证据" min-width="190">
+                <template #default="{ row }">
+                  <div v-if="evidenceStateNodes(row).length || evidenceTransitions(row).length" class="coverage-evidence-links">
+                    <span v-if="evidenceStateNodes(row).length" class="coverage-evidence-group">
+                      <em>页面</em>
+                      <el-button
+                        v-for="node in evidenceStateNodes(row)"
+                        :key="node.state_id"
+                        link
+                        type="primary"
+                        @click="openCoverageState(node)"
+                      >{{ node.display_label || pageLabelForStateId(node.state_id) }}</el-button>
+                    </span>
+                    <span v-if="evidenceTransitions(row).length" class="coverage-evidence-group">
+                      <em>动作</em>
+                      <code v-for="transition in evidenceTransitions(row)" :key="transition.id">
+                        {{ evidenceTransitionLabel(transition) }}
+                      </code>
+                    </span>
+                  </div>
+                  <span v-else>-</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="判定" min-width="300" show-overflow-tooltip>
+                <template #default="{ row }">{{ inspectionCoverageItemReason(row) }}</template>
+              </el-table-column>
+            </el-table>
+          </section>
+        </div>
       </el-tab-pane>
 
       <el-tab-pane label="页面树状图" name="page-tree">
@@ -1865,6 +1991,8 @@ onBeforeUnmount(() => {
 .running-summary { min-height: 42px; padding: 8px 16px; display: flex; align-items: center; gap: 10px 22px; overflow: hidden; border-bottom: 1px solid #ebeef5; background: #fff; color: #606266; font-size: 12px; }
 .running-summary strong { flex: none; color: #303133; }
 .running-summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.coverage-blind-spots { flex: none; min-height: 36px; padding: 7px 16px; display: flex; align-items: center; gap: 8px 18px; flex-wrap: wrap; border-bottom: 1px solid #fab6b6; background: #fef0f0; color: #c45656; font-size: 12px; }
+.coverage-blind-spots strong { color: #b42318; }
 .diagnostic-collapse { flex: none; border-bottom: 1px solid #ebeef5; background: #fff; }
 .diagnostic-collapse :deep(.el-collapse-item__header) { height: 34px; padding: 0 16px; color: #606266; font-size: 12px; }
 .diagnostic-collapse :deep(.el-collapse-item__wrap) { border-bottom: 0; }
@@ -1876,6 +2004,21 @@ onBeforeUnmount(() => {
 .success { color: #67c23a; } .warning { color: #e6a23c; } .danger { color: #f56c6c; }
 .report-tabs { flex: 1; min-height: 0; margin: 12px; padding: 0 14px 14px; background: #fff; border: 1px solid #ebeef5; border-radius: 4px; }
 .report-tabs :deep(.el-tabs__content), .report-tabs :deep(.el-tab-pane) { height: calc(100% - 28px); }
+.coverage-tab { height: 100%; overflow: auto; }
+.coverage-manifest-line { min-height: 42px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #ebeef5; color: #606266; font-size: 12px; }
+.coverage-manifest-line code { color: #909399; }
+.coverage-branch { padding: 12px 0 18px; border-bottom: 1px solid #ebeef5; }
+.coverage-branch:last-child { border-bottom: 0; }
+.coverage-branch header { min-height: 32px; display: flex; align-items: center; gap: 10px; }
+.coverage-branch h3 { margin: 0; color: #303133; font-size: 14px; letter-spacing: 0; }
+.coverage-branch header > span { color: #909399; font-size: 12px; }
+.coverage-branch :deep(.el-table) { width: 100%; }
+.coverage-branch :deep(.el-table .cell) { white-space: normal; overflow-wrap: anywhere; }
+.coverage-evidence-links { display: flex; align-items: flex-start; gap: 2px 10px; flex-direction: column; }
+.coverage-evidence-group { display: flex; min-width: 0; align-items: center; gap: 2px 8px; flex-wrap: wrap; }
+.coverage-evidence-group em { color: #909399; font-size: 11px; font-style: normal; }
+.coverage-evidence-group code { color: #606266; font-size: 11px; }
+.coverage-evidence-links :deep(.el-button) { height: 24px; margin: 0; padding: 0; }
 .filters { min-height: 46px; padding: 6px 0; flex-wrap: wrap; }
 .tree-legend { display: flex; align-items: center; gap: 10px; color: #606266; font-size: 11px; white-space: nowrap; }
 .tree-legend span { display: inline-flex; align-items: center; gap: 4px; }
@@ -1948,6 +2091,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 560px) {
   .toolbar-right { justify-content: flex-start; flex-wrap: wrap; }
+  .stats { grid-template-columns: minmax(0, 1fr); }
   .stats > div { padding: 10px 12px; }
   .report-tabs { margin: 8px; padding-inline: 8px; }
   .filters :deep(.el-select) { width: 100% !important; }

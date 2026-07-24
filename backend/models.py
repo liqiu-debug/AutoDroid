@@ -269,6 +269,9 @@ class CompatibilityRun(SQLModel, table=True):
         default=[],
         sa_column=Column(PydanticListType(int)),
     )
+    source_coverage_snapshot: Dict[str, Any] = Field(
+        default={}, sa_column=Column(JSON, default={})
+    )
     old_package_id: Optional[int] = Field(default=None, foreign_key="apppackage.id", index=True)
     new_package_id: Optional[int] = Field(
         default=None,
@@ -436,6 +439,17 @@ class InspectionRun(SQLModel, table=True):
         default=["guest", "authenticated"],
         sa_column=Column(PydanticListType(str)),
     )
+    coverage_manifest_id: Optional[str] = Field(default=None, index=True)
+    coverage_manifest_version: Optional[str] = None
+    coverage_manifest_hash: Optional[str] = Field(default=None, index=True)
+    coverage_manifest_snapshot: Dict[str, Any] = Field(
+        default={}, sa_column=Column(JSON, default={})
+    )
+    coverage_assessment: Dict[str, Any] = Field(
+        default={}, sa_column=Column(JSON, default={})
+    )
+    coverage_verdict: str = Field(default="NOT_EVALUATED", index=True)
+    coverage_evaluated_at: Optional[datetime] = None
     status: str = Field(default="PENDING", index=True)
     current_stage: Optional[str] = None
     stop_reason: Optional[str] = None

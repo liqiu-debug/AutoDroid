@@ -243,6 +243,7 @@ class InspectionLiveEngineTests(unittest.TestCase):
         verify_mock=None,
         family_convergence=False,
         coverage_scheduler=None,
+        business_coverage=False,
     ):
         device = device or Mock()
         device.window_size.return_value = (1080, 2400)
@@ -274,6 +275,9 @@ class InspectionLiveEngineTests(unittest.TestCase):
                 coverage_scheduler
             )
             profile["inspection_visual_home_actions"] = False
+        if business_coverage:
+            profile["inspection_business_coverage_v2"] = True
+            profile["coverage_manifest"] = {"journeys": []}
         with patch(
             "backend.inspection.engine.engine",
             self.engine,
@@ -1392,6 +1396,74 @@ class InspectionLiveEngineTests(unittest.TestCase):
             outcome.stop_reason,
             "探索阶段 90% 动作预算已用完",
         )
+
+    def test_business_coverage_shadow_mode_does_not_change_scheduler_budget(self):
+        capture = _capture(
+            _page(
+                '<node package="com.demo" class="android.widget.Button" '
+                'content-desc="Open" clickable="true" enabled="true" '
+                'bounds="[10,180][500,300]"/>'
+            )
+        )
+        action = next(
+            item
+            for item in enumerate_actions(capture.model, screen_size=(1080, 2400))
+            if item.action_type == "click"
+        )
+        work = self._work(capture, [action])
+        verify = Mock(return_value=0)
+
+        outcome = self._run_branch(
+            capture=capture,
+            work=work,
+            persist_results=[PersistedState(work=work, is_new=True)],
+            publish_mock=Mock(),
+            perform_mock=Mock(),
+            wait_captures=[capture],
+            max_actions=1,
+            verify_mock=verify,
+            coverage_scheduler=False,
+            business_coverage=True,
+        )
+
+        self.assertEqual(outcome.stop_reason, "探索阶段 90% 动作预算已用完")
+        self.assertIsNone(verify.call_args.kwargs["max_paths"])
+        self.assertFalse(verify.call_args.kwargs["representative_only"])
+        self.assertFalse(verify.call_args.kwargs["coverage_reverify_once"])
+
+    def test_business_coverage_directed_mode_reserves_fifteen_percent(self):
+        capture = _capture(
+            _page(
+                '<node package="com.demo" class="android.widget.Button" '
+                'content-desc="Open" clickable="true" enabled="true" '
+                'bounds="[10,180][500,300]"/>'
+            )
+        )
+        action = next(
+            item
+            for item in enumerate_actions(capture.model, screen_size=(1080, 2400))
+            if item.action_type == "click"
+        )
+        work = self._work(capture, [action])
+        verify = Mock(return_value=0)
+
+        outcome = self._run_branch(
+            capture=capture,
+            work=work,
+            persist_results=[PersistedState(work=work, is_new=True)],
+            publish_mock=Mock(),
+            perform_mock=Mock(),
+            wait_captures=[capture],
+            max_actions=1,
+            verify_mock=verify,
+            coverage_scheduler=True,
+            business_coverage=True,
+        )
+
+        self.assertEqual(outcome.stop_reason, "探索阶段 85% 动作预算已用完")
+        self.assertEqual(verify.call_args.kwargs["max_paths"], 24)
+        self.assertTrue(verify.call_args.kwargs["representative_only"])
+        self.assertTrue(verify.call_args.kwargs["coverage_reverify_once"])
 
     def test_navigation_is_not_precovered_when_active_indicator_is_ambiguous(self):
         action = InspectionAction(

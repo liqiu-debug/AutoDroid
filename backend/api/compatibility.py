@@ -369,6 +369,7 @@ def _run_read(
         inspection_run_id=row.inspection_run_id,
         inspection_state_ids=row.inspection_state_ids or [],
         inspection_observation_ids=row.inspection_observation_ids or [],
+        source_coverage_snapshot=row.source_coverage_snapshot or {},
         old_package_id=row.old_package_id,
         new_package_id=row.new_package_id,
         package_name=row.package_name,
@@ -437,6 +438,27 @@ def _validate_inspection_source(
         raise HTTPException(status_code=400, detail="巡检来源与测试包的 package_name 不一致")
     if str(source_run.status or "").upper() not in {"PASS", "WARNING", "FAIL"}:
         raise HTTPException(status_code=400, detail="巡检来源任务尚未完成")
+    assessment = (
+        dict(source_run.coverage_assessment or {})
+        if isinstance(source_run.coverage_assessment, dict)
+        else {}
+    )
+    default_eligible = bool(
+        str(source_run.status or "").upper() == "PASS"
+        and str(assessment.get("selected_scope_verdict") or "") == "COMPLETE"
+    )
+    if (
+        not inspection_state_ids
+        and not inspection_observation_ids
+        and not default_eligible
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "该巡检报告不允许空选择自动采用路径；"
+                "请人工明确选择稳定 State 或 Observation"
+            ),
+        )
 
     explicit_observations: Dict[int, InspectionObservation] = {}
     requested_observation_ids = list(inspection_observation_ids or [])
@@ -552,7 +574,8 @@ def _validate_inspection_source(
         )
         has_legacy = bool(item.screenshot_path and item.xml_path)
         if (
-            item.stable_status != "STABLE"
+            str(item.stable_status or "").upper()
+            not in {"STABLE", "VERIFIED_TWICE"}
             or (not has_cas and not has_legacy)
             or item.locator_quality == "COORDINATE_ONLY"
         ):
@@ -3839,6 +3862,39 @@ def create_run(
         inspection_run_id=inspection_source.id if inspection_source else None,
         inspection_state_ids=[item.id for item in inspection_states],
         inspection_observation_ids=observation_ids,
+        source_coverage_snapshot=(
+            {
+                "inspection_run_id": int(inspection_source.id),
+                "manifest_id": inspection_source.coverage_manifest_id,
+                "manifest_version": inspection_source.coverage_manifest_version,
+                "manifest_hash": inspection_source.coverage_manifest_hash,
+                "coverage_verdict": inspection_source.coverage_verdict,
+                "selected_scope_verdict": (
+                    (inspection_source.coverage_assessment or {}).get(
+                        "selected_scope_verdict"
+                    )
+                    if isinstance(inspection_source.coverage_assessment, dict)
+                    else None
+                ),
+                "full_app_verdict": (
+                    (inspection_source.coverage_assessment or {}).get(
+                        "full_app_verdict"
+                    )
+                    if isinstance(inspection_source.coverage_assessment, dict)
+                    else None
+                ),
+                "assessment_origin": (
+                    (inspection_source.coverage_assessment or {}).get(
+                        "assessment_origin"
+                    )
+                    if isinstance(inspection_source.coverage_assessment, dict)
+                    else None
+                ),
+                "frozen_at": datetime.now().isoformat(),
+            }
+            if inspection_source
+            else {}
+        ),
         old_package_id=old_pkg.id if old_pkg else None,
         new_package_id=new_pkg.id if new_pkg else None,
         package_name=(

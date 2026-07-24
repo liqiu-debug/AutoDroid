@@ -209,7 +209,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 24)
+        self.assertEqual(len(rows), 25)
 
         # Re-run should be no-op and keep same version records.
         _run_migrations_with_conn(self.conn)
@@ -228,6 +228,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertEqual(run_columns["new_package_id"][3], 0)
         self.assertIn("source_package_snapshot", run_columns)
         self.assertIn("target_package_snapshot", run_columns)
+        self.assertIn("source_coverage_snapshot", run_columns)
         cell_columns = {row[1] for row in self._table_columns("compatibilitycell")}
         self.assertIn("preflight_at", cell_columns)
         self.assertIn("installed_package_snapshot", cell_columns)

@@ -76,6 +76,8 @@ const durationPresetOptions = [
   { label: '30 分', value: '30' },
   { label: '45 分', value: '45' },
   { label: '60 分', value: '60' },
+  { label: '90 分', value: '90' },
+  { label: '120 分', value: '120' },
   { label: '自定义', value: 'custom' },
 ]
 
@@ -84,19 +86,19 @@ const androidDevices = computed(() => devices.value.filter(item => (
 )))
 const hasRunning = computed(() => runs.value.some(item => ['PENDING', 'RUNNING', 'QUEUED'].includes(String(item.status).toUpperCase())))
 const selectedProfile = computed(() => profiles.value.find(item => item.id === runForm.profile_id))
-const normalizedRunDurationMinutes = computed(() => Math.min(60, Math.max(5, Number(runForm.duration_minutes) || 30)))
+const normalizedRunDurationMinutes = computed(() => Math.min(120, Math.max(5, Number(runForm.duration_minutes) || 30)))
 const runDurationPreset = computed({
   get: () => {
     const minutes = normalizedRunDurationMinutes.value
-    return [30, 45, 60].includes(minutes) ? String(minutes) : 'custom'
+    return [30, 45, 60, 90, 120].includes(minutes) ? String(minutes) : 'custom'
   },
   set: (value) => {
-    runForm.duration_minutes = value === 'custom' ? 50 : Number(value)
+    runForm.duration_minutes = value === 'custom' ? 75 : Number(value)
   },
 })
 const runDurationAllocation = computed(() => {
   const total = normalizedRunDurationMinutes.value
-  const exploration = Math.max(1, Math.floor(total * 0.9))
+  const exploration = Math.max(1, Math.floor(total * 0.85))
   return `${exploration} 分钟探索 · ${Math.max(1, total - exploration)} 分钟验证`
 })
 const packageOptions = computed(() => packages.value.filter(item => (
@@ -115,7 +117,7 @@ const runAdvancedSummary = computed(() => {
 watch(selectedProfile, (profile) => {
   if (!profile) return
   const seconds = Number(profile.budgets?.duration_seconds || 1800)
-  runForm.duration_minutes = Math.min(60, Math.max(5, Math.round(seconds / 60)))
+  runForm.duration_minutes = Math.min(120, Math.max(5, Math.round(seconds / 60)))
 })
 
 const parseJsonArray = (text, label) => {
@@ -407,7 +409,7 @@ onBeforeUnmount(() => {
                   <el-option v-for="option in durationPresetOptions" :key="option.value" :label="option.label" :value="option.value" />
                 </el-select>
                 <div v-if="runDurationPreset === 'custom'" class="duration-custom">
-                  <el-input-number v-model="runForm.duration_minutes" :min="5" :max="60" controls-position="right" />
+                  <el-input-number v-model="runForm.duration_minutes" :min="5" :max="120" controls-position="right" />
                   <span>分钟</span>
                 </div>
                 <span class="duration-allocation">{{ runDurationAllocation }}</span>
@@ -584,7 +586,7 @@ onBeforeUnmount(() => {
             <el-input-number
               :model-value="Math.round(profileForm.duration_seconds / 60)"
               :min="5"
-              :max="60"
+              :max="120"
               @update:model-value="value => { profileForm.duration_seconds = Number(value) * 60 }"
             />
           </el-form-item>

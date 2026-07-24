@@ -18,6 +18,7 @@ from backend.api.inspections import (
     create_run,
     delete_run,
     get_run,
+    get_run_coverage,
     get_run_graph,
     get_state_action_map,
     list_run_families,
@@ -28,8 +29,13 @@ from backend.api.inspections import (
     update_regression_selection,
 )
 from backend.feature_flags import (
+    FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
     FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE,
     FLAG_MODEL_INSPECTION,
+)
+from backend.inspection.haier_business_coverage import (
+    SEARCH_INPUT_RULE_ID,
+    manifest_hash,
 )
 from backend.inspection.engine import resolve_inspection_asset
 from backend.inspection.runtime import discard_abort_event, get_abort_event
@@ -410,6 +416,85 @@ class InspectionApiTests(unittest.TestCase):
         self.assertEqual(stored.profile_snapshot["graph_schema_version"], 8)
         self.assertIn("effective_features", stored.profile_snapshot)
 
+    def test_haier_run_freezes_v2_manifest_and_fixed_search_rule(self):
+        self._enable()
+        self.session.add(
+            SystemSetting(key=FLAG_INSPECTION_BUSINESS_COVERAGE_V2, value="true")
+        )
+        self.session.commit()
+        profile = create_profile(
+            self._profile_payload().model_copy(
+                update={"package_name": "com.ehaier.zgq.shop.mall"}
+            ),
+            session=self.session,
+            current_user=self.user,
+        )
+
+        created = create_run(
+            InspectionRunCreate(
+                profile_id=profile.id,
+                device_serial=self.device.serial,
+                branches=["authenticated"],
+            ),
+            BackgroundTasks(),
+            session=self.session,
+            current_user=self.user,
+        )
+
+        stored = self.session.get(InspectionRun, created.id)
+        frozen = dict(stored.coverage_manifest_snapshot)
+        frozen_hash = frozen.pop("hash")
+        self.assertEqual(stored.coverage_manifest_id, "haier-mall-v2")
+        self.assertEqual(stored.coverage_manifest_version, "2")
+        self.assertEqual(stored.coverage_manifest_hash, frozen_hash)
+        self.assertEqual(frozen_hash, manifest_hash(frozen))
+        self.assertEqual(frozen["selected_branches"], ["authenticated"])
+        self.assertEqual(stored.coverage_verdict, "PENDING")
+        self.assertEqual(
+            stored.profile_snapshot["input_rules"][0]["id"],
+            SEARCH_INPUT_RULE_ID,
+        )
+        self.assertEqual(stored.profile_snapshot["input_rules"][0]["value"], "冰箱")
+
+    def test_coverage_endpoint_returns_frozen_assessment(self):
+        self._enable()
+        profile = self._create_profile()
+        created = create_run(
+            InspectionRunCreate(
+                profile_id=profile.id,
+                device_serial=self.device.serial,
+                branches=["authenticated"],
+            ),
+            BackgroundTasks(),
+            session=self.session,
+            current_user=self.user,
+        )
+        run = self.session.get(InspectionRun, created.id)
+        assessment = {
+            "manifest": {"id": "haier-mall-v2", "version": 2, "hash": "frozen"},
+            "selected_scope_verdict": "PARTIAL",
+            "full_app_verdict": "INCOMPLETE",
+            "summary": {"covered_required": 3, "total_required": 11},
+            "branches": [],
+            "blind_spots": [{"type": "UNRUN_BRANCH"}],
+        }
+        run.status = "WARNING"
+        run.coverage_assessment = assessment
+        run.coverage_verdict = "INCOMPLETE"
+        run.coverage_evaluated_at = datetime.now()
+        self.session.add(run)
+        self.session.commit()
+
+        response = get_run_coverage(
+            created.id,
+            session=self.session,
+            current_user=self.user,
+        )
+
+        self.assertTrue(response["available"])
+        self.assertEqual(response["coverage_verdict"], "INCOMPLETE")
+        self.assertEqual(response["assessment"], assessment)
+
     def test_run_duration_override_is_bounded_and_only_changes_run_snapshot(self):
         self._enable()
         profile = self._create_profile()
@@ -418,7 +503,7 @@ class InspectionApiTests(unittest.TestCase):
                 profile_id=profile.id,
                 device_serial=self.device.serial,
                 branches=["guest"],
-                duration_seconds=3600,
+                duration_seconds=7200,
             ),
             BackgroundTasks(),
             session=self.session,
@@ -426,10 +511,10 @@ class InspectionApiTests(unittest.TestCase):
         )
 
         stored = self.session.get(InspectionRun, result.id)
-        self.assertEqual(stored.profile_snapshot["budgets"]["duration_seconds"], 3600)
+        self.assertEqual(stored.profile_snapshot["budgets"]["duration_seconds"], 7200)
         self.assertEqual(
             stored.profile_snapshot["run_overrides"],
-            {"duration_seconds": 3600},
+            {"duration_seconds": 7200},
         )
         stored_profile = self.session.get(InspectionProfile, profile.id)
         self.assertEqual(stored_profile.budgets["duration_seconds"], 300)
@@ -438,7 +523,7 @@ class InspectionApiTests(unittest.TestCase):
                 profile_id=profile.id,
                 device_serial=self.device.serial,
                 branches=["guest"],
-                duration_seconds=3601,
+                duration_seconds=7201,
             )
 
     def test_run_creation_rejects_non_idle_device(self):

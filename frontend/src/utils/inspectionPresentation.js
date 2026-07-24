@@ -84,6 +84,7 @@ export const inspectionPageRoleLabel = value => ({
   SERVICE_DETAIL: '服务详情',
   PURCHASE_OPTIONS: '规格选择',
   CHECKOUT: '结算页',
+  CHECKOUT_CONFIRMATION: '结算确认',
   SEARCH: '搜索页',
   ORDER: '订单页',
   ORDER_DETAIL: '订单详情',
@@ -99,12 +100,18 @@ export const inspectionPageRoleLabel = value => ({
   STORE_DETAIL: '门店详情',
   APPOINTMENT_LIST: '预约列表',
   COMMUNITY_FEED: '许愿池',
+  COMMUNITY_DETAIL: '许愿池内容',
+  AUTH_GATE: '登录门槛',
+  MEMBER_BENEFITS: '会员权益',
+  FAVORITES: '商品收藏',
+  BROWSING_HISTORY: '历史浏览',
   OPAQUE: '不透明页面',
   UNKNOWN: '普通页面',
 }[String(value || '').trim().toUpperCase()] || value || '普通页面')
 
 export const inspectionReachabilityLabel = value => ({
   VERIFIED_TWICE: '已复验',
+  REVERIFIED_ONCE: '核心终点已复验一次',
   OBSERVED_ONCE: '已到达，待复验',
   UNSTABLE: '路径不稳定',
   UNKNOWN: '尚无足够证据',
@@ -137,9 +144,12 @@ const stateObserved = state => Boolean(
 )
 
 export const inspectionReachabilityEvidence = state => {
+  const stable = String(state?.stable_status || '').trim().toUpperCase()
+  // Business coverage deliberately uses one independent endpoint replay,
+  // while compatibility regression still requires two stable replays.
+  if (stable === 'REVERIFIED_ONCE' && stateObserved(state)) return 'REVERIFIED_ONCE'
   const explicit = String(state?.reachability_evidence || '').trim().toUpperCase()
   if (explicit) return explicit
-  const stable = String(state?.stable_status || '').trim().toUpperCase()
   if (stable === 'VERIFIED_TWICE' && stateObserved(state)) return 'VERIFIED_TWICE'
   if (['UNSTABLE', 'PATH_DIVERGED'].includes(stable)) return 'UNSTABLE'
   if (stateObserved(state)) return 'OBSERVED_ONCE'
@@ -276,7 +286,7 @@ export const inspectionReportSummary = ({ graph = {}, run = {}, nodes = [] } = {
   const stats = graph?.stats || {}
   const summaryAvailable = graph?.summary_available !== false
     && source?.summary_available !== false
-  const familySource = source.page_family_coverage || source.family_coverage || {}
+  const familySource = source.exploration_coverage || source.page_family_coverage || source.family_coverage || {}
   const familyTotal = Number(
     familySource.total ?? familySource.discovered ?? stats.families_discovered ?? stats.families ?? run.total_families ?? 0,
   ) || 0
@@ -317,6 +327,18 @@ export const inspectionReportSummary = ({ graph = {}, run = {}, nodes = [] } = {
       ?? stats.attention_issues
       ?? (faults + automationFailures),
   ) || 0
+  const assessment = graph?.coverage_assessment || run?.coverage_assessment || {}
+  const businessSource = source.business_coverage || assessment.summary || {}
+  const businessCovered = Number(businessSource.covered_required ?? 0) || 0
+  const businessTotal = Number(businessSource.total_required ?? 0) || 0
+  const scopeSelected = Number(
+    businessSource.scope_branches_selected
+      ?? (Array.isArray(assessment.selected_branches) ? assessment.selected_branches.length : null)
+      ?? businessSource.scope_branches_covered
+      ?? 0,
+  ) || 0
+  const scopeComplete = Number(businessSource.scope_branches_covered ?? 0) || 0
+  const scopeTotal = Number(businessSource.scope_branches_total ?? 2) || 2
   return {
     summaryAvailable,
     family: { total: familyTotal, expanded: familyExpanded, ratio: Math.max(0, Math.min(1, familyRatio)) },
@@ -338,8 +360,84 @@ export const inspectionReportSummary = ({ graph = {}, run = {}, nodes = [] } = {
       infrastructure: infrastructureFaults,
       automation: automationFailures,
     },
+    business: {
+      available: Boolean(businessTotal || assessment?.manifest || businessSource?.manifest),
+      covered: businessCovered,
+      total: businessTotal,
+      ratio: businessTotal > 0 ? Math.max(0, Math.min(1, Number(businessSource.required_ratio ?? businessCovered / businessTotal))) : 0,
+      weightedRatio: Number(businessSource.weighted_coverage ?? businessSource.required_ratio ?? 0) || 0,
+      scopeSelected,
+      scopeComplete,
+      scopeTotal,
+      evidenceQuality: String(businessSource.evidence_quality || 'UNKNOWN').toUpperCase(),
+      selectedScopeVerdict: String(
+        businessSource.selected_scope_verdict || assessment.selected_scope_verdict || 'NOT_EVALUATED',
+      ).toUpperCase(),
+      fullAppVerdict: String(
+        businessSource.full_app_verdict || assessment.full_app_verdict || 'NOT_EVALUATED',
+      ).toUpperCase(),
+      branches: Array.isArray(assessment.branches) ? assessment.branches : [],
+      blindSpots: Array.isArray(assessment.blind_spots) ? assessment.blind_spots : [],
+      manifest: assessment.manifest || businessSource.manifest || {},
+      origin: assessment.assessment_origin || '',
+    },
   }
 }
+
+export const inspectionCoverageVerdictLabel = value => ({
+  COMPLETE: '完整',
+  PARTIAL: '部分覆盖',
+  INCOMPLETE: '不完整',
+  INCONCLUSIVE: '证据不足',
+  NOT_IN_SCOPE: '不在本次范围',
+  NOT_EVALUATED: '未评估',
+  PENDING: '评估中',
+}[String(value || '').trim().toUpperCase()] || value || '未评估')
+
+export const inspectionCoverageItemStatusMeta = value => ({
+  COVERED: { label: '已覆盖', type: 'success' },
+  MISSING: { label: '缺失', type: 'danger' },
+  INCONCLUSIVE: { label: '证据不足', type: 'warning' },
+  NOT_IN_SCOPE: { label: '不在范围', type: 'info' },
+}[String(value || '').trim().toUpperCase()] || { label: value || '未知', type: 'info' })
+
+const LEGACY_COVERAGE_DETAIL_LABELS = Object.freeze({
+  'home and four bottom-tab destinations have real transitions': '首页及四个底栏目的地均有真实 Transition 证据',
+  'no HOME has XML labels plus real transitions to all four destinations': '缺少带完整底栏标签的首页，或未形成到四个目的地的真实 Transition',
+  'matching states do not form the required real transition chain': '候选页面未形成该旅程要求的真实 Transition 链',
+  'real transition chain matched': '已匹配该旅程自己的真实 Transition 链',
+  'physical detail/specification/checkout/cashier transition chain missing': '缺少商品详情、规格、结算到收银台的完整真实 Transition 链',
+  'real purchase chain (inline selected specification) reached cashier and final payment was blocked': '真实购买链已携带选中规格到达收银台，最终支付动作已安全拦截',
+  'cashier reached, but no executed PAYMENT/BLOCKED boundary evidence': '已到达收银台，但缺少已执行的 BLOCKED/PAYMENT 安全边界证据',
+  'state evidence matched': '已匹配可定位的页面证据',
+  'no matching state/XML evidence': '未找到匹配的页面或 XML 证据',
+})
+
+const COVERAGE_REASON_CODE_LABELS = Object.freeze({
+  BRANCH_NOT_SELECTED: '本次 Run 未选择该业务线或该旅程不适用',
+  ENDPOINT_NOT_REVERIFIED: '终点未通过保留预算复验',
+  EXECUTION_INCOMPLETE: '任务在预算或执行边界停止，无法判定该旅程缺失',
+  PATH_MISSING: '未形成该旅程自己的真实 Transition 链',
+  PAYMENT_BOUNDARY_MISSING: '已到达收银台，但缺少明确的 BLOCKED/PAYMENT 证据',
+  UNKNOWN_OR_OPAQUE: '业务线包含未知或不透明页面，证据不足',
+  V1_EVIDENCE_MISSING: '历史 v1 证据未满足该旅程判定条件',
+  XML_MISSING: '页面 XML 缺失或不可读，无法完成判定',
+})
+
+export const inspectionCoverageItemReason = item => {
+  const detail = String(item?.detail || '').trim()
+  if (LEGACY_COVERAGE_DETAIL_LABELS[detail]) return LEGACY_COVERAGE_DETAIL_LABELS[detail]
+  if (detail) return detail
+  const code = String(item?.reason_code || '').trim().toUpperCase()
+  return COVERAGE_REASON_CODE_LABELS[code] || code || '-'
+}
+
+export const inspectionEvidenceQualityLabel = value => ({
+  HIGH: '高',
+  MEDIUM: '中',
+  LOW: '低',
+  UNKNOWN: '未评估',
+}[String(value || '').trim().toUpperCase()] || value || '未评估')
 
 export const inspectionActionStatus = action => String(
   action?.failure_type

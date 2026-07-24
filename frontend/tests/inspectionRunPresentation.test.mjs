@@ -25,6 +25,65 @@ test('prefers page-family coverage counts when the new summary is available', ()
   )
 })
 
+test('business journey coverage takes precedence over discovered family expansion', () => {
+  assert.deepEqual(
+    inspectionRunCoverage({
+      status: 'WARNING',
+      selected_branches: ['authenticated'],
+      coverage_assessment: {
+        assessment_origin: 'BACKFILLED_V1',
+        selected_scope_verdict: 'COMPLETE',
+        full_app_verdict: 'INCOMPLETE',
+      },
+      summary: {
+        business_coverage: {
+          covered_required: 11,
+          total_required: 11,
+          weighted_coverage: 0.965,
+          selected_scope_verdict: 'COMPLETE',
+          full_app_verdict: 'INCOMPLETE',
+        },
+        family_coverage: { representatives_expanded: 29, total: 43 },
+      },
+    }),
+    {
+      label: '11/11',
+      detail: '核心旅程 · 96.5% · 已登录范围完整 · 全应用不完整',
+      percent: 96.5,
+      source: 'business',
+    },
+  )
+})
+
+test('run 47 remains partial when family expansion is high but core coverage is 10.5%', () => {
+  assert.deepEqual(
+    inspectionRunCoverage({
+      status: 'WARNING',
+      selected_branches: ['authenticated'],
+      coverage_assessment: {
+        selected_scope_verdict: 'PARTIAL',
+        full_app_verdict: 'INCOMPLETE',
+      },
+      summary: {
+        business_coverage: {
+          covered_required: 2,
+          total_required: 19,
+          required_ratio: 0.105,
+          selected_scope_verdict: 'PARTIAL',
+          full_app_verdict: 'INCOMPLETE',
+        },
+        exploration_coverage: { expanded: 13, total: 14, ratio: 0.929 },
+      },
+    }),
+    {
+      label: '2/19',
+      detail: '核心旅程 · 10.5% · 部分覆盖 · 全应用不完整',
+      percent: 10.5,
+      source: 'business',
+    },
+  )
+})
+
 test('supports graph v6 coverage and replay summary field names', () => {
   const run = {
     status: 'PASS',

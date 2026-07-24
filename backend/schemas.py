@@ -827,6 +827,7 @@ class InspectionInputRule(BaseModel):
     text_regex: Optional[str] = None
     class_regex: Optional[str] = None
     ancestor_regex: Optional[str] = None
+    page_subtype_regex: Optional[str] = None
     value_source: str = "literal"
     value: Optional[str] = None
     variable_key: Optional[str] = None
@@ -855,6 +856,7 @@ class InspectionInputRule(BaseModel):
             self.text_regex,
             self.class_regex,
             self.ancestor_regex,
+            self.page_subtype_regex,
         ]
         if not any(patterns):
             raise ValueError("input rule requires at least one matcher")
@@ -928,7 +930,7 @@ class InspectionSanitizerRule(BaseModel):
 
 
 class InspectionBudgets(BaseModel):
-    duration_seconds: int = Field(default=1800, ge=30, le=3600)
+    duration_seconds: int = Field(default=1800, ge=30, le=7200)
     max_states: int = Field(default=200, ge=1, le=5000)
     max_device_actions: int = Field(default=800, ge=1, le=50000)
     max_actions: Optional[int] = Field(default=None, ge=1, le=50000)
@@ -1037,7 +1039,7 @@ class InspectionRunCreate(BaseModel):
     device_serial: str
     package_id: Optional[int] = None
     branches: List[str] = Field(default_factory=lambda: ["guest", "authenticated"])
-    duration_seconds: Optional[int] = Field(default=None, ge=300, le=3600)
+    duration_seconds: Optional[int] = Field(default=None, ge=300, le=7200)
 
     @field_validator("device_serial", mode="before")
     @classmethod
@@ -1380,6 +1382,13 @@ class InspectionRunRead(BaseModel):
     profile_snapshot: Dict[str, Any] = Field(default_factory=dict)
     device_serial: str
     selected_branches: List[str] = Field(default_factory=list)
+    coverage_manifest_id: Optional[str] = None
+    coverage_manifest_version: Optional[str] = None
+    coverage_manifest_hash: Optional[str] = None
+    coverage_manifest_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    coverage_assessment: Dict[str, Any] = Field(default_factory=dict)
+    coverage_verdict: str = "NOT_EVALUATED"
+    coverage_evaluated_at: Any = None
     status: str
     current_stage: Optional[str] = None
     phase: Optional[str] = None
@@ -1398,6 +1407,8 @@ class InspectionRunRead(BaseModel):
     summary_unavailable_reason: Optional[str] = None
     replay_source_eligible: bool = False
     replay_source_reason: Optional[str] = None
+    replay_evidence_available: bool = False
+    replay_default_eligible: bool = False
     last_active_state_id: Optional[int] = None
     last_observation_id: Optional[int] = None
     error_message: Optional[str] = None
@@ -1777,6 +1788,7 @@ class CompatibilityRunRead(BaseModel):
     inspection_run_id: Optional[int] = None
     inspection_state_ids: List[int] = Field(default_factory=list)
     inspection_observation_ids: List[int] = Field(default_factory=list)
+    source_coverage_snapshot: Dict[str, Any] = Field(default_factory=dict)
     old_package_id: Optional[int] = None
     new_package_id: Optional[int] = None
     package_name: str = ""

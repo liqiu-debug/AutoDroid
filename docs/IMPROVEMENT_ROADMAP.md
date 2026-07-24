@@ -144,15 +144,15 @@
 
 ### ✅ P2.10 模型化智能巡检
 
-**已落地方案**：新增 Android 单设备巡检 Profile/Run/Branch 模型和 `backend/inspection/` 引擎；Profile 固化 guest/authenticated 双业务线入口、输入/安全/脱敏规则、动态文本、预算与监控。Graph schema v8 / hierarchy v2 区分 PageTemplate、State、Observation、Transition、ExplorationFamily 和 CoverageContract；支持页面族增量覆盖、Frontier 优先级、父页面恢复、实时只读画面、Crash/ANR/性能证据、稳定 State/Observation 人工选择和历史协议兼容。
+**已落地方案**：新增 Android 单设备巡检 Profile/Run/Branch 模型和 `backend/inspection/` 引擎；Profile 固化 guest/authenticated 双业务线入口、输入/安全/脱敏规则、动态文本、预算与监控。Graph schema v8 / hierarchy v2 区分 PageTemplate、State、Observation、Transition、ExplorationFamily 和 CoverageContract；支持页面族增量覆盖、Frontier 优先级、父页面恢复、实时只读画面、Crash/ANR/性能证据、稳定 State/Observation 人工选择和历史协议兼容。海尔商城新增 `haier-mall-v2` 冻结清单和 `CoverageGoalTracker`，报告独立展示核心旅程、运行范围、证据质量、页面族探索率和显著盲区；Profile/Run 时长上限扩展为 120 分钟。
 
-**灰度开关**：`model_inspection` 总开关默认关；身份模型与页面族收敛默认开但受总开关约束；覆盖调度、相似状态收敛和视觉首页动作独立灰度。
+**灰度开关**：`model_inspection` 总开关默认关；身份模型与页面族收敛默认开但受总开关约束；`inspection_business_coverage_v2` 可先做海尔影子评估，与 `inspection_coverage_scheduler_v2` 同时开启后启用定向补齐和 15% 终点复验；相似状态收敛和视觉首页动作继续独立灰度。
 
-**验收**：巡检 API、身份预算、增量导航、页面族、实时引擎、同伴页面恢复、回放与语义测试已覆盖；离线可运行 `replay_inspection_coverage.py` 和 `audit_haier_coverage.py`。
+**验收**：巡检 API、身份预算、增量导航、页面族、实时引擎、同伴页面恢复、回放、语义和海尔覆盖评估测试已覆盖。真机已连续两次完成已登录 v2 必达旅程 `11/11`，缩短预算验收能准确列出未完成项；历史 Run 仅用 `haier-mall-v1` 回填且禁止覆盖 v2。离线可运行 `replay_inspection_coverage.py`、`audit_haier_coverage.py` 和 `backfill_haier_business_coverage.py`。
 
 ### ✅ P2.11 巡检基线与兼容性路径回放
 
-**已落地方案**：兼容性来源扩展为 `page_set` 或 `inspection`，巡检稳定 State/Observation 可执行快照、版本和机型对比。新增 `execution_mode=installed_replay`：预检冻结包身份、路径计划和设备快照摘要，创建时防 TOCTOU 重校验；只允许一台 Android 设备、不接收 APK ID、不做安装，按完整路径或安全边界前缀回放当前版本。Trace 对输入值脱敏，终点结果区分业务故障、基础设施故障、自动化失败、安全阻断和预算停止。
+**已落地方案**：兼容性来源扩展为 `page_set` 或 `inspection`，巡检稳定 State/Observation 可执行快照、版本和机型对比。新增 `execution_mode=installed_replay`：预检冻结包身份、路径计划和设备快照摘要，创建时防 TOCTOU 重校验；只允许一台 Android 设备、不接收 APK ID、不做安装，按完整路径或安全边界前缀回放当前版本。Trace 对输入值脱敏，终点结果区分业务故障、基础设施故障、自动化失败、安全阻断和预算停止。兼容性任务同时冻结来源覆盖清单与结论；不完整 Run 必须人工明确选择稳定证据，禁止空选择自动采用全部路径。
 
 **验收**：`test_compatibility_replay_api.py`、`test_compatibility_assets.py`、前端 `compatibilityReplay.test.mjs` 覆盖计划冻结、摘要变化、结果呈现和资产归档。
 
@@ -174,7 +174,7 @@
 
 ### 🚧 P2.8 前端测试与渐进 TS
 
-**已落地部分**：新增 72 个基于 Node test runner 的工具函数与 UI 契约测试，覆盖巡检思维导图/报告呈现、运行摘要、兼容性回放、报告列表、定时任务和系统设置；可运行 `node --test frontend/tests/*.test.mjs`。
+**已落地部分**：新增基于 Node test runner 的工具函数与 UI 契约测试，覆盖巡检思维导图/报告呈现、运行摘要、可信覆盖时长、兼容性回放、报告列表、定时任务和系统设置；可运行 `node --test frontend/tests/*.test.mjs`。
 
 **剩余工作**：测试尚未接入 `.github/workflows/ci.yml`，也未引入 Vitest 组件挂载；`stores/`、`composables/` 和交互组件仍缺行为级覆盖，渐进 TS/JSDoc 类型治理尚未开始。
 
@@ -185,4 +185,4 @@
 - `backend/tests` 中曾有 2 个与代码演进脱节的过期断言（录制等待时长、投屏重连状态），已随 P0.2 修复；后续行为变更需同步更新测试。
 - OCR（PaddleOCR）为可选依赖且不在 requirements 中，`utils/ocr_compat.py` 做了容错；若团队常用 OCR 步骤，建议固化安装说明。
 - `backend/inspection/engine.py`、`backend/inspection/semantics.py`、`backend/api/inspections.py` 和巡检报告页面已成为新的巨型模块；后续拆分必须先固化 Graph/实时快照/回放契约测试，避免把协议演进与代码移动混在同一批次。
-- 巡检覆盖调度、视觉首页动作、内容寻址资产和分层保留仍是灰度开关；正式默认开启前需要真机覆盖率、磁盘水位和回滚物化演练数据。
+- 海尔业务覆盖、巡检定向调度、视觉首页动作、内容寻址资产和分层保留仍是灰度开关；正式默认开启前需要双业务线 120 分钟真机覆盖、磁盘水位和回滚物化演练数据。

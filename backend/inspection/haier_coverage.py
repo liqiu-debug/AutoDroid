@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+import hashlib
+import json
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -34,6 +36,13 @@ class StateEvidence:
     foreground_package: str = ""
     xml_path: str = ""
     xml_text: Optional[str] = None
+    branch_key: str = ""
+    screenshot_path: str = ""
+    stable_status: str = ""
+    coverage_status: str = "DISCOVERED"
+    expansion_status: str = "DISCOVERED"
+    is_opaque: bool = False
+    visit_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -51,6 +60,9 @@ class TransitionEvidence:
     failure_type: str = ""
     risk_type: str = ""
     reason: str = ""
+    sampling_disposition: str = ""
+    input_rule_id: str = ""
+    input_length: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -898,3 +910,54 @@ def weighted_coverage(items: Iterable[ItemResult]) -> float:
     rows = tuple(items)
     total = sum(item.weight for item in rows)
     return sum(item.weight for item in rows if item.covered) / total if total else 0.0
+
+
+def serialize_v1_manifest(
+    manifest: Sequence[ManifestItem] = HAIER_COVERAGE_MANIFEST,
+) -> dict[str, Any]:
+    """Serialize the historical contract for immutable backfill snapshots."""
+
+    def matcher_payload(matcher: StateMatcher) -> dict[str, Any]:
+        return {
+            "subtypes": list(matcher.subtypes),
+            "xml_patterns": list(matcher.xml_patterns),
+            "xml_exclude_patterns": list(matcher.xml_exclude_patterns),
+        }
+
+    return {
+        "id": MANIFEST_VERSION,
+        "version": 1,
+        "journeys": [
+            {
+                "key": item.key,
+                "label": item.label,
+                "weight": item.weight,
+                "required": item.required,
+                "kind": item.kind,
+                "matcher": matcher_payload(item.matcher) if item.matcher else None,
+                "path": [matcher_payload(value) for value in item.path],
+                "edge_role_patterns": list(item.edge_role_patterns),
+                "alternative_paths": [
+                    [matcher_payload(value) for value in path]
+                    for path in item.alternative_paths
+                ],
+                "alternative_edge_role_patterns": [
+                    list(value) for value in item.alternative_edge_role_patterns
+                ],
+                "description": item.description,
+            }
+            for item in manifest
+        ],
+    }
+
+
+def v1_manifest_hash(
+    manifest: Sequence[ManifestItem] = HAIER_COVERAGE_MANIFEST,
+) -> str:
+    payload = json.dumps(
+        serialize_v1_manifest(manifest),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

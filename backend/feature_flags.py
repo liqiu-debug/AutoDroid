@@ -25,6 +25,10 @@ FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE = (
     "inspection_exploration_family_convergence"
 )
 FLAG_INSPECTION_COVERAGE_SCHEDULER_V2 = "inspection_coverage_scheduler_v2"
+# Versioned Haier Mall business-journey assessment.  Enabling this flag alone
+# runs shadow evaluation; the existing scheduler flag additionally enables
+# goal-directed action ordering.
+FLAG_INSPECTION_BUSINESS_COVERAGE_V2 = "inspection_business_coverage_v2"
 FLAG_INSPECTION_VISUAL_HOME_ACTIONS = "inspection_visual_home_actions"
 FLAG_COMPATIBILITY_INSTALLED_REPLAY = "compatibility_installed_replay"
 FLAG_COMPATIBILITY_LEGACY_COMPARE_CREATION = (
@@ -48,6 +52,7 @@ _FLAG_DEFAULTS = {
     FLAG_INSPECTION_SIMILARITY_CONVERGENCE: False,
     FLAG_INSPECTION_EXPLORATION_FAMILY_CONVERGENCE: True,
     FLAG_INSPECTION_COVERAGE_SCHEDULER_V2: False,
+    FLAG_INSPECTION_BUSINESS_COVERAGE_V2: False,
     FLAG_INSPECTION_VISUAL_HOME_ACTIONS: False,
     FLAG_COMPATIBILITY_INSTALLED_REPLAY: True,
     FLAG_COMPATIBILITY_LEGACY_COMPARE_CREATION: False,

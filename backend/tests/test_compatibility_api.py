@@ -320,6 +320,15 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
             package_name="com.demo.app",
             device_serial="android-1",
             status="PASS",
+            coverage_manifest_id="haier-mall-v2",
+            coverage_manifest_version="2",
+            coverage_manifest_hash="manifest-sha256",
+            coverage_verdict="INCOMPLETE",
+            coverage_assessment={
+                "assessment_origin": "RUNTIME_V2",
+                "selected_scope_verdict": "COMPLETE",
+                "full_app_verdict": "INCOMPLETE",
+            },
             profile_snapshot={
                 "branches": {
                     "guest": {
@@ -413,6 +422,18 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(created.source_type, "inspection")
             self.assertEqual(created.compare_mode, "snapshot")
             self.assertEqual(created.inspection_state_ids, [state.id])
+            self.assertEqual(
+                created.source_coverage_snapshot["manifest_hash"],
+                "manifest-sha256",
+            )
+            self.assertEqual(
+                created.source_coverage_snapshot["selected_scope_verdict"],
+                "COMPLETE",
+            )
+            self.assertEqual(
+                created.source_coverage_snapshot["full_app_verdict"],
+                "INCOMPLETE",
+            )
             self.assertEqual(len(tasks.tasks), 1)
             copied_page = created.page_set_snapshot[0]
             copied_screenshot = reports / copied_page.baseline_screenshot_path
@@ -423,6 +444,43 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
                 f"compatibility/{created.id}/inspection_baseline",
                 copied_page.baseline_screenshot_path,
             )
+
+    def test_incomplete_inspection_source_rejects_empty_replay_selection(self):
+        user = self._user()
+        new_pkg = self._package("com.demo.app", "2.0")
+        self._device()
+        self.session.add(SystemSetting(key=FLAG_MODEL_INSPECTION, value="true"))
+        source_run = InspectionRun(
+            name="partial inspection source",
+            package_name="com.demo.app",
+            device_serial="android-1",
+            status="WARNING",
+            coverage_verdict="INCOMPLETE",
+            coverage_assessment={
+                "selected_scope_verdict": "PARTIAL",
+                "full_app_verdict": "INCOMPLETE",
+            },
+        )
+        self.session.add(source_run)
+        self.session.commit()
+
+        with self.assertRaises(HTTPException) as context:
+            create_run(
+                CompatibilityRunCreate(
+                    name="must select evidence",
+                    new_package_id=new_pkg.id,
+                    source_type="inspection",
+                    inspection_run_id=source_run.id,
+                    device_serials=["android-1"],
+                    compare_mode="snapshot",
+                ),
+                BackgroundTasks(),
+                session=self.session,
+                current_user=user,
+            )
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertIn("不允许空选择自动采用路径", str(context.exception.detail))
 
     async def test_inspection_version_prepares_only_before_in_place_upgrade(self):
         user = self._user()

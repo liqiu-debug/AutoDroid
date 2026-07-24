@@ -366,8 +366,21 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 - `replay.py`：冻结稳定路径、检查定位质量和安全边界。
 - `live.py`：发布完整最新快照和短效单次 WebSocket 票据。
 - `monitor.py`：Crash/ANR、性能、卡顿和可选 Perfetto 证据。
+- `haier_business_coverage.py`：冻结海尔商城 v2 核心旅程、计算证据状态，并为缺失旅程提供下一动作提示。
 
 Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observation、Transition、ExplorationFamily 与 CoverageContract。历史报告按创建时的快照和版本解释，不用新算法重算。
+
+海尔商城采用“版本化核心旅程 + 定向补齐 + 开放式探索”的混合模型。Run 创建时冻结 `haier-mall-v2` 清单、版本和 SHA-256 哈希；搜索旅程固定输入非敏感关键词“冰箱”。`CoverageGoalTracker` 持续计算每条旅程的最深阶段，未完成旅程的下一动作优先于普通页面族探索，已完成必达项后继续消费剩余预算发现长尾页面。任务前 85% 用于探索，最后 15% 只复验已到达的核心终点。
+
+覆盖口径严格拆分：
+
+- `exploration_coverage` 是已发现页面族中的代表页展开率，只用于分析调度效率。
+- `selected_scope_verdict` 判断本次选择的业务线是否完整。
+- `full_app_verdict` 只有在 `guest` 与 `authenticated` 同一 Run 都执行且全部必达项通过时才为 `COMPLETE`。
+- 单项只有在同一业务线中存在真实成功 Transition、XML 可读并通过一次终点复验时才为 `COVERED`；支付边界以明确的 `BLOCKED/PAYMENT` 为成功证据。
+- `InspectionRun.status` 保留执行健康语义，`coverage_verdict` 独立保存业务完整性，不用告警数量推导覆盖结论。
+
+Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合常规核心验收，90 分钟适合长尾探索；双业务线共享任务预算，因此完整运行建议使用 120 分钟。增加时长只能减少真正的预算未到达，不能替代 `SAMPLED_OUT`、安全阻断、页面族复用或路径恢复失败的治理。
 
 兼容性链路支持：
 
@@ -430,10 +443,11 @@ Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observa
 ### 13.4 巡检流（发现 -> 审核 -> 回归）
 
 1. Profile 固化双业务线入口、安全/输入/脱敏规则和预算。
-2. 单台 Android 设备获取 owner-safe 租约并执行不可变 Run 快照。
-3. 引擎生成版本化 Graph、Observation、页面族覆盖和故障证据。
-4. 人工选择稳定 State/Observation，冻结回归路径并 PIN 证据。
-5. 兼容性任务以冻结来源执行快照/版本/机型对比，或回放设备当前安装版本。
+2. 海尔商城 Run 同时冻结核心旅程清单、所选业务线和清单哈希。
+3. 单台 Android 设备获取 owner-safe 租约，先定向补齐核心旅程，再进行开放式探索和终点复验。
+4. 报告独立展示业务覆盖、页面族探索率、运行健康和显著盲区。
+5. 人工选择稳定 State/Observation，冻结回归路径并 PIN 证据。
+6. 兼容性任务冻结来源覆盖结论后执行快照/版本/机型对比，或回放设备当前安装版本。
 
 ## 14. 数据模型（核心表）
 
@@ -447,7 +461,7 @@ Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observa
 | `ScheduledTask` | 定时任务配置 |
 | `FastbotTask` / `FastbotReport` | Fastbot 任务与报告 |
 | `CompatibilityRun` / `CompatibilityCell` / `CompatibilityPageResult` | 兼容性任务、设备单元和页面结果 |
-| `InspectionProfile` / `InspectionRun` / `InspectionBranchRun` | 巡检配置、任务快照和业务线执行 |
+| `InspectionProfile` / `InspectionRun` / `InspectionBranchRun` | 巡检配置、任务快照、冻结覆盖清单/结论和业务线执行 |
 | `InspectionPageTemplate` / `InspectionState` / `InspectionObservation` | 页面模板、业务节点和实际采集 |
 | `InspectionTransition` / `InspectionExplorationFamily` / `InspectionCoverageContract` | 动作拓扑、页面族和覆盖契约 |
 | `InspectionFault` | 巡检故障及证据 |
@@ -474,8 +488,9 @@ Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observa
 1. `new_step_model` 默认开启，legacy 步骤在启动时自动回填标准表；如需临时回退可在 `SystemSetting` 显式写 `false`。  
 2. 跨端 Runner 已是唯一执行链路（原 `cross_platform_runner` 开关已移除），关注执行必须选择设备的交互变化。  
 3. 开启 `ios_execution`：WDA 运维稳定后逐步引入 iOS 执行。  
-4. 开启 `model_inspection`：先验证默认身份/页面族模型，再开启覆盖调度和视觉首页动作。
-5. 开启 `content_addressed_assets`：双写、回填、核对 `/api/assets/status` 后再开启 `tiered_asset_retention`。
+4. 开启 `model_inspection`：先验证默认身份/页面族模型。
+5. 海尔商城开启 `inspection_business_coverage_v2` 观察影子评估；核对清单、盲区和历史 v1 回填后，再开启 `inspection_coverage_scheduler_v2` 定向调度，最后按需开启视觉首页动作。
+6. 开启 `content_addressed_assets`：双写、回填、核对 `/api/assets/status` 后再开启 `tiered_asset_retention`。
 
 配套监控建议：
 
