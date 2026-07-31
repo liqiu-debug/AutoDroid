@@ -195,6 +195,7 @@ const expansionStatusLabel = value => ({
   DEFERRED: '延迟恢复',
   EXPANDED: '已展开',
   BUDGET_SKIPPED: '预算跳过',
+  COVERED_BY_SURFACE: '同面已覆盖',
   ABORTED: '已中止',
 }[String(value || '').toUpperCase()] || value || '-')
 const presentedNodes = computed(() => {
@@ -241,6 +242,17 @@ const reportSummary = computed(() => inspectionReportSummary({
 const businessCoverage = computed(() => reportSummary.value.business || {})
 const coverageBranches = computed(() => businessCoverage.value.branches || [])
 const coverageBlindSpots = computed(() => businessCoverage.value.blindSpots || [])
+const surfaceCoverage = computed(() => businessCoverage.value.surface || {})
+const surfaceMetricClass = computed(() => (
+  surfaceCoverage.value.verdict === 'COMPLETE' ? 'success' : 'danger'
+))
+// Surfaces the map knows about that no run has ever exercised, plus the ones
+// this run discovered but never expanded.  Listing them by name is the point:
+// a report that can say what it did not check is the one worth trusting.
+const surfaceGapCount = computed(() => (
+  (surfaceCoverage.value.neverCovered || []).length
+  + (surfaceCoverage.value.stale || []).length
+))
 const coverageMetricClass = computed(() => (
   businessCoverage.value.selectedScopeVerdict === 'COMPLETE' ? 'success'
     : businessCoverage.value.selectedScopeVerdict === 'INCONCLUSIVE' ? 'warning' : 'danger'
@@ -1508,19 +1520,34 @@ onBeforeUnmount(() => {
           {{ businessCoverage.available ? `${businessCoverage.covered}/${businessCoverage.total}` : '未评估' }}
         </strong>
         <small v-if="businessCoverage.available">
-          {{ Math.round((businessCoverage.origin === 'BACKFILLED_V1' ? businessCoverage.weightedRatio : businessCoverage.ratio) * 1000) / 10 }}% · {{ inspectionCoverageVerdictLabel(businessCoverage.selectedScopeVerdict) }}
+          业务线 {{ businessCoverage.scopeSelected }}/{{ businessCoverage.scopeTotal }} · {{ inspectionCoverageVerdictLabel(businessCoverage.selectedScopeVerdict) }}
         </small>
         <small v-else>当前报告没有冻结的业务覆盖清单</small>
       </div>
       <div>
-        <span>运行范围</span>
-        <strong :class="businessCoverage.scopeSelected === businessCoverage.scopeTotal ? 'success' : 'danger'">
-          {{ businessCoverage.available ? `${businessCoverage.scopeSelected}/${businessCoverage.scopeTotal}` : '-' }}
+        <span class="metric-label">
+          应用面覆盖
+          <el-tooltip content="分母是跨 run 累积的应用面总数，不是本次发现的页面数。判定门槛看累积值，本次值仅供参考" placement="top">
+            <el-icon aria-label="应用面覆盖说明"><InfoFilled /></el-icon>
+          </el-tooltip>
+        </span>
+        <strong :class="surfaceMetricClass">
+          {{ surfaceCoverage.available ? `${surfaceCoverage.runVisited}/${surfaceCoverage.known}` : '-' }}
         </strong>
-        <small v-if="businessCoverage.available">
-          所选范围{{ inspectionCoverageVerdictLabel(businessCoverage.selectedScopeVerdict) }} · 全应用{{ inspectionCoverageVerdictLabel(businessCoverage.fullAppVerdict) }}
+        <small v-if="surfaceCoverage.available">
+          近 {{ surfaceCoverage.windowDays }} 天累计 {{ surfaceCoverage.cumulativeCovered }}/{{ surfaceCoverage.known }} · {{ inspectionCoverageVerdictLabel(surfaceCoverage.verdict) }}
         </small>
-        <small v-else>未区分 guest / authenticated 业务线</small>
+        <small v-else>应用地图为空，需先回填历史 run</small>
+      </div>
+      <div>
+        <span>残留未覆盖</span>
+        <strong :class="surfaceGapCount ? 'danger' : 'success'">
+          {{ surfaceCoverage.available ? surfaceGapCount : '-' }}
+        </strong>
+        <small v-if="surfaceCoverage.available">
+          从未覆盖 {{ surfaceCoverage.neverCovered.length }} · 超窗 {{ surfaceCoverage.stale.length }} · 动作槽位 {{ surfaceCoverage.slots.neverCovered }}/{{ surfaceCoverage.slots.total }} 未覆盖
+        </small>
+        <small v-else>无法统计残留</small>
       </div>
       <div>
         <span class="metric-label">
@@ -1584,6 +1611,52 @@ onBeforeUnmount(() => {
             </el-tooltip>
             <el-tag v-if="businessCoverage.origin === 'BACKFILLED_V1'" type="info" effect="plain">历史 v1 回填</el-tag>
           </div>
+          <section v-if="surfaceCoverage.available" class="coverage-branch surface-gap">
+            <header>
+              <h3>应用面覆盖</h3>
+              <span>
+                分母 {{ surfaceCoverage.known }} 个已知面（跨 run 累积）·
+                本次访问 {{ surfaceCoverage.runVisited }} ·
+                本次完整覆盖 {{ surfaceCoverage.runFullyCovered }} ·
+                近 {{ surfaceCoverage.windowDays }} 天累计完整覆盖 {{ surfaceCoverage.cumulativeCovered }}
+              </span>
+            </header>
+            <p v-if="surfaceCoverage.unclassified" class="surface-gap-note">
+              其中 {{ surfaceCoverage.unclassified }} 个面无法被识别为已知业务页面，本身即为盲区。
+            </p>
+            <el-table
+              v-if="surfaceCoverage.neverCovered.length"
+              :data="surfaceCoverage.neverCovered"
+              size="small"
+              border
+            >
+              <el-table-column label="从未覆盖的面" prop="page_subtype" min-width="160">
+                <template #default="{ row }">{{ row.label || row.page_subtype }}</template>
+              </el-table-column>
+              <el-table-column label="动作槽位" prop="action_slot_count" width="100" />
+              <el-table-column label="首次发现" prop="first_seen_run_id" width="110">
+                <template #default="{ row }">Run {{ row.first_seen_run_id || '-' }}</template>
+              </el-table-column>
+              <el-table-column label="最近出现" prop="last_seen_run_id" width="110">
+                <template #default="{ row }">Run {{ row.last_seen_run_id || '-' }}</template>
+              </el-table-column>
+            </el-table>
+            <p v-else class="surface-gap-note">所有已知面都至少被覆盖过一次。</p>
+            <el-table
+              v-if="surfaceCoverage.stale.length"
+              :data="surfaceCoverage.stale"
+              size="small"
+              border
+            >
+              <el-table-column label="超出时间窗的面" prop="page_subtype" min-width="160">
+                <template #default="{ row }">{{ row.label || row.page_subtype }}</template>
+              </el-table-column>
+              <el-table-column label="未覆盖槽位" prop="stale_slot_count" width="110" />
+              <el-table-column label="最早覆盖时间" prop="oldest_covered_at" min-width="170">
+                <template #default="{ row }">{{ row.oldest_covered_at || '从未' }}</template>
+              </el-table-column>
+            </el-table>
+          </section>
           <section v-for="branch in coverageBranches" :key="branch.branch_key" class="coverage-branch">
             <header>
               <h3>{{ branchDisplayLabel(branch.branch_key) }}</h3>
@@ -2008,6 +2081,8 @@ onBeforeUnmount(() => {
 .coverage-manifest-line { min-height: 42px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #ebeef5; color: #606266; font-size: 12px; }
 .coverage-manifest-line code { color: #909399; }
 .coverage-branch { padding: 12px 0 18px; border-bottom: 1px solid #ebeef5; }
+.surface-gap { display: flex; flex-direction: column; gap: 10px; }
+.surface-gap-note { margin: 0; color: #909399; font-size: 12px; }
 .coverage-branch:last-child { border-bottom: 0; }
 .coverage-branch header { min-height: 32px; display: flex; align-items: center; gap: 10px; }
 .coverage-branch h3 { margin: 0; color: #303133; font-size: 14px; letter-spacing: 0; }

@@ -380,6 +380,39 @@ export const inspectionReportSummary = ({ graph = {}, run = {}, nodes = [] } = {
       blindSpots: Array.isArray(assessment.blind_spots) ? assessment.blind_spots : [],
       manifest: assessment.manifest || businessSource.manifest || {},
       origin: assessment.assessment_origin || '',
+      surface: buildSurfaceCoverage(assessment.surface_coverage),
+    },
+  }
+}
+
+// Coverage against the cross-run application map.  Reported beside the manifest
+// verdict and never merged with it: the manifest says whether the business
+// journeys passed, this says out of how many screens, and which were missed.
+const buildSurfaceCoverage = source => {
+  const payload = source && typeof source === 'object' ? source : {}
+  const known = Number(payload.package_known_surfaces) || 0
+  const slots = payload.action_slots && typeof payload.action_slots === 'object'
+    ? payload.action_slots
+    : {}
+  return {
+    available: Boolean(payload.available) && known > 0,
+    reason: String(payload.reason || ''),
+    known,
+    runVisited: Number(payload.run_visited_surfaces) || 0,
+    runFullyCovered: Number(payload.run_fully_covered_surfaces) || 0,
+    windowDays: Number(payload.cumulative_window_days) || 0,
+    cumulativeCovered: Number(payload.cumulative_covered_surfaces) || 0,
+    verdict: String(payload.cumulative_verdict || 'NOT_EVALUATED').toUpperCase(),
+    unclassified: Number(payload.unclassified_surfaces) || 0,
+    neverCovered: Array.isArray(payload.never_covered_surfaces)
+      ? payload.never_covered_surfaces
+      : [],
+    stale: Array.isArray(payload.stale_surfaces) ? payload.stale_surfaces : [],
+    slots: {
+      total: Number(slots.total) || 0,
+      coveredEver: Number(slots.covered_ever) || 0,
+      coveredThisRun: Number(slots.covered_this_run) || 0,
+      neverCovered: Number(slots.never_covered) || 0,
     },
   }
 }

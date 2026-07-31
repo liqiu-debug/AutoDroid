@@ -266,6 +266,17 @@ _PROFILE_SURFACE_SIGNAL_PATTERNS: Tuple[re.Pattern[str], ...] = (
 )
 _COMMUNITY_FEED_DATE_RE = re.compile(r"\b\d{2}-\d{2}\s+\d{2}:\d{2}\b")
 _HAIER_MALL_PACKAGES = frozenset({"com.ehaier.zgq.shop.mall"})
+
+# Surface identity: a content-insensitive page identity layer above
+# ``template_key``.  Bump this whenever the skeleton rule changes; accumulated
+# cross-run coverage is only comparable within one version.
+SURFACE_FINGERPRINT_VERSION = 1
+
+# Geometry bands that hold page chrome (header / bottom nav and action bar).
+# Everything between them is record content and never reaches the signature.
+_SURFACE_TOP_BAND = 0.12
+_SURFACE_BOTTOM_BAND = 0.82
+
 _SETTINGS_SIGNAL_RE = re.compile(
     r"账号与安全|账号关联|隐私设置|意见反馈|关于海尔商城|清除本地缓存|退出登录",
     re.I,
@@ -546,6 +557,8 @@ class PageModel:
     page_subtype: str = "UNKNOWN"
     template_key: str = ""
     semantic_key: str = ""
+    surface_key: str = ""
+    surface_fingerprint_version: int = SURFACE_FINGERPRINT_VERSION
     activity_family: str = ""
     screenshot_phash: str = ""
     template_tokens: Tuple[str, ...] = field(default_factory=tuple, repr=False)
@@ -553,6 +566,7 @@ class PageModel:
     landmark_keys: Tuple[str, ...] = field(default_factory=tuple, repr=False)
     control_tokens: Tuple[str, ...] = field(default_factory=tuple, repr=False)
     risk_tokens: Tuple[str, ...] = field(default_factory=tuple, repr=False)
+    skeleton_tokens: Tuple[str, ...] = field(default_factory=tuple, repr=False)
     _by_ordinal: Dict[int, SemanticNode] = field(default_factory=dict, repr=False)
 
     def node(self, ordinal: Optional[int]) -> Optional[SemanticNode]:
@@ -570,11 +584,14 @@ class PageModel:
             "activity_family": self.activity_family,
             "template_key": self.template_key,
             "semantic_key": self.semantic_key,
+            "surface_key": self.surface_key,
+            "surface_fingerprint_version": self.surface_fingerprint_version,
             "template_tokens": list(self.template_tokens),
             "action_tokens": list(self.action_tokens),
             "landmark_keys": list(self.landmark_keys),
             "control_tokens": list(self.control_tokens),
             "risk_tokens": list(self.risk_tokens),
+            "skeleton_tokens": list(self.skeleton_tokens),
         }
 
 
@@ -3146,6 +3163,78 @@ def _page_identity_signatures(
     )
 
 
+def _is_strict_descendant(node: SemanticNode, ancestor: SemanticNode) -> bool:
+    return (
+        len(node.path) > len(ancestor.path)
+        and node.path[: len(ancestor.path)] == ancestor.path
+    )
+
+
+def _skeleton_signature(
+    identity_nodes: Sequence[SemanticNode],
+) -> Tuple[str, ...]:
+    """Return the content-insensitive chrome tokens of one capture.
+
+    ``template_tokens`` hashes every visible node, so a product detail page with
+    one extra promo module reads as a different page.  On a single-Activity
+    Flutter shell that makes page identity content-driven: the same logical
+    screen mints a new template per data variation, the frontier fills with
+    pseudo-new states, and half of it is never expanded.
+
+    What a person means by "the same page" here is the chrome: the header and
+    the bottom bar.  Those live in fixed geometry bands, so the skeleton is
+    built from the *recognized* interactive elements inside those bands only -
+    an add-to-cart button, a bottom tab, a search field.  Unrecognized chrome
+    contributes nothing: its class family ("container", "scroll") tracks the
+    wrapper the current record happened to render, and counting elements tracks
+    how many promo badges it carries.  Record content never reaches the
+    signature, and neither does wrapper nesting depth, which shifts between
+    captures of one screen.
+    """
+    visible = [node for node in identity_nodes if node.visible]
+    width = max((node.bounds[2] for node in visible if node.bounds), default=0)
+    height = max((node.bounds[3] for node in visible if node.bounds), default=0)
+    if width <= 0 or height <= 0:
+        return ()
+
+    tokens: set[str] = set()
+    for node in visible:
+        if node.bounds is None:
+            continue
+        if not (node.clickable or node.editable or node.scrollable):
+            continue
+        _, top_edge, _, bottom_edge = node.bounds
+        if bottom_edge <= height * _SURFACE_TOP_BAND:
+            band = "top"
+        elif top_edge >= height * _SURFACE_BOTTOM_BAND:
+            band = "bottom"
+        else:
+            continue
+        # A bounded vocabulary only.  The label itself is content, and an
+        # unrecognized label carries no chrome identity worth splitting on.
+        kind = _semantic_kind(node.semantic)
+        if not kind and node.editable:
+            kind = "EDITABLE"
+        if not kind:
+            continue
+        tokens.add(_hash_payload({"chrome": band, "kind": kind}))
+
+    scrollables = [node for node in visible if node.scrollable]
+    tokens.add(
+        _hash_payload(
+            {
+                "scroll_orientations": sorted(
+                    {_scroll_orientation(node) for node in scrollables}
+                ),
+                # Bucketed: the exact container count tracks how many promo
+                # carousels the current record happens to carry.
+                "scroll_bucket": min(2, len(scrollables)),
+            }
+        )
+    )
+    return tuple(sorted(tokens))
+
+
 def _multiset_similarity(left: Sequence[str], right: Sequence[str]) -> float:
     left_counts = Counter(left)
     right_counts = Counter(right)
@@ -3332,6 +3421,16 @@ def build_page_model(
             "risk_tokens": risk_tokens,
         }
     )
+    skeleton_tokens = _skeleton_signature(identity_nodes)
+    surface_key = _hash_payload(
+        {
+            "version": SURFACE_FINGERPRINT_VERSION,
+            "package": normalized_package,
+            "role": role,
+            "page_subtype": page_subtype,
+            "skeleton_tokens": skeleton_tokens,
+        }
+    )
     cluster_payload = {
         "package": str(package_name or ""),
         "activity": str(activity or ""),
@@ -3384,6 +3483,8 @@ def build_page_model(
         page_subtype=page_subtype,
         template_key=template_key,
         semantic_key=semantic_key,
+        surface_key=surface_key,
+        surface_fingerprint_version=SURFACE_FINGERPRINT_VERSION,
         activity_family=activity_family,
         screenshot_phash=str(screenshot_phash or ""),
         template_tokens=template_tokens,
@@ -3391,6 +3492,7 @@ def build_page_model(
         landmark_keys=landmark_keys,
         control_tokens=control_tokens,
         risk_tokens=risk_tokens,
+        skeleton_tokens=skeleton_tokens,
         _by_ordinal={node.ordinal: node for node in nodes},
     )
 
