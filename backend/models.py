@@ -604,6 +604,10 @@ class InspectionState(SQLModel, table=True):
     semantic_key: Optional[str] = Field(default=None, index=True)
     identity_version: int = Field(default=1, index=True)
     instance_anchor: Optional[str] = Field(default=None, index=True)
+    # Content-insensitive logical screen identity; drives frontier priority and
+    # the cross-run coverage denominator.  Coarser than semantic_key on purpose.
+    surface_key: Optional[str] = Field(default=None, index=True)
+    surface_fingerprint_version: int = Field(default=1, index=True)
     exploration_family_id: Optional[int] = Field(
         default=None,
         foreign_key="inspectionexplorationfamily.id",
@@ -977,6 +981,94 @@ class InspectionFault(SQLModel, table=True):
     trace_path: Optional[str] = None
     details: Dict[str, Any] = Field(default={}, sa_column=Column(JSON, default={}))
     occurrence_count: int = Field(default=1)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionAppSurface(SQLModel, table=True):
+    """A logical application screen, accumulated across runs.
+
+    Every other inspection table is scoped to one run, so a run can only measure
+    coverage against what it happened to discover itself.  This table is scoped
+    to the package instead: it is the denominator the report needs in order to
+    say "we checked 61 of 70 screens" rather than "we checked everything we
+    found".  Rows accumulate; a run updates it and never owns it.
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "package_name",
+            "surface_fingerprint_version",
+            "surface_key",
+            name="uq_inspectionappsurface_package_version_key",
+        ),
+        Index(
+            "ix_inspectionappsurface_package_subtype",
+            "package_name",
+            "page_subtype",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    package_name: str = Field(index=True)
+    surface_key: str = Field(index=True)
+    # Identity is only comparable within one skeleton rule.  Queries filter on
+    # this so a rule change cannot silently corrupt the accumulated denominator.
+    surface_fingerprint_version: int = Field(default=1, index=True)
+    page_subtype: str = Field(default="UNKNOWN", index=True)
+    role: str = Field(default="UNKNOWN")
+    # Optional human name, shown in the report instead of the hash.
+    label: Optional[str] = None
+    first_seen_run_id: Optional[int] = Field(default=None, index=True)
+    last_seen_run_id: Optional[int] = Field(default=None, index=True)
+    last_seen_at: Optional[datetime] = Field(default=None, index=True)
+    seen_run_count: int = Field(default=0)
+    representative_state_id: Optional[int] = Field(default=None, index=True)
+    representative_screenshot_path: Optional[str] = None
+    # Set by hand when a screen is retired from the app, to drop it from the
+    # denominator without deleting its history.
+    is_retired: bool = Field(default=False, index=True)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class InspectionAppAction(SQLModel, table=True):
+    """One action slot on a surface, with its cross-run coverage history.
+
+    ``action_role_key`` is already stable across runs (82 of 92 shared between
+    two runs of the Haier mall, versus 47 of 75 for page templates), so it can
+    carry the per-slot record that drives frontier priority: never covered
+    first, then longest un-covered, then last failed.
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "surface_id",
+            "action_role_key",
+            name="uq_inspectionappaction_surface_role",
+        ),
+        Index(
+            "ix_inspectionappaction_package_covered",
+            "package_name",
+            "last_covered_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    surface_id: int = Field(foreign_key="inspectionappsurface.id", index=True)
+    package_name: str = Field(index=True)
+    action_role_key: str = Field(index=True)
+    action_role: Optional[str] = None
+    action_type: Optional[str] = None
+    last_covered_run_id: Optional[int] = Field(default=None, index=True)
+    last_covered_at: Optional[datetime] = Field(default=None, index=True)
+    coverage_count: int = Field(default=0)
+    # NEVER until an execution produces a verdict; then the transition status.
+    last_status: str = Field(default="NEVER", index=True)
+    # Distinct runs whose outcome for this slot was a failure.  Derived, like
+    # coverage_count, so re-folding a run cannot inflate it.
+    failed_run_count: int = Field(default=0)
+    first_seen_run_id: Optional[int] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
 

@@ -51,6 +51,14 @@ from backend.inspection.device import (
     wait_for_stable_page,
 )
 from backend.inspection.live import inspection_live_registry
+from backend.inspection.app_map import (
+    AppMapView,
+    build_surface_coverage,
+    load_app_map,
+    normalize_action_slot,
+    surface_priority,
+    sync_app_map,
+)
 from backend.inspection.haier_business_coverage import (
     CoverageGoalTracker,
     coverage_state_assignments,
@@ -64,6 +72,7 @@ from backend.inspection.sanitizer import InspectionArtifactSanitizer
 from backend.inspection.semantics import (
     InspectionAction,
     PageModel,
+    SURFACE_FINGERPRINT_VERSION,
     build_page_model,
     compare_exploration_families,
     compare_page_models,
@@ -116,6 +125,7 @@ class StateWork:
     parent_state_id: Optional[int] = None
     semantic_key: str = ""
     template_key: str = ""
+    surface_key: str = ""
     role: str = "UNKNOWN"
     activity_family: str = ""
     observation_id: Optional[int] = None
@@ -960,6 +970,29 @@ _MAX_CONSECUTIVE_VIEWPORT_HANDOFFS = 2
 _PRIMARY_ENTRY_CONTINUATION_PRIORITY = 350
 _PROFILE_CONTINUATION_PRIORITY = 150
 _OVERLAY_CLEANUP_ACTION_ROLES = frozenset({"FILTER_CLOSE", "DIALOG_CLOSE"})
+
+# Frontier priorities are compared per 100-wide band, not exactly.  Run 72
+# showed why: the app-map tiers (90/150/750) interleaved with the engine's own
+# (40/100/700), and strict ordering marched the device across the whole app in
+# priority order - 99 entry-case replays ate ~25 of 60 minutes.  Within a band,
+# path locality picks the next state, so nearby work is swept before jumping.
+# Deliberate cross-band contracts (150 preempts 200, 200 preempts 350) hold.
+_FRONTIER_PRIORITY_BAND = 100
+
+# Action-map statuses that prove a surface's action slot was exercised (or
+# deliberately reused) during this run.  Used by the surface dedup to decide
+# that a repeat instance of an already-walked surface owes nothing new.
+_SURFACE_COVERED_ACTION_STATUSES = frozenset(
+    {
+        "PASS",
+        "SUCCESS",
+        "SELF_LOOP",
+        "NO_NEW_COVERAGE",
+        "COVERED_BY_FAMILY",
+        "COVERED_BY_CONTRACT",
+        "NAVIGATION_REUSED",
+    }
+)
 
 
 def _primary_entry_continuation_priority(work: StateWork) -> int:
@@ -3176,6 +3209,11 @@ def _persist_state(
                 semantic_key=semantic_key if identity_v2 else None,
                 identity_version=2 if identity_v2 else 1,
                 instance_anchor=instance_anchor if identity_v2 else None,
+                surface_key=str(capture.model.surface_key or "") or None,
+                surface_fingerprint_version=int(
+                    capture.model.surface_fingerprint_version
+                    or SURFACE_FINGERPRINT_VERSION
+                ),
                 exploration_family_id=(
                     exploration_family.id
                     if identity_v2 and exploration_family is not None
@@ -3228,6 +3266,12 @@ def _persist_state(
         else:
             row = existing
             row.visit_count += 1
+            if not row.surface_key and capture.model.surface_key:
+                row.surface_key = str(capture.model.surface_key)
+                row.surface_fingerprint_version = int(
+                    capture.model.surface_fingerprint_version
+                    or SURFACE_FINGERPRINT_VERSION
+                )
             if identity_v2 and not row.semantic_key:
                 row.semantic_key = semantic_key
                 row.identity_version = 2
@@ -3518,6 +3562,7 @@ def _persist_state(
             else capture.model.replay_key
         ),
         template_key=str(capture.model.template_key or ""),
+        surface_key=str(capture.model.surface_key or ""),
         role=str(capture.model.role or "UNKNOWN"),
         activity_family=str(capture.model.activity_family or ""),
         observation_id=observation_id,
@@ -3905,7 +3950,8 @@ def _pop_most_local(
         best_index = min(
             range(len(queue)),
             key=lambda index: (
-                int(queue[index].frontier_priority or 700),
+                int(queue[index].frontier_priority or 700)
+                // _FRONTIER_PRIORITY_BAND,
                 0 if _is_primary_entry_surface(queue[index]) else 1,
                 index if _is_primary_entry_surface(queue[index]) else 0,
                 (
@@ -5013,6 +5059,34 @@ def _execute_branch(
         if business_coverage_v2
         else None
     )
+    # Loaded once per branch: what previous runs of this package already
+    # covered.  Read-only during exploration; the run folds itself back in from
+    # a single write point once it finishes.
+    app_map_view: Optional[AppMapView] = None
+    if coverage_scheduler:
+        try:
+            with Session(engine) as session:
+                app_map_view = load_app_map(session, package_name)
+        except Exception as exc:  # noqa: BLE001 - the map is an optimisation
+            logger.warning(
+                "inspection app map unavailable, falling back to heuristics: %s",
+                _safe_error(exc),
+            )
+    # Run-scoped surface dedup: once every action role of a surface has been
+    # exercised this run, further instances of that surface owe nothing and are
+    # finalized as COVERED_BY_SURFACE instead of queueing.  Run 72 measured the
+    # waste this removes: 14 of its 43 budget-skipped states were repeat
+    # instances of surfaces the run had already walked.  Opt out per profile
+    # with inspection_surface_dedup=false.
+    surface_dedup_flag = _profile_bool(
+        profile, "inspection_surface_dedup", "surface_dedup"
+    )
+    surface_dedup = bool(coverage_scheduler and surface_dedup_flag is not False)
+    surface_covered_roles: Dict[str, set] = {}
+    # States finalized as COVERED_BY_SURFACE.  The budget-stop sweeps walk all
+    # tracked work and would otherwise relabel them EXPANDED, because their
+    # action maps are terminal by then - run 74 measured exactly that.
+    surface_covered_state_ids: set[int] = set()
     if coverage_scheduler:
         # Coverage runs should not spend most of their device budget waiting
         # on a long-tail animation. The stable-page sampler still requires a
@@ -5384,6 +5458,24 @@ def _execute_branch(
             if (logical_key, action.action_key) not in attempted_actions
         ]
 
+    def surface_roles_covered(
+        work: StateWork,
+        remaining: Sequence[InspectionAction],
+    ) -> bool:
+        """True when every pending action's role was already exercised on this
+        surface during this run.  An action without a role key can never be
+        proven covered, so its state must keep queueing."""
+        if not (surface_dedup and work.surface_key and remaining):
+            return False
+        covered = surface_covered_roles.get(str(work.surface_key))
+        if not covered:
+            return False
+        slots = [
+            normalize_action_slot(item.action_role, item.action_role_key)
+            for item in remaining
+        ]
+        return all(slots) and set(slots) <= covered
+
     def state_actions_terminal(work: StateWork) -> bool:
         canonical = tracked_work.get(work.state_id, work)
         logical_key = _work_logical_key(canonical)
@@ -5465,6 +5557,21 @@ def _execute_branch(
         is_primary_entry_surface = bool(
             coverage_scheduler and _is_primary_entry_surface(work)
         )
+        if (
+            not is_primary_entry_surface
+            and not front
+            and work.state_id not in queued_state_ids
+            and work.state_id not in expanded_state_ids
+            and surface_roles_covered(work, pending_actions(work))
+        ):
+            finalize_unqueued_work(
+                work,
+                action_status="COVERED_BY_SURFACE",
+                state_status="COVERED_BY_SURFACE",
+                reason="同一 surface 的动作已在本 run 覆盖",
+            )
+            surface_covered_state_ids.add(work.state_id)
+            return False
         queued_work = (
             work
             if (
@@ -5485,6 +5592,25 @@ def _execute_branch(
                 priority,
                 reason,
             )
+            if priority is None and not is_primary_entry_surface:
+                # What earlier runs already covered outranks any heuristic
+                # guess about this one: an unseen surface goes to the front, a
+                # surface covered yesterday goes to the back.  Primary entry
+                # surfaces keep their bootstrap tier so the entry survey still
+                # runs first.
+                map_priority, map_reason = surface_priority(
+                    app_map_view,
+                    work.surface_key,
+                    [
+                        normalize_action_slot(
+                            item.action_role, item.action_role_key
+                        )
+                        for item in remaining
+                    ],
+                )
+                if map_priority is not None:
+                    priority = map_priority
+                    reason = reason or map_reason
             if priority is None:
                 if is_primary_entry_surface:
                     if work.state_id not in primary_entry_surface_started_ids:
@@ -5827,6 +5953,18 @@ def _execute_branch(
             sampling_disposition=sampling_disposition,
             secret_values=secret_values,
         )
+        if (
+            surface_dedup
+            and work.surface_key
+            and str(status or "").upper() in _SURFACE_COVERED_ACTION_STATUSES
+        ):
+            covered_slot = normalize_action_slot(
+                action.action_role, action.action_role_key
+            )
+            if covered_slot:
+                surface_covered_roles.setdefault(
+                    str(work.surface_key), set()
+                ).add(covered_slot)
         pending_count = sum(
             1
             for item in work.action_map.get("actions") or []
@@ -6487,8 +6625,25 @@ def _execute_branch(
                 local_warning_reasons.append(exploration_limit_reason)
                 termination_reason = exploration_limit_reason
                 for unfinished in tracked_work.values():
+                    if unfinished.state_id in surface_covered_state_ids:
+                        continue
                     if state_actions_terminal(unfinished):
                         mark_state_expanded_if_terminal(unfinished)
+                        continue
+                    if surface_roles_covered(
+                        unfinished, pending_actions(unfinished)
+                    ):
+                        # Not a blind spot: the surface's every action slot was
+                        # exercised this run on another instance.  Keeping the
+                        # BUDGET label here would overstate what the budget
+                        # actually cut off.
+                        finalize_unqueued_work(
+                            unfinished,
+                            action_status="COVERED_BY_SURFACE",
+                            state_status="COVERED_BY_SURFACE",
+                            reason="同一 surface 的动作已在本 run 覆盖",
+                        )
+                        surface_covered_state_ids.add(unfinished.state_id)
                         continue
                     finalize_unqueued_work(
                         unfinished,
@@ -8739,6 +8894,17 @@ def _execute_branch(
                     None,
                 )
         for unfinished in tracked_work.values():
+            if unfinished.state_id in surface_covered_state_ids:
+                continue
+            if surface_roles_covered(unfinished, pending_actions(unfinished)):
+                finalize_unqueued_work(
+                    unfinished,
+                    action_status="COVERED_BY_SURFACE",
+                    state_status="COVERED_BY_SURFACE",
+                    reason="同一 surface 的动作已在本 run 覆盖",
+                )
+                surface_covered_state_ids.add(unfinished.state_id)
+                continue
             finalize_unqueued_work(
                 unfinished,
                 action_status="BUDGET_NOT_REACHED",
@@ -9146,6 +9312,25 @@ def _persist_business_coverage_assessment(run_id: int) -> None:
             assessment,
             (int(state.id) for state in states if state.id is not None),
         )
+        # The manifest measures business journeys; the app map measures how much
+        # of the application those journeys walked through.  Both are reported,
+        # each with its own denominator, and never merged into one percentage.
+        try:
+            assessment["surface_coverage"] = build_surface_coverage(
+                session,
+                run_id,
+                package_name=str(run.package_name or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail a finished run
+            logger.warning(
+                "inspection surface coverage unavailable for run %s: %s",
+                run_id,
+                _safe_error(exc),
+            )
+            assessment["surface_coverage"] = {
+                "available": False,
+                "reason": "APP_MAP_ERROR",
+            }
         for state in states:
             if state.id is None:
                 continue
@@ -9168,6 +9353,7 @@ def _update_run_summary(
     stop_reason: Optional[str] = None,
 ) -> None:
     evaluate_business_coverage = False
+    sync_package_name = ""
     with Session(engine) as session:
         run = session.get(InspectionRun, run_id)
         if run is None:
@@ -9209,6 +9395,19 @@ def _update_run_summary(
             evaluate_business_coverage = bool(run.coverage_manifest_id)
         session.add(run)
         session.commit()
+        sync_package_name = str(run.package_name or "")
+    if final_status and sync_package_name:
+        # Fold this run into the package-scoped map before the assessment reads
+        # it, so the report's denominator includes what this run just found.
+        try:
+            with Session(engine) as session:
+                sync_app_map(session, run_id, package_name=sync_package_name)
+        except Exception as exc:  # noqa: BLE001 - never fail a finished run
+            logger.warning(
+                "inspection app map sync failed for run %s: %s",
+                run_id,
+                _safe_error(exc),
+            )
     if evaluate_business_coverage:
         _persist_business_coverage_assessment(run_id)
 

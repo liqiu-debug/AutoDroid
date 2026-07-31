@@ -377,6 +377,65 @@ class PopMostLocalTests(unittest.TestCase):
         self.assertIs(popped, profile)
         self.assertEqual(list(queue), [business])
 
+    def test_locality_beats_a_small_priority_edge_within_one_band(self):
+        """Priorities compare per band, so nearby work is swept before jumping.
+
+        Run 72 measured the alternative: strict ordering across interleaved
+        tiers (700 vs 750) marched the device across the app and spent ~25 of
+        60 minutes on 99 entry-case replays.
+        """
+        shared_step = _step(
+            _action("open-order-list", "订单列表"),
+            _capture("首页"),
+            _capture("订单列表"),
+        )
+        near = _work(
+            _capture("订单详情"),
+            state_id=71,
+            depth=1,
+            path=[shared_step],
+        )
+        near.frontier_priority = 750
+        far = _work(_capture("门店列表"), state_id=72, depth=1)
+        far.frontier_priority = 700
+        queue = deque([far, near])
+
+        popped = _pop_most_local(
+            queue,
+            [shared_step],
+            coverage_scheduler=True,
+        )
+
+        self.assertIs(popped, near)
+        self.assertEqual(list(queue), [far])
+
+    def test_a_full_band_still_outranks_locality(self):
+        """Banding must not let locality override a deliberate tier gap."""
+        shared_step = _step(
+            _action("open-order-list", "订单列表"),
+            _capture("首页"),
+            _capture("订单列表"),
+        )
+        near_but_low = _work(
+            _capture("订单详情"),
+            state_id=81,
+            depth=1,
+            path=[shared_step],
+        )
+        near_but_low.frontier_priority = 750
+        new_surface = _work(_capture("收银台"), state_id=82, depth=1)
+        new_surface.frontier_priority = 90
+        queue = deque([near_but_low, new_surface])
+
+        popped = _pop_most_local(
+            queue,
+            [shared_step],
+            coverage_scheduler=True,
+        )
+
+        self.assertIs(popped, new_surface)
+        self.assertEqual(list(queue), [near_but_low])
+
 
 if __name__ == "__main__":
     unittest.main()

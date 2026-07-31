@@ -1440,6 +1440,42 @@ def _migrate_inspection_business_coverage_v2(cursor) -> None:
     )
 
 
+def _migrate_inspection_app_map(cursor) -> None:
+    """Add the cross-run surface identity columns and app-map indexes.
+
+    The two app-map tables themselves are created by ``SQLModel.create_all``,
+    which runs before the migration plan; this only backfills the new
+    ``inspectionstate`` columns on existing databases and adds indexes.
+    """
+    _add_columns_if_present(
+        cursor,
+        "inspectionstate",
+        [
+            ("surface_key", "VARCHAR"),
+            ("surface_fingerprint_version", "INTEGER NOT NULL DEFAULT 1"),
+        ],
+    )
+    if _table_exists(cursor, "inspectionstate"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_inspectionstate_surface_key "
+            "ON inspectionstate(surface_key)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_inspectionstate_run_surface "
+            "ON inspectionstate(run_id, surface_key)"
+        )
+    if _table_exists(cursor, "inspectionappsurface"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_inspectionappsurface_package_subtype "
+            "ON inspectionappsurface(package_name, page_subtype)"
+        )
+    if _table_exists(cursor, "inspectionappaction"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_inspectionappaction_package_covered "
+            "ON inspectionappaction(package_name, last_covered_at)"
+        )
+
+
 def _adopt_inspection_migration_aliases(cursor) -> None:
     """Map unreleased development migration names to their formal versions."""
     aliases = (
@@ -1538,6 +1574,10 @@ def _run_migrations_with_conn(conn) -> None:
             (
                 "20260723_025_inspection_business_coverage_v2",
                 _migrate_inspection_business_coverage_v2,
+            ),
+            (
+                "20260730_026_inspection_app_map",
+                _migrate_inspection_app_map,
             ),
         ]
 
