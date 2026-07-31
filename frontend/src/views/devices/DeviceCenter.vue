@@ -1,12 +1,14 @@
 <script setup>
-import { ref, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection } from '@element-plus/icons-vue'
+import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection, Link, Download, CopyDocument } from '@element-plus/icons-vue'
+import { useRouter } from 'vue-router'
 import api from '@/api'
 import { useClientMode } from '@/composables/useClientMode'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 
 const { isMobileMode } = useClientMode()
+const router = useRouter()
 
 // ==================== 状态 ====================
 const devices = ref([])
@@ -16,6 +18,12 @@ const wdaCheckingSerial = ref('')
 const wirelessLoadingSerial = ref('')
 const deleteLoadingSerial = ref('')
 const stopLoadingSerial = ref('')
+
+// 远程接入点
+const remoteAgents = ref([])
+const agentGuideVisible = ref(false)
+const agentDeleteLoadingId = ref(null)
+const agentScriptDownloading = ref(false)
 
 // 快照弹窗
 const screenshotVisible = ref(false)
@@ -49,6 +57,17 @@ const fetchDevices = async ({ refreshIosWda = false, silent = false } = {}) => {
     if (!silent) {
       loading.value = false
     }
+  }
+  fetchRemoteAgents()
+}
+
+/** 获取远程接入点列表（静默失败，不打扰设备主流程） */
+const fetchRemoteAgents = async () => {
+  try {
+    const { data } = await api.getDeviceAgents()
+    remoteAgents.value = data.items || []
+  } catch (e) {
+    console.error(e)
   }
 }
 
@@ -140,12 +159,80 @@ const handleReboot = async (device) => {
 
 const isDeviceOffline = (device) => String(device?.status || '').trim().toUpperCase() === 'OFFLINE'
 
-/** iOS 连接方式徽标：无线直连 > WiFi 已配对（usbmux network）> USB */
+/** 连接方式徽标：Android 远程USB > iOS 无线直连 > iOS WiFi 已配对 > iOS USB */
 const connectionBadge = (device) => {
-  if (!device || device.platform !== 'ios') return null
+  if (!device) return null
+  if (device.connection_type === 'remote_usb') {
+    const suffix = device.agent_name ? ` · ${device.agent_name}` : ''
+    return { label: `🔌 远程USB${suffix}`, type: 'warning' }
+  }
+  if (device.platform !== 'ios') return null
   if (device.wireless_enabled) return { label: '📶 无线', type: 'success' }
   if (device.connection_type === 'network') return { label: '📶 WiFi已配对', type: 'info' }
   return { label: '🔌 USB', type: 'info' }
+}
+
+// ==================== 远程接入点 ====================
+
+/** Agent 启动命令示例（自动带当前站点地址） */
+const agentCommandExample = computed(() => {
+  const origin = window.location.origin
+  return `python device_agent.py --server ${origin} --token <你的API Token> --name 工位名称`
+})
+
+/** 下载 Agent 脚本 */
+const handleDownloadAgentScript = async () => {
+  agentScriptDownloading.value = true
+  try {
+    const { data } = await api.downloadDeviceAgentScript()
+    const url = URL.createObjectURL(new Blob([data], { type: 'text/x-python' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'device_agent.py'
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    ElMessage.error('下载失败：' + (e.response?.data?.detail || e.message))
+  } finally {
+    agentScriptDownloading.value = false
+  }
+}
+
+/** 复制 Agent 启动命令 */
+const copyAgentCommand = async () => {
+  try {
+    await navigator.clipboard.writeText(agentCommandExample.value)
+    ElMessage.success('启动命令已复制')
+  } catch (e) {
+    ElMessage.warning('复制失败，请手动选择文本复制')
+  }
+}
+
+/** 跳转 API Token 管理页 */
+const gotoApiTokens = () => {
+  agentGuideVisible.value = false
+  router.push({ name: 'api-tokens' })
+}
+
+/** 删除离线接入点 */
+const handleDeleteAgent = async (agent) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除接入点「${agent.name}」吗？其设备端口映射将被释放，该接入点重新上线后按新端口接入（平台侧视为新设备记录）。`,
+      '删除远程接入点',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
+    )
+    agentDeleteLoadingId.value = agent.id
+    await api.deleteDeviceAgent(agent.id)
+    remoteAgents.value = remoteAgents.value.filter(item => item.id !== agent.id)
+    ElMessage.success(`接入点 ${agent.name} 已删除`)
+  } catch (e) {
+    if (!['cancel', 'close'].includes(e)) {
+      ElMessage.error('删除失败：' + (e.response?.data?.detail || e.message))
+    }
+  } finally {
+    agentDeleteLoadingId.value = null
+  }
 }
 
 /** 删除离线设备 */
@@ -430,9 +517,46 @@ onBeforeUnmount(() => {
           {{ devices.length }} 台设备
         </el-tag>
       </div>
-      <el-button type="primary" :icon="Refresh" @click="handleSync" :loading="syncLoading">
-        一键同步物理设备
-      </el-button>
+      <div class="toolbar-actions">
+        <el-button :icon="Link" @click="agentGuideVisible = true">
+          接入远程设备
+        </el-button>
+        <el-button type="primary" :icon="Refresh" @click="handleSync" :loading="syncLoading">
+          一键同步物理设备
+        </el-button>
+      </div>
+    </div>
+
+    <!-- 远程接入点 -->
+    <div v-if="remoteAgents.length > 0" class="agent-strip">
+      <div class="agent-strip-title">
+        <el-icon :size="16" color="#e6a23c"><Link /></el-icon>
+        <span>远程接入点</span>
+      </div>
+      <div class="agent-strip-list">
+        <div v-for="agent in remoteAgents" :key="agent.id" class="agent-chip" :class="{ offline: agent.status !== 'ONLINE' }">
+          <span class="agent-dot" :class="{ online: agent.status === 'ONLINE' }"></span>
+          <span class="agent-name">{{ agent.name }}</span>
+          <el-tooltip
+            :content="agent.status === 'ONLINE'
+              ? `在线 · ${agent.online_device_count}/${agent.device_count} 台设备在线`
+              : `离线 · 最后心跳 ${agent.last_seen_at ? agent.last_seen_at.replace('T', ' ').slice(0, 19) : '—'}`"
+            placement="top"
+          >
+            <span class="agent-meta">{{ agent.status === 'ONLINE' ? `${agent.online_device_count} 台在线` : '离线' }}</span>
+          </el-tooltip>
+          <el-button
+            v-if="agent.status !== 'ONLINE'"
+            class="agent-delete"
+            type="danger"
+            link
+            size="small"
+            :icon="Delete"
+            :loading="agentDeleteLoadingId === agent.id"
+            @click="handleDeleteAgent(agent)"
+          />
+        </div>
+      </div>
     </div>
 
     <!-- 空状态 -->
@@ -504,6 +628,10 @@ onBeforeUnmount(() => {
             <div class="info-row">
               <span class="info-label">设备编号</span>
               <span class="info-value serial">{{ device.serial }}</span>
+            </div>
+            <div v-if="device.source_serial" class="info-row">
+              <span class="info-label">真实序列号</span>
+              <span class="info-value serial">{{ device.source_serial }}</span>
             </div>
             <div class="info-row">
               <span class="info-label">屏幕分辨率</span>
@@ -615,6 +743,56 @@ onBeforeUnmount(() => {
       </template>
     </el-dialog>
 
+    <!-- 接入远程设备指引 -->
+    <el-dialog
+      v-model="agentGuideVisible"
+      title="接入远程设备（设备插在自己电脑上使用平台）"
+      width="640px"
+      align-center
+    >
+      <div class="agent-guide">
+        <p class="agent-guide-intro">
+          在你自己的电脑（B 机）上运行「设备接入助手」，插在 B 机上的 Android 设备会通过反向隧道注册到本平台，
+          全功能可用（投屏、执行、巡检、Fastbot）。数据走 USB + 网络，无需手机连 WiFi。
+        </p>
+        <ol class="agent-guide-steps">
+          <li>
+            <strong>准备环境</strong>：B 机安装
+            <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python 3.8+</a>
+            与
+            <a href="https://developer.android.com/tools/releases/platform-tools" target="_blank" rel="noopener">Android platform-tools（adb）</a>，
+            手机开启「USB 调试」。
+          </li>
+          <li>
+            <strong>生成 API Token</strong>：
+            <el-button type="primary" link @click="gotoApiTokens">前往 API Token 管理页</el-button>
+            创建一个 Token（adk_ 开头，仅创建时可见）。
+          </li>
+          <li>
+            <strong>下载 Agent 脚本</strong>：
+            <el-button type="primary" link :icon="Download" :loading="agentScriptDownloading" @click="handleDownloadAgentScript">
+              下载 device_agent.py
+            </el-button>
+          </li>
+          <li>
+            <strong>在 B 机命令行运行</strong>（把 Token 与工位名换成你的）：
+            <div class="agent-command">
+              <code>{{ agentCommandExample }}</code>
+              <el-button link type="primary" :icon="CopyDocument" @click="copyAgentCommand" />
+            </div>
+          </li>
+          <li>
+            <strong>手机授权</strong>：首次接入会弹出两次「允许 USB 调试」（B 机密钥 + 平台服务器密钥），都点允许。
+            之后回到本页点「一键同步物理设备」即可看到远程设备。
+          </li>
+        </ol>
+        <div class="agent-guide-tips">
+          注意：Agent 运行期间请勿关闭其命令行窗口；执行长任务（巡检/Fastbot）时建议关闭 B 机休眠。
+          手机重启或拔插后 Agent 会自动恢复隧道。
+        </div>
+      </div>
+    </el-dialog>
+
   </div>
 </template>
 
@@ -642,6 +820,134 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+/* 远程接入点条带 */
+.agent-strip {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 10px 20px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  flex-wrap: wrap;
+}
+
+.agent-strip-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  flex-shrink: 0;
+}
+
+.agent-strip-list {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.agent-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 16px;
+  background: #f0f9eb;
+  border: 1px solid #e1f3d8;
+  font-size: 12px;
+}
+
+.agent-chip.offline {
+  background: #f4f4f5;
+  border-color: #e9e9eb;
+}
+
+.agent-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #c0c4cc;
+  flex-shrink: 0;
+}
+
+.agent-dot.online {
+  background: #67c23a;
+}
+
+.agent-name {
+  font-weight: 600;
+  color: #303133;
+}
+
+.agent-meta {
+  color: #909399;
+}
+
+.agent-delete {
+  margin-left: 2px;
+  padding: 0;
+}
+
+/* 接入指引对话框 */
+.agent-guide-intro {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #606266;
+  line-height: 1.6;
+}
+
+.agent-guide-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: #303133;
+  line-height: 2;
+}
+
+.agent-guide-steps a {
+  color: #409eff;
+  text-decoration: none;
+}
+
+.agent-command {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  padding: 8px 12px;
+  background: #f5f7fa;
+  border-radius: 6px;
+}
+
+.agent-command code {
+  flex: 1;
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  font-size: 12px;
+  color: #476582;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.agent-guide-tips {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: #fdf6ec;
+  color: #b88230;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .page-title {

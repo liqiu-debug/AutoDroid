@@ -8,7 +8,7 @@ AutoDroid 是一个面向 Android/iOS 的低代码 UI 自动化测试平台，�
 
 | 业务域 | 主要能力 |
 |---|---|
-| 设备中心 | Android/iOS 设备发现与同步、设备状态、截图、解锁、重启、iOS WDA 检查与启动 |
+| 设备中心 | Android/iOS 设备发现与同步、设备状态、截图、解锁、重启、iOS WDA 检查与启动、远程设备接入（B 机 USB 设备经反向隧道接入平台） |
 | 安装包管理 | APK/Ad Hoc IPA 上传与版本管理，向已接入的 Android/iOS 设备一键安装 |
 | 可视化录制 | Android 实时投屏/静态截图录制；iOS 静态截图、元素审查、交互录制与单步调试 |
 | 用例管理 | 目录与标签、复制、变量、标准步骤模型、平台覆盖、执行前预检、运行中止 |
@@ -70,6 +70,7 @@ flowchart TD
 | 场景并发执行 | 支持 | 支持 | 执行前按设备进行预检 |
 | 图像/OCR 步骤 | 支持 | 支持 | 具体动作与参数见执行规范 |
 | 实时 Scrcpy 画面 | 支持 | 不支持 | 用于 Android 预览和触控 |
+| 远程设备接入（Agent 反向隧道） | 支持 | 不支持 | 设备插在使用者电脑，经反向隧道接入平台，全功能可用 |
 | Fastbot 探索 | 支持 | 不支持 | Android 专项能力 |
 | 冷热启动专项 | 支持 | 不支持 | Android 专项能力，首页就绪 P90 为主指标 |
 | 视觉兼容性测试 | 支持 | 不支持 | Android 生产 APK 专项能力，按页面集合采集截图和 UI XML |
@@ -393,6 +394,7 @@ node --test tests/*.test.mjs
 - [CI 集成指南](docs/CI_INTEGRATION.md)：API Token、场景回归、智能巡检和流水线示例
 - [iOS WDA 运维手册](docs/IOS_WDA_OPS.md)：WDA 启动、健康检查、端口映射和故障排查
 - [Android 无线 adb 指南](docs/ANDROID_WIRELESS_ADB.md)：无线接入步骤、身份与稳定性边界
+- [远程设备接入指南](docs/REMOTE_DEVICE_AGENT.md)：设备接入助手 Agent、反向隧道架构、安全边界与排障
 - [改进路线图](docs/IMPROVEMENT_ROADMAP.md)：能力补充与架构治理清单（P0/P1/P2）
 - [历史优化实施总结](OPTIMIZATION_SUMMARY.md)：早期 OCR、查询与并发治理及其当前演进状态
 

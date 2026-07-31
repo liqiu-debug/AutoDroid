@@ -71,6 +71,7 @@ from backend.api import devices
 from backend.api import packages
 from backend.api import compatibility
 from backend.api import inspections
+from backend.api import device_agents
 from backend.api import assets
 from backend.api import environments
 from backend.api import ai
@@ -107,6 +108,7 @@ def _register_http_routers(
     target.include_router(packages.router, prefix="/packages", tags=["packages"], include_in_schema=include_in_schema)
     target.include_router(compatibility.router, prefix="/compatibility", tags=["compatibility"], include_in_schema=include_in_schema)
     target.include_router(inspections.router, prefix="/inspections", tags=["inspections"], include_in_schema=include_in_schema)
+    target.include_router(device_agents.router, prefix="/device-agents", tags=["device-agents"], include_in_schema=include_in_schema)
     target.include_router(environments.router, prefix="/environments", tags=["environments"], include_in_schema=include_in_schema)
     target.include_router(limiter.router, prefix="/limiter", tags=["limiter"], include_in_schema=include_in_schema)
     if ai_prefix:
@@ -208,6 +210,29 @@ def on_startup():
         register_retention_job()
     except Exception:
         logger.exception("注册报告保留清理任务失败")
+
+    # 远程设备接入：重置接入点状态并启动 adb keeper（sync 处理器在事件循环内执行）
+    try:
+        from backend.device_agents import adb_keeper, tunnel_hub
+
+        tunnel_hub.startup_reset()
+        tunnel_hub.set_keeper(adb_keeper)
+        adb_keeper.configure(tunnel_hub.desired_ports)
+        adb_keeper.start_in_loop()
+    except Exception:
+        logger.exception("启动远程设备接入服务失败")
+
+
+@app.on_event("shutdown")
+async def on_shutdown_device_agents():
+    """异步关闭远程设备接入：停止 keeper 并断开所有 Agent 会话。"""
+    try:
+        from backend.device_agents import adb_keeper, tunnel_hub
+
+        adb_keeper.stop()
+        await tunnel_hub.shutdown()
+    except Exception:
+        logger.exception("关闭时停止远程设备接入服务失败")
 
 
 @app.on_event("shutdown")
@@ -318,6 +343,9 @@ app.include_router(ws_run.router)
 
 # 智能巡检只读实时事件与视频（短期票据认证）
 app.include_router(inspections.ws_router)
+
+# 远程设备接入点反向隧道（API Token 鉴权）
+app.include_router(device_agents.ws_router)
 
 # SPA 兜底路由必须最后挂载（含 /{full_path:path} 通配）
 app.include_router(spa.router)

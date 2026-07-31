@@ -1476,6 +1476,23 @@ def _migrate_inspection_app_map(cursor) -> None:
         )
 
 
+def _migrate_remote_device_agents(cursor) -> None:
+    """Add remote-USB metadata columns to the device table.
+
+    The ``remoteagent`` / ``remoteagentdevice`` tables are created by
+    ``SQLModel.create_all`` before the migration plan runs; this only
+    backfills the new ``device`` columns on existing databases.
+    """
+    _add_columns_if_present(
+        cursor,
+        "device",
+        [
+            ("agent_name", "VARCHAR"),
+            ("source_serial", "VARCHAR"),
+        ],
+    )
+
+
 def _adopt_inspection_migration_aliases(cursor) -> None:
     """Map unreleased development migration names to their formal versions."""
     aliases = (
@@ -1578,6 +1595,10 @@ def _run_migrations_with_conn(conn) -> None:
             (
                 "20260730_026_inspection_app_map",
                 _migrate_inspection_app_map,
+            ),
+            (
+                "20260731_027_remote_device_agents",
+                _migrate_remote_device_agents,
             ),
         ]
 
