@@ -193,11 +193,53 @@ class Device(SQLModel, table=True):
     lease_task_id: Optional[str] = Field(default=None, index=True)
     lease_kind: Optional[str] = None
     lease_acquired_at: Optional[datetime] = None
-    connection_type: Optional[str] = Field(default=None)  # iOS: 最近一次同步的 usbmux 连接方式 usb | network
+    # iOS: usbmux 连接方式 usb | network；Android 远程 USB 设备为 remote_usb
+    connection_type: Optional[str] = Field(default=None)
+    agent_name: Optional[str] = Field(default=None)  # 远程接入点（Agent）名称
+    source_serial: Optional[str] = Field(default=None)  # 远程设备在接入机上的真实 USB serial
     custom_name: Optional[str] = Field(default=None)  # 用户自定义设备名称
     market_name: Optional[str] = Field(default=None)  # 设备市场型号
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
+
+
+class RemoteAgent(SQLModel, table=True):
+    """远程设备接入点（B 机上运行的设备接入助手）。
+
+    Agent 通过 WebSocket 反向连接后端注册；隧道流量与控制消息共用该连接。
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    status: str = Field(default="OFFLINE")  # ONLINE | OFFLINE
+    agent_version: Optional[str] = None
+    os_info: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
+
+
+class RemoteAgentDevice(SQLModel, table=True):
+    """远程接入点上的 USB 设备与其固定隧道端口的映射。
+
+    (agent_id, usb_serial) → tunnel_port 持久固定，保证设备以
+    ``127.0.0.1:<tunnel_port>`` 形态出现时 serial 跨重启稳定，
+    历史记录、报告与租约得以延续。
+    """
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "usb_serial", name="uq_remoteagentdevice_agent_serial"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    agent_id: int = Field(foreign_key="remoteagent.id", index=True)
+    usb_serial: str = Field(index=True)
+    tunnel_port: int = Field(unique=True)
+    model: Optional[str] = None
+    brand: Optional[str] = None
+    os_version: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now)
 
 
 class Environment(SQLModel, table=True):

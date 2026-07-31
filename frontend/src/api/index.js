@@ -545,6 +545,17 @@ export default {
         return api.delete(`/devices/${serial}`)
     },
 
+    // Device Agents (远程设备接入点)
+    getDeviceAgents() {
+        return api.get('/device-agents/')
+    },
+    deleteDeviceAgent(agentId) {
+        return api.delete(`/device-agents/${agentId}`)
+    },
+    downloadDeviceAgentScript() {
+        return api.get('/device-agents/agent-script', { responseType: 'blob', timeout: 60000 })
+    },
+
     // App Packages (包管理)
     getPackages(params) {
         return api.get('/packages/', { params })

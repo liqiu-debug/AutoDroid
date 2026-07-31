@@ -554,8 +554,10 @@ class DeviceRead(BaseModel):
     os_version: str = ""
     resolution: str = ""
     status: str = "IDLE"
-    connection_type: Optional[str] = None  # iOS: usb | network
+    connection_type: Optional[str] = None  # iOS: usb | network；Android 远程 USB: remote_usb
     wireless_enabled: bool = False  # iOS: 是否已配置无线直连 WDA 地址
+    agent_name: Optional[str] = None  # 远程接入点名称（remote_usb 设备）
+    source_serial: Optional[str] = None  # 远程设备在接入机上的真实 USB serial
     custom_name: Optional[str] = None
     market_name: Optional[str] = None
     created_at: Any
