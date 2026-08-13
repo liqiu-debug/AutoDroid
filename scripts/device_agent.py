@@ -37,7 +37,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 PROTOCOL_VERSION = 1
 WS_PATH = "/ws/device-agent"
 
@@ -57,9 +57,9 @@ TCPIP_REAPPEAR_TIMEOUT = 15.0
 # 应用层心跳（服务端 75s 无消息判定失联）
 PING_INTERVAL = 20.0
 
-# 重连退避
-RECONNECT_BACKOFF_START = 5.0
-RECONNECT_BACKOFF_MAX = 60.0
+# 重连退避（起步快、上限低：断网恢复后尽快回归）
+RECONNECT_BACKOFF_START = 1.0
+RECONNECT_BACKOFF_MAX = 15.0
 
 _WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -134,6 +134,11 @@ class MiniWebSocket:
 
         raw = socket.create_connection((host, port), timeout=timeout)
         try:
+            # 隧道上跑的是 adb 小包往返，关闭 Nagle 降低交互延迟
+            try:
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
             if use_tls:
                 context = ssl.create_default_context()
                 # 内网自签证书场景：不强制校验（与浏览器手动信任等价的取舍）
@@ -374,17 +379,24 @@ class AdbManager:
         return [d for d in parse_adb_devices_output(output) if not is_network_serial(d["serial"])]
 
     def get_device_props(self, serial: str) -> Dict[str, str]:
-        props = {"model": "", "brand": "", "os_version": ""}
         mapping = {
             "model": "ro.product.model",
             "brand": "ro.product.brand",
             "os_version": "ro.build.version.release",
         }
-        for key, prop in mapping.items():
-            try:
-                props[key] = self.run("-s", serial, "shell", "getprop", prop, timeout=8).strip()
-            except Exception:
-                pass
+        keys = list(mapping.keys())
+        separator = "___AUTODROID_SEP___"
+        script = f"; echo {separator}; ".join(f"getprop {mapping[key]}" for key in keys)
+        props = {key: "" for key in keys}
+        try:
+            output = self.run("-s", serial, "shell", script, timeout=8)
+        except Exception:
+            return props
+        parts = output.split(separator)
+        if len(parts) != len(keys):
+            return props
+        for key, value in zip(keys, parts):
+            props[key] = value.strip()
         return props
 
     def probe_forward_port(self, local_port: int) -> bool:
@@ -737,6 +749,10 @@ class TunnelAgent:
             return
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3.0)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         try:
             sock.connect(("127.0.0.1", forward_port))
             sock.settimeout(None)
