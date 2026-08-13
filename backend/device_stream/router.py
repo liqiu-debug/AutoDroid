@@ -20,7 +20,11 @@ from pydantic import BaseModel
 
 from . import ios_mjpeg
 from .ios_mjpeg import IOSMjpegStreamError, MjpegClient
-from .manager import device_manager
+from .manager import (
+    device_manager,
+    get_stream_profile_state,
+    set_stream_profile_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,41 @@ def reconnect_device(serial: str):
     """重新连接设备（清理旧连接 + 重新初始化 scrcpy）"""
     device_manager.reconnect_device(serial)
     return {"status": "reconnecting", "serial": serial}
+
+
+class StreamProfileRequest(BaseModel):
+    """投屏清晰度档位请求体；auto/default/空串 = 恢复按 serial 形态的默认档"""
+    profile: str
+
+
+@rest_router.get("/devices/{serial}/stream-profile")
+def get_stream_profile(serial: str):
+    """查询设备当前生效的投屏档位（profile/source/params）"""
+    return {"serial": serial, **get_stream_profile_state(serial)}
+
+
+@rest_router.post("/devices/{serial}/stream-profile")
+def set_stream_profile(serial: str, req: StreamProfileRequest):
+    """
+    设置设备投屏清晰度档位（hd/standard/smooth），设备流在管理中时立即重启生效。
+
+    档位为内存态覆盖，平台重启后回到默认档；前端按设备记忆用户选择并在
+    需要时重新下发。
+    """
+    profile = str(req.profile or "").strip().lower()
+    try:
+        set_stream_profile_override(serial, None if profile in ("", "auto", "default") else profile)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    restarting = bool(device_manager.get_device(serial))
+    if restarting:
+        device_manager.reconnect_device(serial)
+    return {
+        "serial": serial,
+        "status": "reconnecting" if restarting else "saved",
+        **get_stream_profile_state(serial),
+    }
 
 
 

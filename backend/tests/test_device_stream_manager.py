@@ -3,6 +3,9 @@ import unittest
 from queue import Empty
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
+from backend.device_stream import router as stream_router
 from backend.device_stream.manager import (
     ANDROID_MOTION_EVENT_ACTION_DOWN,
     DEFAULT_SCRCPY_BITRATE,
@@ -23,6 +26,10 @@ from backend.device_stream.manager import (
     SCRCPY_REMOTE_GOP_ENV,
     SCRCPY_REMOTE_MAX_FPS_ENV,
     SCRCPY_REMOTE_MAX_SIZE_ENV,
+    STREAM_PROFILE_HD,
+    STREAM_PROFILE_SMOOTH,
+    STREAM_PROFILE_STANDARD,
+    STREAM_PROFILES,
     ClientStreamQueue,
     DeviceInfo,
     ScrcpyDeviceManager,
@@ -32,8 +39,12 @@ from backend.device_stream.manager import (
     _collect_h264_nal_types,
     _get_h264_init_packets,
     _update_h264_init_cache,
+    default_stream_profile,
     get_scrcpy_stream_params,
+    get_stream_profile_state,
     is_remote_serial,
+    is_tunnel_serial,
+    set_stream_profile_override,
 )
 
 SCRCPY_ENV_NAMES = (
@@ -178,10 +189,18 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         self.assertFalse(is_remote_serial("ABCD1234"))
         self.assertFalse(is_remote_serial(""))
 
-    def test_remote_serial_uses_remote_profile_defaults(self):
+    def test_is_tunnel_serial_only_matches_tunnel_port_range(self):
+        self.assertTrue(is_tunnel_serial("127.0.0.1:28100"))
+        self.assertTrue(is_tunnel_serial("127.0.0.1:28199"))
+        self.assertFalse(is_tunnel_serial("127.0.0.1:28200"))
+        self.assertFalse(is_tunnel_serial("192.168.1.5:5555"))
+        self.assertFalse(is_tunnel_serial("ABCD1234"))
+        self.assertFalse(is_tunnel_serial(""))
+
+    def test_wireless_serial_uses_standard_profile_defaults(self):
         with patch.dict(os.environ, {}, clear=False):
             self._clear_scrcpy_env()
-            params = get_scrcpy_stream_params("127.0.0.1:28100")
+            params = get_scrcpy_stream_params("192.168.1.5:5555")
 
         self.assertEqual(
             params,
@@ -192,6 +211,16 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
                 "i_frame_interval": DEFAULT_SCRCPY_REMOTE_GOP,
             },
         )
+
+    def test_tunnel_serial_defaults_to_smooth_profile(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear_scrcpy_env()
+            params = get_scrcpy_stream_params("127.0.0.1:28100")
+
+        self.assertEqual(params, STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
+        self.assertEqual(default_stream_profile("127.0.0.1:28100"), STREAM_PROFILE_SMOOTH)
+        self.assertEqual(default_stream_profile("192.168.1.5:5555"), STREAM_PROFILE_STANDARD)
+        self.assertEqual(default_stream_profile("ABCD1234"), STREAM_PROFILE_HD)
 
     def test_usb_serial_keeps_standard_profile(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -211,7 +240,7 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         with patch.dict(os.environ, env):
             for name in (SCRCPY_MAX_SIZE_ENV, SCRCPY_BITRATE_ENV, SCRCPY_MAX_FPS_ENV, SCRCPY_GOP_ENV):
                 os.environ.pop(name, None)
-            remote = get_scrcpy_stream_params("127.0.0.1:28101")
+            remote = get_scrcpy_stream_params("192.168.1.7:5555")
             usb = get_scrcpy_stream_params("ABCD1234")
 
         self.assertEqual(
@@ -226,14 +255,102 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         self.assertEqual(usb["max_size"], DEFAULT_SCRCPY_MAX_SIZE)
         self.assertEqual(usb["video_bit_rate"], DEFAULT_SCRCPY_BITRATE)
 
-    def test_build_scrcpy_server_command_applies_remote_profile_by_serial(self):
+    def test_build_scrcpy_server_command_applies_smooth_profile_for_tunnel_serial(self):
         with patch.dict(os.environ, {}, clear=False):
             self._clear_scrcpy_env()
             command = _build_scrcpy_server_command("127.0.0.1:28100")
 
-        self.assertIn(f"max_size={DEFAULT_SCRCPY_REMOTE_MAX_SIZE} ", command)
-        self.assertIn(f"video_bit_rate={DEFAULT_SCRCPY_REMOTE_BITRATE} ", command)
-        self.assertIn(f"max_fps={DEFAULT_SCRCPY_REMOTE_MAX_FPS} ", command)
+        smooth = STREAM_PROFILES[STREAM_PROFILE_SMOOTH]
+        self.assertIn(f"max_size={smooth['max_size']} ", command)
+        self.assertIn(f"video_bit_rate={smooth['video_bit_rate']} ", command)
+        self.assertIn(f"max_fps={smooth['max_fps']} ", command)
+
+
+class StreamProfileOverrideTests(unittest.TestCase):
+    SERIAL = "127.0.0.1:28105"
+
+    def setUp(self):
+        self.addCleanup(set_stream_profile_override, self.SERIAL, None)
+        for name in SCRCPY_ENV_NAMES:
+            os.environ.pop(name, None)
+
+    def test_override_takes_precedence_over_default_and_env(self):
+        with patch.dict(os.environ, {SCRCPY_REMOTE_BITRATE_ENV: "1500000"}):
+            set_stream_profile_override(self.SERIAL, STREAM_PROFILE_HD)
+            params = get_scrcpy_stream_params(self.SERIAL)
+
+        self.assertEqual(params, STREAM_PROFILES[STREAM_PROFILE_HD])
+
+    def test_clearing_override_restores_default_profile(self):
+        set_stream_profile_override(self.SERIAL, STREAM_PROFILE_HD)
+        set_stream_profile_override(self.SERIAL, None)
+
+        self.assertEqual(get_scrcpy_stream_params(self.SERIAL), STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
+
+    def test_rejects_unknown_profile_and_empty_serial(self):
+        with self.assertRaises(ValueError):
+            set_stream_profile_override(self.SERIAL, "ultra")
+        with self.assertRaises(ValueError):
+            set_stream_profile_override("", STREAM_PROFILE_HD)
+
+    def test_profile_state_reports_source(self):
+        state = get_stream_profile_state(self.SERIAL)
+        self.assertEqual(state["profile"], STREAM_PROFILE_SMOOTH)
+        self.assertEqual(state["source"], "default")
+
+        set_stream_profile_override(self.SERIAL, STREAM_PROFILE_STANDARD)
+        state = get_stream_profile_state(self.SERIAL)
+        self.assertEqual(state["profile"], STREAM_PROFILE_STANDARD)
+        self.assertEqual(state["source"], "override")
+        self.assertEqual(state["params"], STREAM_PROFILES[STREAM_PROFILE_STANDARD])
+
+
+class StreamProfileEndpointTests(unittest.TestCase):
+    SERIAL = "127.0.0.1:28106"
+
+    def setUp(self):
+        self.addCleanup(set_stream_profile_override, self.SERIAL, None)
+
+    def test_set_profile_reconnects_managed_device(self):
+        request = stream_router.StreamProfileRequest(profile=STREAM_PROFILE_HD)
+        with patch.object(stream_router.device_manager, "get_device", return_value={"serial": self.SERIAL}), \
+             patch.object(stream_router.device_manager, "reconnect_device") as reconnect:
+            payload = stream_router.set_stream_profile(self.SERIAL, request)
+
+        reconnect.assert_called_once_with(self.SERIAL)
+        self.assertEqual(payload["status"], "reconnecting")
+        self.assertEqual(payload["profile"], STREAM_PROFILE_HD)
+        self.assertEqual(payload["source"], "override")
+
+    def test_set_profile_saves_without_reconnect_when_not_managed(self):
+        request = stream_router.StreamProfileRequest(profile=STREAM_PROFILE_STANDARD)
+        with patch.object(stream_router.device_manager, "get_device", return_value=None), \
+             patch.object(stream_router.device_manager, "reconnect_device") as reconnect:
+            payload = stream_router.set_stream_profile(self.SERIAL, request)
+
+        reconnect.assert_not_called()
+        self.assertEqual(payload["status"], "saved")
+        self.assertEqual(payload["profile"], STREAM_PROFILE_STANDARD)
+
+    def test_set_profile_auto_clears_override(self):
+        set_stream_profile_override(self.SERIAL, STREAM_PROFILE_HD)
+        request = stream_router.StreamProfileRequest(profile="auto")
+        with patch.object(stream_router.device_manager, "get_device", return_value=None):
+            payload = stream_router.set_stream_profile(self.SERIAL, request)
+
+        self.assertEqual(payload["source"], "default")
+        self.assertEqual(payload["profile"], STREAM_PROFILE_SMOOTH)
+
+    def test_set_profile_rejects_unknown_value(self):
+        request = stream_router.StreamProfileRequest(profile="ultra")
+        with self.assertRaises(HTTPException) as ctx:
+            stream_router.set_stream_profile(self.SERIAL, request)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_get_profile_returns_state(self):
+        payload = stream_router.get_stream_profile(self.SERIAL)
+        self.assertEqual(payload["serial"], self.SERIAL)
+        self.assertEqual(payload["profile"], STREAM_PROFILE_SMOOTH)
 
 
 class DeviceStreamManagerCacheTests(unittest.TestCase):
