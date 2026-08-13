@@ -813,6 +813,10 @@ class InspectionBranchConfig(BaseModel):
     entry_case_id: int = Field(gt=0)
     env_id: Optional[int] = None
     ready_assertion: InspectionReadyAssertion
+    # "full": BFS exploration from the entry surface (historical behavior).
+    # "single_page": exhaustively operate the entry surface only; targets on
+    # other surfaces are captured for the app map but never expanded.
+    scope: str = "full"
 
     @field_validator("name", mode="before")
     @classmethod
@@ -821,6 +825,14 @@ class InspectionBranchConfig(BaseModel):
         if not name:
             raise ValueError("branch name must not be empty")
         return name
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def normalize_scope(cls, value):
+        scope = str(value or "full").strip().lower()
+        if scope not in {"full", "single_page"}:
+            raise ValueError("branch scope must be full or single_page")
+        return scope
 
 
 class InspectionInputRule(BaseModel):
@@ -992,8 +1004,15 @@ class InspectionProfileCreate(BaseModel):
     @model_validator(mode="after")
     def validate_branches(self):
         required = {"guest", "authenticated"}
-        if set(self.branches.keys()) != required:
-            raise ValueError("branches must contain exactly guest and authenticated")
+        keys = set(self.branches.keys())
+        if not required.issubset(keys):
+            raise ValueError("branches must contain guest and authenticated")
+        # Custom branch keys become report directory names, so keep them slug-safe.
+        for key in keys - required:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", key):
+                raise ValueError(
+                    f"branch key must match [a-z0-9][a-z0-9_-]{{0,63}}: {key}"
+                )
         for label, rules in (
             ("input_rules", self.input_rules),
             ("safety_rules", self.safety_rules),
@@ -1058,7 +1077,9 @@ class InspectionRunCreate(BaseModel):
         result = []
         for item in source:
             key = str(item or "").strip().lower()
-            if key not in {"guest", "authenticated"}:
+            # Membership in the profile's configured branches is enforced by
+            # the run-create endpoint; here only keep keys path-safe.
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", key):
                 raise ValueError(f"unsupported inspection branch: {key}")
             if key not in result:
                 result.append(key)

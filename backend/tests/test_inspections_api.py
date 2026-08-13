@@ -416,6 +416,79 @@ class InspectionApiTests(unittest.TestCase):
         self.assertEqual(stored.profile_snapshot["graph_schema_version"], 8)
         self.assertIn("effective_features", stored.profile_snapshot)
 
+    def test_profile_accepts_single_page_branch_and_validates_keys(self):
+        base = self._profile_payload().model_dump()
+        extra = {**base["branches"]["guest"], "name": "我的页", "scope": "single_page"}
+
+        data = self._profile_payload().model_dump()
+        data["branches"]["profile_page"] = extra
+        profile = InspectionProfileCreate(**data)
+        self.assertEqual(profile.branches["profile_page"].scope, "single_page")
+        self.assertEqual(profile.branches["guest"].scope, "full")
+
+        bad_key = self._profile_payload().model_dump()
+        bad_key["branches"]["Bad Key"] = dict(extra)
+        with self.assertRaises(ValidationError):
+            InspectionProfileCreate(**bad_key)
+
+        missing = self._profile_payload().model_dump()
+        missing["branches"].pop("guest")
+        with self.assertRaises(ValidationError):
+            InspectionProfileCreate(**missing)
+
+        bad_scope = self._profile_payload().model_dump()
+        bad_scope["branches"]["guest"] = {
+            **bad_scope["branches"]["guest"],
+            "scope": "page_only",
+        }
+        with self.assertRaises(ValidationError):
+            InspectionProfileCreate(**bad_scope)
+
+    def test_run_accepts_configured_page_branch_and_rejects_unknown(self):
+        self._enable()
+        data = self._profile_payload().model_dump()
+        data["branches"]["profile_page"] = {
+            **data["branches"]["guest"],
+            "name": "我的页",
+            "scope": "single_page",
+        }
+        profile = create_profile(
+            InspectionProfileCreate(**data),
+            session=self.session,
+            current_user=self.user,
+        )
+
+        with self.assertRaises(HTTPException) as context:
+            create_run(
+                InspectionRunCreate(
+                    profile_id=profile.id,
+                    device_serial="inspection-android-1",
+                    branches=["missing_page"],
+                ),
+                BackgroundTasks(),
+                session=self.session,
+                current_user=self.user,
+            )
+        self.assertEqual(context.exception.status_code, 400)
+
+        tasks = BackgroundTasks()
+        result = create_run(
+            InspectionRunCreate(
+                profile_id=profile.id,
+                device_serial="inspection-android-1",
+                branches=["profile_page"],
+            ),
+            tasks,
+            session=self.session,
+            current_user=self.user,
+        )
+        self.assertEqual(result.selected_branches, ["profile_page"])
+        stored = self.session.get(InspectionRun, result.id)
+        self.assertEqual(
+            stored.profile_snapshot["branches"]["profile_page"]["scope"],
+            "single_page",
+        )
+
     def test_haier_run_freezes_v2_manifest_and_fixed_search_rule(self):
         self._enable()
         self.session.add(

@@ -511,7 +511,7 @@ def _state_frontier_values(
     include_legacy_actions: bool = False,
 ) -> Dict[str, Any]:
     persisted = str(state.expansion_status or "DISCOVERED").strip().upper()
-    if persisted in {"ABORTED", "BUDGET_SKIPPED"}:
+    if persisted in {"ABORTED", "BUDGET_SKIPPED", "SCOPE_SKIPPED"}:
         expansion_status = persisted
     elif state.expansion_completed_at is not None or state.expanded_at is not None:
         expansion_status = "EXPANDED"
@@ -550,6 +550,150 @@ def _frontier_summary(
         "deferred": sum(1 for item in values if item["expansion_status"] == "DEFERRED"),
         "pending": sum(int(item["pending_action_count"]) for item in values),
     }
+
+
+def _branch_scope_config(run: InspectionRun, branch_key: str) -> str:
+    snapshot = run.profile_snapshot if isinstance(run.profile_snapshot, dict) else {}
+    branches = snapshot.get("branches")
+    config = branches.get(branch_key) if isinstance(branches, dict) else None
+    if not isinstance(config, dict):
+        return "full"
+    return str(config.get("scope") or "full").strip().lower()
+
+
+_SCOPE_COVERED_DISPOSITIONS = {
+    "EXECUTED",
+    "RESULT_UNKNOWN",
+    "FAMILY_REUSED",
+    "CONTRACT_REUSED",
+    "NAVIGATION_REUSED",
+}
+
+
+def _scope_coverage_payload(
+    session: Session,
+    run: InspectionRun,
+    branches: List[InspectionBranchRun],
+    states: List[InspectionState],
+    action_records: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Per-branch coverage ledger for single-page scoped branches.
+
+    The credibility contract of single-page inspection: an explicit
+    denominator (every enumerated action on the entry surface), the executed
+    share, every skip reason, plus the surfaces that were reached but are not
+    configured as an entry of any branch — the work list for the next batch
+    of entry cases.
+    """
+    single_page_branches = [
+        item
+        for item in branches
+        if _branch_scope_config(run, item.branch_key) == "single_page"
+    ]
+    if not single_page_branches:
+        return None
+    records_by_state: Dict[int, List[Dict[str, Any]]] = {}
+    for record in action_records:
+        records_by_state.setdefault(int(record["state_id"]), []).append(record)
+    # Entry surfaces of every branch in the run (not only the filtered ones):
+    # a surface reached out-of-scope is "configured" when any branch enters it.
+    run_branches = session.exec(
+        select(InspectionBranchRun).where(InspectionBranchRun.run_id == run.id)
+    ).all()
+    root_state_ids = {
+        int(item.root_state_id)
+        for item in run_branches
+        if item.root_state_id is not None
+    }
+    configured_surfaces: Dict[str, str] = {}
+    if root_state_ids:
+        for root_state in session.exec(
+            select(InspectionState).where(col(InspectionState.id).in_(root_state_ids))
+        ).all():
+            for key in (root_state.surface_key, root_state.semantic_key):
+                if key:
+                    configured_surfaces.setdefault(str(key), root_state.branch_key)
+    branch_payloads: List[Dict[str, Any]] = []
+    for branch in single_page_branches:
+        branch_states = [
+            item for item in states if item.branch_key == branch.branch_key
+        ]
+        in_scope_states = []
+        out_of_scope_states = []
+        for state in branch_states:
+            if str(state.expansion_status or "").upper() == "SCOPE_SKIPPED":
+                out_of_scope_states.append(state)
+            else:
+                in_scope_states.append(state)
+        total = 0
+        executed = 0
+        skipped_by_status: Dict[str, int] = {}
+        safety_blocked = 0
+        for state in in_scope_states:
+            if state.id is None:
+                continue
+            for record in records_by_state.get(int(state.id), []):
+                status = str(record.get("status") or "").upper()
+                if status == "OUT_OF_SCOPE":
+                    continue
+                total += 1
+                disposition = str(
+                    record.get("execution_disposition") or ""
+                ).upper()
+                if disposition in _SCOPE_COVERED_DISPOSITIONS:
+                    executed += 1
+                    continue
+                skipped_by_status[status or "UNKNOWN"] = (
+                    skipped_by_status.get(status or "UNKNOWN", 0) + 1
+                )
+                if status == "BLOCKED" or str(record.get("risk_type") or "").strip():
+                    safety_blocked += 1
+        unconfigured: Dict[str, Dict[str, Any]] = {}
+        for state in out_of_scope_states:
+            surface = str(state.surface_key or state.semantic_key or "")
+            group_key = surface or f"state:{state.id}"
+            entry = unconfigured.setdefault(
+                group_key,
+                {
+                    "surface_key": surface or None,
+                    "page_subtype": state.page_subtype,
+                    "title": _PAGE_TITLE_BY_SUBTYPE.get(
+                        str(state.page_subtype or "").upper()
+                    )
+                    or state.activity
+                    or surface
+                    or f"State {state.id}",
+                    "activity": state.activity,
+                    "state_ids": [],
+                    "configured_branch_key": None,
+                },
+            )
+            if state.id is not None:
+                entry["state_ids"].append(int(state.id))
+            for key in (state.surface_key, state.semantic_key):
+                configured = configured_surfaces.get(str(key or ""))
+                if configured and configured != branch.branch_key:
+                    entry["configured_branch_key"] = configured
+                    break
+        branch_payloads.append(
+            {
+                "branch_key": branch.branch_key,
+                "branch_name": branch.branch_name,
+                "scope": "single_page",
+                "in_scope_states": len(in_scope_states),
+                "total_actions": total,
+                "executed_actions": executed,
+                "skipped_actions": max(0, total - executed),
+                "skipped_by_status": skipped_by_status,
+                "safety_blocked_actions": safety_blocked,
+                "coverage_ratio": round(executed / total, 4) if total else 0.0,
+                "unconfigured_surfaces": sorted(
+                    unconfigured.values(),
+                    key=lambda item: (-len(item["state_ids"]), str(item["title"])),
+                ),
+            }
+        )
+    return {"branches": branch_payloads}
 
 
 def _historical_transition_v4(
@@ -1304,6 +1448,13 @@ def create_run(
     profile = session.get(InspectionProfile, payload.profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="巡检配置不存在")
+    configured_branches = set((profile.branches or {}).keys())
+    for branch_key in payload.branches:
+        if branch_key not in configured_branches:
+            raise HTTPException(
+                status_code=400,
+                detail=f"巡检配置中不存在业务线: {branch_key}",
+            )
     device = session.exec(select(Device).where(Device.serial == payload.device_serial)).first()
     if device is None:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -2163,6 +2314,13 @@ def get_run_graph(
             )
         locator_counts[used] = locator_counts.get(used, 0) + 1
     action_records = _graph_action_records(states, transitions)
+    scope_coverage = _scope_coverage_payload(
+        session,
+        run,
+        branches,
+        states,
+        action_records,
+    )
     for item in action_records:
         risk_type = str(item.get("risk_type") or "").strip()
         if risk_type:
@@ -2325,6 +2483,7 @@ def get_run_graph(
         "replay_default_eligible": replay_default_eligible,
         "coverage_verdict": run.coverage_verdict or "NOT_EVALUATED",
         "coverage_assessment": assessment,
+        "scope_coverage": scope_coverage,
         "paths_included": include_paths is True,
         "replay_paths_url": (
             f"/api/inspections/runs/{run_id}/replay-paths"
