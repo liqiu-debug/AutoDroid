@@ -26,13 +26,16 @@ const runAdvancedOpen = ref([])
 const profileManagerOpen = ref([])
 let pollTimer = null
 
-const blankBranch = (name) => ({
+const blankBranch = (name, scope = 'full') => ({
   name,
   prepare_case_id: '',
   entry_case_id: '',
   env_id: null,
   ready_assertion: { by: 'description', selector: '', timeout: 5 },
+  scope,
 })
+
+const RESERVED_BRANCH_KEYS = ['guest', 'authenticated']
 
 const profileForm = reactive({
   name: '',
@@ -106,6 +109,56 @@ const packageOptions = computed(() => packages.value.filter(item => (
   || !item.package_name
   || item.package_name === selectedProfile.value.package_name
 )))
+
+const profileBranchKeys = computed(() => {
+  const keys = Object.keys(profileForm.branches || {})
+  return [
+    ...RESERVED_BRANCH_KEYS.filter(key => keys.includes(key)),
+    ...keys.filter(key => !RESERVED_BRANCH_KEYS.includes(key)),
+  ]
+})
+
+const availableRunBranches = computed(() => {
+  const profile = selectedProfile.value
+  if (!profile) {
+    return [
+      { key: 'guest', name: '未登录', scope: 'full' },
+      { key: 'authenticated', name: '已登录', scope: 'full' },
+    ]
+  }
+  return Object.entries(profile.branches || {}).map(([key, config]) => ({
+    key,
+    name: config?.name || key,
+    scope: config?.scope || 'full',
+  }))
+})
+
+const addPageBranch = async () => {
+  let value
+  try {
+    ({ value } = await ElMessageBox.prompt(
+      '输入业务线标识（小写字母/数字，可含 _ 和 -）。该业务线将以“单页巡检”模式执行：进入用例到达的页面会被穷举，跳出该页面的入口只记录去向。',
+      '新增单页业务线',
+      {
+        inputPattern: /^[a-z0-9][a-z0-9_-]{0,63}$/,
+        inputErrorMessage: '仅支持小写字母、数字、_ 和 -，且以字母或数字开头',
+      },
+    ))
+  } catch {
+    return
+  }
+  if (!value) return
+  if (profileForm.branches[value]) {
+    ElMessage.warning('该业务线标识已存在')
+    return
+  }
+  profileForm.branches[value] = blankBranch(value, 'single_page')
+}
+
+const removePageBranch = (key) => {
+  if (RESERVED_BRANCH_KEYS.includes(key)) return
+  delete profileForm.branches[key]
+}
 const runAdvancedSummary = computed(() => {
   const selectedPackage = packageOptions.value.find(item => item.id === runForm.package_id)
   const labels = []
@@ -118,6 +171,8 @@ watch(selectedProfile, (profile) => {
   if (!profile) return
   const seconds = Number(profile.budgets?.duration_seconds || 1800)
   runForm.duration_minutes = Math.min(120, Math.max(5, Math.round(seconds / 60)))
+  const keys = Object.keys(profile.branches || {})
+  runForm.branches = keys.length ? keys : ['guest', 'authenticated']
 })
 
 const parseJsonArray = (text, label) => {
@@ -174,6 +229,10 @@ const openEdit = (profile) => {
   profileForm.name = profile.name
   profileForm.package_name = profile.package_name
   profileForm.branches = JSON.parse(JSON.stringify(profile.branches))
+  for (const branch of Object.values(profileForm.branches)) {
+    if (!branch.scope) branch.scope = 'full'
+    if (!branch.ready_assertion) branch.ready_assertion = { by: 'description', selector: '', timeout: 5 }
+  }
   profileForm.dynamic_text_patterns_text = JSON.stringify(profile.dynamic_text_patterns || [], null, 2)
   profileForm.input_rules_text = JSON.stringify(profile.input_rules || [], null, 2)
   profileForm.safety_rules_text = JSON.stringify(profile.safety_rules || [], null, 2)
@@ -222,7 +281,7 @@ const saveProfile = async () => {
   if (!profileForm.name.trim() || !profileForm.package_name.trim()) {
     return ElMessage.warning('请填写配置名称和目标包名')
   }
-  for (const key of ['guest', 'authenticated']) {
+  for (const key of profileBranchKeys.value) {
     const branch = profileForm.branches[key]
     if (!branch.prepare_case_id || !branch.entry_case_id || !branch.ready_assertion?.selector?.trim()) {
       return ElMessage.warning(`请完整配置${branch.name || key}业务线`)
@@ -398,8 +457,9 @@ onBeforeUnmount(() => {
             </el-form-item>
             <el-form-item label="业务线">
               <el-checkbox-group v-model="runForm.branches">
-                <el-checkbox value="guest">未登录</el-checkbox>
-                <el-checkbox value="authenticated">已登录</el-checkbox>
+                <el-checkbox v-for="item in availableRunBranches" :key="item.key" :value="item.key">
+                  {{ item.name }}<template v-if="item.scope === 'single_page'">（单页）</template>
+                </el-checkbox>
               </el-checkbox-group>
             </el-form-item>
             <el-form-item label="本次运行上限">
@@ -546,8 +606,17 @@ onBeforeUnmount(() => {
         </div>
 
         <el-tabs>
-          <el-tab-pane v-for="branchKey in ['guest', 'authenticated']" :key="branchKey" :label="profileForm.branches[branchKey].name">
+          <el-tab-pane v-for="branchKey in profileBranchKeys" :key="branchKey" :label="profileForm.branches[branchKey].name || branchKey">
             <div class="dialog-grid">
+              <el-form-item label="业务线名称" v-if="!RESERVED_BRANCH_KEYS.includes(branchKey)">
+                <el-input v-model="profileForm.branches[branchKey].name" placeholder="例如：我的页面" />
+              </el-form-item>
+              <el-form-item label="巡检范围">
+                <el-select v-model="profileForm.branches[branchKey].scope">
+                  <el-option label="整应用探索（BFS）" value="full" />
+                  <el-option label="仅入口单页穷举" value="single_page" />
+                </el-select>
+              </el-form-item>
               <el-form-item label="准备用例">
                 <el-select v-model="profileForm.branches[branchKey].prepare_case_id" filterable>
                   <el-option v-for="item in cases" :key="item.id" :label="item.name" :value="item.id" />
@@ -577,8 +646,17 @@ onBeforeUnmount(() => {
                 <el-input-number v-model="profileForm.branches[branchKey].ready_assertion.timeout" :min="1" :max="60" />
               </el-form-item>
             </div>
+            <div v-if="profileForm.branches[branchKey].scope === 'single_page'" class="scope-note">
+              单页模式：进入用例到达的页面（含滚动视口和弹层）会被穷举；跳出该页面的控件只记录去向，报告会列出这些“已发现未配置”的页面。
+            </div>
+            <div v-if="!RESERVED_BRANCH_KEYS.includes(branchKey)" class="branch-actions">
+              <el-button link type="danger" :icon="Delete" @click="removePageBranch(branchKey)">删除该业务线</el-button>
+            </div>
           </el-tab-pane>
         </el-tabs>
+        <div class="add-branch-row">
+          <el-button link type="primary" :icon="Plus" @click="addPageBranch">新增单页业务线</el-button>
+        </div>
 
         <el-divider content-position="left">预算与监控</el-divider>
         <div class="budget-grid">
@@ -673,6 +751,9 @@ onBeforeUnmount(() => {
 .profile-manager-title strong { color: #303133; font-size: 14px; }
 .profile-manager-title span { color: #909399; font-size: 12px; }
 .budget-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 16px; }
+.scope-note { margin: 4px 0 8px; padding: 8px 10px; color: #606266; font-size: 12px; line-height: 1.45; border-left: 3px solid #409eff; background: #ecf5ff; }
+.branch-actions { display: flex; justify-content: flex-end; }
+.add-branch-row { margin: 4px 0 8px; }
 .advanced { margin-top: 18px; }
 .json-grid { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
 @media (max-width: 1200px) {

@@ -40,6 +40,7 @@ export const INSPECTION_ACTION_STATUS_META = Object.freeze({
   NAVIGATION_REUSED: { label: '导航已复用', type: 'info' },
   VISUAL_STALE: { label: '视觉入口已变化', type: 'warning' },
   NO_NEW_COVERAGE: { label: '无新增覆盖', type: 'info' },
+  OUT_OF_SCOPE: { label: '超出单页范围', type: 'info' },
 })
 
 export const NON_NUMBERED_INSPECTION_ACTION_STATUSES = new Set([
@@ -49,7 +50,7 @@ export const NON_NUMBERED_INSPECTION_ACTION_STATUSES = new Set([
   'BUDGET_LIMIT', 'BUDGET_NOT_REACHED', 'COVERED_BY_FAMILY', 'FILTERED_NON_ACTIONABLE',
   'QUEUE_TRUNCATED', 'CYCLE_CONVERGED', 'COVERAGE_EXHAUSTED',
   'COVERED_BY_CONTRACT', 'SAMPLED_OUT', 'NAVIGATION_REUSED', 'VISUAL_STALE',
-  'NO_NEW_COVERAGE',
+  'NO_NEW_COVERAGE', 'OUT_OF_SCOPE',
 ])
 
 export const INSPECTION_LOCATOR_FAILURE_STATUSES = new Set([

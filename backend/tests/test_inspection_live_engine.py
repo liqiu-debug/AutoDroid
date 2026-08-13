@@ -244,6 +244,7 @@ class InspectionLiveEngineTests(unittest.TestCase):
         family_convergence=False,
         coverage_scheduler=None,
         business_coverage=False,
+        branch_config=None,
     ):
         device = device or Mock()
         device.window_size.return_value = (1080, 2400)
@@ -318,7 +319,7 @@ class InspectionLiveEngineTests(unittest.TestCase):
                 device_serial="android-1",
                 package_name="com.demo",
                 profile=profile,
-                branch_config={},
+                branch_config=branch_config or {},
                 abort_event=abort_event,
                 monitor=None,
             )
@@ -3494,6 +3495,131 @@ class InspectionLiveEngineTests(unittest.TestCase):
             state = session.get(InspectionState, self.state_id)
         self.assertEqual(state.expansion_status, "BUDGET_SKIPPED")
         self.assertEqual(state.pending_action_count, 0)
+
+    def test_single_page_scope_prunes_cross_page_targets_but_keeps_viewports(self):
+        root_capture = _capture(
+            _page(
+                '<node package="com.demo" class="android.widget.Button" '
+                'content-desc="进入详情" clickable="true" enabled="true" '
+                'bounds="[10,20][300,140]"/>'
+            ),
+            screenshot_sha="scope-root",
+        )
+        child_capture = _capture(
+            _page(
+                '<node package="com.demo" class="android.widget.Button" '
+                'content-desc="详情页动作" clickable="true" enabled="true" '
+                'bounds="[10,20][300,140]"/>'
+            ),
+            screenshot_sha="scope-child",
+        )
+        viewport_capture = _capture(
+            _page(
+                '<node package="com.demo" class="android.widget.TextView" '
+                'text="第二屏" enabled="true" bounds="[0,100][1080,300]"/>'
+            ),
+            screenshot_sha="scope-viewport",
+        )
+        open_child = InspectionAction(
+            action_type="click",
+            action_key="scope-open-child",
+            locator_candidates=[{"by": "description", "selector": "进入详情"}],
+            target_meta={"content_desc": "进入详情"},
+        )
+        child_action = InspectionAction(
+            action_type="click",
+            action_key="scope-child-action",
+            locator_candidates=[{"by": "description", "selector": "详情页动作"}],
+            target_meta={"content_desc": "详情页动作"},
+        )
+
+        def scope_scroll(index: int) -> InspectionAction:
+            return InspectionAction(
+                action_type="scroll",
+                action_key=f"scope-scroll-{index}",
+                locator_candidates=[],
+                target_meta={
+                    "direction": "up",
+                    "bounds": [0, 100, 1080, 2200],
+                    "screen_size": [1080, 2400],
+                },
+                coordinate_only=True,
+                replayable=False,
+                action_role="SCROLL:vertical:up",
+                action_role_key=f"scope-scroll-role-{index}",
+            )
+
+        scroll_root = scope_scroll(0)
+        scroll_viewport = scope_scroll(1)
+        root_work = replace(
+            self._work(root_capture, [open_child, scroll_root]),
+            semantic_key=root_capture.model.semantic_key,
+        )
+        child_work = self._stored_work(
+            child_capture,
+            [child_action],
+            depth=1,
+            path=[_serialize_action(open_child)],
+            parent_state_id=self.state_id,
+        )
+        viewport_work = self._stored_work(
+            viewport_capture,
+            [scroll_viewport],
+            depth=0,
+            path=[_serialize_action(scroll_root)],
+            parent_state_id=self.state_id,
+        )
+        performer = Mock(
+            side_effect=lambda _device, action, **_kwargs: (
+                "scroll:up:coordinate"
+                if action.action_type == "scroll"
+                else "description"
+            )
+        )
+
+        with patch(
+            "backend.inspection.engine._restore_parent_after_transition",
+            return_value=root_capture,
+        ):
+            outcome = self._run_branch(
+                capture=root_capture,
+                work=root_work,
+                persist_results=[
+                    PersistedState(work=root_work, is_new=True),
+                    PersistedState(work=child_work, is_new=True),
+                    PersistedState(work=viewport_work, is_new=True),
+                    PersistedState(work=viewport_work, is_new=False),
+                ],
+                publish_mock=Mock(),
+                perform_mock=performer,
+                wait_captures=[
+                    root_capture,
+                    child_capture,
+                    viewport_capture,
+                    viewport_capture,
+                ],
+                branch_config={"scope": "single_page"},
+            )
+
+        self.assertEqual(outcome.stop_reason, "队列自然耗尽")
+        # The cross-page child is captured but never dequeued: its own action
+        # must not run, while same-page viewport scrolling keeps expanding.
+        self.assertEqual(
+            [call.args[1].action_key for call in performer.call_args_list],
+            [
+                open_child.action_key,
+                scroll_root.action_key,
+                scroll_viewport.action_key,
+            ],
+        )
+        self.assertEqual(
+            [item["status"] for item in child_work.action_map["actions"]],
+            ["OUT_OF_SCOPE"],
+        )
+        with Session(self.engine) as session:
+            child_state = session.get(InspectionState, child_work.state_id)
+        self.assertEqual(child_state.expansion_status, "SCOPE_SKIPPED")
+        self.assertEqual(child_state.pending_action_count, 0)
 
     def test_cancel_finalizes_active_and_remaining_actions(self):
         capture = _capture(

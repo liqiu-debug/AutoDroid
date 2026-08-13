@@ -72,6 +72,7 @@ import {
   inspectionReportSummary,
   inspectionTerminalReviewState,
   inspectionTerminalOutcomeLabel,
+  INSPECTION_ACTION_STATUS_META,
   INSPECTION_LOCATOR_FAILURE_STATUSES,
 } from '@/utils/inspectionPresentation'
 
@@ -195,6 +196,7 @@ const expansionStatusLabel = value => ({
   DEFERRED: '延迟恢复',
   EXPANDED: '已展开',
   BUDGET_SKIPPED: '预算跳过',
+  SCOPE_SKIPPED: '超出单页范围',
   COVERED_BY_SURFACE: '同面已覆盖',
   ABORTED: '已中止',
 }[String(value || '').toUpperCase()] || value || '-')
@@ -263,6 +265,20 @@ const evidenceQualityClass = computed(() => ({
   LOW: 'danger',
 }[businessCoverage.value.evidenceQuality] || 'warning'))
 const evidenceStateNodes = item => (item?.evidence_state_ids || [])
+  .map(id => nodeByStateId.value.get(Number(id)))
+  .filter(Boolean)
+
+// Single-page scoped branches: explicit denominator (every enumerated action
+// on the entry surface) plus the reached-but-unconfigured surface work list.
+const scopeCoverageBranches = computed(() => graph.value?.scope_coverage?.branches || [])
+const scopeSkipRows = branch => Object.entries(branch?.skipped_by_status || {})
+  .map(([status, count]) => ({
+    status,
+    label: INSPECTION_ACTION_STATUS_META[String(status || '').toUpperCase()]?.label || status,
+    count,
+  }))
+  .sort((a, b) => b.count - a.count)
+const scopeSurfaceStateNodes = item => (item?.state_ids || [])
   .map(id => nodeByStateId.value.get(Number(id)))
   .filter(Boolean)
 const transitionById = computed(() => new Map(
@@ -1712,6 +1728,62 @@ onBeforeUnmount(() => {
                 <template #default="{ row }">{{ inspectionCoverageItemReason(row) }}</template>
               </el-table-column>
             </el-table>
+          </section>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane v-if="scopeCoverageBranches.length" label="单页覆盖" name="scope-coverage">
+        <div class="coverage-tab">
+          <section v-for="branch in scopeCoverageBranches" :key="branch.branch_key" class="coverage-branch">
+            <header>
+              <h3>{{ branch.branch_name || branch.branch_key }}</h3>
+              <el-tag type="info" effect="plain">单页穷举</el-tag>
+              <span>
+                识别动作 {{ branch.total_actions }} ·
+                已执行 {{ branch.executed_actions }} ·
+                跳过 {{ branch.skipped_actions }}（安全拦截 {{ branch.safety_blocked_actions }}）·
+                页内覆盖率 {{ (branch.coverage_ratio * 100).toFixed(1) }}%
+              </span>
+            </header>
+            <el-table v-if="scopeSkipRows(branch).length" :data="scopeSkipRows(branch)" size="small" border>
+              <el-table-column label="跳过原因" min-width="180">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="次数" prop="count" width="90" />
+            </el-table>
+            <p v-else class="surface-gap-note">入口页面上识别到的动作全部执行完毕。</p>
+            <el-table
+              v-if="(branch.unconfigured_surfaces || []).length"
+              :data="branch.unconfigured_surfaces"
+              size="small"
+              border
+            >
+              <el-table-column label="已发现未配置的页面" min-width="180">
+                <template #default="{ row }">{{ row.title }}</template>
+              </el-table-column>
+              <el-table-column label="Activity" prop="activity" min-width="200" show-overflow-tooltip />
+              <el-table-column label="到达页面" min-width="170">
+                <template #default="{ row }">
+                  <el-button
+                    v-for="node in scopeSurfaceStateNodes(row)"
+                    :key="node.state_id"
+                    link
+                    type="primary"
+                    @click="openCoverageState(node)"
+                  >{{ node.display_label || pageLabelForStateId(node.state_id) }}</el-button>
+                  <span v-if="!scopeSurfaceStateNodes(row).length">-</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="配置状态" width="170">
+                <template #default="{ row }">
+                  <el-tag v-if="row.configured_branch_key" size="small" type="success" effect="plain">
+                    已配置：{{ branchDisplayLabel(row.configured_branch_key) }}
+                  </el-tag>
+                  <el-tag v-else size="small" type="warning" effect="plain">待配置入口用例</el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+            <p v-else class="surface-gap-note">本次未发现跳出该页面且未配置的去向页面。</p>
           </section>
         </div>
       </el-tab-pane>

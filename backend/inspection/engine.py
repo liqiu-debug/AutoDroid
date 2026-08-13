@@ -971,6 +971,19 @@ _PRIMARY_ENTRY_CONTINUATION_PRIORITY = 350
 _PROFILE_CONTINUATION_PRIORITY = 150
 _OVERLAY_CLEANUP_ACTION_ROLES = frozenset({"FILTER_CLOSE", "DIALOG_CLOSE"})
 
+# Transient surfaces drawn over their owning page.  Single-page scoped
+# branches treat them as part of the entry page: their controls are operated,
+# while genuine page-to-page transitions are captured but never expanded.
+_TRANSIENT_OVERLAY_SUBTYPES = frozenset(
+    {"DIALOG", "FILTER_PANEL", "MODAL_PANEL", "PURCHASE_OPTIONS"}
+)
+
+
+def _is_transient_overlay_work(work: StateWork) -> bool:
+    if str(work.role or "").upper() == "DIALOG":
+        return True
+    return str(work.page_subtype or "").upper() in _TRANSIENT_OVERLAY_SUBTYPES
+
 # Frontier priorities are compared per 100-wide band, not exactly.  Run 72
 # showed why: the app-map tiers (90/150/750) interleaved with the engine's own
 # (40/100/700), and strict ordering marched the device across the whole app in
@@ -5035,6 +5048,14 @@ def _execute_branch(
     branch_guard = budget_guard or BudgetGuard(budgets)
     guard: Any = branch_guard
     max_depth = int(budget_value("max_depth", 12))
+    # "single_page" restricts expansion to the entry surface: its viewports
+    # and transient overlays are walked exhaustively, while every transition
+    # to another page is captured for the app map but never expanded.
+    single_page_scope = (
+        str(branch_config.get("scope") or "full").strip().lower() == "single_page"
+    )
+    single_page_keys: set[str] = set()
+    scope_skipped_state_ids: set[int] = set()
     max_scrolls = int(budget_value("max_scrolls_per_direction", 3))
     max_variants = int(budget_value("max_variants_per_cluster", 5))
     stable_wait = float(budget_value("stable_wait_seconds", 5.0))
@@ -5497,6 +5518,10 @@ def _execute_branch(
         return True
 
     def mark_state_expanded_if_terminal(work: StateWork) -> bool:
+        if work.state_id in scope_skipped_state_ids:
+            # Already finalized as SCOPE_SKIPPED; the label must survive the
+            # end-of-run sweeps that relabel terminal action maps EXPANDED.
+            return True
         if not state_actions_terminal(work):
             return False
         expanded_state_ids.add(work.state_id)
@@ -5516,6 +5541,8 @@ def _execute_branch(
         state_status: str,
         reason: str,
     ) -> None:
+        if work.state_id in scope_skipped_state_ids:
+            return
         if state_actions_terminal(work):
             mark_state_expanded_if_terminal(work)
             return
@@ -5544,6 +5571,8 @@ def _execute_branch(
         priority: Optional[int] = None,
         reason: Optional[str] = None,
     ) -> bool:
+        if work.state_id in scope_skipped_state_ids:
+            return False
         remaining = pending_actions(work, actions)
         if goal_tracker is not None and remaining:
             remaining = goal_tracker.prioritize_actions(
@@ -6600,6 +6629,8 @@ def _execute_branch(
             )
         if not root.work.ancestry_state_ids:
             root.work.ancestry_state_ids = (root.work.state_id,)
+        if single_page_scope:
+            single_page_keys.add(_work_page_logical_key(root.work))
 
         queue: Deque[StateWork] = deque()
         enqueue(root.work)
@@ -8530,8 +8561,30 @@ def _execute_branch(
                         and _navigation_metadata(action).get("group_region")
                         == "bottom"
                     )
+                    if single_page_scope and (
+                        is_viewport_scroll
+                        or _is_transient_overlay_work(persisted.work)
+                    ):
+                        # Same-page viewports and overlays belong to the entry
+                        # surface; remember their keys so their own children
+                        # keep passing the scope check below.
+                        single_page_keys.add(
+                            _work_page_logical_key(persisted.work)
+                        )
                     if capture_only_terminal:
                         pass
+                    elif (
+                        single_page_scope
+                        and _work_page_logical_key(persisted.work)
+                        not in single_page_keys
+                    ):
+                        finalize_unqueued_work(
+                            persisted.work,
+                            action_status="OUT_OF_SCOPE",
+                            state_status="SCOPE_SKIPPED",
+                            reason="超出单页巡检范围：仅记录去向，不再扩展",
+                        )
+                        scope_skipped_state_ids.add(persisted.work.state_id)
                     elif persisted.work.depth > max_depth:
                         finalize_unqueued_work(
                             persisted.work,
