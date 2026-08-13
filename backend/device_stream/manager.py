@@ -7,6 +7,7 @@ ScrcpyDeviceManager - USB 设备监听 & Scrcpy 视频流管理
 - 设备断开时自动清理进程和端口资源
 """
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -40,10 +41,26 @@ DEFAULT_SCRCPY_BITRATE = 8_000_000    # 视频码率 (bps)
 DEFAULT_SCRCPY_MAX_FPS = 60           # 最大帧率
 DEFAULT_SCRCPY_GOP = 1                # I 帧间隔（秒），即 i_frame_interval
 
+# 远程/无线设备（Agent 隧道 127.0.0.1:281xx、无线 adb IP:5555）降档默认值：
+# adb 对每台设备只有一条 transport TCP 连接，8Mbps 视频流会队头阻塞该设备
+# 的所有 adb 命令（getprop/截图/控制），远程链路带宽也扛不住 USB 档码率。
+DEFAULT_SCRCPY_REMOTE_MAX_SIZE = 1280
+DEFAULT_SCRCPY_REMOTE_BITRATE = 2_000_000
+DEFAULT_SCRCPY_REMOTE_MAX_FPS = 30
+DEFAULT_SCRCPY_REMOTE_GOP = 1
+
 SCRCPY_MAX_SIZE_ENV = "AUTODROID_SCRCPY_MAX_SIZE"
 SCRCPY_BITRATE_ENV = "AUTODROID_SCRCPY_BITRATE"
 SCRCPY_MAX_FPS_ENV = "AUTODROID_SCRCPY_MAX_FPS"
 SCRCPY_GOP_ENV = "AUTODROID_SCRCPY_GOP"
+
+SCRCPY_REMOTE_MAX_SIZE_ENV = "AUTODROID_SCRCPY_REMOTE_MAX_SIZE"
+SCRCPY_REMOTE_BITRATE_ENV = "AUTODROID_SCRCPY_REMOTE_BITRATE"
+SCRCPY_REMOTE_MAX_FPS_ENV = "AUTODROID_SCRCPY_REMOTE_MAX_FPS"
+SCRCPY_REMOTE_GOP_ENV = "AUTODROID_SCRCPY_REMOTE_GOP"
+
+# ip:port / host:port 形态 serial（无线 adb / 隧道设备），非本机 USB 直插
+_NETWORK_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
 
 SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
 SCRCPY_POINTER_ID_GENERIC_FINGER = -2
@@ -102,16 +119,32 @@ def _stream_param_from_env(env_name: str, default: int) -> int:
         return default
 
 
-def get_scrcpy_stream_params() -> Dict[str, int]:
+def is_remote_serial(serial: str) -> bool:
+    """serial 是否为远程/无线形态（ip:port / host:port），投屏参数走降档配置。"""
+    return bool(_NETWORK_SERIAL_RE.match(str(serial or "")) and ":" in str(serial or ""))
+
+
+def get_scrcpy_stream_params(serial: str = "") -> Dict[str, int]:
     """
     解析当前生效的 scrcpy 视频流参数（每次启动设备流时求值）。
+
+    USB 直插设备走标准档，远程/无线设备（serial 为 ip:port 形态，含
+    Agent 隧道 127.0.0.1:281xx 与无线 adb IP:5555）走降档默认值。
 
     支持环境变量覆盖：
     - AUTODROID_SCRCPY_MAX_SIZE: 画面长边最大像素（默认 1920）
     - AUTODROID_SCRCPY_BITRATE: 视频码率 bps（默认 8000000）
     - AUTODROID_SCRCPY_MAX_FPS: 最大帧率（默认 60）
     - AUTODROID_SCRCPY_GOP: I 帧间隔秒数，对应 i_frame_interval（默认 1）
+    - AUTODROID_SCRCPY_REMOTE_*: 同名远程档覆盖（默认 1280/2000000/30/1）
     """
+    if is_remote_serial(serial):
+        return {
+            "max_size": _stream_param_from_env(SCRCPY_REMOTE_MAX_SIZE_ENV, DEFAULT_SCRCPY_REMOTE_MAX_SIZE),
+            "video_bit_rate": _stream_param_from_env(SCRCPY_REMOTE_BITRATE_ENV, DEFAULT_SCRCPY_REMOTE_BITRATE),
+            "max_fps": _stream_param_from_env(SCRCPY_REMOTE_MAX_FPS_ENV, DEFAULT_SCRCPY_REMOTE_MAX_FPS),
+            "i_frame_interval": _stream_param_from_env(SCRCPY_REMOTE_GOP_ENV, DEFAULT_SCRCPY_REMOTE_GOP),
+        }
     return {
         "max_size": _stream_param_from_env(SCRCPY_MAX_SIZE_ENV, DEFAULT_SCRCPY_MAX_SIZE),
         "video_bit_rate": _stream_param_from_env(SCRCPY_BITRATE_ENV, DEFAULT_SCRCPY_BITRATE),
@@ -121,8 +154,8 @@ def get_scrcpy_stream_params() -> Dict[str, int]:
 
 
 def _build_scrcpy_server_command(serial: str, params: Optional[Dict[str, int]] = None) -> str:
-    """拼接 scrcpy server 启动命令；params 缺省时从环境变量解析。"""
-    effective = params if params is not None else get_scrcpy_stream_params()
+    """拼接 scrcpy server 启动命令；params 缺省时按 serial 解析。"""
+    effective = params if params is not None else get_scrcpy_stream_params(serial)
     return (
         f"adb -s {serial} shell "
         f"CLASSPATH={DEVICE_JAR_PATH} "
@@ -562,7 +595,7 @@ class ScrcpyDeviceManager:
             logger.info(f"端口转发: tcp:{local_port} → localabstract:scrcpy")
 
             # 5. 使用 subprocess 启动 scrcpy server（参数支持环境变量覆盖）
-            stream_params = get_scrcpy_stream_params()
+            stream_params = get_scrcpy_stream_params(serial)
             scrcpy_cmd = _build_scrcpy_server_command(serial, stream_params)
             logger.info(
                 "scrcpy 流参数生效: serial=%s max_size=%s video_bit_rate=%s max_fps=%s i_frame_interval=%s",

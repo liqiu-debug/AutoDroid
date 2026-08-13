@@ -16,8 +16,8 @@ from backend.device_agents.protocol import parse_tunnel_serial, tunnel_serial
 
 logger = logging.getLogger(__name__)
 
-# 周期兜底巡检间隔（秒）
-SYNC_INTERVAL_SECONDS = 30
+# 周期兜底巡检间隔（秒）：隧道条目变 offline 后最迟这么久被修复
+SYNC_INTERVAL_SECONDS = 10
 ADB_COMMAND_TIMEOUT_SECONDS = 10
 
 # 这些 adb 状态不做干预：unauthorized 需要用户在手机上确认 RSA 授权，
@@ -122,11 +122,14 @@ class AdbKeeper:
             return
         states = parse_adb_devices_tunnel_states(output)
 
+        # 各端口的清理/建连互不依赖，并行执行避免坏端口串行阻塞好端口
+        tasks = []
+
         # 清理不再期望的隧道条目
         for port, state in states.items():
             if port in desired:
                 continue
-            await self._disconnect(port, reason=f"tunnel gone (state={state})")
+            tasks.append(self._disconnect(port, reason=f"tunnel gone (state={state})"))
 
         # 建立/修复期望的隧道条目
         for port in sorted(desired):
@@ -138,10 +141,16 @@ class AdbKeeper:
                     "隧道设备 %s 状态 %s，等待授权/握手完成", tunnel_serial(port), state
                 )
                 continue
-            if state is not None:
-                # offline 等异常状态：先断开再重连
-                await self._disconnect(port, reason=f"repair (state={state})")
-            await self._connect(port)
+            tasks.append(self._repair(port, state))
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _repair(self, port: int, state: Optional[str]) -> None:
+        if state is not None:
+            # offline 等异常状态：先断开再重连
+            await self._disconnect(port, reason=f"repair (state={state})")
+        await self._connect(port)
 
     async def _connect(self, port: int) -> None:
         serial = tunnel_serial(port)

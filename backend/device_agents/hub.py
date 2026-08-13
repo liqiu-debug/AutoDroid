@@ -13,6 +13,7 @@
 import asyncio
 import json
 import logging
+import socket
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
@@ -36,7 +37,9 @@ from backend.device_agents.protocol import (
 logger = logging.getLogger(__name__)
 
 # Agent 未发任何消息（含应用层 ping）超过该秒数即判定失联
-SESSION_IDLE_TIMEOUT_SECONDS = 75
+# （Agent ping 间隔 20s，45s = 容忍丢 1 次 ping；失联越早判定，
+#  keeper 越早清理陈旧 adb 条目、新会话越早接管）
+SESSION_IDLE_TIMEOUT_SECONDS = 45
 # 等待首条 register 消息的超时
 REGISTER_TIMEOUT_SECONDS = 15
 # RemoteAgent.last_seen_at 落库节流间隔
@@ -551,6 +554,13 @@ class TunnelHub:
         if agent_session.closed:
             writer.close()
             return
+        # adb 命令多为小包往返，关闭 Nagle 避免每次交互吃合并延迟
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         conn_id = agent_session.allocate_conn_id()
         conn = TunnelConnection(conn_id, runtime.usb_serial, reader, writer)
         agent_session.conns[conn_id] = conn

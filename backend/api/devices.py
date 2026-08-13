@@ -957,27 +957,54 @@ async def _run_adb_command(*args: str, timeout: int = 15) -> bytes:
         raise RuntimeError("ADB command timed out")
 
 
-async def _get_device_prop(serial: str, prop: str) -> str:
-    """获取设备单个属性值"""
+# 批量属性查询的分隔标记：一次 shell 往返取回全部属性，
+# 远程隧道/无线设备下把最多 8 次 adb 往返压缩为 1 次。
+_PROP_BATCH_SEPARATOR = "___AUTODROID_SEP___"
+
+# market_name 候选属性（按优先级）：通用 → OPPO/OnePlus → vivo
+_MARKET_NAME_PROPS = [
+    "ro.product.marketname",
+    "ro.vendor.oplus.market.name",
+    "ro.vivo.market.name",
+]
+
+_BASE_DEVICE_PROPS = [
+    "ro.product.model",
+    "ro.product.brand",
+    "ro.build.version.release",
+]
+
+
+async def _get_device_props_batch(serial: str) -> Dict[str, str]:
+    """一次 adb shell 往返取回基础属性 + market_name 候选 + 分辨率。
+
+    返回 {prop_name: value, "resolution": "1080x2340"}，失败键值为空串。
+    """
+    props = _BASE_DEVICE_PROPS + _MARKET_NAME_PROPS
+    script = f"; echo {_PROP_BATCH_SEPARATOR}; ".join(
+        [f"getprop {prop}" for prop in props] + ["wm size"]
+    )
+    result: Dict[str, str] = {prop: "" for prop in props}
+    result["resolution"] = ""
     try:
-        raw = await _run_adb_command("-s", serial, "shell", "getprop", prop)
-        return raw.decode("utf-8", errors="replace").strip()
+        raw = await _run_adb_command("-s", serial, "shell", script)
     except Exception as e:
-        logger.warning(f"获取 {serial} 属性 {prop} 失败: {e}")
-        return ""
+        logger.warning(f"批量获取 {serial} 属性失败: {e}")
+        return result
 
+    parts = raw.decode("utf-8", errors="replace").split(_PROP_BATCH_SEPARATOR)
+    if len(parts) != len(props) + 1:
+        logger.warning(
+            "批量属性输出段数异常: serial=%s expected=%s got=%s", serial, len(props) + 1, len(parts)
+        )
+        return result
 
-async def _get_device_resolution(serial: str) -> str:
-    """获取设备分辨率"""
-    try:
-        raw = await _run_adb_command("-s", serial, "shell", "wm", "size")
-        # 输出格式: "Physical size: 1080x2340"
-        text = raw.decode("utf-8", errors="replace").strip()
-        if ":" in text:
-            return text.split(":")[-1].strip()
-        return text
-    except Exception:
-        return ""
+    for prop, value in zip(props, parts):
+        result[prop] = value.strip()
+    # wm size 输出格式: "Physical size: 1080x2340"
+    size_text = parts[-1].strip()
+    result["resolution"] = size_text.split(":")[-1].strip() if ":" in size_text else size_text
+    return result
 
 
 async def _run_blocking_call(func, *args):
@@ -1442,30 +1469,20 @@ async def sync_devices(
 
     # Step 2: 并发获取设备属性
     async def _fetch_device_info(serial: str) -> dict:
-        # 1. 获取基础属性
-        model, brand, version, resolution = await asyncio.gather(
-            _get_device_prop(serial, "ro.product.model"),
-            _get_device_prop(serial, "ro.product.brand"),
-            _get_device_prop(serial, "ro.build.version.release"),
-            _get_device_resolution(serial),
-        )
-        
-        # 2. 根据厂商特性尝试获取市场名称
-        market_name_props = [
-            "ro.product.marketname",  # 通用
-            "ro.vendor.oplus.market.name",  # OPPO / OnePlus
-            "ro.vivo.market.name",  # vivo
-            "ro.product.model", # 作为最低限度的 fallback，但我们会优先检查前面的
-        ]
-        
+        # 一次 shell 往返取回全部属性（远程隧道设备下多次往返代价高）
+        props = await _get_device_props_batch(serial)
+        model = props["ro.product.model"]
+        version = props["ro.build.version.release"]
+
+        # 根据厂商特性提取市场名称（候选属性按优先级排列）
         market_name = ""
-        for prop in market_name_props:
-            val = await _get_device_prop(serial, prop)
+        for prop in _MARKET_NAME_PROPS:
+            val = props.get(prop) or ""
             if val and val.lower() not in ["null", "unknown"]:
                 market_name = val
                 break
-                
-        # 如果 market_name 提取出来和 model 相同，或者提取失败，统一交给前端去 fallback 展示
+
+        # 如果 market_name 提取失败或和 model 相同，统一交给前端去 fallback 展示
         if not market_name or market_name == model:
             market_name = None
 
@@ -1473,10 +1490,10 @@ async def sync_devices(
             "serial": serial,
             "platform": "android",
             "model": model or "Unknown",
-            "brand": (brand or "").upper(),
+            "brand": (props["ro.product.brand"] or "").upper(),
             "android_version": version,
             "os_version": version,  # 同步写入跨平台版本号
-            "resolution": resolution,
+            "resolution": props["resolution"],
             "market_name": market_name,
         }
         # 远程接入设备（127.0.0.1:<隧道端口>）补充来源信息

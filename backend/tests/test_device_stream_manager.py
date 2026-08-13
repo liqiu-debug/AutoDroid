@@ -9,12 +9,20 @@ from backend.device_stream.manager import (
     DEFAULT_SCRCPY_GOP,
     DEFAULT_SCRCPY_MAX_FPS,
     DEFAULT_SCRCPY_MAX_SIZE,
+    DEFAULT_SCRCPY_REMOTE_BITRATE,
+    DEFAULT_SCRCPY_REMOTE_GOP,
+    DEFAULT_SCRCPY_REMOTE_MAX_FPS,
+    DEFAULT_SCRCPY_REMOTE_MAX_SIZE,
     SCRCPY_BITRATE_ENV,
     SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT,
     SCRCPY_GOP_ENV,
     SCRCPY_MAX_FPS_ENV,
     SCRCPY_MAX_SIZE_ENV,
     SCRCPY_POINTER_ID_GENERIC_FINGER,
+    SCRCPY_REMOTE_BITRATE_ENV,
+    SCRCPY_REMOTE_GOP_ENV,
+    SCRCPY_REMOTE_MAX_FPS_ENV,
+    SCRCPY_REMOTE_MAX_SIZE_ENV,
     ClientStreamQueue,
     DeviceInfo,
     ScrcpyDeviceManager,
@@ -25,6 +33,7 @@ from backend.device_stream.manager import (
     _get_h264_init_packets,
     _update_h264_init_cache,
     get_scrcpy_stream_params,
+    is_remote_serial,
 )
 
 SCRCPY_ENV_NAMES = (
@@ -32,6 +41,10 @@ SCRCPY_ENV_NAMES = (
     SCRCPY_BITRATE_ENV,
     SCRCPY_MAX_FPS_ENV,
     SCRCPY_GOP_ENV,
+    SCRCPY_REMOTE_MAX_SIZE_ENV,
+    SCRCPY_REMOTE_BITRATE_ENV,
+    SCRCPY_REMOTE_MAX_FPS_ENV,
+    SCRCPY_REMOTE_GOP_ENV,
 )
 
 SPS = b"\x00\x00\x00\x01\x67\x64\x00\x1f"
@@ -157,6 +170,70 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         self.assertIn("video_bit_rate=4000000 ", command)
         self.assertIn("max_fps=25 ", command)
         self.assertTrue(command.endswith("i_frame_interval=5"))
+
+    def test_is_remote_serial_detects_tunnel_and_wireless_forms(self):
+        self.assertTrue(is_remote_serial("127.0.0.1:28100"))
+        self.assertTrue(is_remote_serial("192.168.1.5:5555"))
+        self.assertFalse(is_remote_serial("emulator-5554"))
+        self.assertFalse(is_remote_serial("ABCD1234"))
+        self.assertFalse(is_remote_serial(""))
+
+    def test_remote_serial_uses_remote_profile_defaults(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear_scrcpy_env()
+            params = get_scrcpy_stream_params("127.0.0.1:28100")
+
+        self.assertEqual(
+            params,
+            {
+                "max_size": DEFAULT_SCRCPY_REMOTE_MAX_SIZE,
+                "video_bit_rate": DEFAULT_SCRCPY_REMOTE_BITRATE,
+                "max_fps": DEFAULT_SCRCPY_REMOTE_MAX_FPS,
+                "i_frame_interval": DEFAULT_SCRCPY_REMOTE_GOP,
+            },
+        )
+
+    def test_usb_serial_keeps_standard_profile(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear_scrcpy_env()
+            params = get_scrcpy_stream_params("ABCD1234")
+
+        self.assertEqual(params["max_size"], DEFAULT_SCRCPY_MAX_SIZE)
+        self.assertEqual(params["video_bit_rate"], DEFAULT_SCRCPY_BITRATE)
+
+    def test_remote_env_overrides_remote_profile_only(self):
+        env = {
+            SCRCPY_REMOTE_MAX_SIZE_ENV: "960",
+            SCRCPY_REMOTE_BITRATE_ENV: "1500000",
+            SCRCPY_REMOTE_MAX_FPS_ENV: "20",
+            SCRCPY_REMOTE_GOP_ENV: "2",
+        }
+        with patch.dict(os.environ, env):
+            for name in (SCRCPY_MAX_SIZE_ENV, SCRCPY_BITRATE_ENV, SCRCPY_MAX_FPS_ENV, SCRCPY_GOP_ENV):
+                os.environ.pop(name, None)
+            remote = get_scrcpy_stream_params("127.0.0.1:28101")
+            usb = get_scrcpy_stream_params("ABCD1234")
+
+        self.assertEqual(
+            remote,
+            {
+                "max_size": 960,
+                "video_bit_rate": 1500000,
+                "max_fps": 20,
+                "i_frame_interval": 2,
+            },
+        )
+        self.assertEqual(usb["max_size"], DEFAULT_SCRCPY_MAX_SIZE)
+        self.assertEqual(usb["video_bit_rate"], DEFAULT_SCRCPY_BITRATE)
+
+    def test_build_scrcpy_server_command_applies_remote_profile_by_serial(self):
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear_scrcpy_env()
+            command = _build_scrcpy_server_command("127.0.0.1:28100")
+
+        self.assertIn(f"max_size={DEFAULT_SCRCPY_REMOTE_MAX_SIZE} ", command)
+        self.assertIn(f"video_bit_rate={DEFAULT_SCRCPY_REMOTE_BITRATE} ", command)
+        self.assertIn(f"max_fps={DEFAULT_SCRCPY_REMOTE_MAX_FPS} ", command)
 
 
 class DeviceStreamManagerCacheTests(unittest.TestCase):
