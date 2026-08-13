@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,6 +53,13 @@ CLICK_IMAGE_REQUIRED_DETAIL = "添加步骤失败：当前点击区域无 Desc/T
 CLICK_TARGET_NOT_FOUND_DETAIL = "添加步骤失败：当前点击区域未识别到可录制元素，请重试或使用图像点击步骤。"
 
 RECORDING_IOS_IDLE_TTL_SECONDS = 45.0
+
+# Android u2 连接缓存空闲回收时间；u2 Device 本身无长连接资源，仅避免无限膨胀
+RECORDING_ANDROID_IDLE_TTL_SECONDS = 300.0
+
+# dump 截图统一编码为 JPEG 的质量：截图是图像模板裁剪的素材源，
+# q90 的压缩痕迹对灰度模板匹配（阈值 0.95）影响可忽略，体积比 PNG 小 5-10 倍
+RECORDING_SCREENSHOT_JPEG_QUALITY = 90
 
 
 class _RecordingIOSSessionEntry:
@@ -179,6 +187,52 @@ class _RecordingIOSSessionPool:
 _recording_ios_session_pool = _RecordingIOSSessionPool()
 
 
+class _RecordingAndroidDevicePool:
+    """Android u2 连接缓存：per-serial 复用 Device 对象。
+
+    u2.connect 每次都有版本探测/握手往返，远程隧道设备下以秒计。
+    u2 的层级（uiautomator jsonrpc）与截图（adb screencap）走互相
+    独立的通道，同一 Device 对象可并发使用，故不做 per-entry 互斥，
+    只做缓存与出错失效。
+    """
+
+    def __init__(self) -> None:
+        self._entries: Dict[str, Tuple[Any, float]] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, serial: Optional[str]) -> Any:
+        device_id = str(serial or "").strip()
+        now = time.time()
+        with self._lock:
+            self._evict_stale_locked(now)
+            cached = self._entries.get(device_id)
+            if cached is not None:
+                self._entries[device_id] = (cached[0], now)
+                return cached[0]
+        device = u2.connect(device_id) if device_id else u2.connect()
+        with self._lock:
+            self._entries[device_id] = (device, time.time())
+        return device
+
+    def invalidate(self, serial: Optional[str], device: Optional[Any] = None) -> None:
+        device_id = str(serial or "").strip()
+        with self._lock:
+            cached = self._entries.get(device_id)
+            if cached is None:
+                return
+            if device is not None and cached[0] is not device:
+                return
+            self._entries.pop(device_id, None)
+
+    def _evict_stale_locked(self, now: float) -> None:
+        for device_id, (_, last_used) in list(self._entries.items()):
+            if (now - last_used) >= RECORDING_ANDROID_IDLE_TTL_SECONDS:
+                self._entries.pop(device_id, None)
+
+
+_recording_android_device_pool = _RecordingAndroidDevicePool()
+
+
 @router.get("/api/device/dump")
 @router.get("/device/dump", include_in_schema=False)
 def dump_device_info(
@@ -211,14 +265,32 @@ def dump_device_info(
         _cleanup_recording_device(cleanup)
 
 
-def _take_screenshot_base64(device) -> str:
-    """工具函数：截取设备屏幕并返回 base64 字符串"""
+def _image_bytes_format(raw: bytes) -> str:
+    """按魔数识别压缩图像字节流格式，未知时按 png 处理。"""
+    if raw[:2] == b"\xff\xd8":
+        return "jpeg"
+    return "png"
+
+
+def _take_screenshot_payload(device) -> Tuple[str, str]:
+    """截取设备屏幕，返回 (base64, 图像格式)。
+
+    PIL 图像统一编码为原分辨率 JPEG（体积小、编码快）；驱动直接返回的
+    压缩字节流按魔数标注格式后透传，不做二次编码。分辨率保持原样：
+    截图是模板裁剪素材源，模板匹配多尺度范围有限（0.8-1.2），不可缩放。
+    """
     image = device.screenshot()
     if isinstance(image, (bytes, bytearray)):
-        return base64.b64encode(bytes(image)).decode("utf-8")
+        raw = bytes(image)
+        return base64.b64encode(raw).decode("utf-8"), _image_bytes_format(raw)
     buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    image.convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
+    return base64.b64encode(buffered.getvalue()).decode("utf-8"), "jpeg"
+
+
+def _take_screenshot_base64(device) -> str:
+    """工具函数：截取设备屏幕并返回 base64 字符串"""
+    return _take_screenshot_payload(device)[0]
 
 
 def _resolve_recording_platform(session: Session, serial: Optional[str]) -> str:
@@ -247,7 +319,7 @@ def _connect_recording_device(
             raise HTTPException(status_code=400, detail=str(exc))
         return platform, driver, partial(_recording_ios_session_pool.release, serial, driver)
 
-    device = u2.connect(serial) if serial else u2.connect()
+    device = _recording_android_device_pool.acquire(serial)
     return platform, device, None
 
 
@@ -261,7 +333,11 @@ def _cleanup_recording_device(cleanup) -> None:
 
 
 def _invalidate_recording_device(platform: Optional[str], serial: Optional[str], device: Optional[Any]) -> None:
-    if platform != "ios" or not serial:
+    if platform != "ios":
+        # Android：连接出错时丢弃缓存的 u2 Device，下次请求重新连接
+        _recording_android_device_pool.invalidate(serial, device)
+        return
+    if not serial:
         return
     try:
         _recording_ios_session_pool.invalidate(serial, device if isinstance(device, IOSDriver) else None)
@@ -369,12 +445,31 @@ def _build_device_dump_payload(
     include_screenshot: bool = True,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
+
+    # Android 的层级（uiautomator jsonrpc）与截图（adb screencap）走不同通道，
+    # 并行获取把耗时压到两者较慢一方（远程隧道设备下各自都以秒计）。
+    # iOS 会话按设计串行使用（会话池 per-entry 互斥），保持原串行路径。
+    if platform != "ios" and include_hierarchy and include_screenshot:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            hierarchy_future = executor.submit(_build_hierarchy_payload, device, platform)
+            screenshot_future = executor.submit(_take_screenshot_payload, device)
+            if include_device_info:
+                payload["device_info"] = _get_device_info_payload(device, platform=platform, serial=serial)
+            hierarchy_payload = hierarchy_future.result()
+            screenshot_b64, screenshot_format = screenshot_future.result()
+        payload.update(hierarchy_payload)
+        payload["screenshot"] = screenshot_b64
+        payload["screenshot_format"] = screenshot_format
+        return payload
+
     if include_device_info:
         payload["device_info"] = _get_device_info_payload(device, platform=platform, serial=serial)
     if include_hierarchy:
         payload.update(_build_hierarchy_payload(device, platform=platform))
     if include_screenshot:
-        payload["screenshot"] = _take_screenshot_base64(device)
+        screenshot_b64, screenshot_format = _take_screenshot_payload(device)
+        payload["screenshot"] = screenshot_b64
+        payload["screenshot_format"] = screenshot_format
     return payload
 
 

@@ -46,6 +46,46 @@ const {
   retryLiveStreamChannel
 } = useDeviceStreams({ liveMode, isStageActive })
 
+// 预览模式偏好：远程/无线设备（serial 为 ip:port 形态）默认投屏模式——
+// 静态截图需要整图挤过弱链路，投屏模式仅轮询层级；用户手动切换后按设备记忆。
+const PREVIEW_MODE_STORAGE_PREFIX = 'autodroid.previewMode.'
+const NETWORK_SERIAL_RE = /^[\w.\-]+:\d+$/
+
+function readPreviewModePreference(serial) {
+  try {
+    return window.localStorage?.getItem(PREVIEW_MODE_STORAGE_PREFIX + serial) || ''
+  } catch {
+    return ''
+  }
+}
+
+function rememberPreviewModePreference(isLive) {
+  if (!selectedSerial.value) return
+  try {
+    window.localStorage?.setItem(
+      PREVIEW_MODE_STORAGE_PREFIX + selectedSerial.value,
+      isLive ? 'live' : 'static'
+    )
+  } catch {
+    // localStorage 不可用时偏好仅本次会话生效
+  }
+}
+
+function defaultLiveModeForSerial(serial) {
+  const stored = readPreviewModePreference(serial)
+  if (stored === 'live') return true
+  if (stored === 'static') return false
+  return NETWORK_SERIAL_RE.test(String(serial || ''))
+}
+
+watch(selectedSerial, (serial, oldSerial) => {
+  if (!serial || serial === oldSerial) return
+  const nextLive = isSelectedDeviceBusy.value ? true : defaultLiveModeForSerial(serial)
+  if (liveMode.value !== nextLive) {
+    liveMode.value = nextLive
+  }
+})
+
 const previewMode = computed({
   get: () => (liveMode.value ? 'live' : 'static'),
   set: (value) => {
@@ -55,6 +95,7 @@ const previewMode = computed({
       liveMode.value = true
       return
     }
+    rememberPreviewModePreference(nextLiveMode)
     liveMode.value = nextLiveMode
   }
 })
@@ -472,7 +513,8 @@ watch(
 onMounted(async () => {
   isStageActive.value = true
   await fetchDevices()
-  if (isStageActive.value && selectedSerial.value) {
+  // 远程设备默认已切投屏模式（selectedSerial watcher），静态整图 dump 只在静态模式下拉取
+  if (isStageActive.value && selectedSerial.value && !liveMode.value) {
     fetchDump()
   }
 })

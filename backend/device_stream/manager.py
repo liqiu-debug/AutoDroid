@@ -15,9 +15,10 @@ import threading
 import time
 import logging
 import queue
-from typing import Dict, Optional, Generator, List, Set
+from typing import Any, Dict, Optional, Generator, List, Set
 
 import adbutils
+from backend.device_agents.protocol import parse_tunnel_serial
 from backend.paths import PROJECT_ROOT, project_path
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
 
@@ -58,6 +59,41 @@ SCRCPY_REMOTE_MAX_SIZE_ENV = "AUTODROID_SCRCPY_REMOTE_MAX_SIZE"
 SCRCPY_REMOTE_BITRATE_ENV = "AUTODROID_SCRCPY_REMOTE_BITRATE"
 SCRCPY_REMOTE_MAX_FPS_ENV = "AUTODROID_SCRCPY_REMOTE_MAX_FPS"
 SCRCPY_REMOTE_GOP_ENV = "AUTODROID_SCRCPY_REMOTE_GOP"
+
+# 投屏清晰度档位。运行时可按设备切换（set_stream_profile_override + REST）：
+# - hd（高清）：USB 直插默认档
+# - standard（标准）：非隧道网络设备（无线 adb IP:5555）默认档
+# - smooth（流畅）：Agent 隧道设备默认档 —— 跨公网/VPN 弱链路下码率必须
+#   低于可用带宽，否则隧道各段 TCP 队列积压、投屏延迟无界累积；
+#   GOP 拉长到 2s 减小 IDR 突发（新观看端播种至多回看 2s，可接受）
+STREAM_PROFILE_HD = "hd"
+STREAM_PROFILE_STANDARD = "standard"
+STREAM_PROFILE_SMOOTH = "smooth"
+
+STREAM_PROFILES: Dict[str, Dict[str, int]] = {
+    STREAM_PROFILE_HD: {
+        "max_size": DEFAULT_SCRCPY_MAX_SIZE,
+        "video_bit_rate": DEFAULT_SCRCPY_BITRATE,
+        "max_fps": DEFAULT_SCRCPY_MAX_FPS,
+        "i_frame_interval": DEFAULT_SCRCPY_GOP,
+    },
+    STREAM_PROFILE_STANDARD: {
+        "max_size": DEFAULT_SCRCPY_REMOTE_MAX_SIZE,
+        "video_bit_rate": DEFAULT_SCRCPY_REMOTE_BITRATE,
+        "max_fps": DEFAULT_SCRCPY_REMOTE_MAX_FPS,
+        "i_frame_interval": DEFAULT_SCRCPY_REMOTE_GOP,
+    },
+    STREAM_PROFILE_SMOOTH: {
+        "max_size": 800,
+        "video_bit_rate": 1_000_000,
+        "max_fps": 20,
+        "i_frame_interval": 2,
+    },
+}
+
+# 运行时档位覆盖（内存态，平台重启后回到按 serial 形态的默认档）
+_stream_profile_overrides: Dict[str, str] = {}
+_stream_profile_lock = threading.Lock()
 
 # ip:port / host:port 形态 serial（无线 adb / 隧道设备），非本机 USB 直插
 _NETWORK_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
@@ -124,21 +160,76 @@ def is_remote_serial(serial: str) -> bool:
     return bool(_NETWORK_SERIAL_RE.match(str(serial or "")) and ":" in str(serial or ""))
 
 
+def is_tunnel_serial(serial: str) -> bool:
+    """serial 是否为 Agent 反向隧道设备（127.0.0.1:28100-28199）。"""
+    return parse_tunnel_serial(str(serial or "")) is not None
+
+
+def default_stream_profile(serial: str) -> str:
+    """按 serial 形态返回默认清晰度档位。"""
+    key = str(serial or "").strip()
+    if is_tunnel_serial(key):
+        return STREAM_PROFILE_SMOOTH
+    if is_remote_serial(key):
+        return STREAM_PROFILE_STANDARD
+    return STREAM_PROFILE_HD
+
+
+def set_stream_profile_override(serial: str, profile: Optional[str]) -> None:
+    """设置某设备的运行时档位；profile=None 清除覆盖、恢复默认档。
+
+    只更新内存状态，不重启视频流；调用方（REST 端点）负责触发
+    reconnect_device 使新档位生效。
+    """
+    key = str(serial or "").strip()
+    if not key:
+        raise ValueError("serial 不能为空")
+    if profile is not None and profile not in STREAM_PROFILES:
+        raise ValueError(f"未知投屏档位: {profile}")
+    with _stream_profile_lock:
+        if profile is None:
+            _stream_profile_overrides.pop(key, None)
+        else:
+            _stream_profile_overrides[key] = profile
+
+
+def get_stream_profile_state(serial: str) -> Dict[str, Any]:
+    """返回设备当前生效档位：{profile, source: override|default, params}。"""
+    key = str(serial or "").strip()
+    with _stream_profile_lock:
+        override = _stream_profile_overrides.get(key)
+    if override in STREAM_PROFILES:
+        return {"profile": override, "source": "override", "params": dict(STREAM_PROFILES[override])}
+    return {
+        "profile": default_stream_profile(key),
+        "source": "default",
+        "params": get_scrcpy_stream_params(key),
+    }
+
+
 def get_scrcpy_stream_params(serial: str = "") -> Dict[str, int]:
     """
     解析当前生效的 scrcpy 视频流参数（每次启动设备流时求值）。
 
-    USB 直插设备走标准档，远程/无线设备（serial 为 ip:port 形态，含
-    Agent 隧道 127.0.0.1:281xx 与无线 adb IP:5555）走降档默认值。
+    优先级：运行时档位覆盖（REST 设置，取档位表原值）> 按 serial 形态
+    的默认档 + 环境变量覆盖。默认档：Agent 隧道=流畅（弱链路下优先保
+    延迟），其他 ip:port 无线=标准，USB 直插=高清。
 
-    支持环境变量覆盖：
-    - AUTODROID_SCRCPY_MAX_SIZE: 画面长边最大像素（默认 1920）
-    - AUTODROID_SCRCPY_BITRATE: 视频码率 bps（默认 8000000）
-    - AUTODROID_SCRCPY_MAX_FPS: 最大帧率（默认 60）
-    - AUTODROID_SCRCPY_GOP: I 帧间隔秒数，对应 i_frame_interval（默认 1）
-    - AUTODROID_SCRCPY_REMOTE_*: 同名远程档覆盖（默认 1280/2000000/30/1）
+    环境变量（仅作用于默认档路径）：
+    - AUTODROID_SCRCPY_MAX_SIZE: 高清档长边最大像素（默认 1920）
+    - AUTODROID_SCRCPY_BITRATE: 高清档码率 bps（默认 8000000）
+    - AUTODROID_SCRCPY_MAX_FPS: 高清档最大帧率（默认 60）
+    - AUTODROID_SCRCPY_GOP: 高清档 I 帧间隔秒数（默认 1）
+    - AUTODROID_SCRCPY_REMOTE_*: 标准档同名覆盖（默认 1280/2000000/30/1）
     """
-    if is_remote_serial(serial):
+    key = str(serial or "").strip()
+    with _stream_profile_lock:
+        override = _stream_profile_overrides.get(key)
+    if override in STREAM_PROFILES:
+        return dict(STREAM_PROFILES[override])
+    if is_tunnel_serial(key):
+        return dict(STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
+    if is_remote_serial(key):
         return {
             "max_size": _stream_param_from_env(SCRCPY_REMOTE_MAX_SIZE_ENV, DEFAULT_SCRCPY_REMOTE_MAX_SIZE),
             "video_bit_rate": _stream_param_from_env(SCRCPY_REMOTE_BITRATE_ENV, DEFAULT_SCRCPY_REMOTE_BITRATE),

@@ -6,6 +6,7 @@
 """
 import asyncio
 import base64
+import io
 import logging
 import os
 import platform
@@ -18,7 +19,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -1622,13 +1623,46 @@ async def sync_devices(
     )
 
 
+# 设备中心弹窗预览规格：纯人眼预览（非模板匹配素材），可安全降分辨率换体积
+DEVICE_PREVIEW_MAX_SIDE = 1280
+DEVICE_PREVIEW_JPEG_QUALITY = 80
+
+
+def _encode_preview_image(raw_bytes: bytes) -> Tuple[bytes, str]:
+    """把整图截图压成预览规格（最长边 ≤1280 的 JPEG），返回 (字节, 格式)。
+
+    整图 PNG 通常 1-5MB，转 JPEG 预览后约 100-200KB；转换失败时原样
+    返回并按魔数标注格式，保证截图可用性优先。
+    """
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(raw_bytes))
+        image.load()
+        width, height = image.size
+        longest = max(width, height)
+        if longest > DEVICE_PREVIEW_MAX_SIDE:
+            scale = DEVICE_PREVIEW_MAX_SIDE / float(longest)
+            image = image.resize(
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                Image.LANCZOS,
+            )
+        buffered = io.BytesIO()
+        image.convert("RGB").save(buffered, format="JPEG", quality=DEVICE_PREVIEW_JPEG_QUALITY)
+        return buffered.getvalue(), "jpeg"
+    except Exception as e:
+        logger.warning(f"截图预览转码失败，返回原图: {e}")
+        image_format = "jpeg" if raw_bytes[:2] == b"\xff\xd8" else "png"
+        return raw_bytes, image_format
+
+
 @router.get("/{serial}/screenshot")
 async def get_screenshot(serial: str, session: Session = Depends(get_session)):
     """
     内存级屏幕快照
 
-    执行 adb exec-out screencap -p，直接将 stdout 二进制流转为 Base64，
-    全程不写磁盘，速度极快。
+    执行 adb exec-out screencap -p 后在服务端压成预览规格
+    （最长边 ≤1280 的 JPEG）再转 Base64，全程不写磁盘。
     """
     db_device = session.exec(select(Device).where(Device.serial == serial)).first()
     is_ios_device = bool(
@@ -1666,8 +1700,9 @@ async def get_screenshot(serial: str, session: Session = Depends(get_session)):
 
         if not raw_bytes or len(raw_bytes) < 100:
             raise RuntimeError("截图数据为空或异常")
-        base64_img = base64.b64encode(raw_bytes).decode("utf-8")
-        return {"base64_img": base64_img}
+        preview_bytes, image_format = await _run_blocking_call(_encode_preview_image, raw_bytes)
+        base64_img = base64.b64encode(preview_bytes).decode("utf-8")
+        return {"base64_img": base64_img, "image_format": image_format}
     except HTTPException:
         raise
     except Exception as e:

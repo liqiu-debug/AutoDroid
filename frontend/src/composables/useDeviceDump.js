@@ -97,7 +97,8 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, isIosSt
   const updateStateFromDump = (dump) => {
     if (!dump) return
     if (dump.screenshot) {
-      screenshot.value = `data:image/png;base64,${dump.screenshot}`
+      const format = dump.screenshot_format || 'png'
+      screenshot.value = `data:image/${format};base64,${dump.screenshot}`
       lastScreenshotUpdatedAt = Date.now()
     }
     if (dump.device_info) {

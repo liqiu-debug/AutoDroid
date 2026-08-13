@@ -123,6 +123,112 @@ let resizeObserver = null
 /** WebCodecs 运行期降级标记（连续解码失败 / codec 不支持后置位，切换设备时重置） */
 let runtimeFallbackToJmuxer = false
 
+// ==================== 清晰度档位 ====================
+
+const STREAM_PROFILE_OPTIONS = [
+  { value: 'hd', label: '高清' },
+  { value: 'standard', label: '标准' },
+  { value: 'smooth', label: '流畅' }
+]
+const PROFILE_STORAGE_PREFIX = 'autodroid.scrcpyProfile.'
+/** 换档后服务端重启视频流的等待/重试节奏 */
+const PROFILE_RECONNECT_DELAY_MS = 1200
+const PROFILE_RECONNECT_MAX_RETRIES = 6
+
+const streamProfile = ref('')
+const profileSwitching = ref(false)
+let profileRetryCount = 0
+let profileRetryTimer = null
+/** 本次 serial 是否已做过"本地记忆档位 → 服务端"的同步，避免反复自动下发 */
+let profileSynced = false
+
+function readStoredProfile() {
+  try {
+    return window.localStorage?.getItem(PROFILE_STORAGE_PREFIX + props.serial) || ''
+  } catch {
+    return ''
+  }
+}
+
+function storeProfile(value) {
+  try {
+    window.localStorage?.setItem(PROFILE_STORAGE_PREFIX + props.serial, value)
+  } catch {
+    // localStorage 不可用时档位仅本次会话生效
+  }
+}
+
+/**
+ * 同步服务端档位到下拉框；用户此前选过且与服务端不一致时自动下发一次
+ * （覆盖是服务端内存态，平台重启后会回默认档）。
+ */
+async function syncStreamProfile() {
+  if (!props.serial || props.streamUrl) return
+  try {
+    const { data } = await api.getStreamProfile(props.serial)
+    if (!streamProfile.value || !profileSwitching.value) {
+      streamProfile.value = data.profile || ''
+    }
+    const stored = readStoredProfile()
+    if (
+      !profileSynced
+      && stored
+      && STREAM_PROFILE_OPTIONS.some((opt) => opt.value === stored)
+      && stored !== data.profile
+    ) {
+      profileSynced = true
+      applyStreamProfile(stored)
+      return
+    }
+    profileSynced = true
+  } catch (err) {
+    console.debug('获取投屏档位失败:', err)
+  }
+}
+
+async function applyStreamProfile(value) {
+  profileSwitching.value = true
+  streamProfile.value = value
+  try {
+    await api.setStreamProfile(props.serial, value)
+  } catch (err) {
+    profileSwitching.value = false
+    ElMessage.error('切换清晰度失败: ' + (err.response?.data?.detail || err.message))
+    return
+  }
+  // 服务端正在以新档位重启该设备视频流；稍候重连，未就绪时按次重试
+  profileRetryCount = 0
+  scheduleProfileReconnect()
+}
+
+function scheduleProfileReconnect() {
+  clearProfileRetryTimer()
+  profileRetryTimer = setTimeout(() => {
+    profileRetryTimer = null
+    connect()
+  }, PROFILE_RECONNECT_DELAY_MS)
+}
+
+function clearProfileRetryTimer() {
+  if (profileRetryTimer) {
+    clearTimeout(profileRetryTimer)
+    profileRetryTimer = null
+  }
+}
+
+function resetProfileState() {
+  clearProfileRetryTimer()
+  profileSwitching.value = false
+  profileRetryCount = 0
+  profileSynced = false
+  streamProfile.value = ''
+}
+
+function onProfileChange(value) {
+  storeProfile(value)
+  applyStreamProfile(value)
+}
+
 // ==================== 解码路径选择 ====================
 
 /**
@@ -512,8 +618,12 @@ function connect() {
 
   ws.onopen = () => {
     status.value = 'connected'
+    profileSwitching.value = false
+    profileRetryCount = 0
     emit('connected')
     startFpsCounter()
+    // 设备直连模式下同步清晰度档位（异步，不阻塞出流）
+    syncStreamProfile()
     // 追赶实时边界仅对 MSE 缓冲播放有意义；WebCodecs 路径逐帧直绘，天然贴近实时
     if (activeDecoder.value === DECODER_JMUXER) {
       startLiveEdgeSync()
@@ -545,9 +655,22 @@ function connect() {
     stopFpsCounter()
     stopLiveEdgeSync()
 
+    // 换档期间服务端会重启视频流：旧连接断开 / 新流未就绪(4004) 都按次重试
+    if (profileSwitching.value && profileRetryCount < PROFILE_RECONNECT_MAX_RETRIES) {
+      profileRetryCount++
+      status.value = 'connecting'
+      scheduleProfileReconnect()
+      return
+    }
+    profileSwitching.value = false
+
     if (event.code === 4004) {
       errorMsg.value = event.reason || '设备未就绪'
       status.value = 'error'
+      // 设备直连模式上抛错误，调用方可回落到静态截图等兜底
+      if (!props.streamUrl) {
+        emit('error', errorMsg.value)
+      }
     }
   }
 }
@@ -557,6 +680,7 @@ function disconnect() {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
+  clearProfileRetryTimer()
   stopFpsCounter()
   stopLiveEdgeSync()
   if (ws) {
@@ -678,6 +802,7 @@ onUnmounted(() => {
 
 watch(() => [props.serial, props.streamUrl], ([newSerial, newStreamUrl], [oldSerial, oldStreamUrl]) => {
   if (newSerial === oldSerial && newStreamUrl === oldStreamUrl) return
+  resetProfileState()
   if (newSerial || newStreamUrl) {
     // 切换设备时重置运行期降级标记：新码流重新走自动检测
     runtimeFallbackToJmuxer = false
@@ -703,6 +828,23 @@ defineExpose({ connect, disconnect, reconnect })
       </el-tag>
       <el-tag v-if="readOnly" type="info" size="small" effect="plain">只读</el-tag>
       <span v-if="status === 'connected'" class="fps-counter">{{ fps }} FPS</span>
+      <el-select
+        v-if="!streamUrl && serial"
+        v-model="streamProfile"
+        size="small"
+        class="profile-select"
+        placeholder="清晰度"
+        :disabled="profileSwitching"
+        title="投屏清晰度（远程设备建议流畅档）"
+        @change="onProfileChange"
+      >
+        <el-option
+          v-for="opt in STREAM_PROFILE_OPTIONS"
+          :key="opt.value"
+          :label="opt.label"
+          :value="opt.value"
+        />
+      </el-select>
       <div v-if="!streamUrl" class="toolbar-actions">
         <el-button
           v-if="status === 'disconnected' || status === 'error'"
@@ -856,6 +998,10 @@ defineExpose({ connect, disconnect, reconnect })
   font-size: 12px;
   color: #4ecca3;
   font-family: 'Courier New', monospace;
+}
+
+.profile-select {
+  width: 86px;
 }
 
 .toolbar-actions {

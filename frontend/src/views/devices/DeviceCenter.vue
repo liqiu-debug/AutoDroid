@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection, Link, Download, CopyDocument } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import api from '@/api'
+import ScrcpyPlayer from '@/components/ScrcpyPlayer.vue'
 import { useClientMode } from '@/composables/useClientMode'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 
@@ -25,11 +26,14 @@ const agentGuideVisible = ref(false)
 const agentDeleteLoadingId = ref(null)
 const agentScriptDownloading = ref(false)
 
-// 快照弹窗
+// 快照弹窗：Android 默认嵌实时投屏（避免整图截图挤占远程链路带宽），
+// iOS 或投屏不可用时回落到静态截图
 const screenshotVisible = ref(false)
 const screenshotLoading = ref(false)
 const screenshotData = ref('')
+const screenshotFormat = ref('png')
 const screenshotDevice = ref(null)
+const screenshotLiveMode = ref(false)
 
 // 就地编辑
 const editingSerial = ref(null)
@@ -85,12 +89,32 @@ const handleSync = async () => {
   }
 }
 
-/** 打开快照弹窗 */
+/** 打开快照弹窗：Android 先试实时投屏，iOS 直接静态截图 */
 const handleScreenshot = async (device) => {
   screenshotDevice.value = device
   screenshotData.value = ''
+  screenshotLiveMode.value = device.platform !== 'ios'
   screenshotVisible.value = true
-  await refreshScreenshot(device.serial)
+  if (!screenshotLiveMode.value) {
+    await refreshScreenshot(device.serial)
+  }
+}
+
+/** 实时投屏不可用（设备未就绪等）时回落到静态截图 */
+const handleScreenshotStreamError = () => {
+  if (!screenshotLiveMode.value) return
+  screenshotLiveMode.value = false
+  if (screenshotDevice.value) {
+    refreshScreenshot(screenshotDevice.value.serial)
+  }
+}
+
+/** 手动在实时投屏与静态截图之间切换 */
+const switchScreenshotMode = async (live) => {
+  screenshotLiveMode.value = live
+  if (!live && screenshotDevice.value) {
+    await refreshScreenshot(screenshotDevice.value.serial)
+  }
 }
 
 /** 刷新快照 */
@@ -99,6 +123,7 @@ const refreshScreenshot = async (serial) => {
   try {
     const { data } = await api.getDeviceScreenshot(serial)
     screenshotData.value = data.base64_img
+    screenshotFormat.value = data.image_format || 'png'
   } catch (e) {
     ElMessage.error('截图失败：' + (e.response?.data?.detail || e.message))
   } finally {
@@ -489,19 +514,38 @@ onBeforeUnmount(() => {
       align-center
       destroy-on-close
     >
-      <div class="screenshot-container" v-loading="screenshotLoading">
+      <div v-if="screenshotLiveMode" class="screenshot-live-container">
+        <ScrcpyPlayer
+          :serial="screenshotDevice?.serial || ''"
+          read-only
+          @error="handleScreenshotStreamError"
+        />
+      </div>
+      <div v-else class="screenshot-container" v-loading="screenshotLoading">
         <img
           v-if="screenshotData"
-          :src="`data:image/png;base64,${screenshotData}`"
+          :src="`data:image/${screenshotFormat};base64,${screenshotData}`"
           class="screenshot-img"
           alt="设备截图"
         />
         <el-empty v-else description="暂无截图" :image-size="80" />
       </div>
       <template #footer>
-        <el-button :icon="Refresh" @click="refreshScreenshot(screenshotDevice?.serial)" :loading="screenshotLoading">
-          刷新屏幕
-        </el-button>
+        <template v-if="screenshotLiveMode">
+          <el-button :icon="Picture" @click="switchScreenshotMode(false)">静态截图</el-button>
+        </template>
+        <template v-else>
+          <el-button
+            v-if="screenshotDevice?.platform !== 'ios'"
+            :icon="Monitor"
+            @click="switchScreenshotMode(true)"
+          >
+            实时投屏
+          </el-button>
+          <el-button :icon="Refresh" @click="refreshScreenshot(screenshotDevice?.serial)" :loading="screenshotLoading">
+            刷新屏幕
+          </el-button>
+        </template>
       </template>
     </el-dialog>
   </div>
@@ -727,19 +771,38 @@ onBeforeUnmount(() => {
       align-center
       destroy-on-close
     >
-      <div class="screenshot-container" v-loading="screenshotLoading">
+      <div v-if="screenshotLiveMode" class="screenshot-live-container">
+        <ScrcpyPlayer
+          :serial="screenshotDevice?.serial || ''"
+          read-only
+          @error="handleScreenshotStreamError"
+        />
+      </div>
+      <div v-else class="screenshot-container" v-loading="screenshotLoading">
         <img
           v-if="screenshotData"
-          :src="`data:image/png;base64,${screenshotData}`"
+          :src="`data:image/${screenshotFormat};base64,${screenshotData}`"
           class="screenshot-img"
           alt="设备截图"
         />
         <el-empty v-else description="暂无截图" :image-size="80" />
       </div>
       <template #footer>
-        <el-button :icon="Refresh" @click="refreshScreenshot(screenshotDevice?.serial)" :loading="screenshotLoading">
-          刷新屏幕
-        </el-button>
+        <template v-if="screenshotLiveMode">
+          <el-button :icon="Picture" @click="switchScreenshotMode(false)">静态截图</el-button>
+        </template>
+        <template v-else>
+          <el-button
+            v-if="screenshotDevice?.platform !== 'ios'"
+            :icon="Monitor"
+            @click="switchScreenshotMode(true)"
+          >
+            实时投屏
+          </el-button>
+          <el-button :icon="Refresh" @click="refreshScreenshot(screenshotDevice?.serial)" :loading="screenshotLoading">
+            刷新屏幕
+          </el-button>
+        </template>
       </template>
     </el-dialog>
 
@@ -1173,6 +1236,17 @@ onBeforeUnmount(() => {
   background: #1a1a2e;
   border-radius: 8px;
   overflow: hidden;
+}
+
+.screenshot-live-container {
+  height: min(70vh, 640px);
+  background: #1a1a2e;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.screenshot-live-container :deep(.scrcpy-player) {
+  height: 100%;
 }
 
 .screenshot-img {

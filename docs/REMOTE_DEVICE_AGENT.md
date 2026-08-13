@@ -72,9 +72,10 @@ Agent 脚本为**单文件、纯 Python 标准库**，无需 `pip install` 任�
 
 ## 6. 性能与运维建议
 
-- **投屏参数自动降档**：远程/无线形态设备（serial 为 `ip:port`）投屏默认走远程档 1280px / 2Mbps / 30fps（USB 直插仍为 1920px / 8Mbps / 60fps）。远程档可用环境变量 `AUTODROID_SCRCPY_REMOTE_MAX_SIZE` / `AUTODROID_SCRCPY_REMOTE_BITRATE` / `AUTODROID_SCRCPY_REMOTE_MAX_FPS` / `AUTODROID_SCRCPY_REMOTE_GOP` 覆盖。注意：adb 对每台设备只有一条 transport 连接，把远程档码率调得过高会队头阻塞该设备的所有 adb 命令（同步、截图、控制）。
-- **带宽**：远程档投屏默认 2Mbps；`adb install` 大 APK 受 B→A 上行带宽限制。建议 B→A 链路 ≥ 10Mbps。
-- **延迟**：交互延迟增加约一个 B→A 往返（同城内网通常 <10ms，无感）；隧道两端已启用 TCP_NODELAY，无 Nagle 合并延迟。
+- **投屏清晰度三档**：高清 1920px/8Mbps/60fps（USB 直插默认）、标准 1280px/2Mbps/30fps（无线 adb 默认）、流畅 800px/1Mbps/20fps/GOP2（**Agent 隧道设备默认**）。播放器工具栏可按设备切换档位，选择记忆在浏览器本地并在平台重启后自动重新下发；也可调 REST `POST /api/stream/devices/{serial}/stream-profile`（`{"profile": "hd|standard|smooth|auto"}`）。环境变量 `AUTODROID_SCRCPY_*`（高清档）与 `AUTODROID_SCRCPY_REMOTE_*`（标准档）仍可覆盖默认档参数；运行时档位优先于环境变量。
+- **带宽预算**：投屏码率必须低于 B→A 可用带宽，否则隧道各段 TCP 队列积压、投屏延迟会持续累积。流畅档含开销约 1.2Mbps，建议 B→A ≥ 3Mbps；标准档约 2.5Mbps，建议 ≥ 6Mbps。注意：adb 对每台设备只有一条 transport 连接，码率吃满带宽会队头阻塞该设备的所有 adb 命令（同步、截图、控制）。`adb install` 大 APK 受 B→A 上行带宽限制。
+- **截图链路**：设备中心快照弹窗对 Android 默认走实时投屏（不再整图截图过隧道），静态截图由服务端压为最长边 1280 的 JPEG 预览；用例编辑页对远程设备默认进入投屏模式（仅轮询层级 XML），静态模式截图为原分辨率 JPEG（作为图像模板裁剪素材，不缩放）。
+- **延迟**：交互延迟增加约一个 B→A 往返（同城内网通常 <10ms，无感；跨公网/VPN 取决于线路 RTT）；隧道两端已启用 TCP_NODELAY，无 Nagle 合并延迟。
 - **断连恢复时序**：Agent 断网后平台最迟约 45s 判定失联；Agent 恢复后 1s 起步重连；平台 adb keeper 每 10s 兜底巡检并修复 `adb connect`。整体恢复通常在 1 分钟内。
 - **休眠**：长任务期间 B 机必须保持不休眠、不断网；一台电脑只运行一个 Agent 实例。
 - **多设备**：一个 Agent 可同时接入多台 USB 设备；多个工位各自运行 Agent，互不影响。全平台隧道端口共 100 个（28100-28199），删除废弃接入点可释放端口。
@@ -89,6 +90,6 @@ Agent 脚本为**单文件、纯 Python 标准库**，无需 `pip install` 任�
 | 设备反复 OFFLINE | B 机是否休眠断网；数据线/USB 口是否松动；查看 Agent 控制台日志 |
 | `设备 xxx 未授权` | 手机上确认 B 机的 USB 调试授权弹窗 |
 | 平台日志 `隧道端口 281xx 监听失败` | A 机端口被占用，排查占用进程或删除接入点重新分配 |
-| 投屏卡顿 | 远程设备已默认降档 2Mbps；仍卡顿可进一步调低 `AUTODROID_SCRCPY_REMOTE_BITRATE`（如 1000000）后重启平台 |
+| 投屏卡顿/延迟大 | 隧道设备默认流畅档（1Mbps）；在播放器工具栏确认档位未被调高，仍卡顿说明 B→A 带宽不足 3Mbps，需改善线路 |
 
 隧道设备与直插/无线设备一样出现在 `adb devices` 中，平台侧可用 `adb -s 127.0.0.1:281xx shell` 直接诊断。

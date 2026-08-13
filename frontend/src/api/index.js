@@ -220,6 +220,12 @@ export default {
     reconnectDeviceStream(serial) {
         return api.post(`/stream/devices/${serial}/reconnect`)
     },
+    getStreamProfile(serial) {
+        return api.get(`/stream/devices/${serial}/stream-profile`)
+    },
+    setStreamProfile(serial, profile) {
+        return api.post(`/stream/devices/${serial}/stream-profile`, { profile })
+    },
     sendTouch(serial, action, x, y, options = {}) {
         const payload = { action, x, y }
         if (options.method) {
