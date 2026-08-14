@@ -14,6 +14,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,7 @@ from backend.cross_platform_execution import (
     resolve_ios_wda_url,
 )
 from backend.database import get_session
+from backend.device_transport_metrics import device_transport_metrics
 from backend.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner
 from backend.drivers.ios_driver import IOSDriver
 from backend.feature_flags import FLAG_IOS_EXECUTION, is_flag_enabled
@@ -60,6 +62,7 @@ RECORDING_ANDROID_IDLE_TTL_SECONDS = 300.0
 # dump 截图统一编码为 JPEG 的质量：截图是图像模板裁剪的素材源，
 # q90 的压缩痕迹对灰度模板匹配（阈值 0.95）影响可忽略，体积比 PNG 小 5-10 倍
 RECORDING_SCREENSHOT_JPEG_QUALITY = 90
+NETWORK_DEVICE_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
 
 
 class _RecordingIOSSessionEntry:
@@ -272,20 +275,34 @@ def _image_bytes_format(raw: bytes) -> str:
     return "png"
 
 
-def _take_screenshot_payload(device) -> Tuple[str, str]:
+def _take_screenshot_payload(device, serial: Optional[str] = None) -> Tuple[str, str]:
     """截取设备屏幕，返回 (base64, 图像格式)。
 
     PIL 图像统一编码为原分辨率 JPEG（体积小、编码快）；驱动直接返回的
     压缩字节流按魔数标注格式后透传，不做二次编码。分辨率保持原样：
     截图是模板裁剪素材源，模板匹配多尺度范围有限（0.8-1.2），不可缩放。
     """
-    image = device.screenshot()
-    if isinstance(image, (bytes, bytearray)):
-        raw = bytes(image)
-        return base64.b64encode(raw).decode("utf-8"), _image_bytes_format(raw)
-    buffered = io.BytesIO()
-    image.convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
-    return base64.b64encode(buffered.getvalue()).decode("utf-8"), "jpeg"
+    started_at = time.monotonic()
+    try:
+        image = device.screenshot()
+        if isinstance(image, (bytes, bytearray)):
+            raw = bytes(image)
+            device_transport_metrics.record(
+                str(serial or ""), "recording_screenshot", time.monotonic() - started_at, byte_count=len(raw)
+            )
+            return base64.b64encode(raw).decode("utf-8"), _image_bytes_format(raw)
+        buffered = io.BytesIO()
+        image.convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
+        raw = buffered.getvalue()
+        device_transport_metrics.record(
+            str(serial or ""), "recording_screenshot", time.monotonic() - started_at, byte_count=len(raw)
+        )
+        return base64.b64encode(raw).decode("utf-8"), "jpeg"
+    except Exception:
+        device_transport_metrics.record(
+            str(serial or ""), "recording_screenshot", time.monotonic() - started_at, success=False
+        )
+        raise
 
 
 def _take_screenshot_base64(device) -> str:
@@ -428,8 +445,21 @@ def _get_device_info_payload(device, platform: str, serial: Optional[str]) -> Di
     return device.info
 
 
-def _build_hierarchy_payload(device, platform: str) -> Dict[str, str]:
-    hierarchy_xml = _get_device_hierarchy_xml(device, platform=platform)
+def _build_hierarchy_payload(device, platform: str, serial: Optional[str] = None) -> Dict[str, str]:
+    started_at = time.monotonic()
+    try:
+        hierarchy_xml = _get_device_hierarchy_xml(device, platform=platform)
+    except Exception:
+        device_transport_metrics.record(
+            str(serial or ""), "hierarchy", time.monotonic() - started_at, success=False
+        )
+        raise
+    device_transport_metrics.record(
+        str(serial or ""),
+        "hierarchy",
+        time.monotonic() - started_at,
+        byte_count=len(hierarchy_xml.encode("utf-8")) if hierarchy_xml else 0,
+    )
     payload = {"hierarchy_xml": hierarchy_xml}
     if hierarchy_xml:
         payload["hierarchy_hash"] = hashlib.sha1(hierarchy_xml.encode("utf-8")).hexdigest()
@@ -451,8 +481,8 @@ def _build_device_dump_payload(
     # iOS 会话按设计串行使用（会话池 per-entry 互斥），保持原串行路径。
     if platform != "ios" and include_hierarchy and include_screenshot:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            hierarchy_future = executor.submit(_build_hierarchy_payload, device, platform)
-            screenshot_future = executor.submit(_take_screenshot_payload, device)
+            hierarchy_future = executor.submit(_build_hierarchy_payload, device, platform, serial)
+            screenshot_future = executor.submit(_take_screenshot_payload, device, serial)
             if include_device_info:
                 payload["device_info"] = _get_device_info_payload(device, platform=platform, serial=serial)
             hierarchy_payload = hierarchy_future.result()
@@ -465,9 +495,9 @@ def _build_device_dump_payload(
     if include_device_info:
         payload["device_info"] = _get_device_info_payload(device, platform=platform, serial=serial)
     if include_hierarchy:
-        payload.update(_build_hierarchy_payload(device, platform=platform))
+        payload.update(_build_hierarchy_payload(device, platform=platform, serial=serial))
     if include_screenshot:
-        screenshot_b64, screenshot_format = _take_screenshot_payload(device)
+        screenshot_b64, screenshot_format = _take_screenshot_payload(device, serial)
         payload["screenshot"] = screenshot_b64
         payload["screenshot_format"] = screenshot_format
     return payload
@@ -504,13 +534,23 @@ def _screenshot_hash(device) -> str:
     return hashlib.md5(raw).hexdigest()
 
 
-def _wait_ui_stable(device, platform: str, operation: str, timeout: float = 3.0) -> None:
+def _wait_ui_stable(
+    device,
+    platform: str,
+    operation: str,
+    timeout: float = 3.0,
+    serial: Optional[str] = None,
+) -> None:
     """
     等待设备 UI 稳定：先等最小间隔，再通过截图对比轮询检测。
-    两次连续截图哈希一致即认为页面已稳定。
+    网络设备的全屏截图本身是高成本 ADB 传输，直接使用后续 dump 作为唯一
+    状态采样，避免一次交互额外拉取多张整屏图。
     """
     min_delay = _get_recording_post_action_delay(platform, operation)
     time.sleep(min_delay)
+
+    if NETWORK_DEVICE_SERIAL_RE.match(str(serial or "")):
+        return
 
     poll_interval = 0.25
     deadline = time.monotonic() + (timeout - min_delay)
@@ -765,7 +805,12 @@ def interact_with_device(req: InteractionRequest, session: Session = Depends(get
         _perform_device_operation(device, platform=platform, req=req)
 
         # 5. 等待 UI 稳定后返回新状态
-        _wait_ui_stable(device, platform=platform, operation=req.operation)
+        _wait_ui_stable(
+            device,
+            platform=platform,
+            operation=req.operation,
+            serial=req.device_serial,
+        )
 
         return {
             "step": step_info,
@@ -925,7 +970,12 @@ def execute_single_step(payload: SingleStepPayload, session: Session = Depends(g
         )
         step_result = runner.run_step(standard_step)
         dump_device = _unwrap_runner_dump_device(runner.driver, platform)
-        _wait_ui_stable(dump_device, platform=platform, operation=standard_step.get("action", ""))
+        _wait_ui_stable(
+            dump_device,
+            platform=platform,
+            operation=standard_step.get("action", ""),
+            serial=payload.device_serial,
+        )
         return {
             "result": _cross_platform_result_to_legacy_payload(step_result),
             "dump": _build_device_dump_payload(

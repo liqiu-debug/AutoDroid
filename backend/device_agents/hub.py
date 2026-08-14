@@ -15,8 +15,9 @@ import json
 import logging
 import socket
 import time
+from collections import deque
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from sqlmodel import Session, select
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -46,6 +47,12 @@ REGISTER_TIMEOUT_SECONDS = 15
 LAST_SEEN_WRITE_INTERVAL_SECONDS = 30
 # 服务端 TCP 读块大小（单个 binary 帧 payload 上限之内）
 TCP_READ_CHUNK = 64 * 1024
+# 单次 WebSocket 发送上限。8KB 足以让小控制消息在一帧视频之间插队。
+TUNNEL_SEND_CHUNK_BYTES = 8 * 1024
+# 每条 ADB TCP 连接最多积压 256KB；达到上限后暂停读取该连接并让 TCP 反压上游。
+TUNNEL_CONNECTION_MAX_PENDING_BYTES = 256 * 1024
+# Agent → 平台侧写入同样有界，避免慢视频连接拖住 WebSocket receive loop。
+TUNNEL_CONNECTION_MAX_INBOUND_CHUNKS = 32
 
 
 class TunnelConnection:
@@ -57,6 +64,10 @@ class TunnelConnection:
         self.reader = reader
         self.writer = writer
         self.pump_task: Optional[asyncio.Task] = None
+        self.writer_task: Optional[asyncio.Task] = None
+        self.write_queue: "asyncio.Queue[bytes]" = asyncio.Queue(
+            maxsize=TUNNEL_CONNECTION_MAX_INBOUND_CHUNKS
+        )
         self.closed = False
 
 
@@ -85,10 +96,16 @@ class AgentSession:
         self.agent_id = agent_id
         self.devices: Dict[str, RemoteDeviceRuntime] = {}
         self.conns: Dict[int, TunnelConnection] = {}
-        self.send_lock = asyncio.Lock()
         self.closed = False
         self._next_conn_id = 1
         self._last_seen_written = 0.0
+        self._send_condition = asyncio.Condition()
+        self._control_queue: Deque[Tuple[str, asyncio.Future]] = deque()
+        self._data_queues: Dict[int, Deque[bytes]] = {}
+        self._data_pending_bytes: Dict[int, int] = {}
+        self._round_robin_connections: Deque[int] = deque()
+        self._closed_connections: Set[int] = set()
+        self._sender_task: Optional[asyncio.Task] = None
 
     def allocate_conn_id(self) -> int:
         conn_id = self._next_conn_id
@@ -96,12 +113,138 @@ class AgentSession:
         return conn_id
 
     async def send_control(self, message: Dict[str, Any]) -> None:
-        async with self.send_lock:
-            await self.websocket.send_text(json.dumps(message, ensure_ascii=False))
+        """控制消息优先，且仅在真正写入 WebSocket 后返回。"""
+        payload = json.dumps(message, ensure_ascii=False)
+        future = asyncio.get_running_loop().create_future()
+        async with self._send_condition:
+            if self.closed:
+                raise ConnectionError("Agent 会话已关闭")
+            self._ensure_sender_locked()
+            self._control_queue.append((payload, future))
+            self._send_condition.notify_all()
+        await future
 
     async def send_data(self, conn_id: int, payload: bytes) -> None:
-        async with self.send_lock:
-            await self.websocket.send_bytes(encode_data_frame(conn_id, payload))
+        """按连接有界排队；轮询发送防止视频流长期独占 WebSocket。"""
+        if not payload:
+            return
+        async with self._send_condition:
+            self._ensure_sender_locked()
+            while (
+                not self.closed
+                and conn_id not in self._closed_connections
+                and self._data_pending_bytes.get(conn_id, 0) + len(payload)
+                > TUNNEL_CONNECTION_MAX_PENDING_BYTES
+            ):
+                await self._send_condition.wait()
+            if self.closed or conn_id in self._closed_connections:
+                raise ConnectionError("Agent 隧道连接已关闭")
+            queue_for_connection = self._data_queues.setdefault(conn_id, deque())
+            was_empty = not queue_for_connection
+            queue_for_connection.append(bytes(payload))
+            self._data_pending_bytes[conn_id] = self._data_pending_bytes.get(conn_id, 0) + len(payload)
+            if was_empty:
+                self._round_robin_connections.append(conn_id)
+            self._send_condition.notify_all()
+
+    async def discard_connection_data(self, conn_id: int) -> None:
+        """连接关闭时丢弃尚未发出的完整 TCP 数据，唤醒被反压的读取协程。"""
+        async with self._send_condition:
+            self._closed_connections.add(conn_id)
+            self._data_queues.pop(conn_id, None)
+            self._data_pending_bytes.pop(conn_id, None)
+            self._round_robin_connections = deque(
+                item for item in self._round_robin_connections if item != conn_id
+            )
+            self._send_condition.notify_all()
+
+    async def shutdown_sender(self) -> None:
+        """结束发送任务，并让所有等待控制发送/背压的协程立即退出。"""
+        async with self._send_condition:
+            self.closed = True
+            error = ConnectionError("Agent 会话已关闭")
+            while self._control_queue:
+                _, future = self._control_queue.popleft()
+                if not future.done():
+                    future.set_exception(error)
+            self._data_queues.clear()
+            self._data_pending_bytes.clear()
+            self._round_robin_connections.clear()
+            self._send_condition.notify_all()
+            sender_task = self._sender_task
+            self._sender_task = None
+        if sender_task is not None and sender_task is not asyncio.current_task():
+            sender_task.cancel()
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                pass
+
+    def _ensure_sender_locked(self) -> None:
+        if self._sender_task is None or self._sender_task.done():
+            self._sender_task = asyncio.create_task(
+                self._sender_loop(), name=f"AgentTunnelSender-{self.name}"
+            )
+
+    async def _sender_loop(self) -> None:
+        try:
+            while True:
+                control_future: Optional[asyncio.Future] = None
+                text_payload: Optional[str] = None
+                binary_payload: Optional[bytes] = None
+                async with self._send_condition:
+                    while (
+                        not self.closed
+                        and not self._control_queue
+                        and not self._round_robin_connections
+                    ):
+                        await self._send_condition.wait()
+                    if self.closed:
+                        return
+
+                    if self._control_queue:
+                        text_payload, control_future = self._control_queue.popleft()
+                    else:
+                        conn_id = self._round_robin_connections.popleft()
+                        queue_for_connection = self._data_queues.get(conn_id)
+                        if not queue_for_connection:
+                            continue
+                        pending = queue_for_connection.popleft()
+                        chunk = pending[:TUNNEL_SEND_CHUNK_BYTES]
+                        remainder = pending[TUNNEL_SEND_CHUNK_BYTES:]
+                        if remainder:
+                            queue_for_connection.appendleft(remainder)
+                        if queue_for_connection:
+                            self._round_robin_connections.append(conn_id)
+                        else:
+                            self._data_queues.pop(conn_id, None)
+                        self._data_pending_bytes[conn_id] = max(
+                            0, self._data_pending_bytes.get(conn_id, 0) - len(chunk)
+                        )
+                        if self._data_pending_bytes.get(conn_id) == 0:
+                            self._data_pending_bytes.pop(conn_id, None)
+                        self._send_condition.notify_all()
+                        binary_payload = encode_data_frame(conn_id, chunk)
+
+                try:
+                    if text_payload is not None:
+                        await self.websocket.send_text(text_payload)
+                    elif binary_payload is not None:
+                        await self.websocket.send_bytes(binary_payload)
+                    if control_future is not None and not control_future.done():
+                        control_future.set_result(None)
+                except Exception as exc:
+                    if control_future is not None and not control_future.done():
+                        control_future.set_exception(exc)
+                    logger.info("Agent 隧道发送失败: name=%s error=%s", self.name, exc)
+                    await self.shutdown_sender()
+                    try:
+                        await self.websocket.close()
+                    except Exception:
+                        pass
+                    return
+        except asyncio.CancelledError:
+            raise
 
 
 class TunnelHub:
@@ -438,14 +581,14 @@ class TunnelHub:
                 pass
             return
         try:
-            conn.writer.write(payload)
-            await conn.writer.drain()
-        except Exception as exc:
-            logger.info(
-                "隧道连接本地写入失败: agent=%s conn_id=%s error=%s",
+            conn.write_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            # TCP 字节流不能跳过中间数据；单条连接阻塞时直接关闭它，避免把整个
+            # Agent receive loop 一起卡住。Scrcpy 会自动在上层触发重连。
+            logger.warning(
+                "隧道连接入站队列已满，关闭慢连接: agent=%s conn_id=%s",
                 agent_session.name,
                 conn_id,
-                exc,
             )
             await self._close_conn(agent_session, conn_id, notify_agent=True)
 
@@ -564,13 +707,16 @@ class TunnelHub:
         conn_id = agent_session.allocate_conn_id()
         conn = TunnelConnection(conn_id, runtime.usb_serial, reader, writer)
         agent_session.conns[conn_id] = conn
+        conn.writer_task = asyncio.create_task(
+            self._drain_tunnel_connection(agent_session, conn),
+            name=f"AgentTunnelInbound-{agent_session.name}-{conn_id}",
+        )
         try:
             await agent_session.send_control(
                 {"type": "open", "conn_id": conn_id, "usb_serial": runtime.usb_serial}
             )
         except Exception:
-            agent_session.conns.pop(conn_id, None)
-            writer.close()
+            await self._close_conn(agent_session, conn_id, notify_agent=False)
             return
 
         conn.pump_task = asyncio.current_task()
@@ -591,6 +737,29 @@ class TunnelHub:
             if not conn.closed:
                 await self._close_conn(agent_session, conn_id, notify_agent=True, cancel_pump=False)
 
+    async def _drain_tunnel_connection(
+        self,
+        agent_session: AgentSession,
+        conn: TunnelConnection,
+    ) -> None:
+        """单连接顺序写回本地 ADB；慢连接不会阻塞 Agent WebSocket 接收。"""
+        try:
+            while not conn.closed:
+                payload = await conn.write_queue.get()
+                conn.writer.write(payload)
+                await conn.writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not conn.closed:
+                logger.info(
+                    "隧道连接本地写入失败: agent=%s conn_id=%s error=%s",
+                    agent_session.name,
+                    conn.conn_id,
+                    exc,
+                )
+                await self._close_conn(agent_session, conn.conn_id, notify_agent=True)
+
     async def _close_conn(
         self,
         agent_session: AgentSession,
@@ -603,12 +772,15 @@ class TunnelHub:
         if conn is None or conn.closed:
             return
         conn.closed = True
+        await agent_session.discard_connection_data(conn_id)
         try:
             conn.writer.close()
         except Exception:
             pass
         if cancel_pump and conn.pump_task is not None and conn.pump_task is not asyncio.current_task():
             conn.pump_task.cancel()
+        if conn.writer_task is not None and conn.writer_task is not asyncio.current_task():
+            conn.writer_task.cancel()
         if notify_agent and not agent_session.closed:
             try:
                 await agent_session.send_control({"type": "close", "conn_id": conn_id})
@@ -630,12 +802,15 @@ class TunnelHub:
         for conn_id in list(agent_session.conns.keys()):
             await self._close_conn(agent_session, conn_id, notify_agent=False)
 
+        # 会话已从运行时目录移除后立即反映离线状态；发送队列收尾不应延迟 UI 状态。
+        self._persist_agent_offline(agent_session.agent_id)
+        await agent_session.shutdown_sender()
+
         try:
             await agent_session.websocket.close()
         except Exception:
             pass
 
-        self._persist_agent_offline(agent_session.agent_id)
         self._notify_keeper()
         logger.info("远程接入点下线: name=%s reason=%s", agent_session.name, reason)
 

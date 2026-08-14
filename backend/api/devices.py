@@ -27,6 +27,7 @@ from sqlmodel import Session, select
 
 from backend.database import get_session
 from backend.device_sorting import sort_devices_for_display
+from backend.device_transport_metrics import device_transport_metrics
 from backend.feature_flags import delete_setting_value, get_setting_value, set_setting_value
 from backend.models import Device, SystemSetting, TestExecution
 from backend.paths import project_path
@@ -50,6 +51,16 @@ DEFAULT_IOS_WDA_START_RETRY_INTERVAL_SECONDS = 1.0
 DEFAULT_IOS_WDA_XCODEBUILD_START_RETRY_ATTEMPTS = 45
 _ios_wda_lock_guard = threading.Lock()
 _ios_wda_locks: Dict[str, threading.Lock] = {}
+_android_screenshot_task_lock: Optional[asyncio.Lock] = None
+_android_screenshot_tasks: Dict[str, "asyncio.Task[Tuple[str, str]]"] = {}
+
+
+def _get_android_screenshot_task_lock() -> asyncio.Lock:
+    """延迟创建，避免导入模块时把锁绑定到测试或启动前的事件循环。"""
+    global _android_screenshot_task_lock
+    if _android_screenshot_task_lock is None:
+        _android_screenshot_task_lock = asyncio.Lock()
+    return _android_screenshot_task_lock
 
 
 def _ensure_android_device(device: Device, action: str) -> None:
@@ -935,27 +946,126 @@ def _mark_running_executions_aborted(session: Session, serial: str) -> int:
 
 # ==================== ADB 异步工具函数 ====================
 
+async def _stop_adb_process(proc: asyncio.subprocess.Process, *, command: List[str]) -> None:
+    """终止超时/cancel 的 adb 进程，并等待其子进程完全退出。"""
+    if proc.returncode is not None:
+        return
+
+    try:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        logger.debug("终止 ADB 进程失败（继续等待）: %s error=%s", " ".join(command), exc)
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    try:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        logger.warning("强制终止 ADB 进程失败: %s error=%s", " ".join(command), exc)
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        logger.warning("ADB 子进程在强制终止后仍未退出: %s pid=%s", " ".join(command), proc.pid)
+
+
 async def _run_adb_command(*args: str, timeout: int = 15) -> bytes:
     """异步执行 ADB 命令并返回 stdout 字节流"""
     cmd = ["adb"] + list(args)
+    serial = str(args[1]) if len(args) >= 2 and args[0] == "-s" else ""
+    operation = "screencap" if "screencap" in args else "adb_command"
+    started_at = time.monotonic()
     logger.info(f"执行 ADB 命令: {' '.join(cmd)}")
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # shell 外的 adb 仍可能衍生传输子进程；单独进程组确保超时后不会遗留。
+            start_new_session=os.name != "nt",
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
+        communicate_task = asyncio.create_task(proc.communicate())
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                asyncio.shield(communicate_task), timeout=timeout
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await _stop_adb_process(proc, command=cmd)
+            if not communicate_task.done():
+                try:
+                    await asyncio.wait_for(communicate_task, timeout=1.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    communicate_task.cancel()
+            raise
         if proc.returncode != 0:
             err_msg = stderr.decode("utf-8", errors="replace").strip()
             logger.warning(f"ADB 命令失败 (rc={proc.returncode}): {err_msg}")
+            device_transport_metrics.record(serial, operation, time.monotonic() - started_at, success=False)
             raise RuntimeError(f"ADB error: {err_msg}")
+        device_transport_metrics.record(
+            serial,
+            operation,
+            time.monotonic() - started_at,
+            byte_count=len(stdout or b""),
+        )
         return stdout
     except asyncio.TimeoutError:
         logger.error(f"ADB 命令超时: {' '.join(cmd)}")
+        device_transport_metrics.record(
+            serial,
+            operation,
+            time.monotonic() - started_at,
+            success=False,
+            timed_out=True,
+        )
         raise RuntimeError("ADB command timed out")
+    except asyncio.CancelledError:
+        device_transport_metrics.record(serial, operation, time.monotonic() - started_at, success=False)
+        raise
+
+
+async def _capture_android_screenshot_preview(serial: str) -> Tuple[str, str]:
+    raw_bytes = await _run_adb_command(
+        "-s", serial, "exec-out", "screencap", "-p",
+        timeout=10,
+    )
+    if not raw_bytes or len(raw_bytes) < 100:
+        raise RuntimeError("截图数据为空或异常")
+    preview_bytes, image_format = await _run_blocking_call(_encode_preview_image, raw_bytes)
+    return base64.b64encode(preview_bytes).decode("utf-8"), image_format
+
+
+async def _get_coalesced_android_screenshot_preview(serial: str) -> Tuple[str, str]:
+    """同一设备同一时刻只采一张预览图，避免弱链路中堆积 screencap。"""
+    lock = _get_android_screenshot_task_lock()
+    async with lock:
+        task = _android_screenshot_tasks.get(serial)
+        if task is None or task.done():
+            task = asyncio.create_task(_capture_android_screenshot_preview(serial))
+            _android_screenshot_tasks[serial] = task
+
+    try:
+        # 断开一个浏览器请求不能取消共享中的设备采集。
+        return await asyncio.shield(task)
+    finally:
+        if task.done():
+            async with lock:
+                if _android_screenshot_tasks.get(serial) is task:
+                    _android_screenshot_tasks.pop(serial, None)
 
 
 # 批量属性查询的分隔标记：一次 shell 往返取回全部属性，
@@ -1692,11 +1802,8 @@ async def get_screenshot(serial: str, session: Session = Depends(get_session)):
         else:
             if db_device:
                 _ensure_android_device(db_device, action="截图")
-
-            raw_bytes = await _run_adb_command(
-                "-s", serial, "exec-out", "screencap", "-p",
-                timeout=10,
-            )
+            base64_img, image_format = await _get_coalesced_android_screenshot_preview(serial)
+            return {"base64_img": base64_img, "image_format": image_format}
 
         if not raw_bytes or len(raw_bytes) < 100:
             raise RuntimeError("截图数据为空或异常")
@@ -1712,6 +1819,12 @@ async def get_screenshot(serial: str, session: Session = Depends(get_session)):
             session.add(db_device)
             session.commit()
         raise HTTPException(status_code=500, detail=f"截图失败: {e}")
+
+
+@router.get("/{serial}/transport-metrics")
+async def get_transport_metrics(serial: str):
+    """返回当前进程窗口的设备链路指标，不持久化也不包含图像内容。"""
+    return device_transport_metrics.snapshot(serial)
 
 
 @router.post("/{serial}/unlock")

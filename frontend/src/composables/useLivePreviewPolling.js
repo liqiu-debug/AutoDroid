@@ -1,16 +1,25 @@
 import { computed } from 'vue'
 
-const IOS_LIVE_PREVIEW_POLL_MS = 900
-const ANDROID_LIVE_PREVIEW_POLL_IDLE_MS = 700
-const ANDROID_LIVE_PREVIEW_POLL_ACTIVE_MS = 300
-const LIVE_PREVIEW_BUSY_POLL_MS = 1800
-const LIVE_PREVIEW_POLL_ACTIVE_WINDOW_MS = 2500
+export const LIVE_PREVIEW_POLL_CONFIG = Object.freeze({
+  iosMs: 1500,
+  androidIdleMs: 2500,
+  androidActiveMs: 500,
+  busyMs: 2500,
+  activeWindowMs: 1500
+})
+
+const IOS_LIVE_PREVIEW_POLL_MS = LIVE_PREVIEW_POLL_CONFIG.iosMs
+const ANDROID_LIVE_PREVIEW_POLL_IDLE_MS = LIVE_PREVIEW_POLL_CONFIG.androidIdleMs
+const ANDROID_LIVE_PREVIEW_POLL_ACTIVE_MS = LIVE_PREVIEW_POLL_CONFIG.androidActiveMs
+const LIVE_PREVIEW_BUSY_POLL_MS = LIVE_PREVIEW_POLL_CONFIG.busyMs
+const LIVE_PREVIEW_POLL_ACTIVE_WINDOW_MS = LIVE_PREVIEW_POLL_CONFIG.activeWindowMs
 
 /**
  * 实时预览层级轮询：
  * - 根据平台 / 设备忙闲 / 交互活跃度自适应轮询间隔
  * - 框选、加载中等状态下暂停轮询
- * - 交互后的加速窗口（boost）提升层级同步实时性
+ * - 交互后的短暂加速窗口（boost）提升层级同步实时性；画面实时性由投屏承担，
+ *   层级不再持续高频拉取，避免与视频和执行命令争用无线 ADB。
  */
 export function useLivePreviewPolling({
   isStageActive,
