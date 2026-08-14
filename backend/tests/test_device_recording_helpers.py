@@ -15,6 +15,7 @@ from backend.api.recording import (
     _perform_device_operation,
     _take_screenshot_base64,
     _take_screenshot_payload,
+    _wait_ui_stable,
 )
 from backend.schemas import InteractionRequest
 
@@ -106,6 +107,20 @@ class DeviceRecordingHelperTests(unittest.TestCase):
             _get_recording_post_action_delay("android", "click"),
         )
         self.assertEqual(_get_recording_post_action_delay("android", "click"), 0.2)
+
+    def test_network_device_settle_skips_extra_screenshot_hashes(self):
+        device = Mock()
+
+        with patch("backend.api.recording.time.sleep") as sleep:
+            _wait_ui_stable(
+                device,
+                platform="android",
+                operation="click",
+                serial="192.168.1.8:5555",
+            )
+
+        sleep.assert_called_once_with(0.2)
+        device.screenshot.assert_not_called()
 
     def test_build_device_dump_payload_can_skip_optional_parts(self):
         raw_png = b"\x89PNG\r\n\x1a\nfast"

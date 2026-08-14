@@ -6,6 +6,7 @@ import socket
 import sqlite3
 import struct
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -21,7 +22,7 @@ from backend.core.api_tokens import generate_api_token, hash_api_token
 from backend.core.security import get_password_hash
 from backend.database import get_session
 from backend.device_agents.adb_keeper import AdbKeeper, parse_adb_devices_tunnel_states
-from backend.device_agents.hub import tunnel_hub
+from backend.device_agents.hub import AgentSession, tunnel_hub
 from backend.device_agents.protocol import (
     AGENT_PROTOCOL_VERSION,
     TUNNEL_PORT_RANGE_END,
@@ -297,6 +298,7 @@ class TunnelHubSessionTests(unittest.TestCase):
             finally:
                 sock.close()
 
+
     def test_device_removal_closes_listener(self):
         with self.client.websocket_connect("/ws/device-agent", headers=self._auth_headers()) as ws:
             ws.send_text(json.dumps(self._register_message()))
@@ -313,6 +315,45 @@ class TunnelHubSessionTests(unittest.TestCase):
             with Session(self.engine) as session:
                 mapping = session.exec(select(RemoteAgentDevice)).one()
                 self.assertEqual(mapping.tunnel_port, port)
+
+
+class AgentSessionSendSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    class _FakeWebSocket:
+        def __init__(self):
+            self.events = []
+            self.first_binary_started = asyncio.Event()
+            self.release_first_binary = asyncio.Event()
+            self._first_binary = True
+
+        async def send_text(self, payload):
+            self.events.append(("text", payload))
+
+        async def send_bytes(self, payload):
+            if self._first_binary:
+                self._first_binary = False
+                self.first_binary_started.set()
+                await self.release_first_binary.wait()
+            self.events.append(("binary", payload))
+
+        async def close(self):
+            return None
+
+    async def test_control_message_preempts_remaining_video_chunks(self):
+        websocket = self._FakeWebSocket()
+        session = AgentSession(None, websocket, "fairness-test", 1)
+        try:
+            await session.send_data(1, b"A" * (16 * 1024))
+            await websocket.first_binary_started.wait()
+            control = asyncio.create_task(session.send_control({"type": "pong"}))
+            websocket.release_first_binary.set()
+            await control
+            await asyncio.sleep(0)
+
+            self.assertEqual(websocket.events[0][0], "binary")
+            self.assertEqual(websocket.events[1], ("text", '{"type": "pong"}'))
+            self.assertEqual(len(websocket.events[0][1]), 4 + 8 * 1024)
+        finally:
+            await session.shutdown_sender()
 
 
 class DeviceAgentRestApiTests(unittest.TestCase):
@@ -468,6 +509,44 @@ class AgentScriptLogicTests(unittest.TestCase):
         self.assertEqual(decode_data_frame(frame), (9, b"payload"))
         conn_id, payload = self.agent.parse_data_frame(encode_data_frame(11, b"x"))
         self.assertEqual((conn_id, payload), (11, b"x"))
+
+    def test_agent_sender_prioritizes_control_over_remaining_video_chunks(self):
+        class FakeWebSocket:
+            def __init__(self):
+                self.events = []
+                self.first_binary_started = threading.Event()
+                self.release_first_binary = threading.Event()
+                self.first_binary = True
+
+            def send_text(self, payload):
+                self.events.append(("text", payload))
+
+            def send_binary(self, payload):
+                if self.first_binary:
+                    self.first_binary = False
+                    self.first_binary_started.set()
+                    self.release_first_binary.wait(timeout=1.0)
+                self.events.append(("binary", payload))
+
+        websocket = FakeWebSocket()
+        sender = self.agent.TunnelSendScheduler(websocket)
+        try:
+            self.assertTrue(sender.send_binary(1, b"A" * (16 * 1024)))
+            self.assertTrue(websocket.first_binary_started.wait(timeout=1.0))
+            control_result = []
+            control = threading.Thread(
+                target=lambda: control_result.append(sender.send_text('{"type":"pong"}', wait=True)),
+            )
+            control.start()
+            websocket.release_first_binary.set()
+            control.join(timeout=1.0)
+
+            self.assertFalse(control.is_alive())
+            self.assertEqual(control_result, [True])
+            self.assertEqual(websocket.events[0][0], "binary")
+            self.assertEqual(websocket.events[1], ("text", '{"type":"pong"}'))
+        finally:
+            sender.stop()
 
     def test_mask_payload_symmetry(self):
         mask = b"\x01\x02\x03\x04"

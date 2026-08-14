@@ -197,7 +197,7 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         self.assertFalse(is_tunnel_serial("ABCD1234"))
         self.assertFalse(is_tunnel_serial(""))
 
-    def test_wireless_serial_uses_standard_profile_defaults(self):
+    def test_wireless_serial_uses_smooth_profile_defaults(self):
         with patch.dict(os.environ, {}, clear=False):
             self._clear_scrcpy_env()
             params = get_scrcpy_stream_params("192.168.1.5:5555")
@@ -219,7 +219,7 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
 
         self.assertEqual(params, STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
         self.assertEqual(default_stream_profile("127.0.0.1:28100"), STREAM_PROFILE_SMOOTH)
-        self.assertEqual(default_stream_profile("192.168.1.5:5555"), STREAM_PROFILE_STANDARD)
+        self.assertEqual(default_stream_profile("192.168.1.5:5555"), STREAM_PROFILE_SMOOTH)
         self.assertEqual(default_stream_profile("ABCD1234"), STREAM_PROFILE_HD)
 
     def test_usb_serial_keeps_standard_profile(self):
@@ -573,6 +573,17 @@ class CrashReplayTapPointTests(unittest.TestCase):
 
 
 class DeviceStreamManagerInitializationTests(unittest.TestCase):
+    def test_start_tracking_moves_initial_adb_scan_off_startup_thread(self):
+        manager = ScrcpyDeviceManager()
+
+        with patch("backend.device_stream.manager.threading.Thread") as thread_cls:
+            manager.start_tracking()
+
+        self.assertEqual(thread_cls.call_count, 2)
+        targets = [call.kwargs["target"].__name__ for call in thread_cls.call_args_list]
+        self.assertEqual(targets, ["_track_devices_loop", "_scan_existing_devices"])
+        self.assertTrue(thread_cls.call_args_list[1].kwargs["daemon"])
+
     def test_connection_exception_is_visible_in_device_status(self):
         manager = ScrcpyDeviceManager()
 

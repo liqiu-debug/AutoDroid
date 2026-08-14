@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional, Generator, List, Set
 
 import adbutils
 from backend.device_agents.protocol import parse_tunnel_serial
+from backend.device_transport_metrics import device_transport_metrics
 from backend.paths import PROJECT_ROOT, project_path
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
 
@@ -42,13 +43,19 @@ DEFAULT_SCRCPY_BITRATE = 8_000_000    # 视频码率 (bps)
 DEFAULT_SCRCPY_MAX_FPS = 60           # 最大帧率
 DEFAULT_SCRCPY_GOP = 1                # I 帧间隔（秒），即 i_frame_interval
 
-# 远程/无线设备（Agent 隧道 127.0.0.1:281xx、无线 adb IP:5555）降档默认值：
-# adb 对每台设备只有一条 transport TCP 连接，8Mbps 视频流会队头阻塞该设备
-# 的所有 adb 命令（getprop/截图/控制），远程链路带宽也扛不住 USB 档码率。
-DEFAULT_SCRCPY_REMOTE_MAX_SIZE = 1280
-DEFAULT_SCRCPY_REMOTE_BITRATE = 2_000_000
-DEFAULT_SCRCPY_REMOTE_MAX_FPS = 30
+# 远程/无线设备（Agent 隧道 127.0.0.1:281xx、无线 adb IP:5555）默认走低延迟档。
+# ADB transport、截图和 UIAutomator 都会与视频竞争同一条网络链路；保持视频在
+# 1Mbps 左右可以避免 TCP 队列积压后把小控制命令一并拖慢。
+DEFAULT_SCRCPY_REMOTE_MAX_SIZE = 800
+DEFAULT_SCRCPY_REMOTE_BITRATE = 1_000_000
+DEFAULT_SCRCPY_REMOTE_MAX_FPS = 20
 DEFAULT_SCRCPY_REMOTE_GOP = 1
+
+# 手动选择的标准档仍保留，以便链路稳定时临时提升可读性；它不再是网络设备的默认值。
+STANDARD_SCRCPY_MAX_SIZE = 1280
+STANDARD_SCRCPY_BITRATE = 2_000_000
+STANDARD_SCRCPY_MAX_FPS = 30
+STANDARD_SCRCPY_GOP = 1
 
 SCRCPY_MAX_SIZE_ENV = "AUTODROID_SCRCPY_MAX_SIZE"
 SCRCPY_BITRATE_ENV = "AUTODROID_SCRCPY_BITRATE"
@@ -62,10 +69,10 @@ SCRCPY_REMOTE_GOP_ENV = "AUTODROID_SCRCPY_REMOTE_GOP"
 
 # 投屏清晰度档位。运行时可按设备切换（set_stream_profile_override + REST）：
 # - hd（高清）：USB 直插默认档
-# - standard（标准）：非隧道网络设备（无线 adb IP:5555）默认档
+# - standard（标准）：手动提升网络设备画质的档位
 # - smooth（流畅）：Agent 隧道设备默认档 —— 跨公网/VPN 弱链路下码率必须
 #   低于可用带宽，否则隧道各段 TCP 队列积压、投屏延迟无界累积；
-#   GOP 拉长到 2s 减小 IDR 突发（新观看端播种至多回看 2s，可接受）
+#   1 秒 GOP 限制关键帧恢复等待，拥塞后能尽快恢复画面
 STREAM_PROFILE_HD = "hd"
 STREAM_PROFILE_STANDARD = "standard"
 STREAM_PROFILE_SMOOTH = "smooth"
@@ -78,16 +85,16 @@ STREAM_PROFILES: Dict[str, Dict[str, int]] = {
         "i_frame_interval": DEFAULT_SCRCPY_GOP,
     },
     STREAM_PROFILE_STANDARD: {
-        "max_size": DEFAULT_SCRCPY_REMOTE_MAX_SIZE,
-        "video_bit_rate": DEFAULT_SCRCPY_REMOTE_BITRATE,
-        "max_fps": DEFAULT_SCRCPY_REMOTE_MAX_FPS,
-        "i_frame_interval": DEFAULT_SCRCPY_REMOTE_GOP,
+        "max_size": STANDARD_SCRCPY_MAX_SIZE,
+        "video_bit_rate": STANDARD_SCRCPY_BITRATE,
+        "max_fps": STANDARD_SCRCPY_MAX_FPS,
+        "i_frame_interval": STANDARD_SCRCPY_GOP,
     },
     STREAM_PROFILE_SMOOTH: {
         "max_size": 800,
         "video_bit_rate": 1_000_000,
         "max_fps": 20,
-        "i_frame_interval": 2,
+        "i_frame_interval": DEFAULT_SCRCPY_REMOTE_GOP,
     },
 }
 
@@ -108,10 +115,10 @@ ANDROID_MOTION_EVENT_ACTION_MOVE = 2
 # 它们是解码器可以重建状态的锚点；其余（P/B 帧等）都依赖前序帧。
 SYNC_NAL_TYPES = frozenset({5, 7, 8})
 
-# 观看端队列容量（包数）。30 包在 60fps 下约 0.5s：容量越小，拥塞客户端
-# 追赶实时画面越快；配合"丢帧后等待关键帧"策略，追赶总是以干净的
+# 观看端队列容量（包数）。保持为小队列，使拥塞客户端能尽快丢弃过期画面；
+# 配合"丢帧后等待关键帧"策略，追赶总是以干净的
 # init 序列（SPS/PPS/IDR）重新开始，不会产生花屏。
-CLIENT_QUEUE_MAXSIZE = 30
+CLIENT_QUEUE_MAXSIZE = 8
 
 
 class DeviceInfo:
@@ -168,10 +175,8 @@ def is_tunnel_serial(serial: str) -> bool:
 def default_stream_profile(serial: str) -> str:
     """按 serial 形态返回默认清晰度档位。"""
     key = str(serial or "").strip()
-    if is_tunnel_serial(key):
-        return STREAM_PROFILE_SMOOTH
     if is_remote_serial(key):
-        return STREAM_PROFILE_STANDARD
+        return STREAM_PROFILE_SMOOTH
     return STREAM_PROFILE_HD
 
 
@@ -212,15 +217,15 @@ def get_scrcpy_stream_params(serial: str = "") -> Dict[str, int]:
     解析当前生效的 scrcpy 视频流参数（每次启动设备流时求值）。
 
     优先级：运行时档位覆盖（REST 设置，取档位表原值）> 按 serial 形态
-    的默认档 + 环境变量覆盖。默认档：Agent 隧道=流畅（弱链路下优先保
-    延迟），其他 ip:port 无线=标准，USB 直插=高清。
+    的默认档 + 环境变量覆盖。默认档：所有 ip:port 网络设备=流畅（弱链路
+    下优先保障延迟），USB 直插=高清。
 
     环境变量（仅作用于默认档路径）：
     - AUTODROID_SCRCPY_MAX_SIZE: 高清档长边最大像素（默认 1920）
     - AUTODROID_SCRCPY_BITRATE: 高清档码率 bps（默认 8000000）
     - AUTODROID_SCRCPY_MAX_FPS: 高清档最大帧率（默认 60）
     - AUTODROID_SCRCPY_GOP: 高清档 I 帧间隔秒数（默认 1）
-    - AUTODROID_SCRCPY_REMOTE_*: 标准档同名覆盖（默认 1280/2000000/30/1）
+    - AUTODROID_SCRCPY_REMOTE_*: 网络低延迟档同名覆盖（默认 800/1000000/20/1）
     """
     key = str(serial or "").strip()
     with _stream_profile_lock:
@@ -472,6 +477,8 @@ def _broadcast_video_packet(dev_info: DeviceInfo, data: bytes) -> None:
     if not data:
         return
 
+    device_transport_metrics.record(dev_info.serial, "video", byte_count=len(data))
+
     nal_types = _update_h264_init_cache(dev_info, data)
 
     # 崩溃复现录制取流点：录制器在这里直接消费 reader 线程解析出的原始
@@ -497,12 +504,19 @@ def _broadcast_video_packet(dev_info: DeviceInfo, data: bytes) -> None:
     init_packets = _get_h264_init_packets(dev_info) if is_sync_packet else None
     for client_queue in queues:
         if not client_queue.offer(data, nal_types, init_packets=init_packets):
+            device_transport_metrics.record(
+                dev_info.serial, "video", dropped=1, queue_depth=client_queue.qsize()
+            )
             logger.debug(
                 "丢弃视频包以保护解码链并追赶实时画面: serial=%s nal_types=%s len=%s awaiting_keyframe=%s",
                 dev_info.serial,
                 sorted(nal_types),
                 len(data),
                 client_queue.awaiting_keyframe,
+            )
+        else:
+            device_transport_metrics.record(
+                dev_info.serial, "video", queue_depth=client_queue.qsize()
             )
 
 
@@ -571,8 +585,13 @@ class ScrcpyDeviceManager:
         self._tracking_thread.start()
         logger.info("USB 设备监听已启动")
 
-        # 初始扫描已连接的设备
-        self._scan_existing_devices()
+        # adb server 在失联隧道或异常设备下可能卡住；初始扫描不能阻塞 API
+        # 生命周期。设备跟踪线程仍会处理后续（包括已连接设备）的状态事件。
+        threading.Thread(
+            target=self._scan_existing_devices,
+            daemon=True,
+            name="device-initial-scan",
+        ).start()
 
     def stop_tracking(self):
         """停止监听并清理所有设备资源"""
@@ -1128,12 +1147,15 @@ class ScrcpyDeviceManager:
         clamped_x = min(screen_width - 1, max(0, int(x)))
         clamped_y = min(screen_height - 1, max(0, int(y)))
         input_method = str(method or "scrcpy").strip().lower()
+        started_at = time.monotonic()
 
         if input_method == "adb":
             try:
                 self._send_adb_touch_event(serial, action, clamped_x, clamped_y)
+                device_transport_metrics.record(serial, "control", time.monotonic() - started_at)
                 return
             except Exception as e:
+                device_transport_metrics.record(serial, "control", time.monotonic() - started_at, success=False)
                 logger.error(f"ADB 触控事件发送失败: {e}")
                 raise
         if input_method not in ("scrcpy", "control"):
@@ -1186,6 +1208,7 @@ class ScrcpyDeviceManager:
                                 pressure=0.0,
                             )
                         )
+                device_transport_metrics.record(serial, "control", time.monotonic() - started_at)
                 return
             except Exception as exc:
                 logger.warning("scrcpy control socket 注入失败，降级 adb input: serial=%s error=%s", serial, exc)
@@ -1193,7 +1216,9 @@ class ScrcpyDeviceManager:
         # 兜底通过 adb shell 发送 input 事件
         try:
             self._send_adb_touch_event(serial, action, clamped_x, clamped_y)
+            device_transport_metrics.record(serial, "control", time.monotonic() - started_at)
         except Exception as e:
+            device_transport_metrics.record(serial, "control", time.monotonic() - started_at, success=False)
             logger.error(f"触控事件发送失败: {e}")
             raise
 

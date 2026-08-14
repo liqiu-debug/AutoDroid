@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -44,6 +45,9 @@ WS_PATH = "/ws/device-agent"
 # 数据帧头：4 字节大端 conn_id（与服务端 backend/device_agents/protocol.py 一致）
 DATA_FRAME_HEADER_SIZE = 4
 TCP_READ_CHUNK = 64 * 1024
+# 单个 WebSocket 帧的最大隧道数据块。小块轮转可让控制/自动化命令插队。
+TUNNEL_SEND_CHUNK_BYTES = 8 * 1024
+TUNNEL_CONNECTION_MAX_PENDING_BYTES = 256 * 1024
 
 # 手机端 adbd TCP 端口（adb tcpip 5555）
 DEVICE_ADBD_TCP_PORT = 5555
@@ -279,6 +283,135 @@ class MiniWebSocket:
                     return (kind, bytes(buffered))
                 continue
             # 其他 opcode 忽略
+
+
+class TunnelSendScheduler:
+    """Agent → 平台侧的公平发送器。
+
+    所有连接复用一个 WebSocket，但不能由一条 scrcpy 视频流连续持锁。数据按
+    conn_id 分队列，每轮最多写一个 8KB 块；控制消息始终优先。单连接到达
+    上限时其读取线程阻塞，让 TCP 窗口反压视频而不是挤占其他 ADB 命令。
+    """
+
+    def __init__(self, ws: MiniWebSocket):
+        self._ws = ws
+        self._condition = threading.Condition()
+        self._controls = deque()
+        self._data_queues: Dict[int, deque] = {}
+        self._data_pending_bytes: Dict[int, int] = {}
+        self._round_robin = deque()
+        self._closed_connections = set()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True, name="tunnel-ws-sender")
+        self._thread.start()
+
+    def send_text(self, text: str, *, wait: bool = False) -> bool:
+        done = threading.Event() if wait else None
+        result = []
+        with self._condition:
+            if self._closed:
+                return False
+            self._controls.append((str(text), done, result))
+            self._condition.notify_all()
+        if done is not None:
+            done.wait()
+            return bool(result and result[0] is None)
+        return True
+
+    def send_binary(self, conn_id: int, payload: bytes) -> bool:
+        if not payload:
+            return True
+        with self._condition:
+            while (
+                not self._closed
+                and conn_id not in self._closed_connections
+                and self._data_pending_bytes.get(conn_id, 0) + len(payload)
+                > TUNNEL_CONNECTION_MAX_PENDING_BYTES
+            ):
+                self._condition.wait()
+            if self._closed or conn_id in self._closed_connections:
+                return False
+            queue_for_connection = self._data_queues.setdefault(conn_id, deque())
+            was_empty = not queue_for_connection
+            queue_for_connection.append(bytes(payload))
+            self._data_pending_bytes[conn_id] = self._data_pending_bytes.get(conn_id, 0) + len(payload)
+            if was_empty:
+                self._round_robin.append(conn_id)
+            self._condition.notify_all()
+        return True
+
+    def discard_connection(self, conn_id: int) -> None:
+        with self._condition:
+            self._closed_connections.add(conn_id)
+            self._data_queues.pop(conn_id, None)
+            self._data_pending_bytes.pop(conn_id, None)
+            self._round_robin = deque(item for item in self._round_robin if item != conn_id)
+            self._condition.notify_all()
+
+    def stop(self) -> None:
+        with self._condition:
+            self._closed = True
+            while self._controls:
+                _, done, result = self._controls.popleft()
+                if done is not None:
+                    result.append(ConnectionError("tunnel sender stopped"))
+                    done.set()
+            self._data_queues.clear()
+            self._data_pending_bytes.clear()
+            self._round_robin.clear()
+            self._condition.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while True:
+            control = None
+            binary_payload = None
+            with self._condition:
+                while not self._closed and not self._controls and not self._round_robin:
+                    self._condition.wait()
+                if self._closed:
+                    return
+                if self._controls:
+                    control = self._controls.popleft()
+                else:
+                    conn_id = self._round_robin.popleft()
+                    queue_for_connection = self._data_queues.get(conn_id)
+                    if not queue_for_connection:
+                        continue
+                    pending = queue_for_connection.popleft()
+                    chunk = pending[:TUNNEL_SEND_CHUNK_BYTES]
+                    remainder = pending[TUNNEL_SEND_CHUNK_BYTES:]
+                    if remainder:
+                        queue_for_connection.appendleft(remainder)
+                    if queue_for_connection:
+                        self._round_robin.append(conn_id)
+                    else:
+                        self._data_queues.pop(conn_id, None)
+                    self._data_pending_bytes[conn_id] = max(
+                        0, self._data_pending_bytes.get(conn_id, 0) - len(chunk)
+                    )
+                    if self._data_pending_bytes.get(conn_id) == 0:
+                        self._data_pending_bytes.pop(conn_id, None)
+                    self._condition.notify_all()
+                    binary_payload = build_data_frame(conn_id, chunk)
+            try:
+                if control is not None:
+                    text, done, result = control
+                    self._ws.send_text(text)
+                    if done is not None:
+                        result.append(None)
+                        done.set()
+                elif binary_payload is not None:
+                    self._ws.send_binary(binary_payload)
+            except Exception as exc:
+                if control is not None:
+                    _, done, result = control
+                    if done is not None:
+                        result.append(exc)
+                        done.set()
+                self.stop()
+                return
 
 
 # ==================== 数据帧编解码（与服务端协议一致） ====================
@@ -616,6 +749,7 @@ class TunnelAgent:
         self.name = name
         self.registry = registry
         self.ws: Optional[MiniWebSocket] = None
+        self._sender: Optional[TunnelSendScheduler] = None
         self.conns: Dict[int, socket.socket] = {}
         self._conn_lock = threading.Lock()
         self._stop = threading.Event()
@@ -626,16 +760,19 @@ class TunnelAgent:
 
     def stop(self) -> None:
         self._stop.set()
+        sender = self._sender
+        if sender is not None:
+            sender.stop()
         ws = self.ws
         if ws is not None:
             ws.close()
 
     def notify_devices_changed(self, reports: List[Dict[str, str]]) -> None:
-        ws = self.ws
-        if ws is None or not self._registered.is_set():
+        sender = self._sender
+        if sender is None or not self._registered.is_set():
             return
         try:
-            ws.send_text(json.dumps({"type": "devices", "devices": reports}, ensure_ascii=False))
+            sender.send_text(json.dumps({"type": "devices", "devices": reports}, ensure_ascii=False))
         except Exception as exc:
             log(f"设备列表上报失败（等待重连）: {exc}")
 
@@ -673,6 +810,8 @@ class TunnelAgent:
             headers={"Authorization": f"Bearer {self.token}"},
         )
         self.ws = ws
+        sender = TunnelSendScheduler(ws)
+        self._sender = sender
         try:
             register = {
                 "type": "register",
@@ -684,7 +823,8 @@ class TunnelAgent:
                 },
                 "devices": self.registry.snapshot_reports(),
             }
-            ws.send_text(json.dumps(register, ensure_ascii=False))
+            if not sender.send_text(json.dumps(register, ensure_ascii=False), wait=True):
+                raise ConnectionError("注册消息发送失败")
 
             ping_thread = threading.Thread(target=self._ping_loop, args=(ws,), daemon=True)
             ping_thread.start()
@@ -699,6 +839,8 @@ class TunnelAgent:
             self.ws = None
             self._registered.clear()
             self._close_all_conns()
+            self._sender = None
+            sender.stop()
             ws.close()
 
     def _ping_loop(self, ws: MiniWebSocket) -> None:
@@ -706,9 +848,8 @@ class TunnelAgent:
             time.sleep(PING_INTERVAL)
             if self.ws is not ws:
                 return
-            try:
-                ws.send_text(json.dumps({"type": "ping"}))
-            except Exception:
+            sender = self._sender
+            if sender is None or not sender.send_text(json.dumps({"type": "ping"})):
                 return
 
     # ---------- 控制消息 ----------
@@ -745,7 +886,7 @@ class TunnelAgent:
             return
         forward_port = self.registry.forward_port_of(usb_serial)
         if forward_port is None:
-            self._send_open_result(ws, conn_id, False, f"设备 {usb_serial} 不在本机")
+            self._send_open_result(conn_id, False, f"设备 {usb_serial} 不在本机")
             return
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3.0)
@@ -761,25 +902,23 @@ class TunnelAgent:
                 sock.close()
             except Exception:
                 pass
-            self._send_open_result(ws, conn_id, False, f"本机 forward 端口连接失败: {exc}")
+            self._send_open_result(conn_id, False, f"本机 forward 端口连接失败: {exc}")
             return
         with self._conn_lock:
             self.conns[conn_id] = sock
-        self._send_open_result(ws, conn_id, True, None)
+        self._send_open_result(conn_id, True, None)
         pump = threading.Thread(
-            target=self._pump_device_to_ws, args=(ws, conn_id, sock), daemon=True
+            target=self._pump_device_to_ws, args=(conn_id, sock), daemon=True
         )
         pump.start()
 
-    @staticmethod
-    def _send_open_result(ws: MiniWebSocket, conn_id: int, ok: bool, error: Optional[str]) -> None:
+    def _send_open_result(self, conn_id: int, ok: bool, error: Optional[str]) -> None:
         message = {"type": "open_result", "conn_id": conn_id, "ok": ok}
         if error:
             message["error"] = error
-        try:
-            ws.send_text(json.dumps(message, ensure_ascii=False))
-        except Exception:
-            pass
+        sender = self._sender
+        if sender is not None:
+            sender.send_text(json.dumps(message, ensure_ascii=False), wait=True)
 
     # ---------- 数据转发 ----------
 
@@ -797,13 +936,15 @@ class TunnelAgent:
         except OSError:
             self._close_conn(conn_id, notify=True)
 
-    def _pump_device_to_ws(self, ws: MiniWebSocket, conn_id: int, sock: socket.socket) -> None:
+    def _pump_device_to_ws(self, conn_id: int, sock: socket.socket) -> None:
         try:
             while True:
                 data = sock.recv(TCP_READ_CHUNK)
                 if not data:
                     break
-                ws.send_binary(build_data_frame(conn_id, data))
+                sender = self._sender
+                if sender is None or not sender.send_binary(conn_id, data):
+                    break
         except OSError:
             pass
         except Exception:
@@ -821,12 +962,14 @@ class TunnelAgent:
         except Exception:
             pass
         if notify:
-            ws = self.ws
-            if ws is not None:
-                try:
-                    ws.send_text(json.dumps({"type": "close", "conn_id": conn_id}))
-                except Exception:
-                    pass
+            sender = self._sender
+            if sender is not None:
+                sender.discard_connection(conn_id)
+                sender.send_text(json.dumps({"type": "close", "conn_id": conn_id}))
+        else:
+            sender = self._sender
+            if sender is not None:
+                sender.discard_connection(conn_id)
 
     def _close_all_conns(self) -> None:
         with self._conn_lock:

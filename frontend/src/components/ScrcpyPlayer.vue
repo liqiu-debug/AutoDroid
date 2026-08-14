@@ -17,6 +17,7 @@ import { VideoPlay, VideoPause, Refresh, Loading } from '@element-plus/icons-vue
 import api from '@/api'
 import { findBestRecordableNode } from '@/utils/recordableNode'
 import { useWebCodecsDecoder, isWebCodecsSupported } from '@/composables/useWebCodecsDecoder'
+import { shouldRestoreStoredStreamProfile } from '@/utils/streamProfile'
 
 const props = defineProps({
   /** 设备序列号 */
@@ -172,9 +173,8 @@ async function syncStreamProfile() {
     const stored = readStoredProfile()
     if (
       !profileSynced
-      && stored
       && STREAM_PROFILE_OPTIONS.some((opt) => opt.value === stored)
-      && stored !== data.profile
+      && shouldRestoreStoredStreamProfile(props.serial, stored, data.profile)
     ) {
       profileSynced = true
       applyStreamProfile(stored)
