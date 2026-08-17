@@ -103,6 +103,22 @@ def list_device_agents(current_user=Depends(get_current_user)):
     return {"items": tunnel_hub.list_agents()}
 
 
+@router.post("/{agent_id}/link-probe")
+async def probe_device_agent_link(agent_id: int, current_user=Depends(get_current_user)):
+    """主动测量该接入点 B→A 上行吞吐（Agent ≥1.2.0）。
+
+    探测期间会短暂挤占视频流带宽，属预期行为。
+    """
+    try:
+        return await tunnel_hub.probe_agent_bandwidth(agent_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except ConnectionError as exc:
+        raise HTTPException(status_code=400, detail=f"探测中断：{exc}")
+
+
 @router.get("/agent-script")
 def download_agent_script(current_user=Depends(get_current_user)):
     """下载设备接入助手脚本（B 机运行）。"""

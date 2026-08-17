@@ -25,6 +25,11 @@ const props = defineProps({
   activeImageCropStepUuid: {
     type: String,
     default: ''
+  },
+  /** 单步执行响应是否携带整图截图；投屏模式下传 false 省远程弱链路流量 */
+  includeScreenshot: {
+    type: Boolean,
+    default: true
   }
 })
 
@@ -555,7 +560,8 @@ const handleExecuteStep = async (step) => {
     case_id: currentCase.value.id || null,
     env_id: props.envId,
     variables: currentCase.value.variables || [],
-    device_serial: props.deviceSerial
+    device_serial: props.deviceSerial,
+    include_screenshot: props.includeScreenshot
   }
   try {
     const res = await api.executeStep(payload)

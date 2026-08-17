@@ -42,6 +42,12 @@ const recordMode = computed(() => {
   return deviceStageRef.value?.syncMode ?? true
 })
 
+// 投屏模式下交互/单步执行响应无需整图截图（画面由视频流承担），
+// 远程弱链路时每步可省一张整图传输
+const includeInteractionScreenshot = computed(() => {
+  return !(deviceStageRef.value?.liveMode ?? false)
+})
+
 const initData = async () => {
     const id = route.params.id
     if (id) {
@@ -387,6 +393,7 @@ onUnmounted(() => {
           :device-serial="recordingDeviceSerial"
           :ocr-crop-mode="ocrCropMode"
           :record-mode="recordMode"
+          :include-screenshot="includeInteractionScreenshot"
           @action-start="loading = true"
           @action-end="loading = false"
           @refresh-needed="handleRefreshNeeded"
@@ -398,6 +405,7 @@ onUnmounted(() => {
           :env-id="envId"
           :device-serial="recordingDeviceSerial"
           :active-image-crop-step-uuid="activeImageCropStepUuid"
+          :include-screenshot="includeInteractionScreenshot"
           @refresh-needed="handleRefreshNeeded"
           @request-ocr-crop="handleRequestOcrCrop"
           @request-image-crop="handleRequestImageCrop"

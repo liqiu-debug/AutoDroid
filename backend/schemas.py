@@ -121,6 +121,9 @@ class InteractionRequest(BaseModel):
     xml_dump: Optional[str] = None
     device_serial: Optional[str] = None
     record_step: bool = True
+    # 投屏模式下前端不需要响应里的整图截图（画面由视频流承担），
+    # 置 False 可为远程弱链路省掉每步一张整图的传输
+    include_screenshot: bool = True
 
 # ---- Scenario Schemas ----
 

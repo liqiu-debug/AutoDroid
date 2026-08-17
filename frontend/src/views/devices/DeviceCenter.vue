@@ -25,6 +25,7 @@ const remoteAgents = ref([])
 const agentGuideVisible = ref(false)
 const agentDeleteLoadingId = ref(null)
 const agentScriptDownloading = ref(false)
+const agentProbeLoadingId = ref(null)
 
 // 快照弹窗：Android 默认嵌实时投屏（避免整图截图挤占远程链路带宽），
 // iOS 或投屏不可用时回落到静态截图
@@ -72,6 +73,39 @@ const fetchRemoteAgents = async () => {
     remoteAgents.value = data.items || []
   } catch (e) {
     console.error(e)
+  }
+}
+
+/** 链路速率可读化 */
+const formatBps = (bps) => {
+  const value = Number(bps) || 0
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} Mbps`
+  if (value >= 1_000) return `${Math.round(value / 1_000)} Kbps`
+  return `${value} bps`
+}
+
+/** 接入点芯片上的链路摘要：RTT + B→A 实时吞吐 */
+const agentLinkSummary = (linkQuality) => {
+  if (!linkQuality) return ''
+  const parts = []
+  if (linkQuality.rtt_ms != null) parts.push(`RTT ${Math.round(linkQuality.rtt_ms)}ms`)
+  parts.push(`↑${formatBps(linkQuality.up_bps)}`)
+  return parts.join(' · ')
+}
+
+/** 主动探测 B→A 上行带宽（探测期间会短暂挤占投屏带宽，属预期） */
+const handleProbeAgentLink = async (agent) => {
+  agentProbeLoadingId.value = agent.id
+  try {
+    const { data } = await api.probeDeviceAgentLink(agent.id)
+    ElMessage.success(
+      `${agent.name} B→A 实测吞吐 ${formatBps(data.bps)}（${Math.round(data.bytes / 1024)}KB / ${data.elapsed_ms}ms）`
+    )
+    fetchRemoteAgents()
+  } catch (e) {
+    ElMessage.error('带宽探测失败：' + (e.response?.data?.detail || e.message))
+  } finally {
+    agentProbeLoadingId.value = null
   }
 }
 
@@ -589,6 +623,28 @@ onBeforeUnmount(() => {
           >
             <span class="agent-meta">{{ agent.status === 'ONLINE' ? `${agent.online_device_count} 台在线` : '离线' }}</span>
           </el-tooltip>
+          <el-tooltip
+            v-if="agent.status === 'ONLINE' && agent.link_quality"
+            placement="top"
+          >
+            <template #content>
+              RTT：{{ agent.link_quality.rtt_ms != null ? `${Math.round(agent.link_quality.rtt_ms)}ms（均值 ${agent.link_quality.rtt_avg_ms}ms）` : '待上报（Agent 需 ≥1.2.0）' }}<br />
+              实时吞吐：B→A {{ formatBps(agent.link_quality.up_bps) }} / A→B {{ formatBps(agent.link_quality.down_bps) }}<br />
+              带宽实测：{{ agent.link_quality.bandwidth_probe ? `${formatBps(agent.link_quality.bandwidth_probe.bps)} @ ${agent.link_quality.bandwidth_probe.at}` : '未探测，点「测带宽」' }}
+            </template>
+            <span class="agent-link">{{ agentLinkSummary(agent.link_quality) }}</span>
+          </el-tooltip>
+          <el-button
+            v-if="agent.status === 'ONLINE'"
+            class="agent-probe"
+            type="primary"
+            link
+            size="small"
+            :loading="agentProbeLoadingId === agent.id"
+            @click="handleProbeAgentLink(agent)"
+          >
+            测带宽
+          </el-button>
           <el-button
             v-if="agent.status !== 'ONLINE'"
             class="agent-delete"
@@ -956,6 +1012,18 @@ onBeforeUnmount(() => {
 
 .agent-meta {
   color: #909399;
+}
+
+.agent-link {
+  color: #409eff;
+  font-family: 'Courier New', monospace;
+  font-size: 12px;
+  cursor: default;
+}
+
+.agent-probe {
+  margin-left: 2px;
+  padding: 0;
 }
 
 .agent-delete {
