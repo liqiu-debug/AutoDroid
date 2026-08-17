@@ -22,7 +22,8 @@ from backend.core.api_tokens import generate_api_token, hash_api_token
 from backend.core.security import get_password_hash
 from backend.database import get_session
 from backend.device_agents.adb_keeper import AdbKeeper, parse_adb_devices_tunnel_states
-from backend.device_agents.hub import AgentSession, tunnel_hub
+from backend.device_agents import hub as hub_module
+from backend.device_agents.hub import AgentSession, TunnelHub, tunnel_hub
 from backend.device_agents.protocol import (
     AGENT_PROTOCOL_VERSION,
     TUNNEL_PORT_RANGE_END,
@@ -564,6 +565,154 @@ class AgentScriptLogicTests(unittest.TestCase):
         medium = self.agent.build_ws_frame(0x2, b"a" * 300)
         self.assertEqual(medium[1] & 0x7F, 126)
         self.assertEqual(struct.unpack(">H", medium[2:4])[0], 300)
+
+    def test_pong_computes_rtt_for_next_ping(self):
+        agent = self.agent.TunnelAgent("ws://example", "token", "b1", None)
+        agent._last_ping_sent_at = time.monotonic() - 0.05
+        agent._on_control({"type": "pong"})
+        self.assertIsNotNone(agent._last_rtt_ms)
+        self.assertGreaterEqual(agent._last_rtt_ms, 40.0)
+        self.assertLess(agent._last_rtt_ms, 10_000.0)
+
+    def test_bandwidth_probe_replies_with_clamped_payload(self):
+        agent = self.agent.TunnelAgent("ws://example", "token", "b1", None)
+        sent = []
+
+        class _FakeSender:
+            def send_text(self, text, wait=False):
+                sent.append(text)
+                return True
+
+        agent._sender = _FakeSender()
+        agent._on_control({"type": "bandwidth_probe", "probe_id": 3, "size": 10})
+
+        message = json.loads(sent[0])
+        self.assertEqual(message["type"], "bandwidth_probe_result")
+        self.assertEqual(message["probe_id"], 3)
+        # size=10 被钳到最小 64KB 原始数据，base64 后 ≥ 4/3 倍
+        self.assertGreaterEqual(len(message["payload"]), 64 * 1024 * 4 // 3)
+
+
+class LinkQualityTests(unittest.IsolatedAsyncioTestCase):
+    class _FakeWebSocket:
+        def __init__(self):
+            self.texts = []
+
+        async def send_text(self, payload):
+            self.texts.append(payload)
+
+        async def send_bytes(self, payload):
+            return None
+
+        async def close(self):
+            return None
+
+    def _make_session(self, hub, agent_id=7):
+        websocket = self._FakeWebSocket()
+        session = AgentSession(hub, websocket, "link-test", agent_id)
+        # 跳过 last_seen 落库（本组测试不建库）
+        session._last_seen_written = time.time()
+        return session, websocket
+
+    def test_rate_window_accumulates_and_expires(self):
+        with patch("backend.device_agents.hub.time.time", return_value=1000.0):
+            window = hub_module._LinkRateWindow(window_seconds=10)
+            window.record(1000)
+            window.record(500)
+            self.assertEqual(window.rate_bps(), int(1500 * 8 / 10))
+        with patch("backend.device_agents.hub.time.time", return_value=1020.0):
+            self.assertEqual(window.rate_bps(), 0)
+
+    async def test_ping_with_rtt_updates_session_and_replies_pong(self):
+        hub = TunnelHub()
+        session, websocket = self._make_session(hub)
+        try:
+            await hub._on_control(session, {"type": "ping", "rtt_ms": 42.5})
+            self.assertEqual(session.link_rtt_ms, 42.5)
+            self.assertEqual(list(session.link_rtt_samples), [42.5])
+            self.assertTrue(any('"pong"' in text for text in websocket.texts))
+        finally:
+            await session.shutdown_sender()
+
+    async def test_ping_ignores_invalid_rtt_values(self):
+        hub = TunnelHub()
+        session, _ = self._make_session(hub)
+        try:
+            await hub._on_control(session, {"type": "ping", "rtt_ms": "abc"})
+            await hub._on_control(session, {"type": "ping", "rtt_ms": -5})
+            self.assertIsNone(session.link_rtt_ms)
+            self.assertEqual(len(session.link_rtt_samples), 0)
+        finally:
+            await session.shutdown_sender()
+
+    async def test_bandwidth_probe_round_trip(self):
+        hub = TunnelHub()
+        session, websocket = self._make_session(hub, agent_id=7)
+        session.link_rtt_ms = 0.0
+        async with hub._lock:
+            hub._sessions["link-test"] = session
+
+        async def _agent_reply():
+            while not websocket.texts:
+                await asyncio.sleep(0.01)
+            request = json.loads(websocket.texts[-1])
+            assert request["type"] == "bandwidth_probe"
+            await hub._on_control(
+                session,
+                {
+                    "type": "bandwidth_probe_result",
+                    "probe_id": request["probe_id"],
+                    "payload": "x" * 80_000,
+                },
+            )
+
+        try:
+            reply_task = asyncio.create_task(_agent_reply())
+            result = await hub.probe_agent_bandwidth(7, size_bytes=60_000, timeout=5.0)
+            await reply_task
+            self.assertEqual(result["bytes"], 80_000)
+            self.assertGreater(result["bps"], 0)
+            self.assertIs(session.bandwidth_probe, result)
+            self.assertEqual(session._probe_futures, {})
+        finally:
+            await session.shutdown_sender()
+
+    async def test_bandwidth_probe_times_out_for_old_agent(self):
+        hub = TunnelHub()
+        session, _ = self._make_session(hub, agent_id=9)
+        async with hub._lock:
+            hub._sessions["link-test"] = session
+        try:
+            with self.assertRaises(TimeoutError):
+                await hub.probe_agent_bandwidth(9, timeout=0.2)
+            self.assertEqual(session._probe_futures, {})
+        finally:
+            await session.shutdown_sender()
+
+    async def test_bandwidth_probe_rejects_offline_agent(self):
+        hub = TunnelHub()
+        with self.assertRaises(ValueError):
+            await hub.probe_agent_bandwidth(12345)
+
+    async def test_link_quality_snapshot_shape(self):
+        hub = TunnelHub()
+        session, _ = self._make_session(hub)
+        try:
+            session.link_rtt_ms = 30.0
+            session.link_rtt_samples.extend([10.0, 50.0])
+            snapshot = TunnelHub._link_quality_snapshot(session)
+            self.assertEqual(snapshot["rtt_ms"], 30.0)
+            self.assertEqual(snapshot["rtt_avg_ms"], 30.0)
+            self.assertIn("up_bps", snapshot)
+            self.assertIn("down_bps", snapshot)
+            self.assertIsNone(snapshot["bandwidth_probe"])
+
+            self.assertIsNone(TunnelHub._link_quality_snapshot(None))
+            session.closed = True
+            self.assertIsNone(TunnelHub._link_quality_snapshot(session))
+        finally:
+            session.closed = False
+            await session.shutdown_sender()
 
 
 if __name__ == "__main__":

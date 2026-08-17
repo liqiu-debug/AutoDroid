@@ -54,6 +54,38 @@ TUNNEL_CONNECTION_MAX_PENDING_BYTES = 256 * 1024
 # Agent → 平台侧写入同样有界，避免慢视频连接拖住 WebSocket receive loop。
 TUNNEL_CONNECTION_MAX_INBOUND_CHUNKS = 32
 
+# 带宽探测：Agent 回填的最大数据量与等待时长
+BANDWIDTH_PROBE_DEFAULT_BYTES = 1_000_000
+BANDWIDTH_PROBE_TIMEOUT_SECONDS = 20.0
+
+
+class _LinkRateWindow:
+    """滚动窗口字节速率统计（按秒分桶）。
+
+    record() 只在事件循环内调用；rate_bps() 可能被 REST 线程读取，
+    因此读取路径不做淘汰、仅按时间过滤快照，避免跨线程修改 deque。
+    """
+
+    def __init__(self, window_seconds: int = 10):
+        self._window = window_seconds
+        self._buckets: Deque[Tuple[int, int]] = deque()
+
+    def record(self, nbytes: int) -> None:
+        now_s = int(time.time())
+        cutoff = now_s - self._window
+        while self._buckets and self._buckets[0][0] <= cutoff:
+            self._buckets.popleft()
+        if self._buckets and self._buckets[-1][0] == now_s:
+            second, value = self._buckets[-1]
+            self._buckets[-1] = (second, value + nbytes)
+        else:
+            self._buckets.append((now_s, nbytes))
+
+    def rate_bps(self) -> int:
+        cutoff = int(time.time()) - self._window
+        window_bytes = sum(value for second, value in list(self._buckets) if second > cutoff)
+        return int(window_bytes * 8 / self._window)
+
 
 class TunnelConnection:
     """一条经隧道中继的 TCP 连接（A 的 adb server → 本机监听端口）。"""
@@ -106,6 +138,14 @@ class AgentSession:
         self._round_robin_connections: Deque[int] = deque()
         self._closed_connections: Set[int] = set()
         self._sender_task: Optional[asyncio.Task] = None
+        # 链路质量观测：RTT 由 Agent 随 ping 捎带上报；吞吐在数据转发处累计
+        self.link_rtt_ms: Optional[float] = None
+        self.link_rtt_samples: Deque[float] = deque(maxlen=20)
+        self.inbound_rate = _LinkRateWindow()   # B→A（视频/截图/命令响应）
+        self.outbound_rate = _LinkRateWindow()  # A→B（adb 命令/触控）
+        self.bandwidth_probe: Optional[Dict[str, Any]] = None
+        self._probe_futures: Dict[int, asyncio.Future] = {}
+        self._next_probe_id = 1
 
     def allocate_conn_id(self) -> int:
         conn_id = self._next_conn_id
@@ -229,8 +269,10 @@ class AgentSession:
                 try:
                     if text_payload is not None:
                         await self.websocket.send_text(text_payload)
+                        self.outbound_rate.record(len(text_payload))
                     elif binary_payload is not None:
                         await self.websocket.send_bytes(binary_payload)
+                        self.outbound_rate.record(len(binary_payload))
                     if control_future is not None and not control_future.done():
                         control_future.set_result(None)
                 except Exception as exc:
@@ -384,12 +426,74 @@ class TunnelHub:
                         "device_count": len(devices),
                         "online_device_count": sum(1 for d in devices if d["online"]),
                         "devices": devices,
+                        "link_quality": self._link_quality_snapshot(live),
                     }
                 )
         return result
 
     def is_agent_online(self, name: str) -> bool:
         return name in self._sessions
+
+    async def probe_agent_bandwidth(
+        self,
+        agent_id: int,
+        size_bytes: int = BANDWIDTH_PROBE_DEFAULT_BYTES,
+        timeout: float = BANDWIDTH_PROBE_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        """主动测量 B→A 上行吞吐：让 Agent 回填一块数据并计时。
+
+        结果含约一个 RTT 的固定开销（按最近上报 RTT 扣除）；探测数据与
+        视频流共享 WebSocket，探测期间会短暂挤占视频属预期——测的就是
+        真实可用容量。旧版 Agent（<1.2.0）不识别该消息，等待超时后报错。
+        """
+        async with self._lock:
+            agent_session = next(
+                (s for s in self._sessions.values() if s.agent_id == agent_id), None
+            )
+        if agent_session is None or agent_session.closed:
+            raise ValueError("接入点不在线，无法探测")
+
+        probe_id = agent_session._next_probe_id
+        agent_session._next_probe_id += 1
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        agent_session._probe_futures[probe_id] = future
+        started = time.monotonic()
+        await agent_session.send_control(
+            {"type": "bandwidth_probe", "probe_id": probe_id, "size": int(size_bytes)}
+        )
+        try:
+            payload_bytes = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            agent_session._probe_futures.pop(probe_id, None)
+            raise TimeoutError(
+                "Agent 未在时限内回传探测数据：请确认 Agent 已升级到 1.2.0+，"
+                "若已升级则说明链路吞吐极低"
+            )
+        elapsed = max(time.monotonic() - started, 1e-6)
+        rtt_seconds = (agent_session.link_rtt_ms or 0.0) / 1000.0
+        transfer_seconds = max(elapsed - rtt_seconds, 1e-6)
+        result = {
+            "bps": int(payload_bytes * 8 / transfer_seconds),
+            "bytes": int(payload_bytes),
+            "elapsed_ms": int(elapsed * 1000),
+            "rtt_ms_at_probe": agent_session.link_rtt_ms,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        agent_session.bandwidth_probe = result
+        return result
+
+    @staticmethod
+    def _link_quality_snapshot(agent_session: Optional["AgentSession"]) -> Optional[Dict[str, Any]]:
+        if agent_session is None or agent_session.closed:
+            return None
+        samples = list(agent_session.link_rtt_samples)
+        return {
+            "rtt_ms": agent_session.link_rtt_ms,
+            "rtt_avg_ms": round(sum(samples) / len(samples), 1) if samples else None,
+            "up_bps": agent_session.inbound_rate.rate_bps(),
+            "down_bps": agent_session.outbound_rate.rate_bps(),
+            "bandwidth_probe": agent_session.bandwidth_probe,
+        }
 
     # ==================== WS 会话主流程 ====================
 
@@ -526,10 +630,20 @@ class TunnelHub:
         msg_type = str(control.get("type") or "")
         if msg_type == "ping":
             self._touch_last_seen(agent_session)
+            # Agent ≥1.2.0 会把上一次 ping→pong 实测 RTT 捎带上来
+            rtt_raw = control.get("rtt_ms")
+            if isinstance(rtt_raw, (int, float)) and 0 <= float(rtt_raw) < 60_000:
+                agent_session.link_rtt_ms = float(rtt_raw)
+                agent_session.link_rtt_samples.append(float(rtt_raw))
             try:
                 await agent_session.send_control({"type": "pong"})
             except Exception:
                 pass
+        elif msg_type == "bandwidth_probe_result":
+            probe_id = int(control.get("probe_id") or 0)
+            future = agent_session._probe_futures.pop(probe_id, None)
+            if future is not None and not future.done():
+                future.set_result(len(str(control.get("payload") or "")))
         elif msg_type == "devices":
             accepted, rejected = await self._apply_device_list(
                 agent_session, control.get("devices") or []
@@ -558,6 +672,7 @@ class TunnelHub:
             logger.debug("接入点 %s 未知控制消息: %s", agent_session.name, msg_type)
 
     async def _on_data_frame(self, agent_session: AgentSession, frame: bytes) -> None:
+        agent_session.inbound_rate.record(len(frame))
         try:
             conn_id, payload = decode_data_frame(frame)
         except ValueError:
@@ -801,6 +916,12 @@ class TunnelHub:
             await self._remove_device_runtime(agent_session, usb_serial)
         for conn_id in list(agent_session.conns.keys()):
             await self._close_conn(agent_session, conn_id, notify_agent=False)
+
+        # 结束未决的带宽探测，避免 REST 端等待到超时
+        for future in agent_session._probe_futures.values():
+            if not future.done():
+                future.set_exception(ConnectionError("Agent 会话已关闭"))
+        agent_session._probe_futures.clear()
 
         # 会话已从运行时目录移除后立即反映离线状态；发送队列收尾不应延迟 UI 状态。
         self._persist_agent_offline(agent_session.agent_id)

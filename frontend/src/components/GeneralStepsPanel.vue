@@ -19,6 +19,11 @@ const props = defineProps({
   recordMode: {
     type: Boolean,
     default: true
+  },
+  /** 响应是否携带整图截图；投屏模式下父组件传 false 省远程弱链路流量 */
+  includeScreenshot: {
+    type: Boolean,
+    default: true
   }
 })
 
@@ -93,7 +98,7 @@ const executeAction = async (action, data = '') => {
 
   emit('action-start')
   try {
-    const res = await api.interactDevice(0, 0, action, null, finalData, props.deviceSerial, props.recordMode)
+    const res = await api.interactDevice(0, 0, action, null, finalData, props.deviceSerial, props.recordMode, props.includeScreenshot)
 
     if (props.recordMode && res.data.step) {
       caseStore.addStep(res.data.step)

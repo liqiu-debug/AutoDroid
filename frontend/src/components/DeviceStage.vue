@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, onBeforeUnmount, onDeactivated, onActivated, watch } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
+import { DataLine, Refresh } from '@element-plus/icons-vue'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
@@ -86,6 +86,50 @@ watch(selectedSerial, (serial, oldSerial) => {
   }
 })
 
+// 链路诊断：展示该设备各操作（截图/层级/adb 命令）的耗时与字节数,
+// 用于区分"链路带宽/RTT 瓶颈"与"设备侧耗时"
+const linkDiagVisible = ref(false)
+const linkDiagLoading = ref(false)
+const linkDiagRows = ref([])
+
+const LINK_DIAG_OP_LABELS = {
+  screencap: '整图截图 (adb screencap)',
+  recording_screenshot: '录制/编辑截图',
+  hierarchy: 'UI 层级 dump',
+  adb_command: '其他 adb 命令'
+}
+
+const formatKb = (bytes) => {
+  const value = Number(bytes) || 0
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`
+  if (value >= 1024) return `${Math.round(value / 1024)} KB`
+  return `${value} B`
+}
+
+const openLinkDiagnostics = async () => {
+  if (!selectedSerial.value) return
+  linkDiagVisible.value = true
+  linkDiagLoading.value = true
+  try {
+    const { data } = await api.getDeviceTransportMetrics(selectedSerial.value)
+    const operations = data?.operations || {}
+    linkDiagRows.value = Object.entries(operations).map(([op, metric]) => ({
+      op: LINK_DIAG_OP_LABELS[op] || op,
+      count: metric.count,
+      failures: metric.failures + metric.timeouts,
+      p50: metric.p50_ms != null ? `${Math.round(metric.p50_ms)} ms` : '—',
+      p95: metric.p95_ms != null ? `${Math.round(metric.p95_ms)} ms` : '—',
+      avgBytes: metric.count > 0 ? formatKb(metric.bytes / metric.count) : '—',
+      totalBytes: formatKb(metric.bytes)
+    }))
+  } catch (e) {
+    ElMessage.error('获取链路指标失败: ' + (e.response?.data?.detail || e.message))
+    linkDiagRows.value = []
+  } finally {
+    linkDiagLoading.value = false
+  }
+}
+
 const previewMode = computed({
   get: () => (liveMode.value ? 'live' : 'static'),
   set: (value) => {
@@ -153,7 +197,8 @@ const {
 } = useStageCanvas({ liveMode, nodes, liveNodes })
 
 const executeRawTapAndRefresh = async (x, y) => {
-  const res = await api.interactDevice(x, y, 'click', hierarchyXml.value, null, selectedSerial.value, false)
+  // 投屏模式下响应无需整图截图（画面由视频流承担），为远程弱链路省一张整图
+  const res = await api.interactDevice(x, y, 'click', hierarchyXml.value, null, selectedSerial.value, false, !liveMode.value)
   if (res?.data?.dump) {
     updateStateFromDump(res.data.dump)
   }
@@ -322,7 +367,7 @@ const onCanvasClick = async (event) => {
 
   loading.value = true
   try {
-    const res = await api.interactDevice(coords.realX, coords.realY, 'click', hierarchyXml.value, null, selectedSerial.value)
+    const res = await api.interactDevice(coords.realX, coords.realY, 'click', hierarchyXml.value, null, selectedSerial.value, true, !liveMode.value)
 
     // Update Device State
     updateStateFromDump(res.data.dump)
@@ -391,7 +436,7 @@ const onScrcpyTouch = async ({ x, y, relX, relY }) => {
   loading.value = true
 
   try {
-    const res = await api.interactDevice(x, y, 'click', hierarchyXml.value, null, selectedSerial.value)
+    const res = await api.interactDevice(x, y, 'click', hierarchyXml.value, null, selectedSerial.value, true, !liveMode.value)
     if (res.data.step) {
       caseStore.addStep(res.data.step)
       ElMessage.success('操作成功并添加步骤')
@@ -564,7 +609,8 @@ defineExpose({
   ocrCropMode,
   imageCropMode,
   activeImageCropStepUuid,
-  syncMode
+  syncMode,
+  liveMode
 })
 </script>
 
@@ -602,6 +648,7 @@ defineExpose({
         <slot name="before-refresh"></slot>
         <el-button v-if="liveMode" :icon="Refresh" @click="fetchLiveHierarchy({ showLoading: true, forceHierarchy: true })" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">{{ isIosLivePreview ? '刷新截图/层级' : '刷新层级' }}</el-button>
         <el-button v-if="!liveMode" :icon="Refresh" @click="fetchDump" :loading="loading" :disabled="!selectedSerial || isSelectedDeviceBusy">刷新</el-button>
+        <el-button :icon="DataLine" @click="openLinkDiagnostics" :disabled="!selectedSerial" title="查看该设备各操作的链路耗时与字节数">链路诊断</el-button>
       </div>
     </div>
 
@@ -767,11 +814,35 @@ defineExpose({
       </div>
     </div>
 
+    <!-- 链路诊断：per-op 耗时/字节，用于定位远程链路瓶颈 -->
+    <el-dialog v-model="linkDiagVisible" title="链路诊断（本次后端运行期累计）" width="640px" align-center>
+      <el-table :data="linkDiagRows" v-loading="linkDiagLoading" size="small" empty-text="暂无采样：先执行几次截图/刷新层级/录制步骤">
+        <el-table-column prop="op" label="操作" min-width="170" />
+        <el-table-column prop="count" label="次数" width="70" align="right" />
+        <el-table-column prop="failures" label="失败" width="70" align="right" />
+        <el-table-column prop="p50" label="P50 耗时" width="90" align="right" />
+        <el-table-column prop="p95" label="P95 耗时" width="90" align="right" />
+        <el-table-column prop="avgBytes" label="平均体积" width="90" align="right" />
+        <el-table-column prop="totalBytes" label="累计流量" width="90" align="right" />
+      </el-table>
+      <template #footer>
+        <span class="link-diag-hint">判读：P95 耗时高且体积大 → 带宽瓶颈；体积小但耗时高 → RTT/设备侧耗时。接入点卡片可测 B→A 带宽。</span>
+        <el-button :icon="Refresh" @click="openLinkDiagnostics" :loading="linkDiagLoading">刷新</el-button>
+      </template>
+    </el-dialog>
 
   </div>
 </template>
 
 <style scoped>
+.link-diag-hint {
+  float: left;
+  max-width: 420px;
+  text-align: left;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.5;
+}
 .device-stage {
   --stage-row-height: 44px;
   --stage-row-padding-y: 4px;

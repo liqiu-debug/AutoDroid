@@ -1,6 +1,8 @@
 import base64
+import gzip
 import hashlib
 import io
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -12,12 +14,42 @@ from backend.api.recording import (
     _build_device_dump_payload,
     _get_device_hierarchy_xml,
     _get_recording_post_action_delay,
+    _json_response_with_optional_gzip,
     _perform_device_operation,
     _take_screenshot_base64,
     _take_screenshot_payload,
     _wait_ui_stable,
 )
 from backend.schemas import InteractionRequest
+
+
+class JsonGzipResponseTests(unittest.TestCase):
+    @staticmethod
+    def _request(accept_encoding=""):
+        request = Mock()
+        request.headers = {"accept-encoding": accept_encoding}
+        return request
+
+    def test_large_payload_gzipped_when_accepted(self):
+        payload = {"hierarchy_xml": "<node text='x' />" * 600}
+        response = _json_response_with_optional_gzip(self._request("gzip, deflate"), payload)
+
+        self.assertEqual(response.headers.get("content-encoding"), "gzip")
+        self.assertEqual(json.loads(gzip.decompress(response.body)), payload)
+        self.assertLess(len(response.body), len(json.dumps(payload)))
+
+    def test_plain_when_client_does_not_accept_gzip(self):
+        payload = {"hierarchy_xml": "<node text='x' />" * 600}
+        response = _json_response_with_optional_gzip(self._request(""), payload)
+
+        self.assertIsNone(response.headers.get("content-encoding"))
+        self.assertEqual(json.loads(response.body), payload)
+
+    def test_small_payload_not_gzipped(self):
+        response = _json_response_with_optional_gzip(self._request("gzip"), {"ok": True})
+
+        self.assertIsNone(response.headers.get("content-encoding"))
+        self.assertEqual(json.loads(response.body), {"ok": True})
 
 
 class DeviceRecordingHelperTests(unittest.TestCase):

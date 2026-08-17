@@ -38,7 +38,7 @@ from collections import deque
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 PROTOCOL_VERSION = 1
 WS_PATH = "/ws/device-agent"
 
@@ -755,6 +755,10 @@ class TunnelAgent:
         self._stop = threading.Event()
         self._registered = threading.Event()
         self._fatal: Optional[str] = None
+        # 链路 RTT 自测：记录 ping 发出时刻，收到 pong 后得到 RTT，
+        # 随下一次 ping 捎带给平台做链路质量展示
+        self._last_ping_sent_at: Optional[float] = None
+        self._last_rtt_ms: Optional[float] = None
 
     # ---------- 对外 ----------
 
@@ -849,7 +853,13 @@ class TunnelAgent:
             if self.ws is not ws:
                 return
             sender = self._sender
-            if sender is None or not sender.send_text(json.dumps({"type": "ping"})):
+            if sender is None:
+                return
+            message: Dict[str, object] = {"type": "ping"}
+            if self._last_rtt_ms is not None:
+                message["rtt_ms"] = round(self._last_rtt_ms, 1)
+            self._last_ping_sent_at = time.monotonic()
+            if not sender.send_text(json.dumps(message)):
                 return
 
     # ---------- 控制消息 ----------
@@ -871,7 +881,11 @@ class TunnelAgent:
         elif msg_type == "close":
             self._close_conn(int(control.get("conn_id") or 0), notify=False)
         elif msg_type == "pong":
-            pass
+            sent_at = self._last_ping_sent_at
+            if sent_at is not None:
+                self._last_rtt_ms = max(0.0, (time.monotonic() - sent_at) * 1000.0)
+        elif msg_type == "bandwidth_probe":
+            self._handle_bandwidth_probe(control)
         elif msg_type == "error":
             message = str(control.get("message") or "服务端返回错误")
             if "鉴权" in message or "Token" in message or "协议版本" in message:
@@ -879,6 +893,23 @@ class TunnelAgent:
             log(f"服务端消息: {message}")
         else:
             log(f"未知控制消息: {msg_type}")
+
+    def _handle_bandwidth_probe(self, control: Dict) -> None:
+        """回填指定体积的随机数据，供平台测量 B→A 实际上行吞吐。
+
+        数据经发送调度器排队，控制消息优先级会让它整体一次发出，
+        期间短暂挤占视频流属预期（测的就是真实容量）。
+        """
+        probe_id = int(control.get("probe_id") or 0)
+        size = int(control.get("size") or 0)
+        size = max(64 * 1024, min(size, 4 * 1024 * 1024))
+        sender = self._sender
+        if sender is None:
+            return
+        payload = base64.b64encode(os.urandom(size)).decode("ascii")
+        sender.send_text(
+            json.dumps({"type": "bandwidth_probe_result", "probe_id": probe_id, "payload": payload})
+        )
 
     def _on_open(self, conn_id: int, usb_serial: str) -> None:
         ws = self.ws

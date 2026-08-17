@@ -165,8 +165,8 @@ export default {
         const query = serial ? `&serial=${serial}` : ''
         return api.post(`/device/inspect?x=${x}&y=${y}${query}`)
     },
-    interactDevice(x, y, operation, xml_dump, action_data, serial, record_step = true) {
-        return api.post('/device/interact', { x, y, operation, xml_dump, action_data, device_serial: serial, record_step })
+    interactDevice(x, y, operation, xml_dump, action_data, serial, record_step = true, include_screenshot = true) {
+        return api.post('/device/interact', { x, y, operation, xml_dump, action_data, device_serial: serial, record_step, include_screenshot })
     },
     executeStep(step) {
         return api.post('/device/execute_step', step)
@@ -554,6 +554,12 @@ export default {
     // Device Agents (远程设备接入点)
     getDeviceAgents() {
         return api.get('/device-agents/')
+    },
+    probeDeviceAgentLink(agentId) {
+        return api.post(`/device-agents/${agentId}/link-probe`, null, { timeout: 30000 })
+    },
+    getDeviceTransportMetrics(serial) {
+        return api.get(`/devices/${serial}/transport-metrics`)
     },
     deleteDeviceAgent(agentId) {
         return api.delete(`/device-agents/${agentId}`)

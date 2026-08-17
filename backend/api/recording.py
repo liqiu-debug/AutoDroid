@@ -10,8 +10,10 @@
 与原先挂载在 app 上的行为保持一致。
 """
 import base64
+import gzip
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -22,7 +24,8 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import uiautomator2 as u2
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
@@ -63,6 +66,26 @@ RECORDING_ANDROID_IDLE_TTL_SECONDS = 300.0
 # q90 的压缩痕迹对灰度模板匹配（阈值 0.95）影响可忽略，体积比 PNG 小 5-10 倍
 RECORDING_SCREENSHOT_JPEG_QUALITY = 90
 NETWORK_DEVICE_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
+
+# 大 JSON 响应 gzip 阈值：层级 XML 压缩比 5-10×，浏览器与平台之间
+# 同样可能隔着弱链路；小响应不压避免无谓 CPU
+RESPONSE_GZIP_MIN_BYTES = 2048
+
+
+def _json_response_with_optional_gzip(request: Request, payload: Any) -> Response:
+    """对白名单端点（dump/interact/execute_step）的大 JSON 响应按需 gzip。
+
+    不用全局 GZipMiddleware：避免影响 MJPEG multipart 流式响应与 WS 升级。
+    """
+    body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    accept_encoding = (request.headers.get("accept-encoding") or "").lower()
+    if len(body) >= RESPONSE_GZIP_MIN_BYTES and "gzip" in accept_encoding:
+        return Response(
+            content=gzip.compress(body, compresslevel=6),
+            media_type="application/json",
+            headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+        )
+    return Response(content=body, media_type="application/json")
 
 
 class _RecordingIOSSessionEntry:
@@ -239,6 +262,7 @@ _recording_android_device_pool = _RecordingAndroidDevicePool()
 @router.get("/api/device/dump")
 @router.get("/device/dump", include_in_schema=False)
 def dump_device_info(
+    request: Request,
     serial: Optional[str] = None,
     include_device_info: bool = True,
     include_hierarchy: bool = True,
@@ -251,7 +275,7 @@ def dump_device_info(
     device = None
     try:
         platform, device, cleanup = _connect_recording_device(session, serial)
-        return _build_device_dump_payload(
+        payload = _build_device_dump_payload(
             device,
             platform=platform,
             serial=serial,
@@ -259,6 +283,7 @@ def dump_device_info(
             include_hierarchy=include_hierarchy,
             include_screenshot=include_screenshot,
         )
+        return _json_response_with_optional_gzip(request, payload)
     except HTTPException:
         raise
     except Exception as e:
@@ -750,7 +775,7 @@ def inspect_device(
 
 @router.post("/api/device/interact")
 @router.post("/device/interact", include_in_schema=False)
-def interact_with_device(req: InteractionRequest, session: Session = Depends(get_session)):
+def interact_with_device(request: Request, req: InteractionRequest, session: Session = Depends(get_session)):
     """
     交互模式：分析元素 → 执行点击 → 返回新状态。
 
@@ -812,10 +837,15 @@ def interact_with_device(req: InteractionRequest, session: Session = Depends(get
             serial=req.device_serial,
         )
 
-        return {
+        return _json_response_with_optional_gzip(request, {
             "step": step_info,
-            "dump": _build_device_dump_payload(device, platform=platform, serial=req.device_serial),
-        }
+            "dump": _build_device_dump_payload(
+                device,
+                platform=platform,
+                serial=req.device_serial,
+                include_screenshot=req.include_screenshot,
+            ),
+        })
     except HTTPException:
         raise
     except Exception as e:
@@ -832,6 +862,8 @@ class SingleStepPayload(BaseModel):
     env_id: Optional[int] = None
     variables: Optional[List[dict]] = Field(default_factory=list)
     device_serial: Optional[str] = None
+    # 投屏模式下响应 dump 不需要整图截图，见 InteractionRequest.include_screenshot
+    include_screenshot: bool = True
 
 
 def _disconnect_runner_if_supported(runner) -> None:
@@ -931,7 +963,7 @@ def _unwrap_runner_dump_device(driver, platform: str):
 
 @router.post("/api/device/execute_step")
 @router.post("/device/execute_step", include_in_schema=False)
-def execute_single_step(payload: SingleStepPayload, session: Session = Depends(get_session)):
+def execute_single_step(request: Request, payload: SingleStepPayload, session: Session = Depends(get_session)):
     """
     执行单个步骤并返回最新 UI 快照（统一走跨端 Runner）。
     """
@@ -976,14 +1008,15 @@ def execute_single_step(payload: SingleStepPayload, session: Session = Depends(g
             operation=standard_step.get("action", ""),
             serial=payload.device_serial,
         )
-        return {
+        return _json_response_with_optional_gzip(request, {
             "result": _cross_platform_result_to_legacy_payload(step_result),
             "dump": _build_device_dump_payload(
                 dump_device,
                 platform=platform,
                 serial=payload.device_serial,
+                include_screenshot=payload.include_screenshot,
             ),
-        }
+        })
     except HTTPException:
         raise
     except Exception as e:
