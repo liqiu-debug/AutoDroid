@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from sqlmodel import Session, SQLModel, create_engine
 
 from backend.api.reports import get_dashboard_overview
-from backend.models import Device, ScheduledTask, TestExecution, TestScenario
+from backend.models import ApiRun, Device, ScheduledTask, TestExecution, TestScenario
 
 
 class DashboardOverviewTests(unittest.TestCase):
@@ -174,6 +174,49 @@ class DashboardOverviewTests(unittest.TestCase):
 
         alert_types = {item.type for item in overview.alerts}
         self.assertIn("device_wda_down", alert_types)
+
+    def test_dashboard_includes_api_automation_in_its_own_block(self):
+        now = datetime.now()
+        runs = [
+            ApiRun(id="api-pass", scenario_id=1, scenario_name="下单回归", env_name="测试", status="PASS",
+                   created_at=now - timedelta(days=1), started_at=now - timedelta(days=1), duration_ms=4000),
+            ApiRun(id="api-fail", scenario_id=1, scenario_name="下单回归", env_name="测试", status="FAIL",
+                   created_at=now - timedelta(hours=3), started_at=now - timedelta(hours=3), duration_ms=2000),
+            ApiRun(id="api-running", scenario_id=2, scenario_name="登录链路", env_name="测试", status="RUNNING",
+                   created_at=now - timedelta(minutes=2), started_at=now - timedelta(minutes=2)),
+            # Out of the 7d window, must not be counted.
+            ApiRun(id="api-old", scenario_id=1, scenario_name="下单回归", env_name="测试", status="PASS",
+                   created_at=now - timedelta(days=9), started_at=now - timedelta(days=9), duration_ms=1000),
+        ]
+        self.session.add_all(runs)
+        self.session.commit()
+
+        overview = get_dashboard_overview(range_key="7d", platform="android", limit_recent=10, limit_tasks=10, session=self.session)
+        block = overview.api_automation
+        self.assertIsNotNone(block)
+        self.assertEqual(block.total_runs, 3)
+        self.assertEqual(block.completed_runs, 2)
+        self.assertEqual(block.pass_rate, 50.0)
+        self.assertEqual(block.failed_runs, 1)
+        self.assertEqual(block.running_runs, 1)
+        self.assertEqual(block.avg_duration, 3.0)
+        # Device KPIs are untouched: the platform filter and scenario id space
+        # are device concepts, so API runs never leak into them.
+        self.assertEqual(overview.kpis.total_executions, 4)
+        self.assertEqual({item.name for item in overview.top_failed_scenarios}, {"主链路冒烟"})
+        self.assertEqual([run.id for run in block.recent_runs], ["api-running", "api-fail", "api-pass"])
+        self.assertEqual(block.recent_runs[0].status, "RUNNING")
+        self.assertEqual(block.recent_runs[2].duration, 4.0)
+        self.assertEqual(sum(point.total for point in block.trend), 3)
+        self.assertEqual(sum(point.running_count for point in block.trend), 1)
+        self.assertGreaterEqual(len(block.trend), 7)
+
+    def test_dashboard_api_block_is_empty_but_present_without_runs(self):
+        overview = get_dashboard_overview(range_key="24h", platform="all", limit_recent=5, limit_tasks=5, session=self.session)
+        self.assertEqual(overview.api_automation.total_runs, 0)
+        self.assertEqual(overview.api_automation.pass_rate, 0.0)
+        self.assertEqual(overview.api_automation.recent_runs, [])
+        self.assertEqual(len(overview.api_automation.trend), 24)
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ jobs:
         run: python -m unittest discover -s backend/tests -p 'test_*.py'
 
   frontend:
-    name: Frontend (build)
+    name: Frontend (test + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -45,6 +45,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Test
+        run: node --test tests/*.test.mjs
 
       - name: Build
         run: npm run build

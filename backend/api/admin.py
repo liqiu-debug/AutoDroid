@@ -62,11 +62,11 @@ def create_user(
 ) -> Any:
     username = user_in.username.strip()
     if not username:
-        raise HTTPException(status_code=400, detail="Username is required")
+        raise HTTPException(status_code=400, detail="请输入用户名")
 
     existing = session.exec(select(User).where(User.username == username)).first()
     if existing:
-        raise HTTPException(status_code=400, detail="The user with this username already exists")
+        raise HTTPException(status_code=400, detail="用户名已存在")
 
     user = User(
         username=username,
@@ -92,10 +92,10 @@ def update_user_status(
 ) -> Any:
     user = session.get(User, user_id)
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="用户不存在")
 
     if user.id == current_user.id and not status_in.is_active:
-        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+        raise HTTPException(status_code=400, detail="不能停用自己的账号")
 
     user.is_active = status_in.is_active
     session.add(user)

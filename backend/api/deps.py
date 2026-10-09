@@ -63,7 +63,7 @@ async def get_current_user(
 ) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
+        detail="登录状态无效或已过期，请重新登录",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -94,7 +94,7 @@ def is_api_token_auth(request: Optional[Request]) -> bool:
 
 async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
     if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise HTTPException(status_code=400, detail="账号已被停用，请联系管理员")
     return current_user
 
 
@@ -109,14 +109,14 @@ async def get_current_user_no_token(
     if is_api_token_auth(request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="API tokens are not allowed to access this endpoint",
+            detail="API Token 不能访问此接口，请使用账号登录",
         )
     return current_user
 
 
 async def get_current_admin_user(current_user: User = Depends(get_current_user_no_token)) -> User:
     if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="没有权限执行此操作")
     return current_user
 
 

@@ -1,4 +1,5 @@
 import { createUuid } from './uuid.js'
+import { describeError } from './errors.js'
 
 export const copy = value => JSON.parse(JSON.stringify(value))
 export const literal = (value = '') => ({ kind: 'literal', value })
@@ -61,15 +62,19 @@ export function overridesFor(snapshot, config) {
   return overrides
 }
 export function stepFromInterface(item) {
-  return { id: createUuid(), name: item.name, kind: 'request', interface_id: item.id, interface_version: item.version, snapshot: copy(item.config), overrides: {}, seconds: 1 }
+  return { id: createUuid(), name: item.name, kind: 'request', interface_id: item.id, interface_version: item.version, snapshot: copy(item.config), overrides: {}, seconds: 1, retry_count: 0 }
 }
 export function localRequestStep(config = blankConfig(), name = '新请求') {
-  return { id: createUuid(), name, kind: 'request', interface_id: null, interface_version: null, snapshot: copy(config), overrides: {}, seconds: 1 }
+  return { id: createUuid(), name, kind: 'request', interface_id: null, interface_version: null, snapshot: copy(config), overrides: {}, seconds: 1, retry_count: 0 }
 }
 export function cloneStep(step) {
   return { ...copy(step), id: createUuid(), name: `${step.name} 副本` }
 }
 export const pathLabel = path => (path || []).map(k => typeof k === 'number' ? `[${k}]` : k).join(' › ')
+// Mirrors backend api_testing.values.conflict_key. Section and request field
+// names never contain dots, so joining keeps both sides byte-identical without
+// depending on JSON whitespace.
+export const conflictKey = path => (path || []).map(String).join('.')
 export const referenceLabel = (value, sources = []) => value.kind === 'env' ? `环境 → ${value.name}` : `${sources.find(s => s.id === value.step_id)?.name || '失效步骤'} → ${fieldName(value.path)}`
 export const fieldName = path => typeof path?.at(-1) === 'number' ? `[${path.at(-1)}]` : path?.at(-1) || '响应'
 export const shortValue = value => {
@@ -102,11 +107,22 @@ export function requestPreview(request, sources = []) {
   return { 方法: request.method, 地址: previewValue(request.url, sources), 路径参数: request.path_params.filter(p=>p.enabled).map(p=>({名称:p.name,值:previewValue(p.value,sources)})), 查询参数: request.query.filter(p=>p.enabled).map(p=>({名称:p.name,值:previewValue(p.value,sources)})), 请求头: request.headers.filter(p=>p.enabled).map(p=>({名称:p.name,值:previewValue(p.value,sources)})), 鉴权: authLabel(request.auth.kind), 请求体: request.body_type === 'form' ? request.form.filter(p=>p.enabled).map(p=>({名称:p.name,值:previewValue(p.value,sources)})) : request.body_type === 'none' ? null : previewValue(request.body,sources) }
 }
 export function businessAssertion(field, realValue = false) {
-  const name = String(field.path?.at(-1) || '')
-  if (/(?:^id$|_id$|Id$|ID$|token|uuid|nonce|timestamp|(?:^|_)time$|Time$|_at$|At$)/.test(name)) {
+  if (dynamicField(field.path)) {
     return { id:createUuid(), path:copy(field.path), op:'not_empty', expected:literal(null) }
   }
   return { id:createUuid(), path:copy(field.path), op:'eq', expected:realValue && Object.hasOwn(field,'example') ? fromJson(field.example) : literal('') }
+}
+// Shared by the automatic suggestion and the manual-edit warning so the two
+// never drift apart. Names that change every run must not be pinned to a value.
+const DYNAMIC_FIELD = /(?:^id$|_id$|Id$|ID$|token|uuid|nonce|timestamp|(?:^|_)time$|Time$|_at$|At$)/
+export const dynamicField = path => DYNAMIC_FIELD.test(String(path?.at(-1) || ''))
+// Computed once per step so the card does not deep-copy the same snapshot for
+// every field it renders. The card is narrow, so it shows only the method and
+// the check count.
+export function stepSummary(step) {
+  if (step.kind === 'wait') return `等待 ${step.seconds} 秒`
+  const config = effectiveStep(step)
+  return `${config.request.method} · ${config.assertions.length} 条校验`
 }
 export function referenceIssues(steps) {
   const available = new Set(), issues = []
@@ -138,17 +154,49 @@ export function failureSummary(run) {
 export function validateReferences(steps) {
   return [...new Set(referenceIssues(steps).map(issue=>`${issue.step_name}：${issue.message}`))]
 }
+// Which steps a batch AI pass can generate for, in order, and why the others
+// cannot. Mirrors the server: a suggestion needs a real response from this
+// debug session, the chain stops at the first non-PASS step, and an error
+// response must never be turned into a template.
+export function batchSuggestionPlan(steps, results = {}) {
+  let blockedBy = null
+  return (steps || []).map(step => {
+    const base = { stepId: step.id, name: step.name }
+    if (step.kind !== 'request') return { ...base, eligible: false, reason: 'wait' }
+    const row = results[step.id]
+    if (!row?.detail?.response) return { ...base, eligible: false, reason: 'not_executed', blockedBy }
+    const eligible = ['PASS', 'UNCHECKED'].includes(row.status)
+    if (row.status !== 'PASS' && !blockedBy) blockedBy = step.id
+    return eligible ? { ...base, eligible: true, reason: null, status: row.status } : { ...base, eligible: false, reason: 'failed', status: row.status }
+  })
+}
 export function apiError(error) {
   const detail = error.response?.data?.detail
   if (typeof detail === 'string') return detail
   if (Array.isArray(detail)) return detail.map(v => v.message || v.msg || JSON.stringify(v)).join('；')
   if (detail?.message) return `${detail.message}：${(detail.scenarios || detail.tasks || []).join('、')}`
-  return error.message || '操作失败'
+  return describeError(error) || '操作失败'
 }
 export const activeStatus = status => ['QUEUED', 'RUNNING', 'PENDING'].includes(status)
 export const statusType = status => ({ PASS: 'success', FAIL: 'danger', ERROR: 'danger', UNCHECKED:'warning', RUNNING: 'primary', QUEUED: 'info', ABORTED: 'warning', SKIP: 'info' }[status] || 'info')
 export const statusLabel = status => ({ PASS: '通过', FAIL: '校验失败', ERROR: '执行异常', UNCHECKED:'未校验', RUNNING: '运行中', QUEUED: '排队中', PENDING: '待执行', ABORTED: '已中止', SKIP: '已跳过', IDLE: '未运行' }[status] || status)
 export const assertionLabel = op => ({ is_2xx: '状态码 2xx', eq: '等于', ne: '不等于', contains: '包含', exists: '存在', not_empty: '非空', gt: '大于', gte: '大于等于', lt: '小于', lte: '小于等于', type: '类型为', length: '长度等于' }[op] || op)
+// Identity of a check (same path, condition and expected value). Server dumps
+// and locally built literals differ in shape, so literals compare by value.
+export const assertionKey = assertion => {
+  const expected = assertion.expected
+  const value = ['exists', 'not_empty', 'is_2xx'].includes(assertion.op) ? null
+    : !expected ? null
+    : expected.kind === 'literal' ? ['literal', expected.value ?? null]
+    : expected
+  return JSON.stringify([assertion.path, assertion.op, value])
+}
+// Applying AI suggestions must be idempotent: a second click never appends a
+// check the step already has.
+export function newAssertions(existing, additions) {
+  const seen = new Set((existing || []).map(assertionKey))
+  return (additions || []).filter(assertion => { const key = assertionKey(assertion); if (seen.has(key)) return false; seen.add(key); return true })
+}
 export async function downloadReport(api, id) {
   const { data } = await api.download(id)
   const url = URL.createObjectURL(data)

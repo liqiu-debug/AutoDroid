@@ -93,7 +93,7 @@ def list_tokens(
     statement = select(ApiToken)
     if all:
         if current_user.role != "admin":
-            raise HTTPException(status_code=403, detail="Not enough permissions")
+            raise HTTPException(status_code=403, detail="没有权限执行此操作")
     else:
         statement = statement.where(ApiToken.user_id == current_user.id)
     statement = statement.order_by(ApiToken.created_at.desc())

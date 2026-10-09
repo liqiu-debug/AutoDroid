@@ -1,4 +1,7 @@
 import axios from 'axios'
+import { normalizeError } from '@/utils/errors'
+
+export const LOGIN_NOTICE_KEY = 'autodroid.login_notice'
 
 const api = axios.create({
     baseURL: '/api', // Proxy handles this
@@ -31,9 +34,14 @@ api.interceptors.response.use(
         return response
     },
     (error) => {
+        // Every failure leaves here with Chinese `message` and `data.detail`,
+        // so call sites that print either never show axios/English text.
+        normalizeError(error)
         if (error.response && error.response.status === 401) {
+            const expired = !!localStorage.getItem('token')
             localStorage.removeItem('token')
-            window.location.href = '/login'
+            if (expired) sessionStorage.setItem(LOGIN_NOTICE_KEY, '登录状态已失效，请重新登录')
+            if (!window.location.pathname.startsWith('/login')) window.location.href = '/login'
         }
         return Promise.reject(error)
     }

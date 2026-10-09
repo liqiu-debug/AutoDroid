@@ -162,8 +162,6 @@ def request_issues(request, env, outputs=None):
         for index, parameter in enumerate(getattr(request, group)):
             if parameter.enabled:
                 text(parameter.value, [group, index, "value"])
-                if group == "headers" and parameter.name.lower() in {"host", "content-length", "transfer-encoding", "connection"}:
-                    add([group, index, "name"], "该请求头由执行器管理，请移除或禁用")
     if request.body_type == "text":
         text(request.body, ["body"])
     auth = request.auth
@@ -362,3 +360,37 @@ def sync_preview(step: Step, config, version):
     proposal.snapshot, proposal.interface_version = config, version
     proposal.effective()
     return {"step": proposal.model_dump(), "changes": changes, "conflicts": conflicts}
+
+
+def conflict_key(path):
+    """Stable conflict identifier shared with the frontend.
+
+    Section names and request field names never contain dots, so joining is
+    unambiguous and avoids depending on JSON whitespace matching.
+    """
+    return ".".join(str(part) for part in path)
+
+
+def apply_sync(step, config, version, choices=None):
+    """Apply an interface update to a step, honouring per-conflict choices.
+
+    Returns ``(updated_step, unresolved_conflicts)``. Callers must treat a
+    non-empty unresolved list as a refusal to write anything: an unresolved
+    conflict means the user has not decided whether to keep their local edit.
+    """
+    preview = sync_preview(step, config, version)
+    choices = choices or {}
+    unresolved = [
+        list(path) for path in preview["conflicts"] if choices.get(conflict_key(path)) not in {"keep", "template"}
+    ]
+    if unresolved:
+        return None, unresolved
+    updated = Step.model_validate(preview["step"])
+    for path in preview["conflicts"]:
+        if choices[conflict_key(path)] == "template":
+            if len(path) == 2:
+                updated.overrides.get("request", {}).pop(path[1], None)
+            else:
+                updated.overrides.pop(path[0], None)
+    updated.effective()
+    return updated, []

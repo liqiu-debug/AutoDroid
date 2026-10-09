@@ -33,10 +33,14 @@ from backend.api_testing.schemas import (
     PrecheckRequest,
     RunRequest,
     ScenarioWrite,
+    SpecApplyRequest,
+    SpecInput,
     Step,
+    SyncApplyRequest,
 )
 from backend.api_testing.security import MASK
-from backend.api_testing.values import field_tree, sync_preview, validate_steps, at_path
+from backend.api_testing.specs import parse_spec
+from backend.api_testing.values import apply_sync, field_tree, sync_preview, validate_steps, at_path
 
 router = APIRouter(dependencies=[Depends(get_current_active_user)])
 router.include_router(ai_router)
@@ -129,6 +133,38 @@ def import_curl(payload: CurlInput):
         "config": DefinitionConfig(request=spec).model_dump(),
         "warning": "仅解析，尚未发送请求。请将鉴权值替换为敏感环境变量。",
     }
+
+
+@router.post("/imports/spec")
+def import_spec(payload: SpecInput):
+    """Parse an OpenAPI/Swagger/Postman document. Never sends a request."""
+    try:
+        return parse_spec(payload.content)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+@router.post("/imports/apply")
+def apply_spec(
+    payload: SpecApplyRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_active_user),
+):
+    """Create the selected entries in one transaction: all of them, or none."""
+    check_folder(session, payload.folder_id, "interface")
+    created = []
+    for item in payload.items:
+        row = ApiDefinition(
+            **{**definitions_values(item), "folder_id": payload.folder_id},
+            user_id=user.id,
+            updater_id=user.id,
+        )
+        session.add(row)
+        created.append(row)
+    session.commit()
+    for row in created:
+        session.refresh(row)
+    return {"created": [definition_read(session, row) for row in created]}
 
 
 @router.get("/folders")
@@ -263,6 +299,119 @@ def preview_sync(interface_id: int, step: Step, session: Session = Depends(get_s
     return sync_preview(step, DefinitionConfig.model_validate(row.config), row.version)
 
 
+def step_uses_interface(definition, interface_id, interface_version):
+    """A step is stale when its frozen template version trails the interface."""
+    if definition.get("interface_id") != interface_id:
+        return False
+    return definition.get("interface_version") != interface_version
+
+
+@router.get("/interfaces/{interface_id}/usages")
+def interface_usages(interface_id: int, session: Session = Depends(get_session)):
+    """Where this interface is used, and which steps are behind the current version."""
+    row = require(session, ApiDefinition, interface_id)
+    config = DefinitionConfig.model_validate(row.config)
+    rows = session.exec(select(ApiScenarioStep).where(ApiScenarioStep.interface_id == interface_id)).all()
+    scenarios = {
+        item.id: item
+        for item in session.exec(
+            select(ApiScenario).where(ApiScenario.id.in_({r.scenario_id for r in rows}))
+        ).all()
+    } if rows else {}
+    grouped, total, stale = {}, 0, 0
+    for step_row in sorted(rows, key=lambda r: (r.scenario_id, r.position)):
+        step = Step.model_validate(step_row.definition)
+        behind = step_uses_interface(step_row.definition, interface_id, row.version)
+        total += 1
+        stale += behind
+        _, conflicts = (None, sync_preview(step, config, row.version)["conflicts"]) if behind else (None, [])
+        grouped.setdefault(step_row.scenario_id, []).append(
+            {
+                "step_id": step_row.step_id,
+                "name": step.name,
+                "position": step_row.position,
+                "interface_version": step.interface_version,
+                "stale": behind,
+                "conflicts": conflicts,
+            }
+        )
+    items = [
+        {
+            "scenario_id": scenario_id,
+            "scenario_name": scenarios[scenario_id].name if scenario_id in scenarios else "已删除的场景",
+            "folder_id": scenarios[scenario_id].folder_id if scenario_id in scenarios else None,
+            "version": scenarios[scenario_id].version if scenario_id in scenarios else None,
+            "steps": steps,
+        }
+        for scenario_id, steps in grouped.items()
+    ]
+    return {
+        "interface_id": interface_id,
+        "version": row.version,
+        "total_scenarios": len(items),
+        "total_steps": total,
+        "stale_steps": stale,
+        "items": items,
+    }
+
+
+def apply_sync_item(db_engine, interface_id, config, interface_version, item):
+    """One scenario step per transaction: a refusal must not affect the others."""
+    identity = {"scenario_id": item.scenario_id, "step_id": item.step_id, "ok": False, "changed": False}
+
+    def refuse(message, **extra):
+        return {**identity, "error": message, **extra}
+
+    try:
+        with Session(db_engine) as session:
+            scenario = session.get(ApiScenario, item.scenario_id)
+            if not scenario or scenario.version != item.version:
+                return refuse("场景已被其他人修改，请刷新后重试")
+            if session.exec(
+                select(ApiRun).where(ApiRun.scenario_id == item.scenario_id, ApiRun.status.in_(service.ACTIVE))
+            ).first():
+                return refuse("场景正在运行，请先结束执行")
+            step_row = session.exec(
+                select(ApiScenarioStep).where(
+                    ApiScenarioStep.scenario_id == item.scenario_id, ApiScenarioStep.step_id == item.step_id
+                )
+            ).first()
+            if not step_row or step_row.interface_id != interface_id:
+                return refuse("步骤不存在或未引用该接口")
+            step = Step.model_validate(step_row.definition)
+            if not step_uses_interface(step_row.definition, interface_id, interface_version):
+                return {**identity, "ok": True, "version": scenario.version}
+            updated, conflicts = apply_sync(step, config, interface_version, item.choices)
+            if conflicts:
+                return refuse("存在需要逐项确认的冲突", conflicts=conflicts)
+            optimistic_update(session, ApiScenario, scenario.id, item.version, {"updated_at": datetime.now()})
+            step_row.definition = updated.model_dump()
+            session.add(step_row)
+            session.commit()
+            return {**identity, "ok": True, "changed": True, "version": item.version + 1}
+    except HTTPException as exc:
+        return refuse(str(exc.detail))
+
+
+@router.post("/interfaces/{interface_id}/sync-apply")
+def apply_sync_batch(
+    interface_id: int,
+    payload: SyncApplyRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_active_user),
+):
+    """Update steps to the current interface version, one decision per conflict."""
+    row = require(session, ApiDefinition, interface_id)
+    config = DefinitionConfig.model_validate(row.config)
+    db_engine = session.get_bind()
+    results = [apply_sync_item(db_engine, interface_id, config, row.version, item) for item in payload.items]
+    return {
+        "applied": sum(1 for item in results if item["changed"]),
+        "failed": sum(1 for item in results if not item["ok"]),
+        "items": results,
+    }
+
+
 def validate_scenario(session, payload):
     check_folder(session, payload.folder_id, "scenario")
     if payload.env_id is not None:
@@ -289,6 +438,38 @@ def save_steps(session, scenario_id, steps):
         )
 
 
+def stale_step_counts(session, scenario_ids):
+    """Per scenario, how many steps trail their interface's current version.
+
+    A junior tester should not have to open every scenario to discover that an
+    interface changed; the list surfaces it in one batched query.
+    """
+    if not scenario_ids:
+        return {}
+    rows = session.exec(
+        select(ApiScenarioStep.scenario_id, ApiScenarioStep.definition).where(
+            ApiScenarioStep.scenario_id.in_(scenario_ids), ApiScenarioStep.interface_id.isnot(None)
+        )
+    ).all()
+    versions = (
+        dict(
+            session.exec(
+                select(ApiDefinition.id, ApiDefinition.version).where(
+                    ApiDefinition.id.in_({definition.get("interface_id") for _, definition in rows})
+                )
+            ).all()
+        )
+        if rows
+        else {}
+    )
+    counts = {}
+    for scenario_id, definition in rows:
+        interface_id = definition.get("interface_id")
+        if interface_id in versions and definition.get("interface_version") != versions[interface_id]:
+            counts[scenario_id] = counts.get(scenario_id, 0) + 1
+    return counts
+
+
 @router.get("/scenarios")
 def list_scenarios(
     keyword: str = "",
@@ -301,11 +482,12 @@ def list_scenarios(
     users = asset_users(session, rows)
     ids = [row.id for row in rows]
     counts = dict(session.exec(select(ApiScenarioStep.scenario_id, func.count()).where(ApiScenarioStep.scenario_id.in_(ids)).group_by(ApiScenarioStep.scenario_id)).all())
+    stale = stale_step_counts(session, ids)
     latest_ids = select(ApiRun.scenario_id, func.max(ApiRun.created_at).label("latest")).where(ApiRun.scenario_id.in_(ids)).group_by(ApiRun.scenario_id).subquery()
     latest = {}
     for run in session.exec(select(ApiRun).join(latest_ids, (ApiRun.scenario_id == latest_ids.c.scenario_id) & (ApiRun.created_at == latest_ids.c.latest))).all():
         latest[run.scenario_id] = {key: getattr(run, key) for key in ("id", "status", "created_at", "env_name")}
-    return {"total": total, "items": [{**asset_read(session, row, users), "step_count": counts.get(row.id, 0), "last_run": latest.get(row.id)} for row in rows]}
+    return {"total": total, "items": [{**asset_read(session, row, users), "step_count": counts.get(row.id, 0), "stale_steps": stale.get(row.id, 0), "last_run": latest.get(row.id)} for row in rows]}
 
 
 @router.post("/scenarios")

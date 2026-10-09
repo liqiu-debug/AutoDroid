@@ -3,10 +3,11 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
 import { createUuid } from '@/utils/uuid'
-import { apiError, copy, effectiveStep, pathLabel, assertionLabel, previewValue } from '@/utils/apiTesting'
+import AiSuggestionList from './AiSuggestionList.vue'
+import { apiError, copy, effectiveStep, newAssertions } from '@/utils/apiTesting'
 const props=defineProps({steps:Array,stepId:String,envId:[Number,String],debugSessionId:String,editorId:String,result:Object,disabled:Boolean})
 const emit=defineEmits(['update-assertions'])
-const available=ref(false),open=ref(false),busy=ref(false),applying=ref(false),goal=ref(''),suggestions=ref([]),chosen=ref([]),warnings=ref([]),error=ref(''),callId=ref(''),revision=ref(createUuid()),resultRevision=ref(''),applied=ref(null)
+const available=ref(false),open=ref(false),busy=ref(false),applying=ref(false),goal=ref(''),suggestions=ref([]),chosen=ref([]),warnings=ref([]),error=ref(''),callId=ref(''),revision=ref(createUuid()),resultRevision=ref(''),applied=ref(null),appliedIndexes=ref([])
 let alive=true,modificationRecorded=false
 const recordedFeedback=new Map()
 const assertions=computed(()=>{const step=props.steps?.find(s=>s.id===props.stepId);return step?effectiveStep(step).assertions:[]})
@@ -32,7 +33,7 @@ async function generate(){
   if(!alive||busy.value||applying.value||props.disabled)return
   const token=revision.value
   if(suggestions.value.length)feedback('dismissed')
-  busy.value=true;error.value='';suggestions.value=[];chosen.value=[];warnings.value=[];callId.value='';resultRevision.value=''
+  busy.value=true;error.value='';suggestions.value=[];chosen.value=[];appliedIndexes.value=[];warnings.value=[];callId.value='';resultRevision.value=''
   try{
     const {data}=await api.apiTesting.post('/ai/suggest-assertions',{steps:copy(props.steps),step_id:props.stepId,env_id:props.envId||null,debug_session_id:props.debugSessionId,editor_id:props.editorId,goal:goal.value,draft_token:token},{timeout:95000})
     if(!alive)return
@@ -42,17 +43,21 @@ async function generate(){
 }
 async function apply(){
   if(!alive||stale.value||props.disabled||busy.value||applying.value||!chosen.value.length||!callId.value)return
-  const indexes=[...new Set(chosen.value)]
-  if(indexes.some(index=>!Number.isInteger(index)||!suggestions.value[index]?.assertion))return
+  const indexes=[...new Set(chosen.value)].filter(index=>!appliedIndexes.value.includes(index))
+  if(!indexes.length||indexes.some(index=>!Number.isInteger(index)||!suggestions.value[index]?.assertion))return
   applying.value=true
-  const additions=indexes.map(index=>({...copy(suggestions.value[index].assertion),id:createUuid()}))
+  // Idempotent: a check the step already has is skipped instead of appended.
+  const additions=newAssertions(assertions.value,indexes.map(index=>({...copy(suggestions.value[index].assertion),id:createUuid()})))
+  const skipped=indexes.length-additions.length
   const accepted={callId:callId.value,stepId:props.stepId,assertions:additions}
   try{
-    emit('update-assertions',[...copy(assertions.value),...additions])
+    if(additions.length)emit('update-assertions',[...copy(assertions.value),...additions])
     await nextTick()
     if(!alive||props.stepId!==accepted.stepId)return
-    applied.value=accepted;modificationRecorded=false
-    feedback('accepted',accepted.callId,additions.length);open.value=false;ElMessage.success('已加入校验草稿，可重新校验当前响应')
+    appliedIndexes.value=[...new Set([...appliedIndexes.value,...indexes])];chosen.value=[]
+    if(additions.length){applied.value=accepted;modificationRecorded=false;feedback('accepted',accepted.callId,additions.length)}
+    open.value=false
+    ElMessage[additions.length?'success':'warning'](additions.length?`已加入 ${additions.length} 条校验草稿${skipped?`，${skipped} 条已存在跳过`:''}，可重新校验当前响应`:'选中的建议都已存在，未重复添加')
   }finally{applying.value=false}
   recordModification()
 }
@@ -75,9 +80,9 @@ function dismiss(){if(callId.value&&suggestions.value.length)feedback('dismissed
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-alert v-else-if="suggestions.length&&stale" title="配置或响应已改变，请重新生成后再应用。" type="warning" :closable="false" />
     <p v-for="warning in warnings" :key="warning" class="hint">{{ warning }}</p>
-    <el-checkbox-group v-model="chosen" class="suggestions"><div v-for="(item,index) in suggestions" :key="index" class="suggestion"><el-checkbox :value="index" :disabled="stale"><b>{{ pathLabel(item.assertion.path) }} {{ assertionLabel(item.assertion.op) }}</b></el-checkbox><p v-if="!['exists','not_empty','is_2xx'].includes(item.assertion.op)">期望：{{ previewValue(item.assertion.expected,steps) }}</p><p>{{ item.reason }}</p><small>依据字段：{{ pathLabel(item.evidence.path) }} · {{ item.evidence.type }}</small></div></el-checkbox-group>
-    <template #footer><el-button @click="dismiss">关闭</el-button><el-button type="primary" :loading="applying" :disabled="!chosen.length||stale||busy||disabled" @click="apply">应用选中的 {{ chosen.length }} 条建议</el-button></template>
+    <AiSuggestionList v-model="chosen" :suggestions="suggestions" :disabled="stale" :applied="appliedIndexes" :sources="steps" />
+    <template #footer><el-button @click="dismiss">关闭</el-button><el-button type="primary" :loading="applying" :disabled="!chosen.filter(i=>!appliedIndexes.includes(i)).length||stale||busy||disabled" @click="apply">应用选中的 {{ chosen.filter(i=>!appliedIndexes.includes(i)).length }} 条建议</el-button></template>
   </el-dialog>
 </template>
-<style scoped>.ai-actions{display:inline-flex;gap:8px;flex-wrap:wrap}.generate{margin:12px 0}.hint,small{font-size:12px;color:var(--ad-muted);line-height:1.6}.suggestions{max-height:42vh;overflow:auto}.suggestion{padding:12px 0;border-bottom:1px solid var(--ad-border)}.suggestion p{font-size:13px;margin:6px 0;overflow-wrap:anywhere}.suggestion :deep(.el-checkbox){height:auto;white-space:normal}.suggestion :deep(.el-checkbox__label){white-space:normal;overflow-wrap:anywhere}@media(max-width:760px){.hint,small,.suggestion p{font-size:14px}.suggestion{padding:12px}.tools{flex-wrap:wrap}}
+<style scoped>.ai-actions{display:inline-flex;gap:8px;flex-wrap:wrap}.generate{margin:12px 0}.hint{font-size:12px;color:var(--ad-muted);line-height:1.6}@media(max-width:760px){.hint{font-size:14px}}
 </style>

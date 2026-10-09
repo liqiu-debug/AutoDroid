@@ -4,6 +4,101 @@
 
 ## 本次体验优化验证
 
+### 面向初级测试的可维护性改造（2026-10-08）
+
+本轮目标是“初级测试也能维护”：接手别人建的场景时能看懂在测什么、知道接口改了该去哪修、不容易写出会误报的断言。所有浏览器验证均在隔离预览程序内完成，未访问真实业务接口、设备或飞书，未调用真实模型。
+
+#### 接口变更影响面与批量同步
+
+- 新增 `GET /interfaces/{id}/usages`：一次批量查询返回引用该接口的场景与步骤，逐项标记 `stale` 与冲突字段路径；场景列表新增 `stale_steps`，接口页顶部显示“被 N 个场景的 M 个步骤引用”，场景列表在名称旁显示“接口有更新”角标。
+- 新增 `POST /interfaces/{id}/sync-apply`：只同步没有本步骤修改的旧版本步骤；每项独立事务，版本不匹配（场景已被他人修改）、场景正在运行、存在未决冲突时只跳过该项并返回原因，其余步骤照常更新。成功同步提升场景版本号，因此并发的编辑器保存会得到 409 而不是静默覆盖。
+- 隔离预览实测：`查询订单` 接口刻意比场景快照高一个版本。批量同步“订单查询 · 轻量示例”的无冲突步骤成功并升版（场景 v1→v2，步骤升到 v2）；“下单回归 · 示例”中改过 `query` 的步骤被拒绝，返回 `存在需要逐项确认的冲突` 与 `[["request","query"]]`；同步后完整场景（登录 → 创建订单 → 查询订单）重新运行三步全部 PASS。
+- 后端覆盖 `test_interface_usages_report_stale_steps_and_conflicts`、`test_sync_apply_updates_clean_steps_and_requires_conflict_decisions`、`test_sync_apply_refuses_stale_version_running_scenario_and_current_steps`。前后端共用同一冲突键（`request.url` 形式的点号拼接），避免依赖 JSON 空格匹配。
+
+#### 编辑器可读性与防误用
+
+- 步骤卡片保持只显示请求方法与校验数（`POST · 2 条校验`）；曾尝试加入请求路径，因卡片宽度放不下而回退。保留的改动是同一卡片在一次渲染里只深拷贝一次步骤（此前调用两次 `effectiveStep`），显示内容与此前完全一致。
+- 场景说明常驻标题下方，为空时给出补充提示并可点击进入“场景信息”；说明随运行写入快照（`snapshot.description`），报告页与 HTML 导出都会显示。旧报告没有该字段，读取处使用 `.get()`，打开正常。场景列表新增“说明”列。
+- 断言把动态字段识别抽成共享函数 `dynamicField`，自动建议与手动提示使用同一条规则。手动把 id/token/时间类字段改成“等于”时，该行就地提示“该字段每次运行通常不同，固定值容易误报”，并提供一键改为“非空”或“与前序字段一致”，不阻断保存。
+
+#### 步骤级失败重试
+
+- 步骤新增 `retry_count`（0–3，默认 0），入口在请求配置的「高级 → 失败重试」。步骤存在 JSON 列中，旧数据按默认值解析，无需数据库迁移。
+- **只重试请求未到达服务端的失败**（连接被拒绝、连接超时、代理错误）；已收到响应、读超时、写超时一律不重试。这与 UI 用例的失败重试语义有意不同：接口步骤可能是写操作，本模块不做业务回滚，重复发送等于重复写入业务数据。
+- 内部可重试标记不落库、不出现在结果中（测试断言 `retryable` 不泄漏）；结果记录 `attempts` 与 `retry_history`，报告和响应区在尝试次数大于 1 时标注“共尝试 N 次”并列出前几次的连接失败原因。
+- 隔离预览实测：`/flaky` 首次模拟连接失败，`retry_count=1` 的步骤最终 PASS，`attempts=2`、`retry_history` 一条、耗时约 1.1 秒（含 1 秒退避）。
+- 后端覆盖 `test_retry_only_repeats_requests_that_never_reached_the_server`、`test_read_timeout_and_received_responses_are_never_repeated`、`test_zero_retries_keep_current_behaviour_and_backoff_is_cancellable`、`test_retried_step_is_labelled_in_the_exported_report`。
+
+#### 接口文档导入
+
+- 新增 `backend/api_testing/specs.py` 与 `POST /imports/spec`（只读解析）、`POST /imports/apply`（一次事务全建或全不建）。支持 OpenAPI 3、Swagger 2.0、Postman v2.1，JSON 与 YAML 均可；YAML 使用 `safe_load`，拒绝任意对象构造；不读文件、不起 shell、不访问网络；单次上限 2 MiB、300 个接口，超出时显式提示只导入前 300 个。
+- 路径参数保留 `{id}` 占位并生成同名路径参数；JSON 请求体按文档结构生成可编辑示例；OpenAPI 的 2xx 示例与 Postman 保存的响应会一并存为样例，导入后无需先调试即可选取字段。
+- **Postman 声明的凭证不作为值导入**：Bearer/Basic/API Key 只映射类型、凭证留空；请求头中的凭证按 cURL 导入的既有策略保留原文并提示替换为敏感环境变量。此策略与 cURL 导入保持一致，未引入新的脱敏规则。
+- 前端入口：「接口管理 → 导入文档」与场景「添加步骤 → 导入接口文档」（后者导入后同时加入场景草稿）。粘贴 → 解析预览 → 勾选（可搜索、跨筛选保留选择）→ 选目标目录 → 导入。
+- 后端覆盖 `backend/tests/test_api_testing_specs.py` 8 项（OpenAPI JSON/YAML、`$ref` 与自引用终止、Swagger 2 host/basePath/body/formData、Postman 嵌套目录与 raw/urlencoded 请求体、危险 YAML 标签与超大输入拒绝、候选数量上限、重复 key 去重），以及 `test_document_import_parses_then_creates_only_selected_entries`、`test_document_import_is_all_or_nothing`。
+- 新增依赖 `pyyaml` 到 `requirements-base.txt`（此前只是 androguard/paddleocr 的传递依赖）；未安装时 JSON 文档仍可解析，YAML 会给出明确提示。
+
+#### 工程保障
+
+- 前端测试接入 CI：`.github/workflows/ci.yml` 的 frontend job 在 `npm ci` 后先执行 `node --test tests/*.test.mjs` 再构建。此前 17 个测试文件只在本地运行，CI 只做构建。
+- 新增 `frontend/tests/apiMaintainabilityUiContracts.test.mjs`（7 项）覆盖本轮界面契约；`tests/apiTesting.test.mjs` 新增 `stepSummary`、`dynamicField`、`conflictKey` 用例。
+- 预览种子扩展为 2 个场景 / 4 个接口，覆盖过期检测、批量同步、冲突确认与失败重试四条路径。
+
+自动检查：
+
+| 检查 | 本轮结果 |
+|---|---|
+| 接口自动化后端（values/engine/api/ai/specs） | 78 项通过 |
+| 后端全量回归 | 1334 项通过 |
+| 前端全量测试 | 153 项通过 |
+| 前端生产构建 | 通过 |
+| Ruff（backend + scripts） | 通过 |
+
+复现命令：
+
+```bash
+.venv/bin/python -m unittest backend.tests.test_api_testing_values backend.tests.test_api_testing_engine backend.tests.test_api_testing_api backend.tests.test_api_testing_ai backend.tests.test_api_testing_specs -v
+cd frontend
+node --test tests/*.test.mjs
+npm run build
+```
+
+隔离预览（种子已包含过期接口、无冲突步骤、冲突步骤和一次性连接失败）：
+
+```bash
+API_PREVIEW_DIR=$(mktemp -d /tmp/autodroid-api-preview.XXXXXX)
+AUTODROID_API_PREVIEW=1 AUTODROID_DB_PATH="$API_PREVIEW_DIR/preview.db" \
+  .venv/bin/python -m uvicorn backend.tests.api_testing_preview_app:app --host 127.0.0.1 --port 18765
+```
+
+本轮未做（已知遗留，非本轮范围）：报告读取端点的归属校验（见路线图 P2.9）、执行线程池固定 4 worker 的容量问题、环境变量缺少审计、AI `debug_context` 中循环泄漏的 `result` 变量可读性。
+
+#### 同日跟进修正
+
+按实际使用反馈处理的几处问题，均为既有行为的修正而非新功能：
+
+- **确认弹窗横向铺满**：Element Plus 的 `.el-message-box` 以 `width:100%` 配合 `max-width` 限宽，而全局样式只覆盖了 `max-width: calc(100vw - 32px)`，等于把 420px 的上限换成了接近视口宽度，所有 `ElMessageBox.confirm` 弹窗（退出登录、删除确认等）都被拉成通栏。修正为保留 `width: var(--el-messagebox-width, 420px)`、仅用 `max-width` 适配窄屏；弹窗由遮罩层的 `text-align:center` 居中，无需额外处理。
+- **账户菜单回到顶栏右侧**：界面重构曾把账户菜单（头像 + 姓名 + 修改密码 / 退出登录）移到侧边栏底部，顶栏右侧只剩模式切换。现搬回顶栏右侧并移除侧栏底部账户区，侧栏全部留给菜单。
+- **请求头以配置为准**：预检不再对 `Host` / `Content-Length` / `Connection` / `Transfer-Encoding` 报“由执行器管理，请移除或禁用”。真实 socket 验证：httpx 对显式 `Host`、匹配的 `Content-Length`、`Connection` 按原值发送；`Transfer-Encoding: chunked` 改为以流式请求体发送，由传输层做分块并省略 `Content-Length`（若直接把该头随定长请求体发出，报文会同时带两种长度标记而被服务端误读）。顺带修正一个既有缺口：传输层拒绝的组合会抛出 `h11.LocalProtocolError`，它不在 httpx 异常体系内、此前会逃出执行引擎记为“执行器内部异常”，现在在引擎内捕获并记为配置错误，明确提示检查 `Content-Length` 与 `Transfer-Encoding`。后端新增 `test_configured_host_frame_headers_are_sent_as_written`、`test_chunked_body_is_framed_by_the_transport`、`test_headers_the_transport_refuses_report_a_configuration_error`、`test_configured_frame_headers_are_no_longer_blocked_by_precheck`。
+- **定时任务列表「执行内容」列**：与相邻的「下次运行 / 状态 / 操作」一致改为居中（`align="center"`），并给单元格内的 flex 容器加 `justify-content:center`——仅靠列的 `text-align` 不会移动 flex 子元素，表头与内容才会一起居中。
+- **修改密码页标题**：页头同时带 `page-header` 与全局 `ad-page-header`（`justify-content: space-between`），导致「修改密码」被推到最右。页内样式显式设为靠左，与「返回」并排；顶栏面包屑仍显示「账号设置 / 修改密码」。
+- 步骤卡片的请求路径按反馈回退（见上文）。
+- **运行大盘加入接口自动化**：大盘此前只统计 `TestExecution`（设备执行），接口运行记录在独立的 `ApiRun` 表里，因此完全不出现。新增 `DashboardOverview.api_automation` 独立板块（次数 / 通过率 / 失败 / 运行中 / 平均耗时、同时间范围的趋势、最近运行并可跳转接口报告），复用既有趋势分桶逻辑。**有意不合并进顶部设备 KPI**：`ApiRun.scenario_id` 与 `TestExecution.scenario_id` 属于不同的 id 空间，平台筛选对接口无意义，强行合并会让“高失败场景”和告警把两类场景混在一起；接口板块只跟随时间范围。隔离预览实测：跑完一次场景后 24h 板块显示 1 次、通过率 100%、最近运行一条并指向接口报告。后端新增 `test_dashboard_includes_api_automation_in_its_own_block`、`test_dashboard_api_block_is_empty_but_present_without_runs`，并断言设备 KPI 与高失败场景不受影响。移动端大盘未加该板块，因为接口报告详情路由不支持移动模式，点进去会落到“不可用”页。
+- **UI 用例编辑页恢复三栏**：界面重构把「通用步骤」从 220px 常驻列改成了「添加动作」抽屉，并把步骤列从 350px 放宽为 `1fr`（宽屏约半屏），同时删掉了步骤卡片按动作类型着色的两条规则（`StepBuilder` 至今仍在为每个步骤计算 `--action-color`，只是没有样式再引用它；同类的场景编排页保留着这套着色）。现恢复为设备画面（弹性）+ 通用步骤 220px + 步骤构建器 350px 三栏，移除抽屉，恢复卡片左侧色条与序号色块；保留重构带来的“点击即可添加动作”和设计令牌化。通用步骤面板在视口较矮时自身滚动，不再被裁切。
+
+#### AI 校验建议：重叠修复、批量生成与一个既有清洗缺陷
+
+- **重叠错乱（已定位并修复）**：Element Plus 的 `.el-checkbox-group` 自带 `font-size:0; line-height:0`，而建议的说明段落 `<p>` 就渲染在该 group 内，只覆盖了 `font-size`、没覆盖 `line-height` → 每行行框高度为零，多行文字叠在一起。修复放在新的共享展示组件 `AiSuggestionList.vue` 上（`.suggestions{font-size:13px;line-height:1.6}`），单步对话框与批量面板共用同一份行渲染，DOM 结构不变（checkbox 仍需留在 group 内才能 v-model）。`AiAssertions.vue` 的 `<script>` 未改动，其 11 项行为测试（过期 token、迟到响应、重复点击、撤销保护、反馈去重）零改动通过。
+- **场景级批量生成**：新增入口「更多 → AI 校验建议（全部步骤）」（仅 AI 可用时显示）与新抽屉 `AiBatchAssertions.vue`。流程为：统一确认（真实执行警告）→ 从头执行到最后一步 → **顺序**为每个 PASS/未校验且拿到响应的步骤调用现有 `/ai/suggest-assertions`（顺序调用天然满足服务端每用户 2 并发上限）→ 按步骤分组审阅、默认全选 → 应用全部到草稿 → **按顺序**调用 `/debug-sessions/{id}/assertions` 重新校验（不重发请求）→ 用户保存。失败步骤不生成（避免把错误响应固化），其后步骤标「未执行：前序步骤未通过」。
+- **时序约束被测试锁住**：`test_batch_flow_must_generate_for_every_step_before_applying` 断言"一次 through 执行后可为每一步生成 → 给第 1 步应用断言后第 2 步生成返回 409 → 按顺序 recheck 修复链路后第 3 步又可生成"。这正是界面不能边生成边应用的原因。
+- **`useApiDebug` 的两处可选参数**：`run(stepId, mode, { confirmed })` 让批量流程复用统一的确认框，`recheck(stepId, { silent })` 返回 `{status, error}` 供批量流程判断是否继续；两者默认行为不变，现有调用点零改动。
+- **顺带修掉一个既有清洗缺陷**：预览里实测发现登录响应的 `user_id` 根本没被送给模型。原因是 `Sanitizer.allowed_path` 用 `text(part) == part` 判断字段名，而步骤文档会登记出值为 `id` 的"密钥"（`add()` 对每个值同时登记原文、URL 编码和 base64），于是 `user_id` 被当成"包含密钥"整体剔除 —— `text("user_id")` 变成 `user_` + `[已隐藏]`。后果不只是少一个字段：预览里"动态 ID 建议应被过滤"的演示也因此失效（动态字段压根没进上下文）。修复为新增 `identifier()`，字段名只按**长度 ≥ 4** 的密钥值判定，正文清洗（`text()`）仍使用全部已登记值，因此脱敏强度不变。修复后预览三步各自恢复出 2 条建议 + 1 条"动态字段不能使用固定值比较"的过滤提示。
+- **重复点击累加 + 一次 20 条**（同日反馈）：根因两处——`apply()` 对草稿是追加且应用后建议列表与勾选仍在，再点一次就再追加；提示词明确要求"优先建议类型、存在和非空"，模型便为每个字段各给一套。修正：服务端 `validate_suggestions` 新增 existing 过滤（相同指纹或该字段已有结构性校验的不再列出并提示）、按字段合并、按价值排序（下游引用 > 业务结果字段 > 状态码 > 浅层）、截断到 `MAX_SUGGESTIONS=6`（有业务目标 8）；提示词同步改写并把下游引用路径作为事实送入上下文。前端 `newAssertions()` 在单步与批量两处应用时再去重，已应用建议置灰标"已应用"，应用按钮只统计新选中项。预览实测：首次生成 `body.code` 只剩 1 条（type），应用后再生成提示"1 条建议已存在"且不再给同字段的非空。新增后端测试 3 项（合并/排序/截断、已存在过滤、下游引用与目标上限），前端 `assertionKey/newAssertions` 单测与"重复应用不累加"行为测试。
+- 隔离预览实测（API 层，确定性 mock 模型）：through 执行三步全 PASS → 三步各生成建议 → 应用全部 → 顺序 recheck 全部 PASS（`3/3/4` 条断言，未发新请求）→ 草稿保存成功（场景升到 v2）。后端新增 `test_short_secrets_do_not_hide_unrelated_field_names`、`test_batch_flow_must_generate_for_every_step_before_applying`；前端新增 `batchSuggestionPlan` 与 3 项界面契约测试。
+- 未做：不自动保存；不自动"再跑一遍以继续后面的步骤"（through 模式会从第 1 步重发请求，重复写入），链路在某步停下时由用户修好后再执行；不改 AI 过滤规则。
+
+跟进后自动检查：后端全量 1346 项通过、前端 166 项通过（新增 `layoutUiContracts.test.mjs` 7 项与本轮 3 项 AI 契约测试）、生产构建与 Ruff 通过。弹窗居中、顶栏账户菜单、表格对齐、用例编辑页三栏与卡片着色、AI 建议行距与批量面板排版属于视觉效果，未经真实浏览器目视确认。
+
 ### 提交前 CI 兼容性修正（2026-10-02）
 
 合并前补跑全量回归时，确认下文记录的两个旧日期依赖失败在 `origin/main` 的隔离副本中同样存在。测试随后固定服务时钟到夹具时间，保留真实查询和清理逻辑，避免随日历推进失效。

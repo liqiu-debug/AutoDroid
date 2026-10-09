@@ -9,7 +9,20 @@ import httpx
 from .security import PRIVATE_HTTP_LOGS
 from .values import ExecutionError, assertion_outcome, evaluate_assertions, field_tree, request_issues, resolve, scalar_text
 
+try:
+    # httpcore re-raises h11's own protocol error, and httpx only remaps the
+    # httpcore classes, so this one escapes the usual httpx hierarchy. h11 ships
+    # with httpx via httpcore.
+    from h11 import LocalProtocolError as H11ProtocolError
+except ImportError:  # pragma: no cover - only if httpx changes transport stack
+    H11ProtocolError = None
+# It sits outside the httpx exception hierarchy, so it has to be listed
+# explicitly or it surfaces as an internal runner error instead of a
+# configuration error the user can act on.
+_PROTOCOL_ERRORS = (H11ProtocolError,) if H11ProtocolError else ()
+
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+RETRY_DELAY_SECONDS = 1
 
 
 class RunCancelled(Exception):
@@ -37,6 +50,17 @@ async def cancellable(awaitable, cancel, timeout=None):
         await asyncio.gather(operation, watcher, return_exceptions=True)
 
 
+def is_chunked(headers):
+    return any(
+        name.lower() == "transfer-encoding" and value.strip().lower() == "chunked" for name, value in headers
+    )
+
+
+async def chunked_body(data):
+    """A single-chunk async stream; httpx frames streams as chunked."""
+    yield data
+
+
 def make_request(spec, env, outputs, refs):
     issues = request_issues(spec, env, outputs)
     if issues:
@@ -57,9 +81,10 @@ def make_request(spec, env, outputs, refs):
         raise ExecutionError("请求 URL 无效") from None
     if target.scheme not in {"http", "https"} or not target.host or target.userinfo:
         raise ExecutionError("仅支持不含用户凭证的 HTTP/HTTPS URL")
+    # Configured headers win: Host, Content-Length and Connection are derived by
+    # httpx only when the request does not already set them, so an explicit value
+    # reproduces the request exactly as written.
     headers = [(p.name, text(p.value)) for p in spec.headers if p.enabled]
-    if any(name.lower() in {"host", "content-length", "transfer-encoding", "connection"} for name, _ in headers):
-        raise ExecutionError("Host/Content-Length/Transfer-Encoding/Connection 由执行器管理")
     params = [(p.name, text(p.value)) for p in spec.query if p.enabled]
     auth = spec.auth
     if auth.kind == "bearer":
@@ -96,11 +121,16 @@ def make_request(spec, env, outputs, refs):
         kwargs["content"] = urlencode(pairs).encode("utf-8")
         if not any(k.lower() == "content-type" for k, _ in headers):
             headers.append(("Content-Type", "application/x-www-form-urlencoded"))
+    if is_chunked(headers) and isinstance(kwargs.get("content"), (bytes, bytearray)):
+        # Feeding the body as a stream is how httpx emits chunked framing and
+        # drops Content-Length; sending the header over a body with a length
+        # would leave both on the wire and corrupt the request.
+        kwargs["content"] = chunked_body(bytes(kwargs["content"]))
     display = {"method": spec.method, "url": str(target), "headers": dict(headers), "body": body}
     return target, headers, kwargs, display
 
 
-async def execute_step(step, client, env, outputs, cancel):
+async def _execute_once(step, client, env, outputs, cancel):
     started = time.monotonic()
     log_token = PRIVATE_HTTP_LOGS.set(True)
     detail = {"references": [], "assertions": [], "error": None, "error_category": None}
@@ -157,7 +187,7 @@ async def execute_step(step, client, env, outputs, cancel):
     except RunCancelled:
         status, detail["error"] = "ABORTED", "用户已中止；已发送的请求可能已经生效"
         detail["error_category"] = "cancelled"
-    except (ExecutionError, httpx.HTTPError, ValueError, TypeError) as exc:
+    except (ExecutionError, httpx.HTTPError, ValueError, TypeError, *_PROTOCOL_ERRORS) as exc:
         status = "ERROR"
         # Never expose raw client exceptions, which may contain resolved URLs.
         if isinstance(exc, ExecutionError):
@@ -166,8 +196,21 @@ async def execute_step(step, client, env, outputs, cancel):
                 detail["error_location"] = exc.location
         elif isinstance(exc, httpx.TimeoutException):
             detail["error"], detail["error_category"] = "请求超时，请检查目标服务和超时设置", "connection"
+            # Only a connect timeout proves the request never arrived; read and
+            # write timeouts may have been processed by the server already.
+            detail["retryable"] = isinstance(exc, httpx.ConnectTimeout)
         elif isinstance(exc, (httpx.ConnectError, httpx.NetworkError, httpx.ProxyError)):
             detail["error"], detail["error_category"] = "无法连接目标服务，请检查地址、网络和证书", "connection"
+            # NetworkError also covers read/write errors, which must not repeat.
+            detail["retryable"] = isinstance(exc, (httpx.ConnectError, httpx.ProxyError))
+        elif isinstance(exc, httpx.LocalProtocolError) or (
+            H11ProtocolError is not None and isinstance(exc, H11ProtocolError)
+        ):
+            # The transport refused the configured headers themselves.
+            detail["error"], detail["error_category"] = (
+                "请求头无法按配置发送：请检查 Content-Length 是否与请求体一致；Transfer-Encoding 仅支持 chunked",
+                "configuration",
+            )
         elif isinstance(exc, httpx.HTTPError):
             detail["error"], detail["error_category"] = "HTTP 通信异常，请检查服务响应和连接状态", "http"
         else:
@@ -181,6 +224,40 @@ async def execute_step(step, client, env, outputs, cancel):
         "duration_ms": round((time.monotonic() - started) * 1000, 2),
         "detail": detail,
     }, response
+
+
+async def execute_step(step, client, env, outputs, cancel):
+    """Run one step, repeating only failures that never reached the server.
+
+    Interface steps can create business data, and this module never rolls back,
+    so an already-received response (or a timeout after the request was sent) is
+    never repeated even when its assertions failed.
+    """
+    attempts = 1 + (step.retry_count or 0)
+    history = []
+    for attempt in range(1, attempts + 1):
+        result, response = await _execute_once(step, client, env, outputs, cancel)
+        detail = result["detail"]
+        # Internal marker: never persisted, never shown to the user.
+        retryable = detail.pop("retryable", False)
+        detail["attempts"] = attempt
+        if history:
+            # Keep the failures that led here, so a retried pass is never read
+            # as a stable one.
+            detail["retry_history"] = list(history)
+        if not retryable or attempt == attempts:
+            return result, response
+        history.append(
+            {"attempt": attempt, "error": detail.get("error"), "error_category": detail.get("error_category")}
+        )
+        try:
+            await cancellable(asyncio.sleep(RETRY_DELAY_SECONDS), cancel)
+        except RunCancelled:
+            result["status"] = "ABORTED"
+            detail["error"], detail["error_category"] = "用户已中止", "cancelled"
+            detail["retry_history"] = list(history)
+            return result, response
+    return result, response
 
 
 def make_client(cookies=None, transport=None):

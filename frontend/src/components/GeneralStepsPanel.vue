@@ -179,6 +179,7 @@ const executeAction = async (action, data = '') => {
 <style scoped>
 .general-panel {
   height: 100%;
+  overflow-y: auto;
   background: var(--ad-surface);
   border-left: none;
   display: flex;

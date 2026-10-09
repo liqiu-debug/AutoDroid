@@ -18,6 +18,8 @@ from typing import List, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, Depends, HTTPException
+
+from backend.core.errors import install_error_handlers
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
@@ -43,6 +45,7 @@ REPORT_API_RESERVED_SEGMENTS = {"executions", "dashboard"}
 # ==================== FastAPI 应用 ====================
 
 app = FastAPI(title="AutoDroid", description="Android UI 自动化低代码平台")
+install_error_handlers(app)
 api_router = APIRouter(prefix="/api")
 
 # Mount reports directory for canonical static asset access
@@ -140,7 +143,7 @@ app.include_router(api_router)
 def _build_report_asset_url(report_path: str) -> str:
     normalized = str(report_path or "").strip().lstrip("/")
     if not normalized:
-        raise HTTPException(status_code=404, detail="Report asset not found")
+        raise HTTPException(status_code=404, detail="报告附件不存在")
     return f"{REPORT_ASSET_API_PREFIX}/{quote(normalized, safe='/')}"
 
 
@@ -153,7 +156,7 @@ def redirect_legacy_report_asset(report_path: str):
 def redirect_legacy_api_report_asset(report_path: str):
     normalized = str(report_path or "").strip().lstrip("/")
     if not normalized:
-        raise HTTPException(status_code=404, detail="Report asset not found")
+        raise HTTPException(status_code=404, detail="报告附件不存在")
 
     head = normalized.split("/", 1)[0]
     if head in REPORT_API_RESERVED_SEGMENTS:

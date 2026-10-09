@@ -315,7 +315,7 @@ def _run_scenario_cross_platform(
                                     "timeout": 1,
                                 },
                                 "success": False,
-                                "error": f"Case not found: {scenario_step.case_id}",
+                                "error": f"用例不存在: {scenario_step.case_id}",
                                 "duration": 0,
                             }
                         ],

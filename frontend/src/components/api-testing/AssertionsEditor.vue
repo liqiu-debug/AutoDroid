@@ -3,10 +3,16 @@ import { ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import ValueEditor from './ValueEditor.vue'
 import ReferencePicker from './ReferencePicker.vue'
-import { businessAssertion, copy, pathLabel, flattenFields, literal, fromJson } from '@/utils/apiTesting'
+import { businessAssertion, copy, pathLabel, flattenFields, literal, fromJson, dynamicField } from '@/utils/apiTesting'
 const props = defineProps({ modelValue: {type:Array,default:()=>[]}, fields: Array, sources: Array, variables: Array, fieldSource:Object })
 const emit = defineEmits(['update:modelValue','added'])
 const picker=ref(false), expectedPicker=ref(false), active=ref(-1)
+const rowReferenceOpen=ref(false), rowReferenceIndex=ref(-1)
+// Pinning a value that changes every run is the most common source of false
+// failures; the automatic suggestion avoids it, manual edits need the reminder.
+const dynamicWarning=row=>['eq','ne'].includes(row.op)&&dynamicField(row.path)&&row.expected?.kind==='literal'
+function compareWithPredecessor(i){rowReferenceIndex.value=i;rowReferenceOpen.value=true}
+function applyPredecessor(value){const rows=copy(props.modelValue),row=rows[rowReferenceIndex.value];if(!row)return;row.op='eq';row.expected=value;emit('update:modelValue',rows);rowReferenceOpen.value=false}
 const suggestionOpen=ref(false),suggestionField=ref(null),suggestion=ref(null),suggestionMode=ref('eq'),suggestionReferenceOpen=ref(false)
 const addedIndex=ref(null)
 const types=[['string','文本'],['number','数字'],['boolean','布尔'],['null','空值'],['object','对象'],['array','数组']]
@@ -76,6 +82,7 @@ defineExpose({add})
       <span v-else class="hint">{{row.op==='is_2xx'?'HTTP 状态码 200–299':'无需期望值'}}</span>
       </div>
       <el-button class="delete-assertion" link type="danger" @click="emit('update:modelValue',modelValue.filter((_,j)=>j!==i))">删除</el-button>
+      <p v-if="dynamicWarning(row)" class="dynamic-warning" role="note">该字段每次运行通常不同，固定值容易误报。<el-button link type="primary" size="small" @click="changeOp(i,'not_empty')">改为「非空」</el-button><el-button v-if="sources?.length" link type="primary" size="small" @click="compareWithPredecessor(i)">与前序字段一致</el-button></p>
     </div>
     <el-button type="primary" plain @click="active=-1;picker=true">+ 添加业务校验</el-button>
     <p v-if="!fields?.length" class="hint">先发送请求或添加响应样例，再选择业务字段。</p>
@@ -89,11 +96,13 @@ defineExpose({add})
       <template #footer><el-button @click="suggestionOpen=false">取消</el-button><el-button type="primary" @click="confirmSuggestion">添加校验</el-button></template>
     </el-dialog>
     <ReferencePicker v-model="suggestionReferenceOpen" :sources="sources" :variables="variables" step-only @select="suggestion.expected=$event" />
+    <ReferencePicker v-model="rowReferenceOpen" :sources="sources" :variables="variables" step-only @select="applyPredecessor" />
   </div>
 </template>
 <style scoped>
 .assertions{container-type:inline-size;min-width:0}
 .check-notice{font-size:12px;color:var(--ad-warning);background:var(--ad-warning-soft);border:1px solid var(--ad-border);border-radius:6px;padding:10px 12px;margin-bottom:12px;line-height:20px}
+.dynamic-warning{grid-column:1/-1;margin:0;font-size:12px;color:var(--ad-warning);background:var(--ad-warning-soft);border:1px solid var(--ad-border);border-radius:6px;padding:6px 10px;line-height:20px;overflow-wrap:anywhere}.dynamic-warning .el-button{margin:0}
 .suggestion-path{font-size: 13px;font-weight:600;overflow-wrap:anywhere;margin-top:0}.suggestion-options{margin:10px 0;display:flex;flex-wrap:wrap}.suggestion-expected{margin-top:12px;min-width:0}.suggestion-expected>label{display:block;font-size:12px;color:var(--ad-muted);margin-bottom:8px}.suggestion-expected>.el-select{width:160px}.reference-choice{max-width:100%;height:auto;min-height:32px;white-space:normal;text-align:left;overflow-wrap:anywhere}
 .assertion{display:grid;grid-template-columns:minmax(0,1fr) 120px minmax(0,1.25fr) 32px;align-items:start;gap:8px;padding:10px;background:var(--ad-bg);border:1px solid var(--ad-border);border-radius: var(--ad-radius);margin-bottom:10px;scroll-margin-top:12px}
 .field-button{width:100%;min-width:0;justify-content:flex-start;white-space:normal;height:auto;min-height:32px;text-align:left;line-height:20px}
@@ -117,5 +126,5 @@ defineExpose({add})
   .operator{grid-column:1/-1;width:min(160px,100%)}
   .expected-value,.structured-assertion>.expected-value{grid-column:1/-1;grid-row:3}
 }
-@media(max-width:760px){.hint,.check-notice,.suggestion-expected>label,.expected-label,.suggestion-path{font-size:14px}.delete-assertion,.field-button{min-height:44px}}
+@media(max-width:760px){.hint,.check-notice,.dynamic-warning,.suggestion-expected>label,.expected-label,.suggestion-path{font-size:14px}.delete-assertion,.field-button{min-height:44px}}
 </style>

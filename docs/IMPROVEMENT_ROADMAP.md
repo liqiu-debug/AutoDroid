@@ -82,6 +82,14 @@
 
 **遗留**：前端 LogConsole/报告详情按结构渲染建议（排入前端会话）。
 
+### ✅ P1.3b 用户可见错误文案统一（2026-10-09）
+
+**现状依据**：登录失败等提示直接显示后端英文 `detail`（`Incorrect username or password` 等约 40 处）；FastAPI 的 422 参数校验返回英文 pydantic 消息；网络/超时/5xx 时前端 88 处直接显示 axios 的 `Network Error` / `Request failed with status code 500`。
+
+**已落地方案**：三个源头统一处理，不逐个改调用点——(1) 后端用户可见的英文 `HTTPException` 文案改为中文（含预检 `Case not found` 原因）；(2) 新增 `backend/core/errors.py::install_error_handlers`，保持 422 的 `loc/msg/type` 结构、按错误类型翻译 `msg`（自有校验器的中文 `ValueError` 原样透传），已装入 `main.py` 与两个预览应用；(3) 前端 `utils/errors.js::describeError/normalizeError` 在 axios 响应拦截器里就地改写 `error.message` 与 `response.data.detail`（网络/超时/状态码/HTML 错误页 → 中文；pydantic 列表 → 中文摘要；应用自身的结构化 detail 保持不变），401 跳转登录页时写入提示由登录页展示。`getErrorDetail` 保留为既有入口。
+
+**验收**：`backend/tests/test_error_messages.py`（登录失败 400 中文、422 结构与翻译、自有校验器透传）、`frontend/tests/errorMessages.test.mjs`。
+
 ### ✅ P1.4 双执行链路统一
 
 **现状依据**：legacy `runner.py`（1072 行）与 `drivers/cross_platform_runner.py` 并存，靠 flag 灰度；双写增加维护与测试成本。
@@ -172,11 +180,11 @@
 
 **建议方案**：报告读取端点统一挂 `get_current_user`；注意 HTML 报告静态资源（`/api/report-assets/`）与报告分享链路的兼容评估。
 
-### 🚧 P2.8 前端测试与渐进 TS
+### ✅ P2.8 前端测试与渐进 TS
 
-**已落地部分**：新增基于 Node test runner 的工具函数与 UI 契约测试，覆盖巡检思维导图/报告呈现、运行摘要、可信覆盖时长、兼容性回放、报告列表、定时任务和系统设置；可运行 `node --test frontend/tests/*.test.mjs`。
+**已落地部分**：新增基于 Node test runner 的工具函数与 UI 契约测试，覆盖巡检思维导图/报告呈现、运行摘要、可信覆盖时长、兼容性回放、报告列表、定时任务、系统设置以及接口自动化的取值/调试/AI/编辑器契约；可运行 `node --test frontend/tests/*.test.mjs`。测试已接入 `.github/workflows/ci.yml` 的 frontend job（`npm ci` 后先 `Test` 再 `Build`），前端行为变更不再依赖人工记得跑本地测试。
 
-**剩余工作**：测试尚未接入 `.github/workflows/ci.yml`，也未引入 Vitest 组件挂载；`stores/`、`composables/` 和交互组件仍缺行为级覆盖，渐进 TS/JSDoc 类型治理尚未开始。
+**剩余工作**：未引入 Vitest 组件挂载，组件仍以 UI 契约（读取源码断言关键结构）而非真实挂载验证；`stores/`、`composables/` 和交互组件仍缺行为级覆盖；渐进 TS/JSDoc 类型治理尚未开始。
 
 ---
 

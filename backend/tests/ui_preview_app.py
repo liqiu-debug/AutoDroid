@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
+from backend.core.errors import install_error_handlers
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from backend.tests.ui_preview_report_fixtures import make_report_fixtures, report_fixture_response
@@ -23,6 +24,7 @@ if os.environ.get('AUTODROID_UI_PREVIEW') != '1':
 ROOT = Path(__file__).resolve().parents[2]
 DIST = Path(os.environ.get('AUTODROID_UI_PREVIEW_DIST', ROOT / 'frontend/dist')).resolve()
 app = FastAPI(title='Isolated AutoDroid visual QA')
+install_error_handlers(app)
 NOW = '2026-10-03T10:24:00'
 USER = dict(id=1, username='preview', full_name='林序', role='admin', is_active=True, created_at=NOW)
 ENVS = [dict(id=1, name='集成测试', description='隔离界面验收'), dict(id=2, name='预发布', description='示例数据')]

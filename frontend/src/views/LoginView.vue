@@ -75,7 +75,8 @@ import { useRouter } from 'vue-router'
 import { useUserStore } from '../stores/useUserStore'
 import { User, Lock } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import api from '@/api'
+import api, { LOGIN_NOTICE_KEY } from '@/api'
+import { describeError } from '@/utils/errors'
 import ClientModeSwitch from '@/components/ClientModeSwitch.vue'
 import { useClientMode } from '@/composables/useClientMode'
 
@@ -116,7 +117,7 @@ const handleLogin = async () => {
         ElMessage.success('登录成功')
         router.push('/')
       } catch (error) {
-        ElMessage.error(error.response?.data?.detail || '登录失败，请检查账号密码')
+        ElMessage.error(describeError(error) || '登录失败，请检查账号密码')
       } finally {
         loading.value = false
       }
@@ -124,7 +125,12 @@ const handleLogin = async () => {
   })
 }
 
-onMounted(loadRegistrationStatus)
+onMounted(() => {
+  loadRegistrationStatus()
+  // Set by the API layer when a request was rejected as unauthenticated.
+  const notice = sessionStorage.getItem(LOGIN_NOTICE_KEY)
+  if (notice) { sessionStorage.removeItem(LOGIN_NOTICE_KEY); ElMessage.warning(notice) }
+})
 </script>
 
 <style scoped src="./account/auth.css"></style>

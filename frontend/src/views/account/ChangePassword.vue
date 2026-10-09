@@ -130,6 +130,9 @@ const handleSubmit = async () => {
 .page-header {
   display: flex;
   align-items: center;
+  /* ad-page-header pushes its two groups apart; here the title belongs to the
+     back button, and the breadcrumb already names the page. */
+  justify-content: flex-start;
   gap: 12px;
   margin-bottom: 16px;
 }

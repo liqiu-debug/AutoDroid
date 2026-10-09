@@ -28,7 +28,8 @@ defineExpose({showAssertions:()=>{tab.value='checks'}})
 </script>
 <template>
   <div v-if="result" class="result-panel">
-    <div class="result-heading"><el-tag v-if="pending" type="warning">校验待更新</el-tag><el-tag v-else :type="unchecked?'warning':statusType(resultStatus)">{{ unchecked?'未校验':statusLabel(resultStatus) }}</el-tag><b v-if="result.detail?.response">HTTP {{ result.detail.response.status_code }}</b><span>{{ Math.round(result.duration_ms||0) }} ms</span><span v-if="checks.length">{{ checks.filter(a=>a.passed).length }}/{{ checks.length }} 条校验通过</span><span v-else-if="result.detail?.response" class="unchecked-note">请求已完成，未配置校验</span></div>
+    <div class="result-heading"><el-tag v-if="pending" type="warning">校验待更新</el-tag><el-tag v-else :type="unchecked?'warning':statusType(resultStatus)">{{ unchecked?'未校验':statusLabel(resultStatus) }}</el-tag><el-tag v-if="(result.detail?.attempts||1)>1" type="warning" size="small">共尝试 {{ result.detail.attempts }} 次</el-tag><b v-if="result.detail?.response">HTTP {{ result.detail.response.status_code }}</b><span>{{ Math.round(result.duration_ms||0) }} ms</span><span v-if="checks.length">{{ checks.filter(a=>a.passed).length }}/{{ checks.length }} 条校验通过</span><span v-else-if="result.detail?.response" class="unchecked-note">请求已完成，未配置校验</span></div>
+    <el-alert v-if="result.detail?.retry_history?.length" :title="`前 ${result.detail.retry_history.length} 次连接失败后重试：${result.detail.retry_history.map(item=>'第 '+item.attempt+' 次 '+item.error).join('；')}`" type="warning" :closable="false" />
     <el-alert v-if="result.detail?.error&&!pending" :title="errorCategory ? errorCategory+'：'+result.detail.error : result.detail.error" type="error" :closable="false" />
     <div v-if="$slots.tools" class="panel-tools"><slot name="tools" /></div>
     <el-tabs v-model="tab">

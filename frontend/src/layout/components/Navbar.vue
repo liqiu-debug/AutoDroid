@@ -34,10 +34,10 @@ const handleCommand = async command => {
   </el-dropdown>
 </template>
 <style scoped>
-.account-menu { width: 100%; }
-.user-trigger { width: 100%; min-width: 0; min-height: 36px; display: flex; align-items: center; gap: 8px; padding: 4px; border: 0; border-radius: 6px; background: transparent; color: var(--ad-text); font: inherit; }
+.account-menu { flex-shrink: 0; min-width: 0; }
+.user-trigger { min-height: 30px; max-width: 190px; display: flex; align-items: center; gap: 8px; padding: 2px 8px 2px 2px; border: 0; border-radius: 6px; background: transparent; color: var(--ad-text); font: inherit; cursor: pointer; }
 .user-trigger:hover { background: var(--ad-primary-soft); }
-.avatar { width: 26px; height: 26px; flex-shrink: 0; display: grid; place-items: center; border-radius: 50%; border: 1px solid var(--ad-border); background: var(--ad-surface); color: var(--ad-muted); font-size: 12px; }
-.user-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; font-size: 12px; }
-.user-trigger > .el-icon { font-size: 12px; color: var(--ad-muted); }
+.avatar { width: 24px; height: 24px; flex-shrink: 0; display: grid; place-items: center; border-radius: 50%; border: 1px solid var(--ad-border); background: var(--ad-surface); color: var(--ad-muted); font-size: 12px; }
+.user-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; font-size: 12px; }
+.user-trigger > .el-icon { font-size: 12px; color: var(--ad-muted); flex-shrink: 0; }
 </style>

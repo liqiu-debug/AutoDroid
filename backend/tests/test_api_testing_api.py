@@ -107,6 +107,161 @@ class ApiTestingApiTests(unittest.TestCase):
         self.assertEqual(self.call("delete", f"/scenarios/{scenario['id']}").status_code, 200)
         self.assertEqual(self.call("delete", f"/interfaces/{interface['id']}").status_code, 200)
 
+    def bump_interface(self, interface, url="https://example.com/login/v2"):
+        payload = {k: interface[k] for k in ["name", "description", "folder_id", "version", "config", "sample"]}
+        payload["config"]["request"]["url"] = literal(url).model_dump()
+        response = self.call("put", f"/interfaces/{interface['id']}", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def save_step_override(self, scenario, override):
+        steps = scenario["steps"]
+        steps[0]["overrides"] = {"request": override}
+        payload = {
+            key: scenario[key] for key in ["name", "description", "folder_id", "version", "env_id", "steps"]
+        }
+        response = self.call("put", f"/scenarios/{scenario['id']}", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def sync_apply(self, interface, scenario, **item):
+        return self.call(
+            "post",
+            f"/interfaces/{interface['id']}/sync-apply",
+            json={"items": [{"scenario_id": scenario["id"], "step_id": "first", "version": scenario["version"], **item}]},
+        ).json()
+
+    def test_interface_usages_report_stale_steps_and_conflicts(self):
+        scenario, interface = self.scenario()
+        usages = self.call("get", f"/interfaces/{interface['id']}/usages").json()
+        self.assertEqual((usages["total_scenarios"], usages["total_steps"], usages["stale_steps"]), (1, 1, 0))
+        self.assertEqual(usages["items"][0]["steps"][0]["conflicts"], [])
+        self.assertEqual(self.call("get", "/scenarios").json()["items"][0]["stale_steps"], 0)
+
+        interface = self.bump_interface(interface)
+        usages = self.call("get", f"/interfaces/{interface['id']}/usages").json()
+        self.assertEqual(usages["stale_steps"], 1)
+        self.assertEqual(usages["items"][0]["scenario_name"], "登录回归")
+        self.assertTrue(usages["items"][0]["steps"][0]["stale"])
+        self.assertEqual(usages["items"][0]["steps"][0]["conflicts"], [])
+        self.assertEqual(self.call("get", "/scenarios").json()["items"][0]["stale_steps"], 1)
+
+        # A local edit on the very field that changed is a decision, not a silent overwrite.
+        self.save_step_override(scenario, {"url": literal("https://local.test/login").model_dump()})
+        usages = self.call("get", f"/interfaces/{interface['id']}/usages").json()
+        self.assertEqual(usages["items"][0]["steps"][0]["conflicts"], [["request", "url"]])
+
+    def test_sync_apply_updates_clean_steps_and_requires_conflict_decisions(self):
+        scenario, interface = self.scenario()
+        interface = self.bump_interface(interface)
+        result = self.sync_apply(interface, scenario)
+        self.assertEqual((result["applied"], result["failed"]), (1, 0))
+        self.assertTrue(result["items"][0]["changed"])
+        refreshed = self.call("get", f"/scenarios/{scenario['id']}").json()
+        self.assertEqual(refreshed["version"], scenario["version"] + 1)
+        self.assertEqual(refreshed["steps"][0]["interface_version"], 2)
+        self.assertEqual(refreshed["steps"][0]["snapshot"]["request"]["url"]["value"], "https://example.com/login/v2")
+        self.assertEqual(self.call("get", f"/interfaces/{interface['id']}/usages").json()["stale_steps"], 0)
+
+        scenario = self.save_step_override(refreshed, {"url": literal("https://local.test/login").model_dump()})
+        interface = self.bump_interface(interface, "https://example.com/login/v3")
+        refused = self.sync_apply(interface, scenario)
+        self.assertEqual((refused["applied"], refused["failed"]), (0, 1))
+        self.assertEqual(refused["items"][0]["conflicts"], [["request", "url"]])
+        untouched = self.call("get", f"/scenarios/{scenario['id']}").json()
+        self.assertEqual(untouched["version"], scenario["version"])
+        self.assertEqual(untouched["steps"][0]["interface_version"], 2)
+
+        kept = self.sync_apply(interface, scenario, choices={"request.url": "keep"})
+        self.assertEqual(kept["applied"], 1)
+        preserved = self.call("get", f"/scenarios/{scenario['id']}").json()
+        self.assertEqual(preserved["steps"][0]["interface_version"], 3)
+        self.assertEqual(preserved["steps"][0]["snapshot"]["request"]["url"]["value"], "https://example.com/login/v3")
+        self.assertEqual(preserved["steps"][0]["overrides"]["request"]["url"]["value"], "https://local.test/login")
+
+        interface = self.bump_interface(interface, "https://example.com/login/v4")
+        applied = self.sync_apply(interface, preserved, choices={"request.url": "template"})
+        self.assertEqual(applied["applied"], 1)
+        dropped = self.call("get", f"/scenarios/{preserved['id']}").json()
+        self.assertEqual(dropped["steps"][0]["interface_version"], 4)
+        self.assertIsNone(dropped["steps"][0]["overrides"].get("request", {}).get("url"))
+
+    def test_sync_apply_refuses_stale_version_running_scenario_and_current_steps(self):
+        scenario, interface = self.scenario()
+        current = self.sync_apply(interface, scenario)
+        self.assertEqual((current["applied"], current["failed"]), (0, 0))
+        self.assertTrue(current["items"][0]["ok"])
+        self.assertFalse(current["items"][0]["changed"])
+        self.assertEqual(self.call("get", f"/scenarios/{scenario['id']}").json()["version"], scenario["version"])
+
+        interface = self.bump_interface(interface)
+        stale = self.sync_apply(interface, {**scenario, "version": scenario["version"] + 5})
+        self.assertEqual((stale["applied"], stale["failed"]), (0, 1))
+        self.assertIn("刷新", stale["items"][0]["error"])
+
+        with Session(self.engine) as session:
+            session.add(ApiRun(id="active-run", scenario_id=scenario["id"], scenario_name="登录回归", status="RUNNING"))
+            session.commit()
+        running = self.sync_apply(interface, scenario)
+        self.assertEqual((running["applied"], running["failed"]), (0, 1))
+        self.assertIn("正在运行", running["items"][0]["error"])
+        self.assertEqual(self.call("get", f"/scenarios/{scenario['id']}").json()["steps"][0]["interface_version"], 1)
+
+    def test_document_import_parses_then_creates_only_selected_entries(self):
+        document = {
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://api.demo.test"}],
+            "paths": {
+                "/orders": {
+                    "post": {
+                        "summary": "创建订单",
+                        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"sku": {"type": "string"}}}}}},
+                        "responses": {"201": {"content": {"application/json": {"example": {"code": 0}}}}},
+                    }
+                },
+                "/orders/{id}": {"get": {"summary": "查询订单", "responses": {}}},
+            },
+        }
+        parsed = self.call("post", "/imports/spec", json={"content": json.dumps(document)})
+        self.assertEqual(parsed.status_code, 200, parsed.text)
+        result = parsed.json()
+        self.assertEqual(result["format"], "openapi")
+        self.assertEqual([item["key"] for item in result["candidates"]], ["POST /orders", "GET /orders/{id}"])
+        self.assertEqual(self.call("post", "/imports/spec", json={"content": "not: ["}).status_code, 422)
+
+        folder = self.call("post", "/folders", json={"name": "订单", "kind": "interface"}).json()
+        chosen = result["candidates"][0]
+        created = self.call(
+            "post",
+            "/imports/apply",
+            json={"folder_id": folder["id"], "items": [{"name": chosen["name"], "config": chosen["config"], "sample": chosen["sample"]}]},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        row = created.json()["created"][0]
+        self.assertEqual(row["name"], "创建订单")
+        self.assertEqual(row["folder_id"], folder["id"])
+        self.assertEqual(row["sample_fields"][0]["path"], ["body"])
+        self.assertEqual(row["config"]["request"]["url"]["value"], "https://api.demo.test/orders")
+        self.assertEqual(self.call("get", "/interfaces").json()["total"], 1)
+
+    def test_document_import_is_all_or_nothing(self):
+        valid = Step(id="first").snapshot.model_dump()
+        invalid = Step(id="second").snapshot.model_dump()
+        invalid["request"]["body_type"] = "json"
+        invalid["request"]["body"] = Value(kind="ref", step_id="absent", path=["body", "id"]).model_dump()
+        response = self.call(
+            "post",
+            "/imports/apply",
+            json={"items": [{"name": "有效", "config": valid}, {"name": "无效", "config": invalid}]},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.call("get", "/interfaces").json()["total"], 0)
+
+        scenario_folder = self.call("post", "/folders", json={"name": "场景目录", "kind": "scenario"}).json()
+        mismatch = self.call("post", "/imports/apply", json={"folder_id": scenario_folder["id"], "items": [{"name": "有效", "config": valid}]})
+        self.assertEqual(mismatch.status_code, 422)
+        self.assertEqual(self.call("get", "/interfaces").json()["total"], 0)
+
     def test_auth_and_delete_permissions(self):
         item = self.interface()
         self.user.role, self.user.id = "user", 999
@@ -385,6 +540,42 @@ class ApiTestingApiTests(unittest.TestCase):
         self.assertIn("登录 → body › token", html)
         self.assertIn("processing", html)
         self.assertIn("响应正文", html)
+
+    def test_retried_step_is_labelled_in_the_exported_report(self):
+        scenario, interface = self.scenario()
+        with Session(self.engine) as session:
+            session.add(ApiRun(id="retried-run", scenario_id=scenario["id"], scenario_name="登录回归", status="PASS"))
+            session.add(
+                ApiStepResult(
+                    run_id="retried-run",
+                    step_id="first",
+                    position=0,
+                    name="登录",
+                    status="PASS",
+                    detail={
+                        "attempts": 2,
+                        "retry_history": [{"attempt": 1, "error": "无法连接目标服务，请检查地址、网络和证书", "error_category": "connection"}],
+                        "assertions": [],
+                    },
+                )
+            )
+            session.commit()
+        html = self.call("get", "/runs/retried-run/download").text
+        self.assertIn("共尝试 2 次", html)
+        self.assertIn("重试记录", html)
+        self.assertIn("无法连接目标服务", html)
+
+        with Session(self.engine) as session:
+            session.add(
+                ApiStepResult(
+                    run_id="retried-run", step_id="second", position=1, name="查询订单", status="PASS",
+                    detail={"attempts": 1, "assertions": []},
+                )
+            )
+            session.commit()
+        html = self.call("get", "/runs/retried-run/download").text
+        # A step that never retried must not claim it did.
+        self.assertEqual(html.count("共尝试"), 1)
 
     def test_precheck_location_and_persisted_editor_schema(self):
         scenario, _ = self.scenario()

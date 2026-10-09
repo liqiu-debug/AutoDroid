@@ -51,7 +51,9 @@ export function useApiDebug(envId, steps, { retainDisplay = false, envName = () 
       if (current(token)) { error.value = apiError(err); await close() }
     }
   }
-  const run = async (stepId, mode = 'single') => {
+  // `confirmed` lets a caller that already showed its own real-request warning
+  // (the batch assertion flow) skip the per-run confirmation.
+  const run = async (stepId, mode = 'single', { confirmed = false } = {}) => {
     if (!alive || running.value || rechecking.value) return
     const draft = copy(steps.value), environment = envId.value || null, environmentName = envName()
     const index = draft.findIndex(s => s.id === stepId)
@@ -61,7 +63,7 @@ export function useApiDebug(envId, steps, { retainDisplay = false, envName = () 
     running.value = true
     let submitted = false
     try {
-      await ElMessageBox.confirm(`将真实执行：${targets.map(s => s.name).join(' → ')}。写入、删除等操作会产生业务数据，停止测试不会回滚。`, mode === 'through' ? '从头执行到此步' : '调试当前步骤', { type: 'warning', confirmButtonText: '确认执行' })
+      if (!confirmed) await ElMessageBox.confirm(`将真实执行：${targets.map(s => s.name).join(' → ')}。写入、删除等操作会产生业务数据，停止测试不会回滚。`, mode === 'through' ? '从头执行到此步' : '调试当前步骤', { type: 'warning', confirmButtonText: '确认执行' })
       if (!current(token)) return
       let sessionId = id.value
       if (!sessionId) {
@@ -78,18 +80,21 @@ export function useApiDebug(envId, steps, { retainDisplay = false, envName = () 
     } catch (err) { if (current(token) && !['cancel','close'].includes(err)) ElMessage.error(apiError(err)) }
     finally { if (current(token) && !submitted) running.value = false }
   }
-  const recheck = async stepId => {
-    if(rechecking.value||running.value)return
-    if (!id.value || !results.value[stepId]) return ElMessage.warning('请先调试当前请求')
+  // Returns { status, error } so a batch caller can decide whether to continue
+  // without parsing toasts; `silent` suppresses the per-step messages.
+  const recheck = async (stepId, { silent = false } = {}) => {
+    if(rechecking.value||running.value)return { status: null, error: '调试进行中' }
+    if (!id.value || !results.value[stepId]) { if (!silent) ElMessage.warning('请先调试当前请求'); return { status: null, error: '请先调试当前请求' } }
     const token=++generation,draft=copy(steps.value),original=cache.value[stepId],sessionId=id.value,environment=envId.value||null
     rechecking.value=true
     try {
       const {data}=await api.apiTesting.post(`/debug-sessions/${sessionId}/assertions`,{editor_id:editorId,env_id:environment,steps:draft,step_id:stepId})
-      if(!current(token)||id.value!==sessionId)return
+      if(!current(token)||id.value!==sessionId)return { status: null, error: '调试上下文已改变' }
       const row={...original,...data.result,assertion_signature:assertionSignature(draft.find(s=>s.id===stepId))}
       cache.value={...cache.value,[stepId]:row};history.value={...history.value,[stepId]:row}
-      ElMessage[data.result.status==='PASS'?'success':'warning'](data.result.status==='PASS'?'校验通过，未重新发送请求':data.result.status==='UNCHECKED'?'尚无校验规则，请先添加':'校验未通过，请查看结果')
-    }catch(err){if(current(token))ElMessage.error(apiError(err))}finally{if(current(token))rechecking.value=false}
+      if(!silent)ElMessage[data.result.status==='PASS'?'success':'warning'](data.result.status==='PASS'?'校验通过，未重新发送请求':data.result.status==='UNCHECKED'?'尚无校验规则，请先添加':'校验未通过，请查看结果')
+      return { status: data.result.status, error: null }
+    }catch(err){const message=apiError(err);if(current(token)&&!silent)ElMessage.error(message);return { status: null, error: message }}finally{if(current(token))rechecking.value=false}
   }
   onBeforeUnmount(() => { alive = false; close() })
   return { id, editorId, running, rechecking, results, displayResults, staleIds, pendingIds, error, run, recheck, close }

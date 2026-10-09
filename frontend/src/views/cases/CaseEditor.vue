@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { Upload, VideoPlay, Back, CircleClose, Plus } from '@element-plus/icons-vue'
+import { Upload, VideoPlay, Back, CircleClose } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
 import DeviceStage from '@/components/DeviceStage.vue'
 import StepBuilder from '@/components/StepBuilder.vue'
@@ -25,7 +25,6 @@ const logConsoleRef = ref(null)
 const deviceStageRef = ref(null)
 const isRunning = ref(false)
 const runPhase = ref('')
-const actionsVisible = ref(false)
 const runBusy = computed(() => Boolean(runPhase.value) || saving.value)
 const runLabel = computed(() => ({ saving: '保存中', prechecking: '预检中', submitting: '启动中' }[runPhase.value] || (isRunning.value ? '终止' : (!currentCase.value.id || hasUnsavedChanges.value ? '保存并运行' : '运行'))))
 const activeRun = ref(null)
@@ -390,16 +389,14 @@ onUnmounted(() => {
           <template #left><span class="pane-title">设备画面</span></template>
         </DeviceStage>
       </section>
+      <section class="actions-pane">
+        <GeneralStepsPanel :loading="loading" :device-serial="recordingDeviceSerial" :ocr-crop-mode="ocrCropMode" :record-mode="recordMode" :include-screenshot="includeInteractionScreenshot" @action-start="loading = true" @action-end="loading = false" @refresh-needed="handleRefreshNeeded" />
+      </section>
       <section class="right-pane">
-        <StepBuilder :env-id="envId" :device-serial="recordingDeviceSerial" :active-image-crop-step-uuid="activeImageCropStepUuid" :include-screenshot="includeInteractionScreenshot" @refresh-needed="handleRefreshNeeded" @request-ocr-crop="handleRequestOcrCrop" @request-image-crop="handleRequestImageCrop">
-          <template #header-actions><el-button :icon="Plus" @click="actionsVisible = true">添加动作</el-button></template>
-        </StepBuilder>
+        <StepBuilder :env-id="envId" :device-serial="recordingDeviceSerial" :active-image-crop-step-uuid="activeImageCropStepUuid" :include-screenshot="includeInteractionScreenshot" @refresh-needed="handleRefreshNeeded" @request-ocr-crop="handleRequestOcrCrop" @request-image-crop="handleRequestImageCrop" />
       </section>
     </div>
     <LogConsole ref="logConsoleRef" :case-id="currentCase.id" @run-start="handleRunStart" @run-complete="handleRunComplete" @run-error="handleRunError" />
-    <el-drawer v-model="actionsVisible" title="添加通用动作" size="360px" :modal="false" :lock-scroll="false">
-      <GeneralStepsPanel :loading="loading" :device-serial="recordingDeviceSerial" :ocr-crop-mode="ocrCropMode" :record-mode="recordMode" :include-screenshot="includeInteractionScreenshot" @action-added="actionsVisible = false" @action-start="loading = true" @action-end="loading = false" @refresh-needed="handleRefreshNeeded" />
-    </el-drawer>
 
     <!-- 多设备运行弹窗 -->
     <el-dialog
@@ -461,11 +458,17 @@ onUnmounted(() => {
 .editor-run-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .environment-select { width: 116px; }
 .editor-device-select { width: 170px; }
-.content-container { display: grid; grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); gap: 12px; flex: 1; min-height: 0; overflow: hidden; }
-.center-pane, .right-pane { min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--ad-border); border-radius: var(--ad-panel-radius); background: var(--ad-surface); }
+.content-container { display: grid; grid-template-columns: minmax(360px, 1fr) 220px 350px; gap: 12px; flex: 1; min-height: 0; overflow: hidden; }
+.center-pane, .actions-pane, .right-pane { min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--ad-border); border-radius: var(--ad-panel-radius); background: var(--ad-surface); }
 .center-pane { display: flex; }
 .center-pane > * { flex: 1; min-width: 0; }
+/* The general-steps list is an authoring surface, so it stays a column; the
+   panel scrolls on its own when the viewport is short. */
+.actions-pane { overflow-y: auto; }
 .pane-title { font-size: 13px; color: var(--ad-text); font-weight: 600; }
 .run-warning-hint { margin-top: 6px; font-size: 12px; color: var(--ad-warning); }
-@media (max-width: 1180px) { .editor-header { flex-wrap: wrap; } .editor-run-controls { flex-wrap: wrap; } }
+/* The case editor is a desktop-only route, so all three columns stay; the
+   side panes shrink before the device view does. */
+@media (max-width: 1400px) { .content-container { grid-template-columns: minmax(320px, 1fr) 200px 330px; } }
+@media (max-width: 1180px) { .editor-header { flex-wrap: wrap; } .editor-run-controls { flex-wrap: wrap; } .content-container { grid-template-columns: minmax(280px, 1fr) 190px 310px; gap: 8px; } }
 </style>

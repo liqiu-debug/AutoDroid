@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { blankConfig, copy, effectiveStep, overridesFor, stepFromInterface, cloneStep, validateReferences, fromJson, toPlainJson, pathLabel, responseFields, requestSignatures, assertionSignature, mergeResponseFields, businessAssertion, referenceIssues, previewValue, failureSummary } from '../src/utils/apiTesting.js'
+import { blankConfig, copy, effectiveStep, overridesFor, stepFromInterface, cloneStep, validateReferences, fromJson, toPlainJson, pathLabel, responseFields, requestSignatures, assertionSignature, mergeResponseFields, businessAssertion, referenceIssues, previewValue, failureSummary, stepSummary, dynamicField, conflictKey, batchSuggestionPlan, assertionKey, newAssertions, literal } from '../src/utils/apiTesting.js'
 import { scheduledTaskExecution } from '../src/utils/scheduledTaskPresentation.js'
 
 test('typed JSON preserves null, booleans and objects with reserved property names', () => {
@@ -99,4 +99,63 @@ test('inactive authentication and disabled parameters do not block scene referen
   assert.deepEqual(referenceIssues([step]),[])
   step.snapshot.request.headers[0].enabled=true
   assert.deepEqual(referenceIssues([step])[0].location,['request','headers',0,'value'])
+})
+test('step summary keeps the narrow card to the method and the check count',()=>{
+  const step=stepFromInterface({id:1,name:'查询订单',version:1,config:blankConfig()})
+  step.snapshot.request.method='POST'
+  assert.equal(stepSummary(step),'POST · 1 条校验')
+  step.snapshot.assertions.push({id:'extra',path:['body','code'],op:'eq',expected:{kind:'literal',value:0}})
+  assert.equal(stepSummary(step),'POST · 2 条校验')
+  // The card cannot fit a URL, so none is produced even when one is configured.
+  step.snapshot.request.url={kind:'literal',value:'https://api.demo.test/orders/{id}?verbose=1'}
+  assert.doesNotMatch(stepSummary(step),/orders|api\.demo\.test/)
+  assert.equal(stepSummary({kind:'wait',seconds:3}),'等待 3 秒')
+})
+test('dynamic field detection is shared by suggestions and manual warnings',()=>{
+  for(const name of ['id','order_id','userId','ID','token','refresh_uuid','nonce','created_at','updatedAt','start_time']) assert.ok(dynamicField(['body','data',name]),name)
+  for(const name of ['status','count','amount','message','name']) assert.ok(!dynamicField(['body','data',name]),name)
+  assert.ok(!dynamicField([]))
+  assert.equal(businessAssertion({path:['body','data','id'],type:'number'}).op,'not_empty')
+  assert.equal(businessAssertion({path:['body','data','status'],type:'string'}).op,'eq')
+})
+test('conflict keys match the backend join format so choices are portable',()=>{
+  assert.equal(conflictKey(['request','url']),'request.url')
+  assert.equal(conflictKey(['assertions']),'assertions')
+  assert.equal(conflictKey([]),'')
+  // The batch endpoint receives these as JSON object keys, so they must not
+  // depend on JSON.stringify whitespace.
+  assert.equal(JSON.stringify(['request','body']),'["request","body"]')
+  assert.notEqual(conflictKey(['request','body']),JSON.stringify(['request','body']))
+})
+
+test('batch suggestion plan follows the executed response chain',()=>{
+  const login=stepFromInterface({id:1,name:'登录',version:1,config:blankConfig()})
+  const order=stepFromInterface({id:2,name:'创建订单',version:1,config:blankConfig()})
+  const query=stepFromInterface({id:3,name:'查询订单',version:1,config:blankConfig()})
+  const pause={id:'pause',name:'等待',kind:'wait',seconds:2}
+  const ok=status=>({status,detail:{response:{status_code:200}}})
+  assert.deepEqual(batchSuggestionPlan([login,pause,order],[login.id].reduce((a,id)=>({...a,[id]:ok('PASS')}),{})),[
+    {stepId:login.id,name:'登录',eligible:true,reason:null,status:'PASS'},
+    {stepId:'pause',name:'等待',eligible:false,reason:'wait'},
+    {stepId:order.id,name:'创建订单',eligible:false,reason:'not_executed',blockedBy:null},
+  ])
+  // A response without assertions is still worth generating for.
+  assert.deepEqual(batchSuggestionPlan([login],[login.id].reduce((a,id)=>({...a,[id]:ok('UNCHECKED')}),{}))[0],{stepId:login.id,name:'登录',eligible:true,reason:null,status:'UNCHECKED'})
+  // A failed step stops the chain and is never turned into a template.
+  const plan=batchSuggestionPlan([login,order,query],{[login.id]:ok('PASS'),[order.id]:ok('FAIL')})
+  assert.deepEqual(plan.map(item=>item.reason),[null,'failed','not_executed'])
+  assert.equal(plan[2].blockedBy,order.id)
+})
+
+test('applying AI suggestions is idempotent: an existing check is never appended twice',()=>{
+  const serverDump={id:'s',path:['body','count'],op:'type',expected:{kind:'literal',value:'number',name:'',step_id:'',path:[],parts:[],fields:{},items:[]}}
+  const local={id:'l',path:['body','count'],op:'type',expected:literal('number')}
+  assert.equal(assertionKey(serverDump),assertionKey(local))
+  // Ops without an expected value compare on path and op only.
+  assert.equal(assertionKey({path:['body','x'],op:'not_empty',expected:literal(null)}),assertionKey({path:['body','x'],op:'not_empty',expected:literal('ignored')}))
+  const ref={path:['body','id'],op:'eq',expected:{kind:'ref',step_id:'a',path:['body','id']}}
+  assert.notEqual(assertionKey(ref),assertionKey({...ref,expected:literal(42)}))
+  const additions=[local,{id:'n',path:['body','active'],op:'type',expected:literal('boolean')},{id:'dup',path:['body','active'],op:'type',expected:literal('boolean')}]
+  assert.deepEqual(newAssertions([serverDump],additions).map(a=>a.id),['n'])
+  assert.deepEqual(newAssertions([serverDump,...newAssertions([serverDump],additions)],additions).map(a=>a.id),[])
 })
