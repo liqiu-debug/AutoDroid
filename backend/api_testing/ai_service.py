@@ -21,10 +21,19 @@ from backend.openai_compat import parse_chat_completion_payload
 from . import service
 from .ai_schemas import Evidence, ExplainedItem, Fact, ModelExplanation, ModelSuggestion, ModelSuggestions, Suggestion
 from .schemas import Assertion, literal
-from .values import value_type
+from .values import input_locations, value_type
 
 logger = logging.getLogger(__name__)
 PROMPT_VERSION = "api-assist-v1"
+# Secrets shorter than this are not credentials; matching them as
+# substrings would reject unrelated field names.
+IDENTIFIER_SECRET_MIN = 4
+# A step needs a handful of meaningful checks, not one per leaf field. The cap
+# is raised slightly when the user stated a goal, since that is what unlocks
+# business-value assertions.
+MAX_SUGGESTIONS = 6
+MAX_SUGGESTIONS_WITH_GOAL = 8
+_BUSINESS_RESULT = re.compile(r"^(code|success|status|result|ok|message|msg|errcode|errmsg)$", re.I)
 CALL_TTL = 1800
 MAX_CALLS = 1000
 _calls = {}
@@ -106,8 +115,21 @@ class Sanitizer:
         result = re.sub(r"(?i)(password|passwd|token|secret|api[_-]?key|姓名|住址|地址|密码|密钥)\s*[:=：]\s*[^\s,，;；]+", r"\1=[已隐藏]", result)
         return result[:limit]
 
+    def identifier(self, value):
+        """Redact secrets that are long enough to be credentials.
+
+        A one or two character "secret" is a coincidence rather than a
+        credential, and treating it as a substring match silently rejects every
+        field name that merely contains it (a registered secret ``id`` hides
+        ``user_id`` from the model). Prose still goes through ``text``.
+        """
+        result = str(value or "")
+        for secret in sorted((item for item in self.secrets if len(item) >= IDENTIFIER_SECRET_MIN), key=len, reverse=True):
+            result = result.replace(secret, "[已隐藏]")
+        return result
+
     def allowed_path(self, path):
-        return all(not isinstance(part, str) or (len(part) <= 100 and not _SENSITIVE.search(part) and self.text(part) == part) for part in path)
+        return all(not isinstance(part, str) or (len(part) <= 100 and not _SENSITIVE.search(part) and self.identifier(part) == part) for part in path)
 
 
 def response_fields(response, sanitizer):
@@ -152,12 +174,22 @@ def debug_context(payload, session, user_id):
                 if not result or result.get("status") != "PASS" or result.get("assertions_pending") or (step.kind == "request" and item.assertion_fingerprints.get(step.id) != expected):
                     raise HTTPException(409, "前序步骤尚未验证通过，请先校验或重新调试")
         step = steps[index]
+        result = item.results.get(step.id)
         if step.kind != "request" or step.id not in item.responses or not result or result.get("status") not in {"PASS", "FAIL", "UNCHECKED"}:
             raise HTTPException(409, "没有有效的真实响应，请先调试本步")
         response = copy.deepcopy(item.responses[step.id])
         documents = [s.model_dump() for s in steps]
         documents.extend(copy.deepcopy(list(item.responses.values())))
-    return response, secrets, documents
+        # Paths of this response that later steps read: an assertion there is
+        # worth more than any structural check elsewhere.
+        referenced = set()
+        for later in steps[index + 1:]:
+            if later.kind == "request":
+                for val, _ in input_locations(later.effective()):
+                    if val.kind == "ref" and val.step_id == step.id:
+                        referenced.add(tuple(val.path))
+        existing = step.effective().assertions
+    return response, secrets, documents, existing, referenced
 
 
 def _strict_schema(schema):
@@ -204,7 +236,12 @@ async def call_model(config, task, context, schema):
         "业务结果完全由现有断言引擎判断。返回符合给定 JSON Schema 的纯 JSON。"
     )
     if task == "assertions":
-        prompt += "优先建议类型、存在和非空校验。不要把单次响应当成业务规格；无明确用户目标时不得固定业务值。禁止对 ID、时间、token 等动态值建议固定等值校验。expected 对无期望值的操作填 null。"
+        prompt += (
+            f"最多给出 {context.get('limit', MAX_SUGGESTIONS)} 条，每个字段只给一条，不要为每个叶子字段都建议。"
+            "优先级：referenced_paths 里被后续步骤引用的字段（必须有校验）> 业务结果字段（code/success/status/message 之类）> 顶层关键字段；"
+            "数字和布尔字段用 type，字符串、数组和对象用 not_empty。"
+            "不要把单次响应当成业务规格；无明确用户目标时不得固定业务值。禁止对 ID、时间、token 等动态值建议固定等值校验。expected 对无期望值的操作填 null。"
+        )
     else:
         prompt += "possible_causes 是待验证的可能原因，不是确定根因；next_steps 只给排查建议。每条必须引用输入中存在的 evidence_ids。不得虚构事实、证据或业务结果。"
     payload = {"model": config["model"], "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps({"task": task, "context": context}, ensure_ascii=False)}], "max_tokens": 2200, "stream": False,
@@ -261,12 +298,73 @@ def _finish_call(user_id, call_id, started, digest, task, *, ok, usage=0, count=
     return elapsed
 
 
-def validate_suggestions(raw, values, sanitizer, goal=""):
+def assertion_fingerprint(path, op, expected):
+    """Identity of a check: the same path/op/expected is the same check."""
+    return json.dumps([list(path), op, None if op in {"exists", "not_empty", "is_2xx"} else expected], ensure_ascii=False)
+
+
+def existing_fingerprints(assertions):
+    keys = set()
+    for assertion in assertions or ():
+        expected = assertion.expected
+        if expected.kind != "literal":
+            continue
+        keys.add(assertion_fingerprint(assertion.path, assertion.op, expected.value))
+    return keys
+
+
+_STRUCTURAL = {"exists": 0, "not_empty": 1, "type": 2}
+
+
+def _collapse_and_rank(suggestions, referenced, limit, covered=()):
+    """One check per field, the most valuable fields first, capped.
+
+    Three structural checks on one field are redundant: not_empty implies
+    exists, and type is the stronger check for numbers/booleans. A field that
+    already carries a structural check in the step is treated as covered, so a
+    regeneration does not resurface the sibling check it collapsed last time.
+    """
+    by_path, covered_hits = {}, 0
+    for item in suggestions:
+        spec = item["assertion"]
+        key = tuple(spec["path"])
+        kind = item["evidence"]["type"]
+        if spec["op"] in _STRUCTURAL and key in covered:
+            covered_hits += 1
+            continue
+        if spec["op"] not in _STRUCTURAL:
+            score = 10  # a value check always beats a structural one
+        elif spec["op"] == "type":
+            score = 3 if kind in {"number", "boolean"} else 1
+        elif spec["op"] == "not_empty":
+            score = 2 if kind not in {"number", "boolean"} else 1
+        else:
+            score = 0
+        current = by_path.get(key)
+        if current is None or score > current[0]:
+            by_path[key] = (score, item)
+
+    def priority(entry):
+        key, (_, item) = entry
+        name = str(key[-1]) if key else ""
+        tier = 0 if key in referenced else 1 if _BUSINESS_RESULT.search(name) else 2 if key == ("status_code",) else 3
+        return (tier, len(key), item["_order"])
+
+    ranked = [item for _, (_, item) in sorted(by_path.items(), key=priority)]
+    kept, dropped = ranked[:limit], len(ranked) - min(len(ranked), limit)
+    for item in kept:
+        item.pop("_order", None)
+    return kept, dropped, covered_hits
+
+
+def validate_suggestions(raw, values, sanitizer, goal="", existing=(), referenced=(), limit=MAX_SUGGESTIONS):
     try:
         envelope = ModelSuggestions.model_validate(raw)
     except ValidationError:
         raise HTTPException(502, "AI 建议结构无效，未应用任何更改") from None
     suggestions, warnings, seen = [], [], set()
+    already = existing_fingerprints(existing)
+    skipped_existing = 0
     for index, item in enumerate(envelope.suggestions, 1):
         try:
             model = ModelSuggestion.model_validate(item)
@@ -301,30 +399,49 @@ def validate_suggestions(raw, values, sanitizer, goal=""):
             if spec.op in {"exists", "not_empty", "is_2xx"}:
                 expected = None
             assertion = Assertion(path=spec.path, op=spec.op, expected=literal(expected))
-            fingerprint = json.dumps([spec.path, spec.op, expected], ensure_ascii=False)
+            fingerprint = assertion_fingerprint(spec.path, spec.op, expected)
             if fingerprint in seen:
                 raise ValueError("重复建议")
             seen.add(fingerprint)
-            suggestions.append(Suggestion(assertion=assertion, reason=sanitizer.text(model.reason, 500), evidence=Evidence(path=spec.path, type=kind)).model_dump())
+            if fingerprint in already:
+                skipped_existing += 1
+                continue
+            row = Suggestion(assertion=assertion, reason=sanitizer.text(model.reason, 500), evidence=Evidence(path=spec.path, type=kind)).model_dump()
+            row["_order"] = index
+            suggestions.append(row)
         except (ValidationError, ValueError, TypeError) as exc:
             reason = str(exc) if type(exc) is ValueError else "格式或类型无效"
             warnings.append(f"已过滤第 {index} 条建议：{reason}")
+    covered = {tuple(a.path) for a in (existing or ()) if a.op in _STRUCTURAL}
+    suggestions, dropped, covered_hits = _collapse_and_rank(suggestions, set(tuple(p) for p in referenced), limit, covered)
+    skipped_existing += covered_hits
+    if skipped_existing:
+        warnings.append(f"{skipped_existing} 条建议已存在于当前校验，未重复列出。")
+    if dropped:
+        warnings.append(f"按价值保留前 {limit} 条，其余 {dropped} 条未列出。")
     if not suggestions:
-        warnings.append("没有可用建议，可继续手动配置校验。")
+        warnings.append("没有新的建议，可继续手动配置校验。" if skipped_existing else "没有可用建议，可继续手动配置校验。")
     return suggestions, warnings
 
 
 async def suggest_assertions(payload, session, user_id):
     config = require_available(session)
-    response, secrets, documents = debug_context(payload, session, user_id)
+    response, secrets, documents, existing, referenced = debug_context(payload, session, user_id)
     sanitizer = Sanitizer([*secrets, config["key"]], documents + [response])
     fields, values = response_fields(response, sanitizer)
-    context = {"goal": sanitizer.text(payload.goal, 2000), "fields": fields}
+    goal = sanitizer.text(payload.goal, 2000)
+    limit = MAX_SUGGESTIONS_WITH_GOAL if goal.strip() else MAX_SUGGESTIONS
+    context = {
+        "goal": goal,
+        "limit": limit,
+        "referenced_paths": [list(path) for path in sorted(referenced, key=lambda p: json.dumps(p, ensure_ascii=False)) if sanitizer.allowed_path(list(path))],
+        "fields": fields,
+    }
     call_id, started, digest = _start_call(user_id, "assertions", context)
     ok, usage, count = False, 0, 0
     try:
         raw, usage = await call_model(config, "assertions", context, suggestion_schema())
-        suggestions, warnings = validate_suggestions(raw, values, sanitizer, context["goal"])
+        suggestions, warnings = validate_suggestions(raw, values, sanitizer, goal, existing=existing, referenced=referenced, limit=limit)
         count, ok = len(suggestions), True
     finally:
         duration = _finish_call(user_id, call_id, started, digest, "assertions", ok=ok, usage=usage, count=count, model=sanitizer.text(config["model"], 100))

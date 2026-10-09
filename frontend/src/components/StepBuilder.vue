@@ -1122,6 +1122,9 @@ const handleExecuteStep = async (step) => {
   background: var(--ad-bg);
   border-radius: 8px;
   border: 1px solid var(--ad-border);
+  /* --action-color is set per step; the coloured edge is how step types are
+     told apart at a glance (the scenario editor keeps the same convention). */
+  border-left: 3px solid var(--action-color);
   overflow: hidden;
   transition: all 0.2s ease;
 }
@@ -1152,14 +1155,14 @@ const handleExecuteStep = async (step) => {
 .step-index {
   width: 28px;
   height: 28px;
-  background: var(--ad-primary-soft);
+  background: var(--action-color);
   border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 12px;
   font-weight: 600;
-  color: var(--ad-primary);
+  color: var(--ad-surface);
   flex-shrink: 0;
 }
 

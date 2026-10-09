@@ -122,7 +122,7 @@ def get_scenario(scenario_id: int, session: Session = Depends(get_session)):
     """Get a single scenario"""
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(status_code=404, detail="场景不存在")
     return scenario
 
 @router.put("/{scenario_id}", response_model=TestScenarioRead)
@@ -135,7 +135,7 @@ def update_scenario(
     """Update scenario details"""
     db_scenario = session.get(TestScenario, scenario_id)
     if not db_scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(status_code=404, detail="场景不存在")
 
     db_scenario.name = scenario.name
     if scenario.description is not None:
@@ -158,7 +158,7 @@ def delete_scenario(
     """Delete a scenario"""
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(status_code=404, detail="场景不存在")
     deps.ensure_owner_or_admin(scenario.user_id, current_user)
 
     # Cascade delete steps
@@ -188,7 +188,7 @@ def update_scenario_steps(
     """Replace all steps in a scenario"""
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(status_code=404, detail="场景不存在")
 
     # 1. Delete old steps
     old_steps = session.exec(select(ScenarioStep).where(ScenarioStep.scenario_id == scenario_id)).all()
@@ -263,7 +263,7 @@ def precheck_scenario_execution(
                     "case_name": "Unknown",
                     "status": "FAIL",
                     "ok": False,
-                    "reason": f"Case not found: {scenario_step.case_id}",
+                    "reason": f"用例不存在: {scenario_step.case_id}",
                     "summary": {"pass": 0, "skip": 0, "fail": 1, "global_fail": 0, "total": 1},
                     "global_checks": [],
                     "steps": [
@@ -272,7 +272,7 @@ def precheck_scenario_execution(
                             "action": "system",
                             "status": "FAIL",
                             "code": "CASE_NOT_FOUND",
-                            "message": f"Case not found: {scenario_step.case_id}",
+                            "message": f"用例不存在: {scenario_step.case_id}",
                         }
                     ],
                 }
@@ -367,7 +367,7 @@ async def run_scenario_api(
     """触发场景在多个设备上的并发执行"""
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(status_code=404, detail="场景不存在")
 
     executor_name = current_user.full_name or current_user.username
 
@@ -509,7 +509,7 @@ def precheck_scenario_api(
     """Precheck scenario executability on target device without execution."""
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+        raise HTTPException(status_code=404, detail="场景不存在")
     return precheck_scenario_execution(
         session=session,
         scenario_id=scenario_id,

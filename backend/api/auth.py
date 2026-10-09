@@ -26,10 +26,10 @@ def login_access_token(
     statement = select(User).where(User.username == form_data.username)
     user = session.exec(statement).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
+        raise HTTPException(status_code=400, detail="用户名或密码错误")
     
     if not user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise HTTPException(status_code=400, detail="账号已被停用，请联系管理员")
         
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -72,7 +72,7 @@ def change_password(
     Change password for the current user after verifying the current password.
     """
     if not verify_password(password_in.current_password, current_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
+        raise HTTPException(status_code=400, detail="当前密码不正确")
 
     current_user.hashed_password = get_password_hash(password_in.new_password)
     session.add(current_user)
@@ -102,7 +102,7 @@ def create_user(
     if user:
         raise HTTPException(
             status_code=400,
-            detail="The user with this username already exists in the system",
+            detail="用户名已存在",
         )
     
     user = User(
@@ -128,13 +128,13 @@ def register_user(
     Open registration for new users.
     """
     if not is_registration_allowed(session):
-        raise HTTPException(status_code=403, detail="Registration is disabled. Please contact administrator.")
+        raise HTTPException(status_code=403, detail="注册已关闭，请联系管理员开通账号")
 
     user = session.exec(select(User).where(User.username == user_in.username)).first()
     if user:
         raise HTTPException(
             status_code=400,
-            detail="The user with this username already exists",
+            detail="用户名已存在",
         )
     user = User(
         username=user_in.username,

@@ -1,12 +1,13 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
+from types import SimpleNamespace
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_
 from sqlmodel import Session, col, select, func, desc
 from ..database import get_session
-from ..models import Device, ScheduledTask, TestExecution, TestResult, TestScenario, User
+from ..models import ApiRun, Device, ScheduledTask, TestExecution, TestResult, TestScenario, User
 from pydantic import BaseModel
 from backend.scheduler_service import SchedulerService
 
@@ -118,6 +119,28 @@ class DashboardTaskItem(BaseModel):
     formatted_schedule: str
 
 
+class DashboardApiRecentRun(BaseModel):
+    id: str
+    scenario_name: str
+    env_name: str
+    status: str
+    start_time: Optional[datetime] = None
+    duration: float  # seconds, same unit as device executions
+
+
+class DashboardApiAutomation(BaseModel):
+    """Interface automation runs are a separate record family (ApiRun), so they
+    get their own block rather than being folded into device-centric KPIs."""
+    total_runs: int
+    completed_runs: int
+    pass_rate: float
+    failed_runs: int
+    running_runs: int
+    avg_duration: float
+    trend: List[DashboardTrendPoint] = []
+    recent_runs: List[DashboardApiRecentRun] = []
+
+
 class DashboardOverview(BaseModel):
     range: str
     platform: str
@@ -129,6 +152,7 @@ class DashboardOverview(BaseModel):
     alerts: List[DashboardAlert] = []
     recent_executions: List[TestExecutionRead] = []
     upcoming_tasks: List[DashboardTaskItem] = []
+    api_automation: Optional[DashboardApiAutomation] = None
 
 
 # --- Flaky 分析 / 执行对比 Schemas ---
@@ -377,6 +401,61 @@ def _build_top_failed_scenarios(executions: List[TestExecution], limit: int = 5)
 
     failed_list.sort(key=lambda x: (x.fail_count, x.fail_rate), reverse=True)
     return failed_list[:limit]
+
+
+API_RUN_COMPLETED = {"PASS", "FAIL", "ERROR", "ABORTED"}
+API_RUN_ACTIVE = {"QUEUED", "RUNNING"}
+
+
+def _build_api_automation(
+    session: Session,
+    window_start: datetime,
+    range_key: str,
+    now: datetime,
+    limit_recent: int,
+) -> DashboardApiAutomation:
+    """Summarise ApiRun records for the same window as the device KPIs.
+
+    The platform filter is a device concept and does not apply here. ApiRun ids
+    live in their own scenario id space, so nothing is merged into the
+    device-centric top-failed/alert lists.
+    """
+    runs = session.exec(select(ApiRun).where(ApiRun.created_at >= window_start)).all()
+    completed = [run for run in runs if run.status in API_RUN_COMPLETED]
+    passed = sum(1 for run in completed if run.status == "PASS")
+    durations = [run.duration_ms / 1000 for run in completed if run.duration_ms]
+    running = int(session.exec(select(func.count(ApiRun.id)).where(ApiRun.status.in_(API_RUN_ACTIVE))).one() or 0)
+
+    # The trend builder only reads start_time/status, so adapt the runs to that
+    # shape instead of duplicating the bucketing logic.
+    adapted = [
+        SimpleNamespace(
+            start_time=run.started_at or run.created_at,
+            status="RUNNING" if run.status in API_RUN_ACTIVE else run.status,
+        )
+        for run in runs
+    ]
+    recent = sorted(runs, key=lambda run: run.created_at, reverse=True)[:limit_recent]
+    return DashboardApiAutomation(
+        total_runs=len(runs),
+        completed_runs=len(completed),
+        pass_rate=round(passed / len(completed) * 100, 1) if completed else 0.0,
+        failed_runs=sum(1 for run in runs if run.status in {"FAIL", "ERROR"}),
+        running_runs=running,
+        avg_duration=round(sum(durations) / len(durations), 1) if durations else 0.0,
+        trend=_build_dashboard_trend(adapted, range_key, now),
+        recent_runs=[
+            DashboardApiRecentRun(
+                id=run.id,
+                scenario_name=run.scenario_name,
+                env_name=run.env_name,
+                status=run.status,
+                start_time=run.started_at or run.created_at,
+                duration=(run.duration_ms or 0) / 1000,
+            )
+            for run in recent
+        ],
+    )
 
 
 def _build_dashboard_alerts(
@@ -643,6 +722,7 @@ def get_dashboard_overview(
         alerts=alerts,
         recent_executions=recent_executions,
         upcoming_tasks=upcoming_tasks,
+        api_automation=_build_api_automation(session, window_start, range_key, now, limit_recent),
     )
 
 @router.get("/executions", response_model=PaginatedTestExecutionRead)
@@ -740,7 +820,7 @@ def compare_executions(
 def get_report_detail(execution_id: int, session: Session = Depends(get_session)):
     execution = session.get(TestExecution, execution_id)
     if not execution:
-        raise HTTPException(status_code=404, detail="Execution not found")
+        raise HTTPException(status_code=404, detail="执行记录不存在")
         
     # Get steps
     steps = session.exec(select(TestResult).where(TestResult.execution_id == execution_id).order_by(TestResult.step_order)).all()
@@ -838,7 +918,7 @@ import base64
 def download_report(execution_id: int, session: Session = Depends(get_session)):
     execution = session.get(TestExecution, execution_id)
     if not execution:
-        raise HTTPException(status_code=404, detail="Execution not found")
+        raise HTTPException(status_code=404, detail="执行记录不存在")
 
     # 1. Try to serve existing report if linked
     if execution.report_id:

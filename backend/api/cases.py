@@ -691,7 +691,7 @@ def get_test_case(case_id: int, session: Session = Depends(get_session)):
     """Get a single test case."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
     return _enrich_case_read(case, session)
 
 
@@ -705,7 +705,7 @@ def update_test_case(
     """Update a test case."""
     db_case = session.get(TestCase, case_id)
     if not db_case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
     previous_standard_steps = _list_standard_steps(session, case_id)
     previous_image_paths = _collect_case_template_image_paths(db_case, previous_standard_steps)
 
@@ -739,7 +739,7 @@ def duplicate_test_case(
     """Clone a test case."""
     original_case = session.get(TestCase, case_id)
     if not original_case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
 
     new_case = TestCase(
         name=f"{original_case.name}_copy",
@@ -777,7 +777,7 @@ def get_case_standard_steps(case_id: int, session: Session = Depends(get_session
     """Read standard cross-platform steps for a case."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
 
     standard_steps = _list_standard_steps(session, case_id)
     if (
@@ -800,7 +800,7 @@ def replace_case_standard_steps(
     """Replace all standard steps for a case (source of truth for new model)."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
     previous_standard_steps = _list_standard_steps(session, case_id)
     previous_image_paths = _collect_case_template_image_paths(case, previous_standard_steps)
 
@@ -833,7 +833,7 @@ def sync_case_standard_steps_from_legacy(
     """One-click migration helper: sync legacy case.steps into standard step rows."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
     previous_standard_steps = _list_standard_steps(session, case_id)
     previous_image_paths = _collect_template_paths_from_standard_steps(previous_standard_steps)
 
@@ -1018,7 +1018,7 @@ def run_test_case(
     """Quick run a test case in background."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
 
     # Pass the engine/factory to background task, not the dependency session.
     from backend.database import engine
@@ -1092,7 +1092,7 @@ def run_test_case_batch(
     """Run one case on multiple devices as one cancellable batch."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
 
     from backend.database import engine
     from sqlmodel import Session as SQLSession
@@ -1241,7 +1241,7 @@ def precheck_test_case(
     """Precheck case executability on target device without running the case."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
     return precheck_case_execution(
         session=session,
         case=case,
@@ -1259,7 +1259,7 @@ def delete_test_case(
     """Delete a test case."""
     case = session.get(TestCase, case_id)
     if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
+        raise HTTPException(status_code=404, detail="用例不存在")
     deps.ensure_owner_or_admin(case.user_id, current_user)
 
     standard_steps = session.exec(select(TestCaseStep).where(TestCaseStep.case_id == case_id)).all()

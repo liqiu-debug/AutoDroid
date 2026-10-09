@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { ref, computed, watch, reactive, effectScope, nextTick } from 'vue'
-import { apiError, copy, effectiveStep, pathLabel, assertionLabel, previewValue, localRequestStep, literal } from '../src/utils/apiTesting.js'
+import { apiError, copy, effectiveStep, pathLabel, assertionLabel, previewValue, localRequestStep, literal, newAssertions } from '../src/utils/apiTesting.js'
 
 // Run production script setup with real Vue reactivity, replacing only imports,
 // lifecycle registration, and the two compiler-provided setup macros.
@@ -10,7 +10,7 @@ function loadScript(name, exports) {
   const source = readFileSync(new URL(`../src/components/api-testing/${name}.vue`, import.meta.url), 'utf8')
     .match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import .*\n/gm, '')
   return new Function('ref', 'computed', 'watch', 'onMounted', 'onBeforeUnmount', 'nextTick', 'ElMessage',
-    'api', 'createUuid', 'apiError', 'copy', 'effectiveStep', 'pathLabel', 'assertionLabel', 'previewValue',
+    'api', 'createUuid', 'apiError', 'copy', 'effectiveStep', 'pathLabel', 'assertionLabel', 'previewValue', 'newAssertions',
     'defineProps', 'defineEmits', `${source}\nreturn {${exports.join(',')}};`)
 }
 const deferred = () => {
@@ -53,7 +53,7 @@ function setup(t, name = 'AiAssertions', overrides = {}) {
   const script = loadScript(name, names)
   const state = scope.run(() => script(ref, computed, watch, fn => mounted.push(fn), fn => lifecycle.push(fn), nextTick,
     Object.fromEntries(['error','warning','success'].map(kind => [kind, text => messages.push({ kind, text })])),
-    api, () => `uuid-${++sequence}`, apiError, copy, effectiveStep, pathLabel, assertionLabel, previewValue, () => props, () => emit))
+    api, () => `uuid-${++sequence}`, apiError, copy, effectiveStep, pathLabel, assertionLabel, previewValue, newAssertions, () => props, () => emit))
   const unmount = () => { lifecycle.forEach(fn => fn()); scope.stop() }
   t.after(unmount)
   return { state, props, calls, events, messages, unmount, mount: () => Promise.all(mounted.map(fn => fn())) }
@@ -121,6 +121,23 @@ test('the same AI generation cannot be applied twice by repeated clicks', async 
   await Promise.all([context.state.apply(), context.state.apply()])
   assert.equal(context.events.length, 1)
   assert.equal(feedbacks(context).filter(call => call.payload.action === 'accepted').length, 1)
+})
+
+test('reopening and applying the same suggestions again never duplicates assertions', async t => {
+  const context = setup(t)
+  await context.state.generate(); context.state.chosen.value = [0]
+  await context.state.apply()
+  const after = context.events.at(-1).payload.length
+  context.state.open.value = true; context.state.chosen.value = [0]
+  await context.state.apply()
+  assert.equal(context.events.length, 1, 'already-applied rows are inert')
+  assert.equal(effectiveStep(context.props.steps[0]).assertions.length, after)
+  // Regenerating offers a fresh list; an identical suggestion is skipped on apply and reported.
+  await context.state.generate(); context.state.chosen.value = [0]
+  await context.state.apply()
+  assert.equal(context.events.length, 1)
+  assert.equal(effectiveStep(context.props.steps[0]).assertions.length, after)
+  assert.ok(context.messages.some(m => m.text.includes('已存在')))
 })
 
 test('repeated generate clicks send one model request while the first is pending', async t => {

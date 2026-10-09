@@ -7,6 +7,7 @@ from backend.api_testing.values import (
     ExecutionError,
     evaluate_assertions,
     field_tree,
+    request_issues,
     resolve,
     sync_preview,
     validate_steps,
@@ -61,6 +62,26 @@ class ApiValueTests(unittest.TestCase):
         self.assertEqual(validate_steps([step], {}), [])
         step.snapshot.request.headers[0].enabled = True
         self.assertEqual(validate_steps([step], {})[0]["location"], ["request", "headers", 0, "value"])
+
+    def test_configured_frame_headers_are_no_longer_blocked_by_precheck(self):
+        step = Step(id="one")
+        step.snapshot.request.url = literal("https://example.com")
+        from backend.api_testing.schemas import Parameter
+
+        step.snapshot.request.headers = [
+            Parameter(name=name, value=literal(value))
+            for name, value in (
+                ("Host", "orders.internal.example"),
+                ("Content-Length", "17"),
+                ("Connection", "close"),
+                ("Transfer-Encoding", "chunked"),
+            )
+        ]
+        # The executor derives these only when the request does not set them, so
+        # an explicit value is the user's decision and must not be an error.
+        self.assertEqual(validate_steps([step], {}), [])
+        self.assertEqual(request_issues(step.snapshot.request, {}), [])
+        self.assertEqual(validate_steps([step], {}, validation_mode="run"), [])
 
     def test_assertions_are_type_strict_and_handle_missing(self):
         assertions = [

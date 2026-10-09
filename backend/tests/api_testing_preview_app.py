@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from backend.core.errors import install_error_handlers
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import SQLModel, Session, select
@@ -28,16 +29,26 @@ if not any(root in _preview_db.parents for root in _temporary_roots):
 from backend.api import api_testing, auth, environments, tasks, reports, settings
 from backend.api_testing import ai_service, service
 from backend.api_testing.engine import make_client
-from backend.api_testing.schemas import Step, Value, Assertion, literal, from_json
+from backend.api_testing.schemas import Step, Value, Assertion, Parameter, literal, from_json
 from backend.core.security import get_password_hash
 from backend.database import engine, PROJECT_ROOT
 from backend.models import User, ApiDefinition, ApiScenario, ApiScenarioStep, ApiRun, ApiStepResult, Environment, SystemSetting
 from backend.notification_service import NotificationService
 
 
+_flaky_attempts = []
+
+
 def simulated_api(request):
     if request.url.host != "api.demo.test":
         return httpx.Response(403, json={"error": "Preview only permits api.demo.test"})
+    # Fails the first time only, so the retry path can be exercised end to end
+    # without ever leaving this process.
+    if request.url.path == "/flaky":
+        if not _flaky_attempts:
+            _flaky_attempts.append(1)
+            raise httpx.ConnectError("隔离预览：模拟连接失败", request=request)
+        return httpx.Response(200, json={"code": 0, "data": {"attempt": "retried"}})
     if request.url.path == "/login":
         return httpx.Response(
             200,
@@ -116,21 +127,35 @@ def seed():
         session.commit()
         session.refresh(user)
         session.refresh(env)
-        definitions = []
+        definitions, frozen = [], []
         samples = [
             {"code": 0, "data": {"token": "preview-token", "user_id": 7}},
             {"code": 0, "data": {"id": 42, "amount": 99.5, "paid": False}},
             {"code": 0, "data": {"id": 42, "status": "created"}},
+            {"code": 0, "data": {"attempt": "retried"}},
         ]
+        # 查询订单 is deliberately one version ahead of the snapshots the steps
+        # freeze below, so the preview can exercise stale detection, the list
+        # badge, batch sync and the per-field conflict decision.
+        versions = [1, 1, 2, 1]
         for index, (name, path, method) in enumerate(
-            [("用户登录", "/login", "POST"), ("创建订单", "/orders", "POST"), ("查询订单", "/orders/{id}", "GET")]
+            [
+                ("用户登录", "/login", "POST"),
+                ("创建订单", "/orders", "POST"),
+                ("查询订单", "/orders/{id}", "GET"),
+                ("不稳定接口", "/flaky", "GET"),
+            ]
         ):
             step = Step()
             step.snapshot.request.url = literal("https://api.demo.test" + path)
             step.snapshot.request.method = method
+            frozen.append(step.snapshot.model_dump())
+            if versions[index] > 1:
+                step.snapshot.request.query = [Parameter(name="detail", value=literal("1"))]
             row = ApiDefinition(
                 name=name,
                 description="隔离验收示例，不发送真实网络请求",
+                version=versions[index],
                 config=step.snapshot.model_dump(),
                 sample=api_testing.sample_data({"body": samples[index]}, step.snapshot),
                 user_id=user.id,
@@ -146,11 +171,10 @@ def seed():
         )
         session.add(scenario)
         session.flush()
-        from backend.api_testing.schemas import Parameter
 
-        for index, row in enumerate(definitions):
+        for index, row in enumerate(definitions[:3]):
             step = Step(
-                id=f"step-{index + 1}", name=row.name, interface_id=row.id, interface_version=1, snapshot=row.config
+                id=f"step-{index + 1}", name=row.name, interface_id=row.id, interface_version=1, snapshot=frozen[index]
             )
             config = step.snapshot.model_copy(deep=True)
             if index:
@@ -167,6 +191,9 @@ def seed():
                         name="id", value=Value(kind="ref", step_id="step-2", path=["body", "data", "id"])
                     ).model_dump()
                 ]
+                # Overriding a field the interface has since changed is what makes
+                # this step need a per-field decision instead of a clean sync.
+                step.overrides["request"]["query"] = [Parameter(name="verbose", value=literal("0")).model_dump()]
                 step.overrides["assertions"] = [
                     *config.model_dump()["assertions"],
                     Assertion(
@@ -179,6 +206,41 @@ def seed():
                 ApiScenarioStep(
                     scenario_id=scenario.id,
                     position=index,
+                    step_id=step.id,
+                    interface_id=row.id,
+                    definition=step.model_dump(),
+                )
+            )
+
+        # A second scenario keeps the maintenance paths demoable: one step can be
+        # synced in bulk, one waits on a decision, and one retries a connect failure.
+        lightweight = ApiScenario(
+            name="订单查询 · 轻量示例",
+            description="单独调试查询订单与不稳定接口；用于验证影响面、批量同步和失败重试",
+            user_id=user.id,
+            env_id=env.id,
+        )
+        session.add(lightweight)
+        session.flush()
+        for position, (row, overrides, retry) in enumerate(
+            [
+                (definitions[2], {"path_params": [Parameter(name="id", value=literal("42")).model_dump()]}, 0),
+                (definitions[3], {}, 1),
+            ]
+        ):
+            step = Step(
+                id=f"lite-{position + 1}",
+                name=row.name,
+                interface_id=row.id,
+                interface_version=1,
+                snapshot=frozen[2 + position],
+                retry_count=retry,
+            )
+            step.overrides = {"request": overrides} if overrides else {}
+            session.add(
+                ApiScenarioStep(
+                    scenario_id=lightweight.id,
+                    position=position,
                     step_id=step.id,
                     interface_id=row.id,
                     definition=step.model_dump(),
@@ -219,6 +281,7 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+install_error_handlers(app)
 app.include_router(auth.router, prefix="/api/auth")
 app.include_router(api_testing.router, prefix="/api/api-testing")
 app.include_router(environments.router, prefix="/api/environments")

@@ -61,7 +61,9 @@ def start_run(session, scenario, user, env_id, *, notify=False, task_id=None, db
     errors = validate_steps(steps, env, validation_mode="run")
     if errors:
         raise HTTPException(422, errors)
-    snapshot = {"version": scenario.version, "steps": [s.model_dump() for s in steps]}
+    # The description is frozen with the run so a reader can tell what the
+    # scenario was for without opening the (possibly since-edited) scenario.
+    snapshot = {"version": scenario.version, "description": scenario.description, "steps": [s.model_dump() for s in steps]}
     run_id, cancel = str(uuid4()), threading.Event()
     run = ApiRun(
         id=run_id,

@@ -15,14 +15,16 @@ summary{cursor:pointer;font-weight:500;padding:8px 0;color:#466b98}details{borde
 @media(max-width:600px){body{padding:8px;font-size:14px}header,section{padding:16px}table{font-size:12px}td,th{padding:6px}summary{min-height:44px}pre{font-size:13px}}
 </style><main>
 <header><small>AutoDroid / 接口自动化</small><h1>{{ run.scenario_name }}</h1>
+{% if (run.snapshot or {}).get('description') %}<p>{{ run.snapshot.get('description') }}</p>{% endif %}
 <b class="{{ run.status }}">{{ run.status }}</b> · {{ run.env_name }} · {{ run.executor_name }}
 <p>开始：{{ run.started_at or run.created_at }} · 总耗时：{{ '%.0f'|format(run.duration_ms) }} ms</p>
 <p>{{ summary.total }} 步 · 通过 {{ summary.passed }} · 失败 {{ summary.failed }} · 跳过 {{ summary.skipped }}{% if summary.unchecked %} · 未校验 {{ summary.unchecked }}{% endif %}</p>
 {% for warning in warnings %}<p class="UNCHECKED">{{ warning }}</p>{% endfor %}
 {% if failure %}<p class="FAIL">{{ failure }}</p>{% elif run.error %}<p>{{ run.error }}</p>{% endif %}</header>
 {% for step in steps %}<section id="step-{{ step.step_id }}"><h2>{{ loop.index }}. {{ step.name }} <span class="{{ step.status }}">{{ step.status|status }}</span></h2>
-<small>{% if step.detail.response %}HTTP {{ step.detail.response.status_code }} · {% endif %}{{ '%.0f'|format(step.duration_ms) }} ms · {{ step.detail.assertions|default([])|selectattr('passed')|list|length }}/{{ step.detail.assertions|default([])|length }} 条断言通过</small>
+<small>{% if step.detail.response %}HTTP {{ step.detail.response.status_code }} · {% endif %}{{ '%.0f'|format(step.duration_ms) }} ms{% if step.detail.attempts|default(1) > 1 %} · 共尝试 {{ step.detail.attempts }} 次{% endif %} · {{ step.detail.assertions|default([])|selectattr('passed')|list|length }}/{{ step.detail.assertions|default([])|length }} 条断言通过</small>
 {% if step.detail.error %}<p>{{ step.detail.error }}</p>{% endif %}
+{% if step.detail.retry_history %}<details><summary>重试记录（仅连接失败会重试）</summary>{% for item in step.detail.retry_history %}<p>第 {{ item.attempt }} 次：{{ item.error }}</p>{% endfor %}</details>{% endif %}
 {% if step.detail.assertions %}<h3>断言</h3><table><tr><th>字段</th><th>条件</th><th>实际值</th><th>期望值</th><th>结果</th></tr>
 {% for a in step.detail.assertions %}<tr><td>{{ a.path|path }}</td><td>{{ a.op|operator }}</td><td>{{ '字段不存在' if a.missing else a.actual|pretty }}</td>
 <td>{{ '200–299' if a.op == 'is_2xx' else '—' if a.op in ['exists','not_empty'] else a.expected|pretty }}</td><td class="{{ 'PASS' if a.passed else 'FAIL' }}">{{ '通过' if a.passed else a.message }}</td></tr>{% endfor %}</table>{% endif %}

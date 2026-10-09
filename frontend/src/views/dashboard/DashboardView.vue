@@ -60,6 +60,7 @@ const emptyOverview = () => ({
   alerts: [],
   recent_executions: [],
   upcoming_tasks: [],
+  api_automation: null,
 })
 
 const overview = ref(emptyOverview())
@@ -94,54 +95,41 @@ const recentProblemExecutions = computed(() => {
     .slice(0, 5)
 })
 
-const trendOption = computed(() => {
-  const trend = overview.value.trend || []
-  return {
-    tooltip: { trigger: 'axis' },
-    legend: { top: 4 },
-    grid: { left: 36, right: 20, top: 34, bottom: 22, containLabel: true },
-    xAxis: {
-      type: 'category',
-      boundaryGap: false,
-      data: trend.map(item => item.date),
-    },
-    yAxis: { type: 'value' },
-    series: [
-      {
-        name: '总执行',
-        type: 'line',
-        smooth: true,
-        data: trend.map(item => item.total),
-        itemStyle: { color: chartColors.primary },
-        lineStyle: { width: 2, color: chartColors.primary },
-      },
-      {
-        name: '通过',
-        type: 'line',
-        smooth: true,
-        data: trend.map(item => item.pass_count),
-        itemStyle: { color: chartColors.success },
-        lineStyle: { width: 2, color: chartColors.success },
-      },
-      {
-        name: '失败',
-        type: 'line',
-        smooth: true,
-        data: trend.map(item => item.fail_count),
-        itemStyle: { color: chartColors.danger },
-        lineStyle: { width: 2, color: chartColors.danger },
-      },
-      {
-        name: '告警',
-        type: 'line',
-        smooth: true,
-        data: trend.map(item => item.warning_count),
-        itemStyle: { color: chartColors.warning },
-        lineStyle: { width: 2, color: chartColors.warning },
-      },
-    ],
-  }
+const trendLine = (name, data, color) => ({ name, type: 'line', smooth: true, data, itemStyle: { color }, lineStyle: { width: 2, color } })
+const buildTrendOption = (trend, { includeWarning = true } = {}) => ({
+  tooltip: { trigger: 'axis' },
+  legend: { top: 4 },
+  grid: { left: 36, right: 20, top: 34, bottom: 22, containLabel: true },
+  xAxis: { type: 'category', boundaryGap: false, data: trend.map(item => item.date) },
+  yAxis: { type: 'value' },
+  series: [
+    trendLine('总执行', trend.map(item => item.total), chartColors.primary),
+    trendLine('通过', trend.map(item => item.pass_count), chartColors.success),
+    trendLine('失败', trend.map(item => item.fail_count), chartColors.danger),
+    ...(includeWarning ? [trendLine('告警', trend.map(item => item.warning_count), chartColors.warning)] : []),
+  ],
 })
+const trendOption = computed(() => buildTrendOption(overview.value.trend || []))
+
+// Interface automation is a separate record family with its own block; its
+// runs never carry a WARNING status, so that series is omitted.
+const apiBlock = computed(() => overview.value.api_automation || null)
+const hasApiRuns = computed(() => loaded.value && (apiBlock.value?.total_runs || 0) > 0)
+const apiTrendOption = computed(() => buildTrendOption(apiBlock.value?.trend || [], { includeWarning: false }))
+const apiStats = computed(() => {
+  const block = apiBlock.value || {}
+  const metric = (value) => loaded.value ? value : '—'
+  return [
+    { key: 'runs', title: `${rangeLabel.value}执行`, value: metric(block.total_runs || 0) },
+    { key: 'pass', title: '通过率', value: loaded.value && block.completed_runs > 0 ? `${Number(block.pass_rate || 0).toFixed(1)}%` : '—' },
+    { key: 'failed', title: '失败', value: metric(block.failed_runs || 0) },
+    { key: 'running', title: '运行中', value: metric(block.running_runs || 0) },
+    { key: 'duration', title: '平均耗时', value: loaded.value ? formatDuration(block.avg_duration) : '—' },
+  ]
+})
+const handleOpenApiRun = (row) => {
+  if (row?.id) router.push(`/execution/reports/api/${row.id}`)
+}
 
 const statusPieOption = computed(() => {
   const labelMap = {
@@ -429,6 +417,21 @@ onUnmounted(() => {
           </div>
         </el-card>
       </section>
+      <section class="block-grid two-col">
+        <el-card shadow="never" class="panel-card" :class="{ 'span-all': !hasApiRuns }">
+          <template #header><div class="panel-header"><span>接口自动化</span><el-button link type="primary" @click="router.push('/execution/reports?tab=api')">全部接口报告</el-button></div></template>
+          <div class="api-stats"><div v-for="item in apiStats" :key="item.key" class="api-stat"><span class="kpi-title">{{ item.title }}</span><strong class="api-stat-value">{{ item.value }}</strong></div></div>
+          <el-table v-if="apiBlock?.recent_runs?.length" :data="apiBlock.recent_runs" size="small">
+            <el-table-column label="场景" min-width="150" show-overflow-tooltip><template #default="{ row }"><button class="ad-name-button" @click="handleOpenApiRun(row)">{{ row.scenario_name || '未命名场景' }}</button></template></el-table-column>
+            <el-table-column prop="env_name" label="环境" min-width="90" show-overflow-tooltip />
+            <el-table-column label="状态" width="88"><template #default="{ row }"><el-tag size="small" :type="statusTagType(row.status)">{{ statusLabel(row.status) }}</el-tag></template></el-table-column>
+            <el-table-column label="开始时间" width="116"><template #default="{ row }">{{ formatDateTime(row.start_time) }}</template></el-table-column>
+            <el-table-column label="耗时" width="72"><template #default="{ row }">{{ formatDuration(row.duration) }}</template></el-table-column>
+          </el-table>
+          <div v-else class="ad-empty-state"><h3>{{ loaded ? '还没有接口运行' : '等待接口数据' }}</h3><p>编排接口场景并运行后，结果会汇总到这里。</p><el-button @click="router.push('/api-testing/scenarios')">前往自动化场景</el-button></div>
+        </el-card>
+        <el-card v-if="hasApiRuns" shadow="never" class="panel-card"><template #header><div class="panel-header">接口执行趋势</div></template><v-chart class="chart-box" :theme="chartTheme" :option="apiTrendOption" autoresize /></el-card>
+      </section>
       <section v-if="hasExecutions" class="block-grid two-col">
         <el-card shadow="never" class="panel-card"><template #header><div class="panel-header">执行趋势</div></template><v-chart class="chart-box" :theme="chartTheme" :option="trendOption" autoresize /></el-card>
         <el-card shadow="never" class="panel-card"><template #header><div class="panel-header">状态分布</div></template><v-chart class="chart-box" :theme="chartTheme" :option="statusPieOption" autoresize /></el-card>
@@ -467,6 +470,10 @@ onUnmounted(() => {
 .dashboard-summary { margin-top: -8px; color: var(--ad-muted); font-size: 12px; }
 .block-grid { display: grid; gap: 16px; }
 .two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.span-all { grid-column: 1 / -1; }
+.api-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+.api-stat { padding: 10px 12px; border: 1px solid var(--ad-border); border-radius: 8px; background: var(--ad-bg); min-width: 0; }
+.api-stat-value { display: block; margin-top: 6px; font-size: 20px; line-height: 1.2; font-weight: 600; color: var(--ad-text); font-variant-numeric: tabular-nums; }
 .activity-grid { grid-template-columns: minmax(0, 1.65fr) minmax(280px, 1fr); }
 .panel-card { min-width: 0; border-radius: var(--ad-panel-radius); }
 .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 600; color: var(--ad-text); min-height: 24px; }
@@ -490,6 +497,6 @@ onUnmounted(() => {
 .mobile-execution-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .mobile-execution-main strong { font-size: 14px; color: var(--ad-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-execution-main span { font-size: 14px; color: var(--ad-muted); }
-@media (max-width: 1100px) { .activity-grid, .two-col { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .activity-grid, .two-col { grid-template-columns: 1fr; } .api-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 720px) { .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>

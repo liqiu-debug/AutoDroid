@@ -464,7 +464,7 @@ watch(() => taskRoute.fullPath, () => {
                     </template>
                 </el-table-column>
 
-                <el-table-column label="执行内容" min-width="260">
+                <el-table-column label="执行内容" min-width="260" align="center">
                     <template #default="{ row }">
                         <div class="execution-cell">
                             <el-tag size="small" :type="row._execution.tagType" effect="plain">
@@ -840,6 +840,9 @@ watch(() => taskRoute.fullPath, () => {
     min-width: 0;
     display: flex;
     align-items: center;
+    /* The column is centred like its neighbours; text-align does not move flex
+       children, so the group needs centring explicitly. */
+    justify-content: center;
     gap: 8px;
 }
 

@@ -63,7 +63,7 @@ function changeBody(type) {
         <div v-if="req.auth.kind === 'api_key'" class="body-content url-row"><el-input :model-value="req.auth.key_name" placeholder="API Key 名称" @update:model-value="setAuth('key_name', $event)" /><el-select :model-value="req.auth.location" style="width:150px" @update:model-value="setAuth('location', $event)"><el-option label="请求头" value="header" /><el-option label="查询参数" value="query" /></el-select></div>
         <p class="hint">{{ allowStepReferences ? '可使用敏感环境变量或前序登录步骤的输出。' : '可使用敏感环境变量配置凭证。' }}Cookie 可在请求头配置，执行内自动保持。</p>
       </el-tab-pane>
-      <el-tab-pane label="高级" name="settings"><label>总超时（秒）</label><el-input-number :model-value="req.timeout_seconds" :min="1" :max="120" @update:model-value="setRequest('timeout_seconds', $event)" /></el-tab-pane>
+      <el-tab-pane label="高级" name="settings"><label>总超时（秒）</label><el-input-number :model-value="req.timeout_seconds" :min="1" :max="120" @update:model-value="setRequest('timeout_seconds', $event)" /><template v-if="$slots.retry"><label>失败重试</label><div class="retry-row"><slot name="retry" /></div></template></el-tab-pane>
     </el-tabs>
       </el-tab-pane>
       <el-tab-pane :label="`校验 (${config.assertions.length})`" name="assertions"><AssertionsEditor ref="assertionsEditor" :model-value="config.assertions" :fields="fields" :field-source="fieldSource" :sources="sources" :variables="variables" @update:model-value="setConfig('assertions', $event)" @added="focus('assertions',['assertions',$event])" /></el-tab-pane>
@@ -76,7 +76,7 @@ function changeBody(type) {
 .main-tabs :deep(>.el-tabs__header){margin-bottom:10px}.main-tabs :deep(>.el-tabs__header .el-tabs__item){font-weight:600}
 .request-address :deep(.el-form-item){margin-bottom:12px;min-width:0}.request-address :deep(.el-form-item__content){display:block;min-width:0}
 .request-address :deep(.el-select){width:100%}.request-address :deep(.el-form-item__label){line-height:22px;padding-bottom:8px}
-.url-row{display:flex;gap:12px;align-items:flex-start}.body-content{margin-top:16px}
+.url-row{display:flex;gap:12px;align-items:flex-start}.body-content{margin-top:16px}.retry-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 h4{font-size:13px;margin:16px 0 12px}label{display:block;color:var(--ad-text);font-size:13px;margin:12px 0 8px}
 .hint{color:var(--ad-muted);font-size:12px;line-height:20px}
 @media(max-width:1100px){.request-address{grid-template-columns:90px minmax(0,1fr)}.request-actions{grid-column:1/-1;margin-top:-4px}}

@@ -302,7 +302,7 @@ class ScenarioPrecheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["summary"]["fail_cases"], 1)
         self.assertEqual(result["cases"][0]["status"], "FAIL")
-        self.assertIn("Case not found", result["cases"][0]["reason"])
+        self.assertIn("用例不存在", result["cases"][0]["reason"])
 
     @patch("backend.cross_platform_execution.check_wda_health")
     @patch("backend.cross_platform_execution.resolve_ios_wda_url", return_value="http://127.0.0.1:8200")

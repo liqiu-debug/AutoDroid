@@ -136,6 +136,9 @@ class Step(Contract):
     # accidentally deep-merged, which would resurrect explicitly removed keys.
     overrides: Dict[str, Any] = Field(default_factory=dict)
     seconds: float = Field(default=1, ge=0, le=300)
+    # Only failures that prove the request never reached the server are ever
+    # repeated, so a write operation cannot be silently duplicated.
+    retry_count: int = Field(default=0, ge=0, le=3)
     response_schema: Optional[ResponseSchema] = None
 
     @model_validator(mode="after")
@@ -211,3 +214,26 @@ class DebugExecute(Contract):
 
 class CurlInput(Contract):
     command: str = Field(min_length=1, max_length=100000)
+
+
+class SyncItem(Contract):
+    scenario_id: int
+    step_id: str = Field(min_length=1, max_length=64)
+    # The caller's view of the scenario version; a mismatch refuses the write
+    # rather than silently discarding someone else's edit.
+    version: int = Field(ge=1)
+    choices: Dict[str, Literal["keep", "template"]] = Field(default_factory=dict)
+
+
+class SyncApplyRequest(Contract):
+    items: List[SyncItem] = Field(min_length=1, max_length=200)
+
+
+class SpecInput(Contract):
+    # Matches specs.MAX_SPEC_CHARS so oversized documents fail at the contract.
+    content: str = Field(min_length=1, max_length=2000000)
+
+
+class SpecApplyRequest(Contract):
+    folder_id: Optional[int] = None
+    items: List[DefinitionWrite] = Field(min_length=1, max_length=200)

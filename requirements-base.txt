@@ -13,4 +13,6 @@ apscheduler>=3.11,<4
 httpx>=0.28
 bcrypt==4.0.1
 websockets>=11.0
+# Interface document import (OpenAPI/Swagger YAML). JSON documents parse without it.
+pyyaml>=6.0
 perfetto>=0.16

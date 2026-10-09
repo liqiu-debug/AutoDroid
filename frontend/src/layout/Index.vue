@@ -87,14 +87,13 @@ const handleMobileLogout = () => {
           <SidebarMenuItem v-for="menu in menuRoutes" :key="menu.path" :item="menu" :can-show-route="canShowRoute" />
         </el-menu>
       </nav>
-      <footer class="sidebar-account"><Navbar /></footer>
     </el-aside>
     <el-container class="layout-body" direction="vertical">
       <el-header class="layout-header">
         <el-breadcrumb separator="/" aria-label="当前位置">
           <el-breadcrumb-item v-for="(title, index) in breadcrumbs" :key="index">{{ title }}</el-breadcrumb-item>
         </el-breadcrumb>
-        <ClientModeSwitch />
+        <div class="header-actions"><ClientModeSwitch /><Navbar /></div>
       </el-header>
       <!-- 右侧内容区 -->
       <el-main class="layout-main">
@@ -177,9 +176,9 @@ const handleMobileLogout = () => {
 .sidebar-menu :deep(.el-sub-menu.is-active > .el-sub-menu__title) { color: var(--ad-text); font-weight: 500; }
 .sidebar-menu :deep(.el-icon) { font-size: 16px; width: 18px; margin-right: 8px; }
 .sidebar-menu :deep(.el-sub-menu__icon-arrow) { width: 12px; margin: 0; font-size: 11px; right: 10px; }
-.sidebar-account { padding: 12px; border-top: 1px solid var(--ad-border); flex-shrink: 0; }
 .layout-body { flex: 1; overflow: hidden; min-width: 0; min-height: 0; }
 .layout-header { height: 44px; flex-shrink: 0; padding: 0 16px; display: flex; justify-content: space-between; align-items: center; gap: 12px; background: var(--ad-surface); border-bottom: 1px solid var(--ad-border); }
+.header-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; min-width: 0; }
 .layout-header :deep(.el-breadcrumb) { font-size: 12px; min-width: 0; }
 .layout-header :deep(.el-breadcrumb__inner) { color: var(--ad-muted); font-weight: 400; }
 .layout-main { padding: 0; overflow: hidden; min-height: 0; min-width: 0; position: relative; display: flex; flex-direction: column; }

@@ -13,7 +13,7 @@ from backend.api.deps import get_current_active_user
 from backend.api_testing import ai_service, service
 from backend.api_testing.ai_routes import router
 from backend.api_testing.ai_schemas import ExplainFailureRequest, FeedbackRequest, SuggestAssertionsRequest
-from backend.api_testing.schemas import Assertion, Parameter, Step, literal
+from backend.api_testing.schemas import Assertion, DebugExecute, Parameter, Step, Value, literal
 from backend.database import get_session
 from backend.models import ApiRun, ApiStepResult, Environment, GlobalVariable, SystemSetting, User
 
@@ -127,6 +127,123 @@ class ApiTestingAiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(raised.exception.status_code, 409)
             model.assert_not_called()
         self.assertEqual(before, self.item.results)
+
+    def test_short_secrets_do_not_hide_unrelated_field_names(self):
+        sanitizer = ai_service.Sanitizer(["actual-provider-secret"])
+        # A registered value of "id" used to make text("user_id") differ from
+        # "user_id", so a perfectly ordinary field never reached the model.
+        sanitizer.add("id")
+        response = {"status_code": 200, "body": {"user_id": 7, "token": "value-of-token"}}
+        fields, _ = ai_service.response_fields(response, sanitizer)
+        paths = [item["path"] for item in fields]
+        self.assertIn(["body", "user_id"], paths)
+        # Sensitive names and real credentials are still withheld.
+        self.assertNotIn(["body", "token"], paths)
+        self.assertFalse(sanitizer.allowed_path(["body", "actual-provider-secret"]))
+        # Prose redaction keeps using every registered secret, however short.
+        self.assertEqual(sanitizer.text("id actual-provider-secret"), "[已隐藏] [已隐藏]")
+
+    def test_suggestions_collapse_per_field_rank_by_value_and_cap(self):
+        sanitizer = ai_service.Sanitizer()
+        values = {("status_code",): 200, ("body", "code"): 0, ("body", "count"): 2, ("body", "active"): True,
+                  ("body", "name_x"): "n", ("body", "deep", "leaf"): "x", ("body", "list"): [1]}
+        for key in list(values):
+            values[key[:-1]] = values.get(key[:-1], {})  # parents exist for allowed_path purposes
+        raw = {"suggestions": [
+            suggestion(["body", "count"], "exists"), suggestion(["body", "count"], "not_empty"), suggestion(["body", "count"], "type", "number"),
+            suggestion(["body", "active"], "not_empty"), suggestion(["body", "active"], "type", "boolean"),
+            suggestion(["body", "name_x"], "exists"), suggestion(["body", "name_x"], "not_empty"), suggestion(["body", "name_x"], "type", "string"),
+            suggestion(["body", "deep", "leaf"], "not_empty"), suggestion(["body", "list"], "not_empty"),
+            suggestion(["body", "code"], "type", "number"), suggestion(["status_code"], "is_2xx"),
+        ]}
+        kept, warnings = ai_service.validate_suggestions(raw, values, sanitizer, referenced={("body", "list")}, limit=5)
+        ops = [(tuple(s["assertion"]["path"]), s["assertion"]["op"]) for s in kept]
+        # One check per field: type for number/boolean, not_empty for strings.
+        self.assertEqual(len(set(path for path, _ in ops)), len(ops))
+        self.assertIn((("body", "count"), "type"), ops)
+        self.assertIn((("body", "active"), "type"), ops)
+        # Referenced field first, then the business result code, then status.
+        self.assertEqual(ops[0][0], ("body", "list"))
+        self.assertEqual(ops[1][0], ("body", "code"))
+        self.assertEqual(ops[2][0], ("status_code",))
+        self.assertEqual(len(kept), 5)
+        self.assertTrue(any("按价值保留前 5 条" in w for w in warnings))
+        # The deep leaf loses to shallow fields and is what got cut.
+        self.assertNotIn(("body", "deep", "leaf"), [path for path, _ in ops])
+
+    def test_suggestions_already_in_the_step_are_not_offered_again(self):
+        sanitizer = ai_service.Sanitizer()
+        values = {("body",): {}, ("body", "count"): 2, ("body", "active"): True}
+        existing = [Assertion(path=["body", "count"], op="type", expected=literal("number"))]
+        # A sibling structural check on an already-covered field is also redundant.
+        raw = {"suggestions": [suggestion(["body", "count"], "type", "number"), suggestion(["body", "count"], "not_empty"), suggestion(["body", "active"], "type", "boolean")]}
+        kept, warnings = ai_service.validate_suggestions(raw, values, sanitizer, existing=existing)
+        self.assertEqual([s["assertion"]["path"] for s in kept], [["body", "active"]])
+        self.assertIn("2 条建议已存在于当前校验，未重复列出。", warnings)
+        kept, warnings = ai_service.validate_suggestions({"suggestions": [suggestion(["body", "count"], "type", "number")]}, values, sanitizer, existing=existing)
+        self.assertEqual(kept, [])
+        self.assertIn("没有新的建议，可继续手动配置校验。", warnings)
+
+    async def test_downstream_references_and_goal_shape_the_request(self):
+        self.configure()
+        second = Step(id="second", snapshot=self.step.snapshot.model_copy(deep=True))
+        second.snapshot.request.auth.kind = "bearer"
+        second.snapshot.request.auth.token = Value(kind="ref", step_id="first", path=["body", "count"])
+        self.prepare_debug([self.step, second])
+        self.payload.steps = [self.step, second]
+        many = [suggestion(["body", "active"], "type", "boolean"), suggestion(["body", "count"], "type", "number")]
+        with self.model(many) as model:
+            result = await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+        context = model.call_args.args[2]
+        self.assertEqual(context["referenced_paths"], [["body", "count"]])
+        # Paths mixing list indexes and keys must not break the request (tuple
+        # ordering would compare int with str).
+        second.snapshot.request.headers = [Parameter(name="X-Item", value=Value(kind="ref", step_id="first", path=["body", "items", 0])),
+                                           Parameter(name="X-Total", value=Value(kind="ref", step_id="first", path=["body", "items", "total"]))]
+        self.prepare_debug([self.step, second])
+        with self.model(many) as model:
+            await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+        self.assertIn(["body", "items", 0], model.call_args.args[2]["referenced_paths"])
+        self.assertEqual(context["limit"], ai_service.MAX_SUGGESTIONS)
+        self.assertEqual(result["suggestions"][0]["assertion"]["path"], ["body", "count"])
+        self.payload.goal = "订单数量应为 2"
+        with self.model(many) as model:
+            await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+        self.assertEqual(model.call_args.args[2]["limit"], ai_service.MAX_SUGGESTIONS_WITH_GOAL)
+
+    async def test_batch_flow_must_generate_for_every_step_before_applying(self):
+        """Locks the ordering the batch UI relies on: generate all, apply, recheck in order."""
+        self.configure()
+        second = Step(id="second", snapshot=self.step.snapshot.model_copy(deep=True))
+        third = Step(id="third", snapshot=self.step.snapshot.model_copy(deep=True))
+        steps = [self.step, second, third]
+        self.prepare_debug(steps)
+
+        def request(step_id, token):
+            return SuggestAssertionsRequest(steps=steps, debug_session_id=self.item.id, editor_id="editor", step_id=step_id, draft_token=token)
+
+        # One through-run is enough for every step.
+        with self.model([suggestion(["body", "count"], "type", "number")]):
+            for step in steps:
+                result = await ai_service.suggest_assertions(request(step.id, f"draft-{step.id}"), self.session, self.user_id)
+                self.assertEqual(len(result["suggestions"]), 1)
+
+        # Applying to an earlier step before later steps were generated would be
+        # refused: the predecessor's assertions changed and are unverified.
+        steps[0].snapshot.assertions.append(Assertion(path=["body", "count"], op="type", expected=literal("number")))
+        with self.model([]) as model:
+            with self.assertRaises(HTTPException) as raised:
+                await ai_service.suggest_assertions(request("second", "late"), self.session, self.user_id)
+            self.assertEqual(raised.exception.status_code, 409)
+            model.assert_not_called()
+
+        # Rechecking in order repairs the chain without sending any request.
+        for step in steps:
+            result = service.recheck_debug(self.item, DebugExecute(editor_id="editor", env_id=None, steps=steps, step_id=step.id), {})
+            self.assertEqual(result["status"], "PASS", step.id)
+        with self.model([suggestion(["body", "active"], "type", "boolean")]):
+            result = await ai_service.suggest_assertions(request("third", "again"), self.session, self.user_id)
+        self.assertEqual(len(result["suggestions"]), 1)
 
     async def test_sanitizes_secrets_auth_cookies_and_personal_free_text_before_model(self):
         self.configure()

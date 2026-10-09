@@ -81,7 +81,10 @@ h1, h2, h3 { color: var(--ad-text); }
 .el-drawer__title { font-size: 16px; font-weight: 600; }
 .el-drawer__body { padding: 16px; min-height: 0; overflow: auto; }
 .el-drawer__footer { padding: 12px 16px; border-top: 1px solid var(--ad-border); }
-.el-message-box { max-width: calc(100vw - 32px); border-radius: 8px; padding: 16px; }
+/* Element Plus sets width:100% with max-width as the only cap, so overriding
+   max-width alone stretched every confirm box across the viewport. Keep the
+   intended fixed width and use max-width only to stay inside narrow screens. */
+.el-message-box { width: var(--el-messagebox-width, 420px); max-width: calc(100vw - 32px); border-radius: 8px; padding: 16px; }
 .el-message-box__title { font-size: 16px; }
 .el-message-box__message { overflow-wrap: anywhere; }
 .el-dropdown-menu__item, .el-select-dropdown__item { font-size: 13px; }
