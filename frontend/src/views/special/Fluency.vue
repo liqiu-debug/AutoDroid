@@ -9,7 +9,7 @@ import api from '@/api'
 const router = useRouter()
 
 const form = reactive({
-    package_name: 'com.ehaier.zgq.shop.mall',
+    package_name: '',
     device_serial: '',
     enable_performance_monitor: true,
     enable_jank_frame_monitor: true,

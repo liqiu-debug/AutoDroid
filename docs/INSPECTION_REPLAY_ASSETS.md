@@ -8,7 +8,7 @@
 - 巡检不是随机点击。引擎先建立页面语义模型，再按安全规则、页面族覆盖和预算选择动作。
 - 巡检不是全控件穷举器。页面族采样、安全阻断和 Coverage Contract 会有意减少重复或高风险操作。
 - 每个 Profile 必须同时定义 `guest` 与 `authenticated` 两条业务线；运行时可只选择其中一条。
-- 海尔商城业务覆盖只适用于 `com.ehaier.zgq.shop.mall`；其他包仍提供页面族探索指标，但不会套用海尔清单。
+- 核心旅程覆盖只适用于商城应用（`com.ehaier.zgq.shop.mall`）；其他包仍提供页面族探索指标，但不会套用该清单。
 - `run.status` 表示设备、故障、告警和队列等执行健康；`coverage_verdict` 表示业务完整性，不能互相替代。
 - 巡检可以使用设备当前安装版本，也可以先安装一个已上传的 Android 包。
 - 巡检报告支持运行中只读 Scrcpy 画面、实时阶段和完整快照；关闭报告页不会中止任务。
@@ -26,7 +26,7 @@
 | `inspection_exploration_family_convergence` | `true` | 同构页面族共享增量覆盖；依赖身份模型 |
 | `inspection_similarity_convergence` | `false` | 高置信相似状态收敛；依赖身份模型 |
 | `inspection_coverage_scheduler_v2` | `false` | 页面族与动作组覆盖调度；依赖身份模型 |
-| `inspection_business_coverage_v2` | `false` | 海尔商城 v2 清单冻结与影子评估；与覆盖调度同时开启时启用定向补齐和 15% 终点复验 |
+| `inspection_business_coverage_v2` | `false` | 商城应用 v2 清单冻结与影子评估；与覆盖调度同时开启时启用定向补齐和 15% 终点复验 |
 | `inspection_visual_home_actions` | `false` | 首页无语义图片入口探测；依赖覆盖调度 |
 | `compatibility_installed_replay` | `true` | 当前安装版本的冻结路径回放 |
 | `compatibility_legacy_compare_creation` | `false` | 旧兼容性创建流程的临时回退入口 |
@@ -37,7 +37,7 @@
 
 1. 开启 `model_inspection`，保留默认的身份模型和页面族收敛。
 2. 用真机验证 Profile 的入口、危险动作阻断、脱敏与预算。
-3. 海尔商城先开启 `inspection_business_coverage_v2`，只观察冻结清单和影子评估，不改变普通探索顺序。
+3. 商城应用先开启 `inspection_business_coverage_v2`，只观察冻结清单和影子评估，不改变普通探索顺序。
 4. 核对旅程证据和盲区后开启 `inspection_coverage_scheduler_v2`，此时缺失旅程动作会优先于普通页面族探索；确认后再按需开启视觉首页动作。
 5. 开启 `content_addressed_assets`，完成一段双写观察期并执行历史资产回填。
 6. 确认资产状态和回滚路径后开启 `tiered_asset_retention`。
@@ -56,7 +56,7 @@
 | Transition | 动作边，记录定位候选、执行结果、安全边界和拓扑关系 |
 | ExplorationFamily | 同构页面实例组成的页面族，用于增量覆盖 |
 | CoverageContract | 页面族与动作组的覆盖要求及采样结果 |
-| Coverage Manifest / Assessment | Run 创建时冻结的海尔清单、哈希、逐项证据、盲区和双层结论 |
+| Coverage Manifest / Assessment | Run 创建时冻结的商城清单、哈希、逐项证据、盲区和双层结论 |
 | Fault | Crash、ANR、基础设施或自动化故障及其证据 |
 
 Graph 当前返回 `schema_version=8`、`hierarchy_version=2`。客户端必须以响应中的版本为准：v2 层级使用 `BRANCH_ROOT / PEER / PAGE / VIEWPORT / ORPHAN` 和 `SELF / VIEWPORT / PEER / CHILD` 关系；设备真实回放始终使用冻结的路径步骤，而不是按画布连线推导。
@@ -74,7 +74,7 @@ Graph 当前返回 `schema_version=8`、`hierarchy_version=2`。客户端必须�
 
 默认预算为 30 分钟、200 个 State、800 次设备动作、深度 12、400 个 Observation 和 512 MiB 任务资产；Profile 与单次创建均可把持续时间设为 5 至 120 分钟。达到预算、覆盖盲区或安全边界可能产生 `WARNING`，不应自动解释为业务失败。
 
-海尔商城建议按目标选择时长：
+商城应用建议按目标选择时长：
 
 | 目标 | 建议时长 | 说明 |
 |---|---:|---|
@@ -82,7 +82,7 @@ Graph 当前返回 `schema_version=8`、`hierarchy_version=2`。客户端必须�
 | 单业务线深度探索 | 90 分钟 | 核心完成后继续发现长尾页面与动作组 |
 | `guest + authenticated` 全应用验收 | 120 分钟 | 两条业务线共享任务预算，约为每条业务线保留一个标准窗口 |
 
-启用海尔 v2 定向调度时，前 85% 预算用于定向补齐和开放式探索，最后 15% 用于终点复验。延长时长不会重新执行 `SAMPLED_OUT`、页面族/Contract 复用和安全阻断；`BUDGET_NOT_REACHED` 适合增加预算，`QUEUE_TRUNCATED` 或 `PATH_DIVERGED` 应优先修复入口和父路径恢复。
+启用商城 v2 定向调度时，前 85% 预算用于定向补齐和开放式探索，最后 15% 用于终点复验。延长时长不会重新执行 `SAMPLED_OUT`、页面族/Contract 复用和安全阻断；`BUDGET_NOT_REACHED` 适合增加预算，`QUEUE_TRUNCATED` 或 `PATH_DIVERGED` 应优先修复入口和父路径恢复。
 
 ### 4.2 Web 操作
 
@@ -95,9 +95,9 @@ Graph 当前返回 `schema_version=8`、`hierarchy_version=2`。客户端必须�
 
 删除 Profile 不会破坏历史报告，因为 Run 持有完整 `profile_snapshot`。运行中的 Profile 不可删除；运行中的 Run 只能先取消。巡检也可在定时任务中选择 `inspection` 类型，但必须指定一个 Profile、一台 Android 设备和至少一条业务线。
 
-### 4.3 海尔商城可信业务覆盖
+### 4.3 商城应用可信业务覆盖
 
-创建海尔商城 Run 时冻结 `haier-mall-v2` 清单、版本、哈希和所选业务线。必达旅程如下：
+创建商城应用 Run 时冻结 `haier-mall-v2` 清单、版本、哈希和所选业务线。必达旅程如下：
 
 | 范围 | 必达旅程 |
 |---|---|
@@ -209,7 +209,7 @@ Graph 当前返回 `schema_version=8`、`hierarchy_version=2`。客户端必须�
 
 仅在明确需要覆盖现有 legacy 文件时追加 `--force`。
 
-历史海尔 Run 只能按 `haier-mall-v1` 回填，禁止使用 v2 规则追溯重判。先预览，再按需指定 Run 执行：
+历史商城应用 Run 只能按 `haier-mall-v1` 回填，禁止使用 v2 规则追溯重判。先预览，再按需指定 Run 执行：
 
 ```bash
 .venv/bin/python scripts/maintenance/backfill_haier_business_coverage.py --dry-run

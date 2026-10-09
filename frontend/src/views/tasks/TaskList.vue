@@ -69,7 +69,7 @@ const form = reactive({
     // 通知
     enable_notification: true,
     // Fastbot 专属
-    fb_package_name: 'com.ehaier.zgq.shop.mall',
+    fb_package_name: '',
     fb_duration_min: 30,
     fb_throttle: 500,
     fb_ignore_crashes: false,
@@ -193,7 +193,7 @@ const resetForm = () => {
     form.interval_unit = 'minutes'
     form.once_datetime = ''
     form.enable_notification = true
-    form.fb_package_name = 'com.ehaier.zgq.shop.mall'
+    form.fb_package_name = ''
     form.fb_duration_min = 30
     form.fb_throttle = 500
     form.fb_ignore_crashes = false
