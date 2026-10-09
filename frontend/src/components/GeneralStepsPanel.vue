@@ -29,7 +29,8 @@ const props = defineProps({
 
 const caseStore = useCaseStore()
 const { currentCase } = storeToRefs(caseStore)
-const DEFAULT_PACKAGE = 'com.ehaier.zgq.shop.mall'
+// No app is assumed: the user fills this in (or it is taken from the case).
+const DEFAULT_PACKAGE = ''
 const packageName = ref(DEFAULT_PACKAGE)
 const emit = defineEmits(['action-start', 'action-end', 'refresh-needed', 'action-added'])
 const hasSelectedDevice = computed(() => !!props.deviceSerial)

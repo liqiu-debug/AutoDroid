@@ -664,10 +664,10 @@ def _generate_mock_steps(text: str) -> List[dict]:
             {
                 "uuid": str(uuid.uuid4()),
                 "action": "start_app",
-                "selector": "com.ehaier.zgq.shop.mall",
+                "selector": "",
                 "selector_type": None,
                 "value": None,
-                "description": "启动应用",
+                "description": "启动应用（请填写包名）",
                 "timeout": 10,
                 "error_strategy": "ABORT"
             },

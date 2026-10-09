@@ -27,7 +27,7 @@ test('settings exposes Haier business coverage as an independent shadow flag', (
   assert.match(source, /form\.value\.inspection_business_coverage_v2 = flagRes\.data\?\.inspection_business_coverage_v2 === true/)
   assert.match(source, /key: 'inspection_business_coverage_v2'/)
   assert.match(source, /v-model="form\.inspection_business_coverage_v2" :disabled="!form\.model_inspection"/)
-  assert.match(source, /海尔核心旅程覆盖/)
+  assert.match(source, /核心旅程覆盖/)
   assert.doesNotMatch(source, /v-model="form\.inspection_business_coverage_v2" :disabled="!form\.inspection_coverage_scheduler_v2"/)
 })
 

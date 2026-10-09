@@ -177,7 +177,7 @@ _PAGE_TITLE_BY_SUBTYPE = {
     "PURCHASE_OPTIONS": "规格选择",
     "CHECKOUT": "确认订单",
     "CHECKOUT_CONFIRMATION": "结算确认",
-    "CASHIER": "海尔收银台",
+    "CASHIER": "收银台",
     "ORDER": "订单",
     "ORDER_DETAIL": "订单详情",
     "CONSUMABLE_LIST": "耗材列表",

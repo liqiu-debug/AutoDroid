@@ -10,7 +10,7 @@ const router = useRouter()
 
 // ---- 配置表单 ----
 const form = reactive({
-    package_name: 'com.ehaier.zgq.shop.mall',
+    package_name: '',
     duration_min: 30,
     throttle: 500,
     enable_performance_monitor: true,

@@ -42,7 +42,8 @@ AutoDroid 是一个低代码 UI 自动化测试平台，核心模式是：
 | 模型化智能巡检 | 页面身份/页面族、覆盖调度、安全边界、双业务线、实时拓扑与稳定路径 | `backend/api/inspections.py`、`backend/inspection/` |
 | 兼容性测试与回放 | 页面合集或巡检快照的版本/机型对比，当前安装版本冻结路径回放 | `backend/api/compatibility.py`、`backend/compatibility_replay.py` |
 | 证据资产 | 内容寻址、引用计数、鉴权读取、分层保留和容量水位 | `backend/artifact_store.py`、`backend/api/assets.py` |
-| AI 能力 | 自然语言生成步骤（NL2Step）、日志 AI 根因分析 | `backend/api/ai.py`、`backend/api/log_analysis.py` |
+| 接口自动化 | 接口库与版本、cURL/文档导入、顺序场景与步骤引用、调试会话、断言与报告、无设备定时执行、影响面与批量同步、可选 AI 校验建议 | `backend/api/api_testing.py`、`backend/api_testing/` |
+| AI 能力 | 自然语言生成步骤（NL2Step）、日志 AI 根因分析、接口校验建议与失败解释 | `backend/api/ai.py`、`backend/api/log_analysis.py`、`backend/api_testing/ai_service.py` |
 | 配置与通知 | 系统配置中心、飞书测试报告卡片通知 | `backend/api/settings.py`、`backend/notification_service.py` |
 | 移动端适配 | 自动/PC/移动模式切换，提供概览、设备、用例/场景执行和报告查看 | `frontend/src/composables/useClientMode.js`、`frontend/src/layout/Index.vue` |
 
@@ -366,11 +367,11 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 - `replay.py`：冻结稳定路径、检查定位质量和安全边界。
 - `live.py`：发布完整最新快照和短效单次 WebSocket 票据。
 - `monitor.py`：Crash/ANR、性能、卡顿和可选 Perfetto 证据。
-- `haier_business_coverage.py`：冻结海尔商城 v2 核心旅程、计算证据状态，并为缺失旅程提供下一动作提示。
+- `haier_business_coverage.py`：冻结商城应用（`haier-mall-v2`）v2 核心旅程、计算证据状态，并为缺失旅程提供下一动作提示。
 
 Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observation、Transition、ExplorationFamily 与 CoverageContract。历史报告按创建时的快照和版本解释，不用新算法重算。
 
-海尔商城采用“版本化核心旅程 + 定向补齐 + 开放式探索”的混合模型。Run 创建时冻结 `haier-mall-v2` 清单、版本和 SHA-256 哈希；搜索旅程固定输入非敏感关键词“冰箱”。`CoverageGoalTracker` 持续计算每条旅程的最深阶段，未完成旅程的下一动作优先于普通页面族探索，已完成必达项后继续消费剩余预算发现长尾页面。任务前 85% 用于探索，最后 15% 只复验已到达的核心终点。
+商城应用采用“版本化核心旅程 + 定向补齐 + 开放式探索”的混合模型。Run 创建时冻结 `haier-mall-v2` 清单、版本和 SHA-256 哈希；搜索旅程固定输入非敏感关键词“冰箱”。`CoverageGoalTracker` 持续计算每条旅程的最深阶段，未完成旅程的下一动作优先于普通页面族探索，已完成必达项后继续消费剩余预算发现长尾页面。任务前 85% 用于探索，最后 15% 只复验已到达的核心终点。
 
 覆盖口径严格拆分：
 
@@ -392,9 +393,40 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 
 证据在 `content_addressed_assets` 开启时双写到 `asset_store/`。`StoredAsset` 按内容哈希去重，`AssetReference` 按 owner/role 管理 HOT、WARM、PINNED、COLD 保留；兼容性冻结基线在源巡检清理后仍可独立读取。完整上线与回滚步骤见 `docs/INSPECTION_REPLAY_ASSETS.md`。
 
-## 12. AI 能力
+## 12. 接口自动化
 
-### 12.1 NL2Step（自然语言生成步骤）
+面向"初级测试也能维护"的低代码接口测试：接口库 + 顺序场景 + 点选式断言，独立于设备执行。
+
+### 12.1 能力与入口
+
+| 能力 | 说明 | 关键实现 |
+|---|---|---|
+| 接口库 | 目录、版本、样例、复制、搜索；接口被场景引用时禁止删除并列出引用者 | `backend/api/api_testing.py` |
+| 录入 | 粘贴 cURL、导入 OpenAPI 3 / Swagger 2.0 / Postman v2.1（JSON/YAML，只解析不发送，只创建勾选项） | `backend/api_testing/curl.py`、`specs.py` |
+| 场景编排 | 步骤引用前序输出、等待步骤、拖拽排序、步骤级局部覆盖与失败重试 | `frontend/src/views/api-testing/ScenarioEditor.vue` |
+| 调试 | 隔离的调试会话：单步、从头执行到此步、不重发请求的"重新校验响应" | `backend/api_testing/service.py` |
+| 断言 | 字段 + 条件 + 期望值；类型严格；零断言记为 `UNCHECKED` 而非通过 | `backend/api_testing/values.py` |
+| 执行与报告 | 无设备顺序执行、冻结配置快照、HTML 报告导出、飞书摘要通知、独立定时任务 | `backend/api_testing/reporting.py`、`notification_service.py` |
+| 影响面 | 接口变更后列出引用它的场景与步骤，无冲突步骤一键批量同步 | `GET /interfaces/{id}/usages`、`POST /interfaces/{id}/sync-apply` |
+| AI 辅助（可选） | 校验建议与失败解释；证据受限、只进草稿、默认关闭 | `backend/api_testing/ai_service.py` |
+
+### 12.2 三个关键设计
+
+- **标签化值模型**：所有输入都是 `literal / env / ref / template / object / array` 之一，用户 JSON 不会被当成表达式执行；只有 `literal` 字符串支持 `{{ENV}}` 替换，对象与数组必须走结构化值（`backend/api_testing/schemas.py`）。
+- **接口模板 + 步骤覆盖**：场景步骤保存接口快照，本步骤的修改以整字段覆盖记录；接口更新后按差异逐项确认，不静默覆盖用户改动。
+- **执行语义保守**：真实请求、不做业务回滚、不自动重试；步骤级重试只覆盖"请求未到达服务端"的连接层失败，读超时与已收到响应一律不重试，避免重复写入。
+
+### 12.3 校验与判定
+
+预检分保存 / 调试 / 运行三档，错误带步骤、输入位置与分类；断言求值类型严格（`1` 与 `"1"` 不相等，大小比较拒绝隐式转换）；响应字段树最多 2000 节点、32 层，响应体上限 5 MiB，超限失败不解析截断数据。
+
+### 12.4 边界
+
+单后端进程内最多 4 个并发执行工作线程，其余排队；调试上下文与 AI 调用缓存不跨进程共享，因此不为该模块单独增加 Uvicorn worker。报告按团队要求明文展示请求与响应（含解析后的凭证），报告读取仅要求登录。
+
+## 13. AI 能力
+
+### 13.1 NL2Step（自然语言生成步骤）
 
 `backend/api/ai.py`：
 
@@ -404,7 +436,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 
 前端入口：`StepBuilder.vue` 的 “AI 智能生成测试步骤”。
 
-### 12.2 日志 AI 根因分析
+### 13.2 日志 AI 根因分析
 
 `backend/api/log_analysis.py`：
 
@@ -414,9 +446,9 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 
 前端入口：`FastbotReportDetail.vue` 的日志弹窗中“一键 AI 分析”。
 
-## 13. 端到端典型流程
+## 14. 端到端典型流程
 
-### 13.1 用例流（录制 -> 执行 -> 报告）
+### 14.1 用例流（录制 -> 执行 -> 报告）
 
 1. 设备中心同步 Android 或 iOS 设备。
 2. 用例编辑页选择设备；Android 可使用实时投屏或静态截图，iOS 使用 WDA 静态截图，通过 `/device/interact` 录制生成步骤。
@@ -426,30 +458,30 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 6. 通过 WebSocket 或后台任务执行。  
 7. 生成 HTML 报告并在报告中心查看。  
 
-### 13.2 场景流（编排 -> 多设备并发）
+### 14.2 场景流（编排 -> 多设备并发）
 
 1. 场景中按顺序编排多个用例。  
 2. 每台目标设备先做场景预检。  
 3. 可执行设备进入并发批次，失败设备写入 `blocked_prechecks`。  
 4. 运行中保留步骤级结果与截图，完成后聚合场景报告。  
 
-### 13.3 定时流（任务 -> 通知）
+### 14.3 定时流（任务 -> 通知）
 
 1. 任务中心配置调度策略与设备。  
 2. 到点由 APScheduler 触发。  
 3. UI 任务先做预检过滤，再执行批次。  
 4. 执行完成后自动发送飞书卡片通知。  
 
-### 13.4 巡检流（发现 -> 审核 -> 回归）
+### 14.4 巡检流（发现 -> 审核 -> 回归）
 
 1. Profile 固化双业务线入口、安全/输入/脱敏规则和预算。
-2. 海尔商城 Run 同时冻结核心旅程清单、所选业务线和清单哈希。
+2. 商城应用 Run 同时冻结核心旅程清单、所选业务线和清单哈希。
 3. 单台 Android 设备获取 owner-safe 租约，先定向补齐核心旅程，再进行开放式探索和终点复验。
 4. 报告独立展示业务覆盖、页面族探索率、运行健康和显著盲区。
 5. 人工选择稳定 State/Observation，冻结回归路径并 PIN 证据。
 6. 兼容性任务冻结来源覆盖结论后执行快照/版本/机型对比，或回放设备当前安装版本。
 
-## 14. 数据模型（核心表）
+## 15. 数据模型（核心表）
 
 | 表 | 作用 |
 |---|---|
@@ -466,11 +498,13 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 | `InspectionTransition` / `InspectionExplorationFamily` / `InspectionCoverageContract` | 动作拓扑、页面族和覆盖契约 |
 | `InspectionFault` | 巡检故障及证据 |
 | `StoredAsset` / `AssetReference` | 不可变内容寻址资产与 owner 引用 |
+| `ApiFolder` / `ApiDefinition` / `ApiScenario` / `ApiScenarioStep` | 接口目录、接口定义（含版本与样例）、接口场景与步骤快照 |
+| `ApiRun` / `ApiStepResult` | 接口运行记录与逐步结果（冻结配置快照） |
 | `Environment` / `GlobalVariable` | 环境变量库 |
 | `AppPackage` | 安装包资产 |
 | `SystemSetting` | 全局配置与 Feature Flag 存储 |
 
-## 15. 安全与权限机制
+## 16. 安全与权限机制
 
 - 认证：OAuth2 Password + JWT（Bearer）  
 - 鉴权：通过依赖注入校验当前用户  
@@ -481,7 +515,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 
 > 生产部署建议：替换默认密钥与默认管理员初始密码，开启 HTTPS 与最小权限策略。
 
-## 16. 发布与运维建议（灰度顺序）
+## 17. 发布与运维建议（灰度顺序）
 
 建议按以下顺序灰度上线：
 
@@ -489,7 +523,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 2. 跨端 Runner 已是唯一执行链路（原 `cross_platform_runner` 开关已移除），关注执行必须选择设备的交互变化。  
 3. 开启 `ios_execution`：WDA 运维稳定后逐步引入 iOS 执行。  
 4. 开启 `model_inspection`：先验证默认身份/页面族模型。
-5. 海尔商城开启 `inspection_business_coverage_v2` 观察影子评估；核对清单、盲区和历史 v1 回填后，再开启 `inspection_coverage_scheduler_v2` 定向调度，最后按需开启视觉首页动作。
+5. 商城应用开启 `inspection_business_coverage_v2` 观察影子评估；核对清单、盲区和历史 v1 回填后，再开启 `inspection_coverage_scheduler_v2` 定向调度，最后按需开启视觉首页动作。
 6. 开启 `content_addressed_assets`：双写、回填、核对 `/api/assets/status` 后再开启 `tiered_asset_retention`。
 
 配套监控建议：
@@ -501,7 +535,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 - 巡检覆盖、稳定路径比例、故障类型和预算停止原因
 - 资产水位、PINNED 字节数、可回收字节数和 507 拒绝次数
 
-## 17. 项目边界与当前形态总结
+## 18. 项目边界与当前形态总结
 
 - 当前明确定位：`Android 实时/静态录制 + iOS MJPEG 预览/静态层级录制 + Android/iOS 执行`。
 - iOS MJPEG 是只读预览；录制与定位仍依赖 WDA 静态截图和层级。
@@ -527,5 +561,6 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 - 兼容性与回放：`backend/api/compatibility.py`、`backend/compatibility_replay.py`
 - 证据资产与保留：`backend/artifact_store.py`、`backend/api/assets.py`、`backend/retention_service.py`
 - 设备长任务租约：`backend/device_execution_lease.py`
+- 接口自动化：`backend/api/api_testing.py`、`backend/api_testing/`（引擎/调试会话/导入/AI）、`frontend/src/views/api-testing/`
 - AI：`backend/api/ai.py`、`backend/api/log_analysis.py`  
 - 前端核心：`frontend/src/components/DeviceStage.vue`、`StepBuilder.vue`、`LogConsole.vue`、`frontend/src/views/*`  

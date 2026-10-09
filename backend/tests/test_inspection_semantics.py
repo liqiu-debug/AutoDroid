@@ -2178,7 +2178,7 @@ class InspectionSemanticsTests(unittest.TestCase):
         self.assertEqual(payment.risk_type, "PAYMENT")
         self.assertEqual(
             payment.blocked_reason,
-            "海尔收银台最终付款安全规则命中: PAYMENT",
+            "收银台最终付款安全规则命中: PAYMENT",
         )
         self.assertFalse(payment.replayable)
         self.assertFalse(payment.coordinate_only)

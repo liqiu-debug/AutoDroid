@@ -10,7 +10,7 @@ import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
 const router = useRouter()
 
 const form = reactive({
-    package_name: 'com.ehaier.zgq.shop.mall',
+    package_name: '',
     activity_name: '',
     cold_enabled: true,
     hot_enabled: true,

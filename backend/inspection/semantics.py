@@ -4872,7 +4872,7 @@ def classify_risk(
     if haier_cashier_page and any(
         _is_final_payment_action(value) for value in payment_labels if value
     ):
-        return "PAYMENT", "海尔收银台最终付款安全规则命中: PAYMENT"
+        return "PAYMENT", "收银台最终付款安全规则命中: PAYMENT"
 
     # Generic confirmation controls may inherit only bounded title-like
     # context. Pure-coordinate controls are handled separately by
