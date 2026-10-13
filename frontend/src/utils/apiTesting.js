@@ -164,10 +164,12 @@ export function batchSuggestionPlan(steps, results = {}) {
     const base = { stepId: step.id, name: step.name }
     if (step.kind !== 'request') return { ...base, eligible: false, reason: 'wait' }
     const row = results[step.id]
+    // A failed step still produced a real response, and its failure may be the
+    // check rather than the interface — the server decides which and either
+    // returns corrections or explains that the response itself is the problem.
     if (!row?.detail?.response) return { ...base, eligible: false, reason: 'not_executed', blockedBy }
-    const eligible = ['PASS', 'UNCHECKED'].includes(row.status)
     if (row.status !== 'PASS' && !blockedBy) blockedBy = step.id
-    return eligible ? { ...base, eligible: true, reason: null, status: row.status } : { ...base, eligible: false, reason: 'failed', status: row.status }
+    return { ...base, eligible: true, reason: null, status: row.status }
   })
 }
 export function apiError(error) {

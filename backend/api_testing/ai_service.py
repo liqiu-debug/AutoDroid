@@ -21,7 +21,7 @@ from backend.openai_compat import parse_chat_completion_payload
 from . import service
 from .ai_schemas import Evidence, ExplainedItem, Fact, ModelExplanation, ModelSuggestion, ModelSuggestions, Suggestion
 from .schemas import Assertion, literal
-from .values import input_locations, value_type
+from .values import input_locations, same_value, value_type
 
 logger = logging.getLogger(__name__)
 PROMPT_VERSION = "api-assist-v1"
@@ -157,6 +157,44 @@ def response_fields(response, sanitizer):
     return fields, values
 
 
+def failure_kind(result, response):
+    """Why did this step fail: the response, or the check itself?
+
+    Deterministic, not a model judgement: an error status, a non-JSON body or a
+    transport error means the response is the suspect; a normal JSON response
+    whose checks disagree means the check is the suspect.
+    """
+    detail = (result or {}).get("detail") or {}
+    failed = [check for check in detail.get("assertions") or [] if not check.get("passed")]
+    if not failed:
+        return None
+    status = (response or {}).get("status_code")
+    if detail.get("json_valid") is False or (type(status) is int and status >= 400):
+        return "response_error"
+    if detail.get("error_category") in {"connection", "http", "internal"}:
+        return "response_error"
+    return "assertion_mismatch"
+
+
+def failed_check_facts(result, sanitizer, limit=5):
+    """Failing checks as metadata: no response values leave the process."""
+    facts = []
+    for check in ((result or {}).get("detail") or {}).get("assertions") or []:
+        if check.get("passed") or len(facts) >= limit:
+            continue
+        expected = check.get("expected")
+        if isinstance(expected, str) and sanitizer.text(expected) != expected:
+            expected = None
+        facts.append({
+            "path": check.get("path"),
+            "op": check.get("op"),
+            "expected": expected,
+            "actual_type": value_type(check.get("actual")),
+            "missing": bool(check.get("missing")),
+        })
+    return facts
+
+
 def debug_context(payload, session, user_id):
     item = service.get_debug(payload.debug_session_id, user_id)
     env, secrets, _ = service.load_env(session, payload.env_id)
@@ -170,9 +208,15 @@ def debug_context(payload, session, user_id):
                 raise HTTPException(409, "请求或环境已改变，请先重新调试")
             result = item.results.get(step.id)
             if position < index:
-                expected = json.dumps([a.model_dump() for a in step.effective().assertions], sort_keys=True)
-                if not result or result.get("status") != "PASS" or result.get("assertions_pending") or (step.kind == "request" and item.assertion_fingerprints.get(step.id) != expected):
-                    raise HTTPException(409, "前序步骤尚未验证通过，请先校验或重新调试")
+                if item.collect:
+                    # A collect run gathers suggestions, not verification: a
+                    # predecessor only needs the real response it produced.
+                    if not result or step.id not in item.responses:
+                        raise HTTPException(409, "前序步骤没有可用响应，请先执行到本步")
+                else:
+                    expected = json.dumps([a.model_dump() for a in step.effective().assertions], sort_keys=True)
+                    if not result or result.get("status") != "PASS" or result.get("assertions_pending") or (step.kind == "request" and item.assertion_fingerprints.get(step.id) != expected):
+                        raise HTTPException(409, "前序步骤尚未验证通过，请先校验或重新调试")
         step = steps[index]
         result = item.results.get(step.id)
         if step.kind != "request" or step.id not in item.responses or not result or result.get("status") not in {"PASS", "FAIL", "UNCHECKED"}:
@@ -189,7 +233,8 @@ def debug_context(payload, session, user_id):
                     if val.kind == "ref" and val.step_id == step.id:
                         referenced.add(tuple(val.path))
         existing = step.effective().assertions
-    return response, secrets, documents, existing, referenced
+        target_result = result
+    return response, secrets, documents, existing, referenced, target_result
 
 
 def _strict_schema(schema):
@@ -241,6 +286,8 @@ async def call_model(config, task, context, schema):
             "优先级：referenced_paths 里被后续步骤引用的字段（必须有校验）> 业务结果字段（code/success/status/message 之类）> 顶层关键字段；"
             "数字和布尔字段用 type，字符串、数组和对象用 not_empty。"
             "不要把单次响应当成业务规格；无明确用户目标时不得固定业务值。禁止对 ID、时间、token 等动态值建议固定等值校验。expected 对无期望值的操作填 null。"
+            "所有建议都必须能通过本次真实响应：字段在当前响应中为空时不要建议非空校验。"
+            "failed_checks 是现有校验与真实响应不符的地方，请给出能在当前响应上通过的修正建议（类型/存在/非空），不要沿用写错的期望值。"
         )
     else:
         prompt += "possible_causes 是待验证的可能原因，不是确定根因；next_steps 只给排查建议。每条必须引用输入中存在的 evidence_ids。不得虚构事实、证据或业务结果。"
@@ -314,6 +361,44 @@ def existing_fingerprints(assertions):
 
 
 _STRUCTURAL = {"exists": 0, "not_empty": 1, "type": 2}
+
+
+def is_empty(value):
+    return value is None or value == "" or value == [] or value == {}
+
+
+def holds_on_response(op, actual, expected):
+    """Would this check pass against the response it was derived from?
+
+    A suggestion that its own evidence already violates can only fail once
+    applied — the most common case being "not_empty" on a field this response
+    legitimately leaves empty.
+    """
+    if op == "exists":
+        return True  # the path came from this response
+    if op == "not_empty":
+        return not is_empty(actual)
+    if op == "is_2xx":
+        return type(actual) is int and 200 <= actual < 300
+    if op == "type":
+        return value_type(actual) == expected
+    if op == "eq":
+        return same_value(actual, expected)
+    if op == "ne":
+        return not same_value(actual, expected)
+    if op == "contains":
+        if isinstance(actual, list):
+            return any(same_value(item, expected) for item in actual)
+        if isinstance(actual, dict):
+            return isinstance(expected, str) and expected in actual
+        return isinstance(actual, str) and isinstance(expected, str) and expected in actual
+    if op == "length":
+        return isinstance(actual, (dict, list, str)) and len(actual) == expected
+    if op in {"gt", "gte", "lt", "lte"}:
+        if value_type(actual) != "number" or value_type(expected) != "number":
+            return False
+        return {"gt": actual > expected, "gte": actual >= expected, "lt": actual < expected, "lte": actual <= expected}[op]
+    return False
 
 
 def _collapse_and_rank(suggestions, referenced, limit, covered=()):
@@ -398,6 +483,13 @@ def validate_suggestions(raw, values, sanitizer, goal="", existing=(), reference
                 raise ValueError("HTTP 成功校验只能用于状态码")
             if spec.op in {"exists", "not_empty", "is_2xx"}:
                 expected = None
+            # An empty field cannot carry a non-empty check: downgrade to
+            # "exists" (the field is genuinely there) and say so.
+            downgraded = ""
+            if spec.op == "not_empty" and is_empty(actual):
+                spec.op, downgraded = "exists", "该字段在当前响应中为空，已改为「存在」校验"
+            elif not holds_on_response(spec.op, actual, expected):
+                raise ValueError("建议与当前响应不符，应用后会立即失败")
             assertion = Assertion(path=spec.path, op=spec.op, expected=literal(expected))
             fingerprint = assertion_fingerprint(spec.path, spec.op, expected)
             if fingerprint in seen:
@@ -406,7 +498,10 @@ def validate_suggestions(raw, values, sanitizer, goal="", existing=(), reference
             if fingerprint in already:
                 skipped_existing += 1
                 continue
-            row = Suggestion(assertion=assertion, reason=sanitizer.text(model.reason, 500), evidence=Evidence(path=spec.path, type=kind)).model_dump()
+            reason = sanitizer.text(model.reason, 500)
+            if downgraded:
+                warnings.append(f"第 {index} 条建议：{downgraded}")
+            row = Suggestion(assertion=assertion, reason=reason, evidence=Evidence(path=spec.path, type=kind)).model_dump()
             row["_order"] = index
             suggestions.append(row)
         except (ValidationError, ValueError, TypeError) as exc:
@@ -426,7 +521,15 @@ def validate_suggestions(raw, values, sanitizer, goal="", existing=(), reference
 
 async def suggest_assertions(payload, session, user_id):
     config = require_available(session)
-    response, secrets, documents, existing, referenced = debug_context(payload, session, user_id)
+    response, secrets, documents, existing, referenced, step_result = debug_context(payload, session, user_id)
+    kind = failure_kind(step_result, response)
+    if kind == "response_error":
+        status = response.get("status_code")
+        raise HTTPException(
+            409,
+            f"该步骤响应异常（HTTP {status}），未生成建议：请先确认接口是否正常，或确认这是否是预期的负向用例；"
+            "如需排查可先用「AI 解释失败」",
+        )
     sanitizer = Sanitizer([*secrets, config["key"]], documents + [response])
     fields, values = response_fields(response, sanitizer)
     goal = sanitizer.text(payload.goal, 2000)
@@ -437,6 +540,8 @@ async def suggest_assertions(payload, session, user_id):
         "referenced_paths": [list(path) for path in sorted(referenced, key=lambda p: json.dumps(p, ensure_ascii=False)) if sanitizer.allowed_path(list(path))],
         "fields": fields,
     }
+    if kind == "assertion_mismatch":
+        context["failed_checks"] = failed_check_facts(step_result, sanitizer)
     call_id, started, digest = _start_call(user_id, "assertions", context)
     ok, usage, count = False, 0, 0
     try:

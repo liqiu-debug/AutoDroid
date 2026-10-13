@@ -86,6 +86,13 @@ AUTODROID_API_PREVIEW=1 AUTODROID_DB_PATH="$API_PREVIEW_DIR/preview.db" \
 - **运行大盘加入接口自动化**：大盘此前只统计 `TestExecution`（设备执行），接口运行记录在独立的 `ApiRun` 表里，因此完全不出现。新增 `DashboardOverview.api_automation` 独立板块（次数 / 通过率 / 失败 / 运行中 / 平均耗时、同时间范围的趋势、最近运行并可跳转接口报告），复用既有趋势分桶逻辑。**有意不合并进顶部设备 KPI**：`ApiRun.scenario_id` 与 `TestExecution.scenario_id` 属于不同的 id 空间，平台筛选对接口无意义，强行合并会让“高失败场景”和告警把两类场景混在一起；接口板块只跟随时间范围。隔离预览实测：跑完一次场景后 24h 板块显示 1 次、通过率 100%、最近运行一条并指向接口报告。后端新增 `test_dashboard_includes_api_automation_in_its_own_block`、`test_dashboard_api_block_is_empty_but_present_without_runs`，并断言设备 KPI 与高失败场景不受影响。移动端大盘未加该板块，因为接口报告详情路由不支持移动模式，点进去会落到“不可用”页。
 - **UI 用例编辑页恢复三栏**：界面重构把「通用步骤」从 220px 常驻列改成了「添加动作」抽屉，并把步骤列从 350px 放宽为 `1fr`（宽屏约半屏），同时删掉了步骤卡片按动作类型着色的两条规则（`StepBuilder` 至今仍在为每个步骤计算 `--action-color`，只是没有样式再引用它；同类的场景编排页保留着这套着色）。现恢复为设备画面（弹性）+ 通用步骤 220px + 步骤构建器 350px 三栏，移除抽屉，恢复卡片左侧色条与序号色块；保留重构带来的“点击即可添加动作”和设计令牌化。通用步骤面板在视口较矮时自身滚动，不再被裁切。
 
+#### AI 校验建议：失败分类、收集响应模式与“建议必须成立”（2026-10-12）
+
+- **用户反馈**：AI 生成的校验反而导致失败——有的字段响应本身就是空的，AI 却生成了「非空」。根因确认：`validate_suggestions` 里 `not_empty / exists / is_2xx` 从未与真实响应比对，`length / eq / contains / gt` 等值校验也没有。修正为一条硬约束 **“建议必须被它自己来源的那次真实响应满足”**：空字段的「非空」降级为「存在」并在提示里说明；期望值、长度、包含、大小比较在当前响应上不成立的建议直接丢弃并说明原因。新增 `test_suggestions_must_hold_on_the_response_they_came_from`。
+- **失败分类（不让模型裁决）**：新增 `failure_kind()`，服务端按确定性依据分两类——HTTP ≥ 400、响应非 JSON、错误类别为连接/HTTP/内部 → `response_error`（**不生成**建议，返回 409 并提示确认接口或确认是否预期的负向用例，引导使用 AI 失败解释）；2xx + JSON 可解析 → `assertion_mismatch`（生成修正型建议，并把失败项的路径/条件/期望值/实际类型/是否缺失作为 `failed_checks` 送入上下文；**不发送响应实际值**，沿用只发路径与类型的隐私约定）。新增 `test_response_error_steps_are_not_turned_into_suggestions`、`test_mismatch_steps_receive_corrections_from_their_failing_checks`。
+- **「收集响应」执行模式**：批量生成原先受失败即停限制——第 2 步校验写错（恰恰最需要 AI 的场景）会让第 3 步之后永远拿不到响应。新增 `DebugExecute.mode="collect"`：校验失败、未校验都继续执行，只有拿不到响应才停；该模式下前序只需有真实响应即可作为生成依据。**正式运行与定时任务的语义完全不变**。新增 `test_collect_mode_runs_every_step_that_can_produce_a_response`（含“无响应即停”与 through 模式仍严格停止的对照）、`test_collect_sessions_generate_for_steps_after_a_failure`；前端 `batchSuggestionPlan` 相应把失败步骤纳入可生成，面板标注失败原因。
+- 隔离预览实测：把第 2 步的断言改成必然失败（请求与鉴权保持原样）→ collect 执行得 `PASS / FAIL / PASS`，三步都有响应，三步都生成了建议（含失败步骤的修正建议）；把某步指向不存在的路径得到 401/404 响应时，生成返回 409「该步骤响应异常（HTTP 401），未生成建议…」。
+
 #### AI 校验建议：重叠修复、批量生成与一个既有清洗缺陷
 
 - **重叠错乱（已定位并修复）**：Element Plus 的 `.el-checkbox-group` 自带 `font-size:0; line-height:0`，而建议的说明段落 `<p>` 就渲染在该 group 内，只覆盖了 `font-size`、没覆盖 `line-height` → 每行行框高度为零，多行文字叠在一起。修复放在新的共享展示组件 `AiSuggestionList.vue` 上（`.suggestions{font-size:13px;line-height:1.6}`），单步对话框与批量面板共用同一份行渲染，DOM 结构不变（checkbox 仍需留在 group 内才能 v-model）。`AiAssertions.vue` 的 `<script>` 未改动，其 11 项行为测试（过期 token、迟到响应、重复点击、撤销保护、反馈去重）零改动通过。
@@ -97,7 +104,7 @@ AUTODROID_API_PREVIEW=1 AUTODROID_DB_PATH="$API_PREVIEW_DIR/preview.db" \
 - 隔离预览实测（API 层，确定性 mock 模型）：through 执行三步全 PASS → 三步各生成建议 → 应用全部 → 顺序 recheck 全部 PASS（`3/3/4` 条断言，未发新请求）→ 草稿保存成功（场景升到 v2）。后端新增 `test_short_secrets_do_not_hide_unrelated_field_names`、`test_batch_flow_must_generate_for_every_step_before_applying`；前端新增 `batchSuggestionPlan` 与 3 项界面契约测试。
 - 未做：不自动保存；不自动"再跑一遍以继续后面的步骤"（through 模式会从第 1 步重发请求，重复写入），链路在某步停下时由用户修好后再执行；不改 AI 过滤规则。
 
-跟进后自动检查：后端全量 1346 项通过、前端 166 项通过（新增 `layoutUiContracts.test.mjs` 7 项与本轮 3 项 AI 契约测试）、生产构建与 Ruff 通过。弹窗居中、顶栏账户菜单、表格对齐、用例编辑页三栏与卡片着色、AI 建议行距与批量面板排版属于视觉效果，未经真实浏览器目视确认。
+跟进后自动检查：后端全量 1354 项通过、前端 170 项通过（新增 `layoutUiContracts.test.mjs` 7 项与本轮 3 项 AI 契约测试）、生产构建与 Ruff 通过。弹窗居中、顶栏账户菜单、表格对齐、用例编辑页三栏与卡片着色、AI 建议行距与批量面板排版属于视觉效果，未经真实浏览器目视确认。
 
 ### 提交前 CI 兼容性修正（2026-10-02）
 

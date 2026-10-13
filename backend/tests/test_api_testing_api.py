@@ -442,6 +442,60 @@ class ApiTestingApiTests(unittest.TestCase):
         self.assertNotIn("two", item.outputs)
         self.assertFalse(list(item.cookies.jar))
 
+    def test_collect_mode_runs_every_step_that_can_produce_a_response(self):
+        """The AI batch flow needs responses for the whole chain, so a collect
+        run continues past failed and unchecked steps but stops when there is no
+        response to work with."""
+        first, second, third = Step(id="one"), Step(id="two"), Step(id="three")
+        for index, step in enumerate((first, second, third)):
+            step.snapshot.request.url = literal(f"https://example.com/step{index + 1}")
+        # Step 2 fails its assertions, step 3 has none at all.
+        first.snapshot.assertions = [Assertion(path=["status_code"], op="is_2xx")]
+        second.snapshot.assertions = [Assertion(path=["body", "code"], op="eq", expected=literal(0))]
+        third.snapshot.assertions = []
+        item = service.create_debug(self.user.id, "editor", None)
+        steps = [first, second, third]
+
+        def handler(request):
+            return httpx.Response(200, json={"code": 7, "token": "real"})
+
+        service.start_debug(item, DebugExecute(editor_id="editor", steps=steps, step_id="three", mode="collect"), {})
+        with patch.object(service, "make_client", side_effect=lambda *a, **k: make_client([], transport=httpx.MockTransport(handler))):
+            fn, args = self.jobs.pop(0)
+            fn(*args)
+        self.assertTrue(item.collect)
+        self.assertEqual([item.results[step.id]["status"] for step in steps], ["PASS", "FAIL", "UNCHECKED"])
+        self.assertEqual(item.results["two"]["detail"]["error_category"], "assertion")
+        # Every step kept its real response, so each one can be used as evidence.
+        self.assertEqual(sorted(item.outputs), ["one", "three", "two"])
+
+        # A "through" run keeps the strict semantics.
+        service.start_debug(item, DebugExecute(editor_id="editor", steps=steps, step_id="three", mode="through"), {})
+        self.assertFalse(item.collect)
+        with patch.object(service, "make_client", side_effect=lambda *a, **k: make_client([], transport=httpx.MockTransport(handler))):
+            fn, args = self.jobs.pop(0)
+            fn(*args)
+        self.assertEqual([item.results[step.id]["status"] for step in steps[:2]], ["PASS", "FAIL"])
+        self.assertNotIn("three", item.results, "a through run stops at the first failure")
+
+        # A step that produces no response still ends the collect run: later
+        # steps have nothing to work with.
+        broken = Step(id="four", snapshot=third.snapshot.model_copy(deep=True))
+        broken.snapshot.request.url = literal("https://example.com/broken")
+
+        def refusing(request):
+            if request.url.path.endswith("broken"):
+                raise httpx.ConnectError("refused", request=request)
+            return httpx.Response(200, json={"code": 0})
+
+        item.results.clear(); item.outputs.clear(); item.responses.clear()
+        service.start_debug(item, DebugExecute(editor_id="editor", steps=[first, broken], step_id="four", mode="collect"), {})
+        with patch.object(service, "make_client", side_effect=lambda *a, **k: make_client([], transport=httpx.MockTransport(refusing))):
+            fn, args = self.jobs.pop(0)
+            fn(*args)
+        self.assertEqual(item.results["four"]["status"], "ERROR")
+        self.assertNotIn("four", item.outputs)
+
     def test_recheck_assertions_without_http_and_block_failed_predecessors(self):
         one, two = Step(id="login", name="登录"), Step(id="order", name="订单")
         one.snapshot.request.url = literal("https://example.com/login")

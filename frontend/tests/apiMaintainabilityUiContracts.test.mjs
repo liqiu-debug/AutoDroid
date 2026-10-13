@@ -90,7 +90,10 @@ test('batch AI assertions run once, generate for every step, then apply and rech
   assert.match(scenario, /:inert="loading\|\|runStarting\|\|debugStarting\|\|batchBusy"/)
   // The drawer is appended to body so it stays usable while the editor is inert.
   assert.match(aiBatch, /append-to-body/)
-  assert.match(aiBatch, /props\.debug\.run\(lastStepId, 'through', \{ confirmed: true \}\)/)
+  assert.match(aiBatch, /props\.debug\.run\(lastStepId, 'collect', \{ confirmed: true \}\)/)
+  // Failed steps are offered corrections, and the panel says why.
+  assert.match(aiBatch, /当前校验失败，按响应给出修正建议/)
+  assert.match(debugComposable, /const wholePrefix = mode === 'through' \|\| mode === 'collect'/)
   // Every generation call happens before anything is applied, and the recheck
   // loop runs after the draft was updated.
   const generate = aiBatch.indexOf("'/ai/suggest-assertions'"), apply = aiBatch.indexOf("emit('apply', payload)")

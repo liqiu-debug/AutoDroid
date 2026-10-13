@@ -299,6 +299,9 @@ class DebugSession:
     results: dict = field(default_factory=dict)
     status: str = "IDLE"
     error: str = ""
+    # Set by a "collect" run: assertion failures do not stop the chain, and
+    # predecessors only need a response (not a verified PASS) for AI context.
+    collect: bool = False
     cancel: Any = field(default_factory=threading.Event)
     lock: Any = field(default_factory=threading.RLock)
 
@@ -432,7 +435,8 @@ def start_debug(item, payload, env):
         _sync_debug(item, steps, env)
         if payload.mode == "single":
             _check_predecessors(item, steps, index)
-        if payload.mode == "through":
+        item.collect = payload.mode == "collect"
+        if payload.mode in {"through", "collect"}:
             targets = steps
         else:
             targets = steps[index:]
@@ -449,11 +453,11 @@ def start_debug(item, payload, env):
                     item.cookies = httpx.Cookies(item.cookies_after[previous.id])
         item.cancel = threading.Event()
         item.status, item.error = "RUNNING", ""
-        chosen = steps[: index + 1] if payload.mode == "through" else [steps[index]]
-        pool.submit(_debug_worker, item, chosen, env)
+        chosen = steps[: index + 1] if payload.mode in {"through", "collect"} else [steps[index]]
+        pool.submit(_debug_worker, item, chosen, env, payload.mode == "collect")
 
 
-def _debug_worker(item, steps, env):
+def _debug_worker(item, steps, env, keep_going=False):
     async def execute():
         async with make_client(item.cookies) as client:
             for step in steps:
@@ -467,10 +471,16 @@ def _debug_worker(item, steps, env):
                         item.responses[step.id] = response
                         item.assertion_fingerprints[step.id] = json.dumps([a.model_dump() for a in step.effective().assertions], sort_keys=True)
                         item.cookies_after[step.id] = httpx.Cookies(client.cookies)
-                    if response is not None and result["status"] == "PASS":
+                    # A collect run only needs real responses: it keeps going
+                    # after failed or unchecked steps and lets later steps read
+                    # the response anyway, because the results are labelled.
+                    if response is not None and (result["status"] == "PASS" or keep_going):
                         item.outputs[step.id] = response
                         item.cookies_after[step.id] = httpx.Cookies(client.cookies)
-                if result["status"] != "PASS":
+                if response is None:
+                    # No response means the next steps have nothing to work with.
+                    return result["status"]
+                if result["status"] != "PASS" and not keep_going:
                     return result["status"]
         return "PASS"
 

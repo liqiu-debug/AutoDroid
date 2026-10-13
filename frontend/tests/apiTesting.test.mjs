@@ -141,9 +141,11 @@ test('batch suggestion plan follows the executed response chain',()=>{
   ])
   // A response without assertions is still worth generating for.
   assert.deepEqual(batchSuggestionPlan([login],[login.id].reduce((a,id)=>({...a,[id]:ok('UNCHECKED')}),{}))[0],{stepId:login.id,name:'登录',eligible:true,reason:null,status:'UNCHECKED'})
-  // A failed step stops the chain and is never turned into a template.
+  // A failed step still produced a real response, so it gets suggestions too
+  // (the server decides whether the check or the response is at fault); steps
+  // after it never ran and are reported as such.
   const plan=batchSuggestionPlan([login,order,query],{[login.id]:ok('PASS'),[order.id]:ok('FAIL')})
-  assert.deepEqual(plan.map(item=>item.reason),[null,'failed','not_executed'])
+  assert.deepEqual(plan.map(item=>[item.eligible,item.reason,item.status]),[[true,null,'PASS'],[true,null,'FAIL'],[false,'not_executed',undefined]])
   assert.equal(plan[2].blockedBy,order.id)
 })
 

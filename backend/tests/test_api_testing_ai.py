@@ -171,6 +171,93 @@ class ApiTestingAiTests(unittest.IsolatedAsyncioTestCase):
         # The deep leaf loses to shallow fields and is what got cut.
         self.assertNotIn(("body", "deep", "leaf"), [path for path, _ in ops])
 
+    async def test_response_error_steps_are_not_turned_into_suggestions(self):
+        """An error response must not become a template; the user is told why."""
+        self.configure()
+        self.item.results[self.step.id] = {
+            "status": "FAIL",
+            "detail": {"response": {"status_code": 500}, "json_valid": False, "assertions": [{"passed": False, "path": ["status_code"], "op": "is_2xx", "actual": 500}]},
+        }
+        self.item.responses[self.step.id] = {"status_code": 500, "text": "boom", "body": None}
+        with self.model([suggestion(["body", "count"], "type", "number")]) as model:
+            with self.assertRaises(HTTPException) as raised:
+                await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("响应异常", str(raised.exception.detail))
+        self.assertIn("AI 解释失败", str(raised.exception.detail))
+        model.assert_not_called()
+
+    async def test_mismatch_steps_receive_corrections_from_their_failing_checks(self):
+        """A normal response whose checks disagree means the check is the suspect."""
+        self.configure()
+        self.item.results[self.step.id] = {
+            "status": "FAIL",
+            "detail": {
+                "response": self.item.responses[self.step.id], "json_valid": True,
+                "assertions": [
+                    {"passed": False, "path": ["body", "count"], "op": "eq", "expected": 99, "actual": 2, "missing": False},
+                    {"passed": False, "path": ["body", "gone"], "op": "exists", "expected": None, "actual": None, "missing": True},
+                    {"passed": True, "path": ["status_code"], "op": "is_2xx", "expected": None, "actual": 200, "missing": False},
+                ],
+            },
+        }
+        self.payload.goal = "数量应为 2"
+        with self.model([suggestion(["body", "count"], "type", "number")]) as model:
+            result = await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+        facts = model.call_args.args[2]["failed_checks"]
+        self.assertEqual([(f["path"], f["op"]) for f in facts], [(["body", "count"], "eq"), (["body", "gone"], "exists")])
+        # Only metadata leaves the process: no response values, just types.
+        self.assertEqual(facts[0]["actual_type"], "number")
+        self.assertEqual(facts[0]["expected"], 99)
+        self.assertTrue(facts[1]["missing"])
+        self.assertEqual(len(result["suggestions"]), 1)
+
+    async def test_collect_sessions_generate_for_steps_after_a_failure(self):
+        """The batch flow relies on this: a failed predecessor with a real
+        response no longer blocks suggestions for later steps."""
+        self.configure()
+        second = Step(id="second", snapshot=self.step.snapshot.model_copy(deep=True))
+        self.prepare_debug([self.step, second])
+        self.item.results[self.step.id] = {"status": "FAIL", "detail": {"response": self.item.responses[self.step.id], "assertions": []}}
+        self.item.collect = True
+        self.payload.steps = [self.step, second]
+        self.payload.step_id = "second"
+        with self.model([suggestion(["body", "count"], "type", "number")]):
+            result = await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+        self.assertEqual(len(result["suggestions"]), 1)
+        # Without a collect session the strict predecessor rule still applies.
+        self.item.collect = False
+        with self.model([]) as model:
+            with self.assertRaises(HTTPException) as raised:
+                await ai_service.suggest_assertions(self.payload, self.session, self.user_id)
+            self.assertEqual(raised.exception.status_code, 409)
+            model.assert_not_called()
+
+    def test_suggestions_must_hold_on_the_response_they_came_from(self):
+        sanitizer = ai_service.Sanitizer()
+        values = {("body",): {}, ("body", "code"): 0, ("body", "coupon"): "", ("body", "tags"): [],
+                  ("body", "note"): None, ("body", "items"): [1, 2], ("body", "title"): "some value",
+                  ("status_code",): 500}
+        raw = {"suggestions": [
+            # A field this response leaves empty cannot carry a non-empty check.
+            suggestion(["body", "coupon"], "not_empty"), suggestion(["body", "tags"], "not_empty"),
+            suggestion(["body", "note"], "not_empty"), suggestion(["body", "title"], "not_empty"),
+            # Value checks the evidence already contradicts.
+            suggestion(["body", "items"], "length", 3), suggestion(["body", "items"], "contains", 9),
+            suggestion(["body", "code"], "gt", 5), suggestion(["body", "title"], "eq", "other"),
+            suggestion(["status_code"], "is_2xx"),
+        ]}
+        kept, warnings = ai_service.validate_suggestions(raw, values, sanitizer, goal="订单数量应为 2")
+        ops = [(tuple(s["assertion"]["path"]), s["assertion"]["op"], s["assertion"]["expected"]["value"]) for s in kept]
+        # Downgraded instead of dropped, and the field keeps a usable check.
+        self.assertIn((("body", "coupon"), "exists", None), ops)
+        self.assertIn((("body", "tags"), "exists", None), ops)
+        self.assertIn((("body", "note"), "exists", None), ops)
+        self.assertIn((("body", "title"), "not_empty", None), ops)
+        self.assertNotIn(("status_code",), [path for path, _, _ in ops])
+        self.assertEqual([w for w in warnings if "已改为" in w].__len__(), 3)
+        self.assertEqual(sum(1 for w in warnings if "与当前响应不符" in w), 5)
+
     def test_suggestions_already_in_the_step_are_not_offered_again(self):
         sanitizer = ai_service.Sanitizer()
         values = {("body",): {}, ("body", "count"): 2, ("body", "active"): True}

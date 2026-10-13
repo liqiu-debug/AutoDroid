@@ -209,7 +209,9 @@ class DebugExecute(Contract):
     env_id: Optional[int] = None
     steps: List[Step] = Field(min_length=1, max_length=100)
     step_id: str
-    mode: Literal["single", "through"] = "single"
+    # "collect" gathers a real response for every step (used by batch AI
+    # suggestions): assertion failures do not stop the chain.
+    mode: Literal["single", "through", "collect"] = "single"
 
 
 class CurlInput(Contract):
