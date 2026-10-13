@@ -19,7 +19,8 @@ const busy = computed(() => ['running', 'generating', 'applying'].includes(phase
 watch(busy, value => emit('update:busy', value))
 const eligible = computed(() => plan.value.filter(item => item.eligible))
 const selectedCount = computed(() => Object.values(chosen.value).reduce((sum, list) => sum + list.length, 0))
-const reasonText = item => ({ wait: '等待步骤，无需校验', failed: `${statusLabel(item.status)}，请先修复再生成`, not_executed: item.blockedBy ? `未执行：前序步骤「${plan.value.find(p => p.stepId === item.blockedBy)?.name || ''}」未通过` : '未执行' })[item.reason] || ''
+const reasonText = item => ({ wait: '等待步骤，无需校验', not_executed: item.blockedBy ? `未执行：前序步骤「${plan.value.find(p => p.stepId === item.blockedBy)?.name || ''}」未通过` : '未执行' })[item.reason] || ''
+const statusNote = item => item.status === 'PASS' ? '' : item.status === 'FAIL' ? '当前校验失败，按响应给出修正建议' : '尚未配置校验，按响应给出建议'
 const untilIdle = () => new Promise(resolve => {
   if (!props.debug.running.value) return resolve()
   const stop = watch(props.debug.running, running => { if (!running) { stop(); resolve() } })
@@ -34,7 +35,9 @@ async function start(lastStepId) {
   reset()
   phase.value = 'running'
   try {
-    await props.debug.run(lastStepId, 'through', { confirmed: true })
+    // A collect run keeps going after failed or unchecked steps, so every step
+    // that can produce a response gets suggestions.
+    await props.debug.run(lastStepId, 'collect', { confirmed: true })
     await untilIdle()
     if (!alive || current !== token) return
     if (props.debug.error.value) { error.value = props.debug.error.value; phase.value = 'review'; return }
@@ -116,7 +119,7 @@ defineExpose({ start })
     <template v-else-if="phase === 'review' || phase === 'applying' || phase === 'done'">
       <el-alert v-if="phase === 'done' && outcome" :type="outcome.failedAt ? 'warning' : 'success'" :closable="false" :title="outcome.failedAt ? `已应用 ${outcome.applied} 步，第「${outcome.failedAt.name}」步校验未通过（${outcome.failedAt.message || statusLabel(outcome.failedAt.status)}），后续步骤待校验` : `已应用 ${outcome.applied} 步并全部重新校验通过${outcome.skipped ? `（${outcome.skipped} 条已存在跳过）` : ''}，请保存场景`" />
       <section v-for="item in plan" :key="item.stepId" class="step-block">
-        <div class="step-heading"><b>{{ item.name }}</b><el-tag v-if="item.status" size="small" :type="statusType(item.status)">{{ statusLabel(item.status) }}</el-tag><span v-if="!item.eligible" class="hint">{{ reasonText(item) }}</span><el-button v-else-if="generated[item.stepId]?.suggestions.length && phase === 'review'" link size="small" @click="toggleAll(item.stepId)">{{ (chosen[item.stepId] || []).length === generated[item.stepId].suggestions.length ? '取消全选' : '全选' }}</el-button></div>
+        <div class="step-heading"><b>{{ item.name }}</b><el-tag v-if="item.status" size="small" :type="statusType(item.status)">{{ statusLabel(item.status) }}</el-tag><span v-if="item.eligible && statusNote(item)" class="hint">{{ statusNote(item) }}</span><span v-if="!item.eligible" class="hint">{{ reasonText(item) }}</span><el-button v-else-if="generated[item.stepId]?.suggestions.length && phase === 'review'" link size="small" @click="toggleAll(item.stepId)">{{ (chosen[item.stepId] || []).length === generated[item.stepId].suggestions.length ? '取消全选' : '全选' }}</el-button></div>
         <template v-if="item.eligible && generated[item.stepId]">
           <el-alert v-if="generated[item.stepId].error" :title="generated[item.stepId].error" type="error" :closable="false" />
           <p v-for="warning in generated[item.stepId].warnings" :key="warning" class="hint">{{ warning }}</p>

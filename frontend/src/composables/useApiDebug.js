@@ -58,12 +58,14 @@ export function useApiDebug(envId, steps, { retainDisplay = false, envName = () 
     const draft = copy(steps.value), environment = envId.value || null, environmentName = envName()
     const index = draft.findIndex(s => s.id === stepId)
     if (index < 0) return
-    const targets = mode === 'through' ? draft.slice(0, index + 1) : [draft[index]]
+    // "collect" runs the whole prefix too, it just keeps going past failures.
+    const wholePrefix = mode === 'through' || mode === 'collect'
+    const targets = wholePrefix ? draft.slice(0, index + 1) : [draft[index]]
     const token = ++generation
     running.value = true
     let submitted = false
     try {
-      if (!confirmed) await ElMessageBox.confirm(`将真实执行：${targets.map(s => s.name).join(' → ')}。写入、删除等操作会产生业务数据，停止测试不会回滚。`, mode === 'through' ? '从头执行到此步' : '调试当前步骤', { type: 'warning', confirmButtonText: '确认执行' })
+      if (!confirmed) await ElMessageBox.confirm(`将真实执行：${targets.map(s => s.name).join(' → ')}。写入、删除等操作会产生业务数据，停止测试不会回滚。`, wholePrefix ? '从头执行到此步' : '调试当前步骤', { type: 'warning', confirmButtonText: '确认执行' })
       if (!current(token)) return
       let sessionId = id.value
       if (!sessionId) {
@@ -73,7 +75,7 @@ export function useApiDebug(envId, steps, { retainDisplay = false, envName = () 
       }
       await api.apiTesting.post(`/debug-sessions/${sessionId}/execute`, { editor_id: editorId, env_id: environment, steps: draft, step_id: stepId, mode })
       if (!current(token) || id.value !== sessionId) return
-      const invalidated = new Set((mode === 'through' ? draft : draft.slice(index)).map(s => s.id))
+      const invalidated = new Set((wholePrefix ? draft : draft.slice(index)).map(s => s.id))
       cache.value = Object.fromEntries(Object.entries(cache.value).filter(([key]) => !invalidated.has(key)))
       error.value = ''; submitted = true
       await poll(token, sessionId, draft, environment, environmentName)
