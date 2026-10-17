@@ -132,13 +132,14 @@ def _resolve_image_asset(image_path: Any) -> Optional[Tuple[str, str]]:
 def _resolve_app_package(
     app_key: str,
     app_key_map: Dict[str, Dict[str, str]],
+    platform: str = "android",
 ) -> Optional[str]:
-    """app_key -> Android 包名；未映射时兼容直接把 app_key 当包名。"""
+    """app_key -> 平台应用标识（Android 包名 / iOS bundle id）；未映射时兼容直接把 app_key 当标识。"""
     key = str(app_key or "").strip()
     if not key:
         return None
     mapped = (app_key_map or {}).get(key) or {}
-    package = str(mapped.get("android") or "").strip()
+    package = str(mapped.get(platform) or "").strip()
     if package:
         return package
     if "." in key and " " not in key:
@@ -161,8 +162,12 @@ def build_script_step(
     *,
     variables: Dict[str, str],
     app_key_map: Dict[str, Dict[str, str]],
+    platform: str = "android",
 ) -> Tuple[Dict[str, Any], List[Tuple[str, str]]]:
-    """编译单个标准步骤。返回 (script_step, 引用的模板图列表)。"""
+    """编译单个标准步骤。返回 (script_step, 引用的模板图列表)。
+
+    platform 决定定位器候选与应用标识的取值（android / ios 在步骤模型里分别维护）。
+    """
     action = normalize_action(step.get("action"))
     args = step.get("args") if isinstance(step.get("args"), dict) else {}
     args = _render_text(args, variables)
@@ -181,7 +186,7 @@ def build_script_step(
     }
 
     if action in LOCATOR_ACTIONS:
-        candidates = resolve_locator_candidates(step, "android")
+        candidates = resolve_locator_candidates(step, platform)
         script_step["locators"] = [
             {"selector": str(item.get("selector")), "by": str(item.get("by")).lower()}
             for item in candidates
@@ -189,7 +194,7 @@ def build_script_step(
 
     if action == "input":
         script_step["args"] = {"text": "" if args.get("text") is None else str(args.get("text"))}
-        candidates = resolve_locator_candidates(step, "android")
+        candidates = resolve_locator_candidates(step, platform)
         script_step["locators"] = [
             {"selector": str(item.get("selector")), "by": str(item.get("by")).lower()}
             for item in candidates
@@ -239,7 +244,7 @@ def build_script_step(
         app_key = _extract_app_key(step)
         script_step["args"] = {
             "app_key": app_key or None,
-            "package": _resolve_app_package(app_key, app_key_map) if app_key else None,
+            "package": _resolve_app_package(app_key, app_key_map, platform) if app_key else None,
         }
 
     return script_step, template_refs
@@ -252,6 +257,7 @@ def build_case_script(
     env_id: Optional[int] = None,
     extra_variables: Optional[Dict[str, str]] = None,
     app_key_map: Optional[Dict[str, Dict[str, str]]] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """编译一个用例为脚本清单（含模板图引用列表）。"""
     if app_key_map is None:
@@ -272,6 +278,7 @@ def build_case_script(
             step,
             variables=variables,
             app_key_map=app_key_map,
+            platform=platform,
         )
         script_steps.append(script_step)
         for ref in refs:

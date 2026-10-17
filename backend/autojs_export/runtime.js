@@ -824,10 +824,12 @@ function renderStep(ctx, step) {
     return rendered;
 }
 
-function stepPlatformAllowed(step) {
+function stepPlatformAllowed(ctx, step) {
+    // 目标平台来自运行配置（Android 引擎默认 android；iOS 端 WDA fork 传 ios）
+    var target = String((ctx && ctx.platform) || "android").toLowerCase();
     var executeOn = step.execute_on || ["android", "ios"];
     for (var i = 0; i < executeOn.length; i++) {
-        if (String(executeOn[i]).toLowerCase() === "android") return true;
+        if (String(executeOn[i]).toLowerCase() === target) return true;
     }
     return false;
 }
@@ -851,7 +853,7 @@ function runStep(ctx, rawStep) {
         output: null
     };
 
-    if (!stepPlatformAllowed(step)) {
+    if (!stepPlatformAllowed(ctx, step)) {
         result.status = "SKIP";
         result.error_code = "P1001_PLATFORM_NOT_ALLOWED";
         logLine(ctx, "步骤 " + order + " SKIP（平台不允许）: " + description);
@@ -1001,6 +1003,7 @@ function buildReportPayload(ctx) {
         run_id: ctx.runId || null,
         notify: ctx.notify !== false,
         format_version: FORMAT_VERSION,
+        platform: ctx.platform || "android",
         kind: ctx.manifest.kind,
         case_id: ctx.manifest.kind === "case" ? ctx.manifest.cases[0].id : null,
         scenario_id: ctx.manifest.kind === "scenario" ? ctx.manifest.scenario_id : null,
@@ -1112,6 +1115,8 @@ function createContext(manifest, baseDir, embeddedAssets) {
         runId: String(runtimeConfig.runId || ""),
         // 是否发送飞书通知（默认发送；App 可逐次关闭）
         notify: runtimeConfig.notify !== false,
+        // 目标平台：android（默认，兼容既有 App）/ ios（WDA fork）
+        platform: String(runtimeConfig.platform || "android"),
         caseResults: [],
         exportedVariables: {},
         logLines: [],
