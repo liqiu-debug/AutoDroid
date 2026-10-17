@@ -2,9 +2,10 @@
 import { ref, onActivated, onDeactivated, onUnmounted, reactive, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, VideoPlay, CopyDocument, Delete, Search, Refresh, Edit, ArrowDown, CircleClose, FolderOpened, MoreFilled } from '@element-plus/icons-vue'
+import { Plus, VideoPlay, CopyDocument, Delete, Search, Refresh, Edit, ArrowDown, CircleClose, FolderOpened, MoreFilled, Download } from '@element-plus/icons-vue'
 import api from '@/api'
 import FolderTreePanel from '@/components/FolderTreePanel.vue'
+import ExportAutoJsDialog from '@/components/ExportAutoJsDialog.vue'
 import { deviceStatusLabel, deviceStatusTagType, normalizeRunStatus, runStatusTagType, runStatusLabel } from '@/utils/statusMeta'
 import { useUserStore } from '@/stores/useUserStore'
 import dayjs from 'dayjs'
@@ -99,6 +100,19 @@ const handleCurrentChange = (val) => {
 
 const handleSelectionChange = (val) => {
     selectedCases.value = val
+}
+
+// AutoDroid 批量导出
+const exportDialogVisible = ref(false)
+const exportTarget = ref(null)
+const openBatchExportDialog = () => {
+    if (!selectedCases.value.length) return
+    exportTarget.value = {
+        type: 'batch',
+        caseIds: selectedCases.value.map(item => item.id),
+        name: `批量导出_${selectedCases.value.length}个用例`
+    }
+    exportDialogVisible.value = true
 }
 
 const canDeleteCase = (row) => {
@@ -614,6 +628,9 @@ onUnmounted(stopActiveRunPolling)
                         </div>
 
                         <div class="right-tools">
+                            <el-button v-if="selectedCases.length" :icon="Download" plain @click="openBatchExportDialog">
+                                批量导出
+                            </el-button>
                             <el-tooltip v-if="selectedCases.length" :content="selectedHasUnauthorizedCase ? '仅能删除自己创建的用例' : '批量删除'" placement="top">
                                 <span class="button-tooltip-wrap">
                                     <el-button type="danger" plain :icon="Delete" :disabled="selectedCases.length === 0 || selectedHasUnauthorizedCase" @click="handleBatchDelete">
@@ -801,6 +818,9 @@ onUnmounted(stopActiveRunPolling)
             </div>
         </template>
     </el-drawer>
+
+    <!-- AutoDroid 批量导出弹窗 -->
+    <ExportAutoJsDialog v-model="exportDialogVisible" :target="exportTarget" />
 </template>
 
 <style scoped>

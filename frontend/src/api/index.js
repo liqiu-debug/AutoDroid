@@ -646,5 +646,25 @@ export default {
     // AI (NL2Script) - 自然语言生成测试步骤
     generateAISteps(text) {
         return api.post('/ai/generate-steps', { text }, { timeout: 120000 })
+    },
+
+    // AutoDroid 脚本导出与设备端执行任务
+    autojs: {
+        precheckCase: (id, envId) => api.get(`/autojs/cases/${id}/precheck`, { params: envId ? { env_id: envId } : {} }),
+        exportCase: (id, format = 'zip', envId) => api.post(`/autojs/cases/${id}/export`, null, {
+            params: { format, ...(envId ? { env_id: envId } : {}) },
+            responseType: 'blob',
+            timeout: 120000
+        }),
+        exportBatch: (data) => api.post('/autojs/cases/export-batch', data, { responseType: 'blob', timeout: 120000 }),
+        precheckScenario: (id, envId) => api.get(`/autojs/scenarios/${id}/precheck`, { params: envId ? { env_id: envId } : {} }),
+        exportScenario: (id, envId) => api.post(`/autojs/scenarios/${id}/export`, null, {
+            params: envId ? { env_id: envId } : {},
+            responseType: 'blob',
+            timeout: 120000
+        }),
+        createTask: (data) => api.post('/autojs/tasks', data),
+        listTasks: (params) => api.get('/autojs/tasks', { params }),
+        cancelTask: (taskId) => api.post(`/autojs/tasks/${taskId}/cancel`)
     }
 }
