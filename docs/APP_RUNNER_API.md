@@ -108,3 +108,62 @@ App 渲染建议：带鉴权下载 HTML → `WebView.loadDataWithBaseURL(serverU
 
 - 官方 AutoJs6 + `scripts/autojs6/autodroid_agent.js` 的旧链路继续可用（任务接口 `/autojs/tasks`、`/device-runs/pending|packages` 不变）；
 - App 专用端点统一走 `/app-runs/*` 前缀，后续变更视为契约变更。
+
+## 8. iOS：设备端执行器（AutoDroid-WDA）
+
+iOS 侧的设备端执行器是 WebDriverAgent 的 fork（<https://github.com/liqiu-debug/AutoDroid-WDA>，
+分支 `autodroid`）：手机上点图标启动 WDA 会话后，平台把脚本包直接下发到执行器，
+由执行器在本机用 JavaScriptCore 跑同一份 `runtime.js`，结果同样回传 `/device-runs/report`。
+
+### 8.1 取 iOS 脚本包
+
+```
+GET /app-runs/cases/{case_id}/script?platform=ios
+GET /app-runs/scenarios/{scenario_id}/script?platform=ios
+```
+
+与 Android 包的差异：
+
+| 项 | Android（默认） | iOS（platform=ios） |
+|---|---|---|
+| `manifest.platform` | `android` | `ios` |
+| 步骤定位器 | 取步骤模型里的 `android` 覆盖 | 取 `ios` 覆盖（`by: label/id/...`） |
+| `start_app/stop_app` 的 `args.package` | Android 包名 | iOS bundle id（应用映射的 `ios` 字段） |
+| `adapter_js` | 不包含 | **包含**：AutoJs6 API 兼容层（`backend/autojs_export/adapters/ios_adapter.js`），执行器优先使用包内适配层，改适配层无需重装 WDA |
+
+`runtime.js` 两侧完全一致，按 `ctx.platform`（执行器在运行配置里传 `platform: "ios"`）
+判定 `execute_on`，不匹配的步骤标记 SKIP。
+
+### 8.2 执行器端点（手机局域网地址，默认 8100 端口）
+
+```
+GET  /autodroid/status            → {running, run_id, last_result, log_count, version}
+POST /autodroid/run               → {accepted, run_id}
+     body: {bundle, run_id, platform, target_bundle_id, server, token, notify}
+GET  /autodroid/logs?since=N      → {lines, next}
+POST /autodroid/stop              → {stopped}
+```
+
+`bundle` 即 8.1 返回的 JSON 包；`server`/`token` 供 runtime.js 回传结果；
+`target_bundle_id` 指定被自动化应用（后续 `start_app` 也会更新它）。
+
+### 8.3 设备注册与上报
+
+- 注册：`POST /device-runs/register` 传 `platform: "ios"` 与 `udid`（拿不到 UDID 时用 IDFV），
+  平台生成 `ios:<udid>` 形式的 serial，`connection_type=wda`；
+- 上报：`POST /device-runs/report` 带 `platform: "ios"`，serial 推导与注册一致（`ios:` 前缀），
+  其余字段（`run_id` 幂等、`notify` 控制飞书）与 Android 完全一致。
+
+### 8.4 自检与验证
+
+```bash
+# 无真机：Node 试验台验证「脚本包 + runtime.js + 适配层 + 报告载荷」
+python -m unittest backend.tests.test_ios_runtime_harness
+
+# 真机：下发自检包（启动设置 → 截图+OCR → 滑动 → 返回 → 回桌面）并等结果
+python -m backend.autojs_export.selftest --url http://<手机IP>:8100
+python -m backend.autojs_export.selftest --output /tmp/ios_selftest.json   # 只生成包
+```
+
+也可用 WDA fork 自带脚本做设备侧检查：`autodroid/verify_device.sh <WDA_URL> --platform-repo .`
+（在线、会话稳定性、日志、完整自检）。
