@@ -100,6 +100,7 @@ Web 前端支持 PC、移动和自动识别三种客户端模式。自动模式�
 - 脚本下发与上报走 App 直跑接口（`/app-runs/cases/{id}/script`、`/app-runs/scenarios/{id}/script`、`/device-runs/report`），契约见 [App 接口契约](docs/APP_RUNNER_API.md)。
 - App 内置 AutoJs6 引擎，导出脚本与设备端执行说明见 [设备端脚本执行](docs/AUTOJS6_EXECUTION.md)。
 - 平台侧入口：用例列表 / 用例编辑器 / 场景编辑器均有「导出脚本」，可下载脚本包或直接推送到设备端 Agent。
+- 预编译 APK 见 App 仓库的 [Releases](https://github.com/liqiu-debug/AutoDroid-Android/releases)；发布包默认服务器地址为占位值，首次登录时改成平台地址即可。
 
 ## 项目结构
 
