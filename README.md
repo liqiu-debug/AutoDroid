@@ -93,6 +93,14 @@ Web 前端支持 PC、移动和自动识别三种客户端模式。自动模式�
 
 移动端还支持巡检报告列表与详情查看。用例编辑、场景复杂编排、变量与安装包管理、定时任务、专项测试配置、用户管理和系统配置仍需使用 PC 模式。
 
+## 移动端 App（Android）
+
+除了 Web 端，平台提供原生 Android 客户端 **[AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)**（应用名 AutoDroid，`com.autodroid.runner`）：登录后直接在手机上执行用例与场景，结果回传平台生成报告，支持设备侧定时任务与执行完成通知；iOS 客户端规划中，将另建仓库。
+
+- 脚本下发与上报走 App 直跑接口（`/app-runs/cases/{id}/script`、`/app-runs/scenarios/{id}/script`、`/device-runs/report`），契约见 [App 接口契约](docs/APP_RUNNER_API.md)。
+- App 内置 AutoJs6 引擎，导出脚本与设备端执行说明见 [设备端脚本执行](docs/AUTOJS6_EXECUTION.md)。
+- 平台侧入口：用例列表 / 用例编辑器 / 场景编辑器均有「导出脚本」，可下载脚本包或直接推送到设备端 Agent。
+
 ## 项目结构
 
 ```text
@@ -396,6 +404,8 @@ node --test tests/*.test.mjs
 - [iOS WDA 运维手册](docs/IOS_WDA_OPS.md)：WDA 启动、健康检查、端口映射和故障排查
 - [Android 无线 adb 指南](docs/ANDROID_WIRELESS_ADB.md)：无线接入步骤、身份与稳定性边界
 - [远程设备接入指南](docs/REMOTE_DEVICE_AGENT.md)：设备接入助手 Agent、反向隧道架构、安全边界与排障
+- [App 接口契约](docs/APP_RUNNER_API.md)：Android 客户端（AutoDroid-Android）的登录、设备注册、脚本下发与结果上报接口
+- [设备端脚本执行](docs/AUTOJS6_EXECUTION.md)：AutoJs6 引擎脚本包结构、导出与设备端 Agent 执行链路
 - [改进路线图](docs/IMPROVEMENT_ROADMAP.md)：能力补充与架构治理清单（P0/P1/P2）
 - [历史优化实施总结](OPTIMIZATION_SUMMARY.md)：早期 OCR、查询与并发治理及其当前演进状态
 
