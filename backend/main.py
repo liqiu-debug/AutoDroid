@@ -80,6 +80,8 @@ from backend.api import environments
 from backend.api import api_testing
 from backend.api import ai
 from backend.api import limiter
+from backend.api import autojs
+from backend.api import app_runs
 from backend.api import deps
 from backend.api import recording
 from backend.api import ws_run
@@ -113,6 +115,9 @@ def _register_http_routers(
     target.include_router(compatibility.router, prefix="/compatibility", tags=["compatibility"], include_in_schema=include_in_schema)
     target.include_router(inspections.router, prefix="/inspections", tags=["inspections"], include_in_schema=include_in_schema)
     target.include_router(device_agents.router, prefix="/device-agents", tags=["device-agents"], include_in_schema=include_in_schema)
+    target.include_router(autojs.router, prefix="/autojs", tags=["autojs"], include_in_schema=include_in_schema)
+    target.include_router(autojs.device_router, prefix="/device-runs", tags=["device-runs"], include_in_schema=include_in_schema)
+    target.include_router(app_runs.router, prefix="/app-runs", tags=["app-runs"], include_in_schema=include_in_schema)
     target.include_router(environments.router, prefix="/environments", tags=["environments"], include_in_schema=include_in_schema)
     target.include_router(limiter.router, prefix="/limiter", tags=["limiter"], include_in_schema=include_in_schema)
     if ai_prefix:

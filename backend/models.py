@@ -123,6 +123,32 @@ class TestResult(SQLModel, table=True):
     duration: float = 0.0 # milliseconds
 
 
+class DeviceRunTask(SQLModel, table=True):
+    """AutoDroid 设备端执行任务（导出脚本包 -> 设备拉取 -> 结果回传）。
+
+    - task_id 为对外任务标识（uuid），设备端凭它拉包与上报
+    - 单用例任务 kind="case"（case_id 必填）；场景任务 kind="scenario"
+    - status: PENDING -> CLAIMED -> DONE / FAILED / CANCELED
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: str = Field(index=True, unique=True)
+    kind: str = Field(default="case")  # case | scenario
+    case_id: Optional[int] = Field(default=None, foreign_key="testcase.id")
+    scenario_id: Optional[int] = Field(default=None, foreign_key="testscenario.id")
+    env_id: Optional[int] = None
+    device_serial: Optional[str] = Field(default=None, index=True)  # 目标设备；空 = 任意 AutoDroid 设备
+    status: str = Field(default="PENDING", index=True)
+    package_name: Optional[str] = None  # 脚本包展示名（zip 文件名）
+    package_path: Optional[str] = None  # 脚本包磁盘路径
+    execution_id: Optional[int] = Field(default=None, foreign_key="testexecution.id")
+    error: Optional[str] = None
+    result_summary: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    created_by: Optional[int] = Field(default=None, foreign_key="user.id")
+    created_at: datetime = Field(default_factory=datetime.now)
+    claimed_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
 class ScheduledTask(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str

@@ -1700,6 +1700,9 @@ async def sync_devices(
     for db_dev in all_db_devices:
         if db_dev.serial in all_online:
             continue
+        if str(db_dev.connection_type or "").strip().lower() == "autojs6":
+            # AutoDroid 设备端设备不依赖 adb，在线状态由 Agent 心跳维护（register 接口）
+            continue
         is_ios = str(db_dev.platform or "android").strip().lower() == "ios"
         if (
             is_ios
