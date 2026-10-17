@@ -45,7 +45,7 @@ from backend.models import (
 from backend.notification_service import NotificationService
 from backend.report_generator import report_generator
 from backend.scenario_results import _persist_case_result_and_build_case_report
-from backend.step_contract import standard_step_to_legacy
+from backend.step_contract import normalize_platform, standard_step_to_legacy
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,8 @@ device_router = APIRouter()
 PACKAGE_DIR = PROJECT_ROOT / "uploads" / "autojs6_packages"
 CLAIM_TIMEOUT = timedelta(minutes=15)
 DEVICE_SERIAL_PREFIX = "autojs6:"
+# iOS 端（AutoDroid-WDA 设备端执行器）设备 serial 前缀
+DEVICE_SERIAL_PREFIX_IOS = "ios:"
 
 
 # --------------------------------------------------------------------------- #
@@ -77,12 +79,16 @@ class DeviceRunTaskCreate(BaseModel):
 
 
 class DeviceRegisterPayload(BaseModel):
+    platform: Optional[str] = None  # android（默认）| ios
     android_id: Optional[str] = None
     serial: Optional[str] = None
+    # iOS：设备 UDID（平台侧能拿到时优先使用；沙箱内 App 拿不到则退回 IDFV）
+    udid: Optional[str] = None
     name: Optional[str] = None
     model: Optional[str] = None
     brand: Optional[str] = None
     android_version: Optional[str] = None
+    os_version: Optional[str] = None
     resolution: Optional[str] = None
     battery: Optional[int] = None
 
@@ -110,6 +116,8 @@ class DeviceReportCase(BaseModel):
 
 class DeviceReportPayload(BaseModel):
     task_id: Optional[str] = None
+    # 上报来源平台：android（默认，兼容既有 AutoDroid App）| ios（WDA fork 设备端执行器）
+    platform: Optional[str] = None
     # App 直跑模式：无任务时用客户端生成的 run_id 做幂等标识
     run_id: Optional[str] = None
     # 是否发送飞书通知（默认发送；App 可逐次关闭）
@@ -261,13 +269,18 @@ def export_scenario(
 #  设备侧：注册 / 任务领取 / 包下载
 # --------------------------------------------------------------------------- #
 def _device_serial_for(payload: DeviceRegisterPayload) -> str:
+    platform = normalize_platform(payload.platform)
     identity = (
-        str(payload.android_id or "").strip()
+        str(payload.udid or "").strip()
+        or str(payload.android_id or "").strip()
         or str(payload.serial or "").strip()
         or str(payload.name or "").strip()
         or "unknown"
     )
-    return f"{DEVICE_SERIAL_PREFIX}{identity}"
+    if identity.startswith(DEVICE_SERIAL_PREFIX) or identity.startswith(DEVICE_SERIAL_PREFIX_IOS):
+        return identity
+    prefix = DEVICE_SERIAL_PREFIX_IOS if platform == "ios" else DEVICE_SERIAL_PREFIX
+    return f"{prefix}{identity}"
 
 
 @device_router.post("/register")
@@ -277,20 +290,23 @@ def register_device(
     current_user: User = Depends(deps.get_current_user),
 ):
     """AutoDroid 设备注册 / 心跳。设备进入平台设备中心。"""
+    platform = normalize_platform(payload.platform)
     serial = _device_serial_for(payload)
     device = session.exec(select(Device).where(Device.serial == serial)).first()
     now = datetime.now()
     if not device:
-        device = Device(serial=serial, platform="android", status="IDLE")
-    device.platform = "android"
-    device.connection_type = "autojs6"
+        device = Device(serial=serial, platform=platform, status="IDLE")
+    device.platform = platform
+    device.connection_type = "wda" if platform == "ios" else "autojs6"
     if payload.model:
         device.model = str(payload.model)
     if payload.brand:
         device.brand = str(payload.brand)
+    os_version = str(payload.os_version or payload.android_version or "").strip()
+    if os_version:
+        device.os_version = os_version
     if payload.android_version:
         device.android_version = str(payload.android_version)
-        device.os_version = str(payload.android_version)
     if payload.resolution:
         device.resolution = str(payload.resolution)
     if payload.name:
@@ -410,10 +426,13 @@ def _device_display(payload: DeviceReportPayload) -> str:
 def _serial_from_device(payload: DeviceReportPayload) -> Optional[str]:
     """App 直跑：从上报的设备信息推导平台设备 serial（与注册接口规则一致）。"""
     device = payload.device or {}
-    identity = str(device.get("android_id") or "").strip()
-    if identity:
-        return f"{DEVICE_SERIAL_PREFIX}{identity}"
-    return None
+    identity = str(device.get("android_id") or device.get("serial") or "").strip()
+    if not identity:
+        return None
+    if identity.startswith(DEVICE_SERIAL_PREFIX) or identity.startswith(DEVICE_SERIAL_PREFIX_IOS):
+        return identity
+    prefix = DEVICE_SERIAL_PREFIX_IOS if normalize_platform(payload.platform) == "ios" else DEVICE_SERIAL_PREFIX
+    return f"{prefix}{identity}"
 
 
 def _resolve_duration(payload: DeviceReportPayload) -> float:

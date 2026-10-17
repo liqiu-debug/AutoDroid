@@ -554,3 +554,112 @@ class DeviceFlowTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IOSPlatformTests(DeviceFlowTests):
+    """iOS 平台脚本包与设备注册（AutoDroid-WDA 设备端执行器）。"""
+
+    def _save_setting(self, key: str, value: str) -> None:
+        from backend.models import SystemSetting
+
+        self.session.add(SystemSetting(key=key, value=value))
+        self.session.commit()
+
+    def _map_ios_app(self, app_key: str = "mall_app", bundle_id: str = "com.demo.mall.ios") -> None:
+        import json as _json
+
+        self._save_setting("app_key_map", _json.dumps({app_key: {"ios": bundle_id}}))
+
+    def test_ios_bundle_uses_ios_locators_and_marks_platform(self):
+        case = self._create_case(name="ios定位器")
+        self._add_step(
+            case.id, 1, "click",
+            platform_overrides={
+                "android": {"selector": "登录", "by": "text"},
+                "ios": {"selector": "Sign in", "by": "label"},
+            },
+        )
+        bundle = packager.build_case_bundle(self.session, case, platform="ios")
+        self.assertEqual(bundle["manifest"]["platform"], "ios")
+        self.assertEqual(bundle["manifest"]["requirements"]["platform"], "ios")
+        # JSON 包内用例脚本单独成文件，直接检查编译结果
+        compiled = bundle["case_files"][0]["content"]
+        self.assertIn("Sign in", compiled)
+        self.assertNotIn("登录", compiled)
+        self.assertIn("createContext", bundle["runtime_js"])
+        self.assertIn("stepPlatformAllowed(ctx", bundle["runtime_js"])
+
+    def test_ios_bundle_maps_app_key_to_bundle_id(self):
+        self._map_ios_app()
+        case = self._create_case(name="ios应用映射")
+        self._add_step(case.id, 1, "start_app", args={"app_key": "mall_app"})
+        bundle = packager.build_case_bundle(self.session, case, platform="ios")
+        compiled = bundle["case_files"][0]["content"]
+        self.assertIn("com.demo.mall.ios", compiled)
+
+    def test_android_bundle_defaults_unchanged(self):
+        case = self._create_case(name="安卓默认")
+        self._add_step(
+            case.id, 1, "click",
+            platform_overrides={
+                "android": {"selector": "登录", "by": "text"},
+                "ios": {"selector": "Sign in", "by": "label"},
+            },
+        )
+        bundle = packager.build_case_bundle(self.session, case)
+        self.assertEqual(bundle["manifest"]["platform"], "android")
+        compiled = bundle["case_files"][0]["content"]
+        self.assertIn("登录", compiled)
+
+    def test_ios_script_bundle_endpoint(self):
+        case = self._create_case(name="ios端点")
+        self._add_step(
+            case.id, 1, "click",
+            platform_overrides={"ios": {"selector": "Sign in", "by": "label"}},
+        )
+        resp = self.client.get(
+            f"/api/app-runs/cases/{case.id}/script?platform=ios", headers=self.headers
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        bundle = resp.json()
+        self.assertEqual(bundle["manifest"]["platform"], "ios")
+        self.assertIn("Sign in", bundle["case_files"][0]["content"])
+
+    def test_register_ios_device_uses_ios_serial_prefix(self):
+        resp = self.client.post(
+            "/api/device-runs/register",
+            json={
+                "platform": "ios",
+                "udid": "00008110-001234567890001E",
+                "name": "工位A-iPhone",
+                "model": "iPhone17,1",
+                "brand": "Apple",
+                "os_version": "26.1",
+                "resolution": "1179x2556",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["device_serial"], "ios:00008110-001234567890001E")
+        device = self.session.exec(
+            select(Device).where(Device.serial == "ios:00008110-001234567890001E")
+        ).first()
+        self.assertIsNotNone(device)
+        self.assertEqual(device.platform, "ios")
+        self.assertEqual(device.connection_type, "wda")
+        self.assertEqual(device.os_version, "26.1")
+
+    def test_ios_report_derives_serial_with_ios_prefix(self):
+        payload = autojs_api.DeviceReportPayload(
+            run_id="run-ios-1",
+            platform="ios",
+            device={"android_id": "IDFV-ABC", "model": "iPhone17,1"},
+        )
+        self.assertEqual(autojs_api._serial_from_device(payload), "ios:IDFV-ABC")
+
+    def test_android_report_serial_unchanged(self):
+        payload = autojs_api.DeviceReportPayload(
+            run_id="run-android-1",
+            device={"android_id": "abc123"},
+        )
+        self.assertEqual(autojs_api._serial_from_device(payload), "autojs6:abc123")

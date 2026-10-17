@@ -93,6 +93,17 @@ def _unwrap_enum(value: Any) -> Any:
     return value
 
 
+SUPPORTED_PLATFORMS = ("android", "ios")
+
+
+def normalize_platform(platform: Any, default: str = "android") -> str:
+    """归一化目标平台（android / ios），未知取值回退到 default。"""
+    text = str(platform or "").strip().lower()
+    if text in SUPPORTED_PLATFORMS:
+        return text
+    return default
+
+
 def normalize_action(action: Any) -> str:
     action = _unwrap_enum(action)
     if action is None:

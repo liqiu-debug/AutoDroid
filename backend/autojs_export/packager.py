@@ -26,6 +26,7 @@ from backend.autojs_export.generator import (
     build_case_script,
 )
 from backend.autojs_export.precheck import precheck_case_package
+from backend.step_contract import normalize_platform
 from backend.models import ScenarioStep, TestCase, TestScenario
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _load_runtime_source() -> str:
     return RUNTIME_JS_PATH.read_text(encoding="utf-8")
+
+
+def _load_adapter_source(platform: str) -> Optional[str]:
+    """iOS 适配层源码（随包下发）。
+
+    设备端执行器（AutoDroid-WDA）只提供原生原语，AutoJs6 API 表面由该适配层用 JS 实现；
+    随平台下发的好处是修适配层无需重新签名/安装 WDA。
+    """
+    if normalize_platform(platform) != "ios":
+        return None
+    adapter_path = Path(__file__).resolve().parent / "adapters" / "ios_adapter.js"
+    if not adapter_path.is_file():
+        logger.warning("iOS 适配层缺失: %s", adapter_path)
+        return None
+    return adapter_path.read_text(encoding="utf-8")
 
 
 def _case_module_source(case_script: Dict[str, Any]) -> str:
@@ -159,23 +175,38 @@ def _build_manifest(
     variables: Dict[str, str],
     scenario_id: Optional[int],
     precheck: Dict[str, Any],
+    platform: str = "android",
 ) -> Dict[str, Any]:
+    platform = normalize_platform(platform)
+    requirements = (
+        {
+            "runtime": "autodroid",
+            "platform": "ios",
+            "accessibility": False,
+            "screenshot": "XCUITest (WebDriverAgentRunner)",
+            "min_ios_version": 15,
+        }
+        if platform == "ios"
+        else {
+            "runtime": "autodroid",
+            "platform": "android",
+            "min_android_sdk": 24,
+            "accessibility": True,
+            "screenshot": "automator (Android 11+) 或 MediaProjection",
+        }
+    )
     return {
         "format_version": SCRIPT_FORMAT_VERSION,
         "generator": GENERATOR_NAME,
         "kind": kind,
+        "platform": platform,
         "name": name,
         "scenario_id": scenario_id,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "cases": case_entries,
         "variables": variables,
         "precheck": precheck,
-        "requirements": {
-            "runtime": "autodroid",
-            "min_android_sdk": 24,
-            "accessibility": True,
-            "screenshot": "automator (Android 11+) 或 MediaProjection",
-        },
+        "requirements": requirements,
     }
 
 
@@ -192,6 +223,10 @@ def _write_zip(
         zf.writestr("README.txt", _PACKAGE_README)
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         zf.writestr("main.js", _main_js_source(manifest))
+        # iOS 包需要把适配层一起放进 zip（JSON 下发路径放在 adapter_js 字段）
+        adapter_source = _load_adapter_source(manifest.get("platform") or "android")
+        if adapter_source:
+            zf.writestr("adapter.js", adapter_source)
         zf.writestr("runtime.js", _load_runtime_source())
         for case_script, module_file in case_scripts:
             zf.writestr(module_file, _case_module_source(case_script))
@@ -219,9 +254,10 @@ def build_case_package(
     case: TestCase,
     *,
     env_id: Optional[int] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """单用例脚本包（zip）。"""
-    case_script = build_case_script(session, case, env_id=env_id)
+    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
     precheck = precheck_case_package([case_script], project_root=PROJECT_ROOT)
     module_file = f"cases/case_{case.id}.js"
     manifest = _build_manifest(
@@ -236,6 +272,7 @@ def build_case_package(
         variables=case_script.get("variables") or {},
         scenario_id=None,
         precheck=precheck,
+        platform=platform,
     )
     content = _write_zip(manifest, [(case_script, module_file)], case_script.get("template_refs") or [])
     return {
@@ -251,6 +288,7 @@ def collect_scenario_parts(
     scenario: TestScenario,
     *,
     env_id: Optional[int] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """收集场景脚本包的组成部件（zip 打包与 App JSON 下发共用）。"""
     scenario_steps = session.exec(
@@ -270,7 +308,7 @@ def collect_scenario_parts(
         if not case:
             missing.append(scenario_step.case_id)
             continue
-        case_script = build_case_script(session, case, env_id=env_id)
+        case_script = build_case_script(session, case, env_id=env_id, platform=platform)
         module_file = f"cases/case_{case.id}.js"
         case_scripts.append((case_script, module_file))
         case_entries.append({
@@ -317,9 +355,10 @@ def build_scenario_package(
     scenario: TestScenario,
     *,
     env_id: Optional[int] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """场景脚本包：全部子用例 + 场景串联入口。"""
-    parts = collect_scenario_parts(session, scenario, env_id=env_id)
+    parts = collect_scenario_parts(session, scenario, env_id=env_id, platform=platform)
     manifest = _build_manifest(
         kind="scenario",
         name=scenario.name,
@@ -327,6 +366,7 @@ def build_scenario_package(
         variables=parts["variables"],
         scenario_id=scenario.id,
         precheck=parts["precheck"],
+        platform=platform,
     )
     content = _write_zip(manifest, parts["case_scripts"], parts["template_refs"])
     return {
@@ -357,7 +397,8 @@ def _bundle_payload(
             assets[asset_name] = base64.b64encode(abs_path.read_bytes()).decode("ascii")
         else:
             logger.warning("模板图缺失，未随脚本下发: %s", rel_path)
-    return {
+    adapter_source = _load_adapter_source(manifest.get("platform") or "android")
+    payload = {
         "format_version": SCRIPT_FORMAT_VERSION,
         "generator": GENERATOR_NAME,
         "kind": kind,
@@ -368,6 +409,9 @@ def _bundle_payload(
         "assets": assets,
         "precheck": precheck,
     }
+    if adapter_source:
+        payload["adapter_js"] = adapter_source
+    return payload
 
 
 def build_case_bundle(
@@ -375,9 +419,10 @@ def build_case_bundle(
     case: TestCase,
     *,
     env_id: Optional[int] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """单用例的 JSON 脚本包（App 直跑）。"""
-    case_script = build_case_script(session, case, env_id=env_id)
+    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
     module_file = f"cases/case_{case.id}.js"
     precheck = precheck_case_package([case_script], project_root=PROJECT_ROOT)
     manifest = _build_manifest(
@@ -392,6 +437,7 @@ def build_case_bundle(
         variables=case_script.get("variables") or {},
         scenario_id=None,
         precheck=precheck,
+        platform=platform,
     )
     return _bundle_payload(
         kind="case",
@@ -407,9 +453,10 @@ def build_scenario_bundle(
     scenario: TestScenario,
     *,
     env_id: Optional[int] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """场景的 JSON 脚本包（App 直跑）。"""
-    parts = collect_scenario_parts(session, scenario, env_id=env_id)
+    parts = collect_scenario_parts(session, scenario, env_id=env_id, platform=platform)
     manifest = _build_manifest(
         kind="scenario",
         name=scenario.name,
@@ -417,6 +464,7 @@ def build_scenario_bundle(
         variables=parts["variables"],
         scenario_id=scenario.id,
         precheck=parts["precheck"],
+        platform=platform,
     )
     return _bundle_payload(
         kind="scenario",
