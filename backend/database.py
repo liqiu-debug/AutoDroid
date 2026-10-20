@@ -1533,6 +1533,18 @@ def _migrate_api_testing_owners(cursor) -> None:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN updater_id INTEGER REFERENCES user(id)")
 
 
+def _migrate_app_device_presence(cursor) -> None:
+    if not _table_exists(cursor, "device"):
+        return
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(device)").fetchall()}
+    for name, kind in [("app_last_seen_at", "TIMESTAMP"), ("app_logged_out_at", "TIMESTAMP"),
+                       ("app_executor_status", "VARCHAR DEFAULT 'UNKNOWN'"), ("app_owner_id", "INTEGER"),
+                       ("bound_device_serial", "VARCHAR")]:
+        if name not in columns:
+            cursor.execute(f"ALTER TABLE device ADD COLUMN {name} {kind}")
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_device_app_binding ON device(bound_device_serial)")
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys")
@@ -1617,6 +1629,7 @@ def _run_migrations_with_conn(conn) -> None:
             ),
             ("20260930_028_api_testing", _migrate_api_testing_schema),
             ("20260930_029_api_testing_owners", _migrate_api_testing_owners),
+            ("20261020_031_app_device_presence", _migrate_app_device_presence),
         ]
 
         for version, migration_func in migration_plan:

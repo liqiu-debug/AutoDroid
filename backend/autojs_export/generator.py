@@ -27,6 +27,7 @@ from backend.step_contract import (
     normalize_action,
     normalize_error_strategy,
     normalize_execute_on,
+    normalize_platform,
 )
 from backend.utils.pydantic_compat import dump_model
 from backend.utils.variable_render import render_step_data
@@ -135,6 +136,7 @@ def _resolve_app_package(
     platform: str = "android",
 ) -> Optional[str]:
     """app_key -> 平台应用标识（Android 包名 / iOS bundle id）；未映射时兼容直接把 app_key 当标识。"""
+    platform = normalize_platform(platform)
     key = str(app_key or "").strip()
     if not key:
         return None
@@ -142,15 +144,34 @@ def _resolve_app_package(
     package = str(mapped.get(platform) or "").strip()
     if package:
         return package
+    # 已登记的映射如果缺少当前平台标识，禁止把另一平台的包名透传。
+    if mapped:
+        return None
     if "." in key and " " not in key:
         return key
     return None
 
 
-def _extract_app_key(step: Dict[str, Any]) -> str:
+def _extract_app_key(step: Dict[str, Any], platform: str = "android") -> str:
+    platform = normalize_platform(platform)
     args = step.get("args") if isinstance(step.get("args"), dict) else {}
-    value = step.get("value")
-    for candidate in (args.get("app_key"), args.get("app_id"), value):
+    candidates = [args.get("app_key"), args.get("app_id")]
+    # 接受已经按目标平台解析过的标准步骤，避免二次导出时丢失应用标识。
+    candidates.append(args.get("bundle_id") if platform == "ios" else args.get("package"))
+    candidates.extend((step.get("value"), step.get("selector")))
+    overrides = step.get("platform_overrides")
+    if isinstance(overrides, dict):
+        override = overrides.get(platform)
+        if isinstance(override, dict):
+            candidates.extend(
+                (
+                    override.get("app_key"),
+                    override.get("app_id"),
+                    override.get("bundle_id") if platform == "ios" else override.get("package"),
+                    override.get("selector"),
+                )
+            )
+    for candidate in candidates:
         text = str(candidate or "").strip()
         if text:
             return text
@@ -168,6 +189,10 @@ def build_script_step(
 
     platform 决定定位器候选与应用标识的取值（android / ios 在步骤模型里分别维护）。
     """
+    platform = normalize_platform(platform)
+    # Render the complete step before resolving platform locators and app ids.
+    # Previously only args were rendered, leaving {{VAR}} in iOS overrides.
+    step = _render_text(step, variables)
     action = normalize_action(step.get("action"))
     args = step.get("args") if isinstance(step.get("args"), dict) else {}
     args = _render_text(args, variables)
@@ -241,10 +266,16 @@ def build_script_step(
         direction = str(args.get("direction") or "up").strip().lower()
         script_step["args"] = {"direction": direction}
     elif action in ("start_app", "stop_app"):
-        app_key = _extract_app_key(step)
+        app_key = _extract_app_key(step, platform)
+        explicit_id = args.get("bundle_id") if platform == "ios" else args.get("package")
+        explicit_id = explicit_id or args.get("app_id")
+        app_id = str(explicit_id).strip() if explicit_id else None
+        if not app_id and app_key:
+            app_id = _resolve_app_package(app_key, app_key_map, platform)
         script_step["args"] = {
             "app_key": app_key or None,
-            "package": _resolve_app_package(app_key, app_key_map, platform) if app_key else None,
+            "package": app_id if platform != "ios" else None,
+            "bundle_id": app_id if platform == "ios" else None,
         }
 
     return script_step, template_refs
@@ -260,6 +291,7 @@ def build_case_script(
     platform: str = "android",
 ) -> Dict[str, Any]:
     """编译一个用例为脚本清单（含模板图引用列表）。"""
+    platform = normalize_platform(platform)
     if app_key_map is None:
         from backend.cross_platform_execution import load_app_key_mapping
 

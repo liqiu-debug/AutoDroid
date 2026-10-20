@@ -148,6 +148,30 @@ class GeneratorTests(_Base):
         self.assertEqual(step["args"]["image"], "element_ab12cd34.png")
         self.assertIn(("element_ab12cd34.png", "static/images/element_ab12cd34.png"), script["template_refs"])
 
+    def test_ios_renders_platform_locators_and_explicit_bundle_id(self):
+        case = self._create_case(variables=[
+            {"key": "IOS_LABEL", "value": "Sign in"},
+            {"key": "IOS_BUNDLE", "value": "com.demo.mall.ios"},
+        ])
+        self._add_step(
+            case.id,
+            1,
+            "click",
+            platform_overrides={"ios": {"selector": "{{IOS_LABEL}}", "by": "label"}},
+        )
+        self._add_step(
+            case.id,
+            2,
+            "start_app",
+            args={"bundle_id": "{{IOS_BUNDLE}}"},
+        )
+
+        script = build_case_script(self.session, case, platform="ios")
+
+        self.assertEqual(script["steps"][0]["locators"], [{"selector": "Sign in", "by": "label"}])
+        self.assertEqual(script["steps"][1]["args"]["bundle_id"], "com.demo.mall.ios")
+        self.assertIsNone(script["steps"][1]["args"]["package"])
+
 
 class PrecheckTests(_Base):
     def test_xpath_rejected(self):
@@ -624,6 +648,40 @@ class IOSPlatformTests(DeviceFlowTests):
         bundle = resp.json()
         self.assertEqual(bundle["manifest"]["platform"], "ios")
         self.assertIn("Sign in", bundle["case_files"][0]["content"])
+
+    def test_ios_script_bundle_endpoint_compiles_start_app(self):
+        """iOS 下发包含启动应用步骤时应正常编译 bundle id。"""
+        self._map_ios_app()
+        case = self._create_case(name="ios启动应用端点")
+        self._add_step(case.id, 1, "start_app", args={"app_key": "mall_app"})
+
+        resp = self.client.get(
+            f"/api/app-runs/cases/{case.id}/script?platform=ios", headers=self.headers
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIn("com.demo.mall.ios", resp.json()["case_files"][0]["content"])
+
+    def test_ios_unmapped_app_is_blocked_before_download_or_dispatch(self):
+        case = self._create_case(name="缺少应用映射")
+        self._add_step(case.id, 1, "start_app", args={"app_key": "adwad"})
+        responses = [
+            self.client.get(
+                f"/api/app-runs/cases/{case.id}/script?platform=ios", headers=self.headers
+            ),
+            self.client.post(
+                "/api/autojs/tasks",
+                json={"kind": "case", "case_id": case.id, "platform": "ios"},
+                headers=self.headers,
+            ),
+        ]
+        for response in responses:
+            self.assertEqual(response.status_code, 400, response.text)
+            issues = response.json()["detail"]["issues"]
+            self.assertEqual(issues[0]["code"], "P1004_APP_MAPPING_MISSING")
+            self.assertIn("adwad", issues[0]["message"])
+            self.assertIn("ios", issues[0]["message"])
+        self.assertEqual(self.session.exec(select(DeviceRunTask)).all(), [])
 
     def test_register_ios_device_uses_ios_serial_prefix(self):
         resp = self.client.post(

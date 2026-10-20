@@ -548,6 +548,9 @@ class JankAiSummaryResponse(BaseModel):
 # ---- Device Management Schemas ----
 
 class DeviceRead(BaseModel):
+    is_app_device: bool = False
+    app_presence: Optional[Dict[str, Any]] = None
+    host_control_available: bool = False
     id: int
     serial: str
     platform: str = "android"
@@ -576,6 +579,10 @@ class DeviceWirelessEnableRequest(BaseModel):
 
 class DeviceRenameRequest(BaseModel):
     custom_name: str
+
+
+class DeviceAppBindingRequest(BaseModel):
+    physical_serial: Optional[str] = None
 
 class DeviceSyncResponse(BaseModel):
     synced: int = 0

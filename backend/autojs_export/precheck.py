@@ -34,6 +34,7 @@ def precheck_case_script(
     case_script: Dict[str, Any],
     *,
     project_root: Optional[Path] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """检查单个用例的编译产物。返回 {"ok": bool, "issues": [...]}。"""
     issues: List[Dict[str, Any]] = []
@@ -75,14 +76,16 @@ def precheck_case_script(
                 )
 
         if action in ("start_app", "stop_app"):
-            if not args.get("package"):
+            app_identifier = (args.get("bundle_id") or args.get("app_id")) if str(platform).lower() == "ios" else (args.get("package") or args.get("app_id"))
+            if not app_identifier:
                 app_key = args.get("app_key") or ""
                 issues.append(
                     _issue(
                         order,
                         "error",
                         "P1004_APP_MAPPING_MISSING",
-                        f"{action} 步骤的 app_key 未映射到 Android 包名: {app_key!r}",
+                        f"{action} 步骤的 app_key 未映射到 {platform} 应用标识: {app_key!r}。"
+                        f"请填写真实应用标识，或在系统设置 app_key_map 中配置该 key 的 {platform} 映射，然后重新下载脚本。",
                     )
                 )
 
@@ -125,11 +128,16 @@ def precheck_case_package(
     case_scripts: List[Dict[str, Any]],
     *,
     project_root: Optional[Path] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """批量预检（场景/批量导出复用）。"""
     all_issues: List[Dict[str, Any]] = []
     for case_script in case_scripts:
-        result = precheck_case_script(case_script, project_root=project_root)
+        result = precheck_case_script(
+            case_script,
+            project_root=project_root,
+            platform=platform,
+        )
         for issue in result.get("issues") or []:
             item = dict(issue)
             item["case_id"] = case_script.get("case_id")

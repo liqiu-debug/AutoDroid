@@ -258,7 +258,9 @@ def build_case_package(
 ) -> Dict[str, Any]:
     """单用例脚本包（zip）。"""
     case_script = build_case_script(session, case, env_id=env_id, platform=platform)
-    precheck = precheck_case_package([case_script], project_root=PROJECT_ROOT)
+    precheck = precheck_case_package(
+        [case_script], project_root=PROJECT_ROOT, platform=platform
+    )
     module_file = f"cases/case_{case.id}.js"
     manifest = _build_manifest(
         kind="case",
@@ -325,7 +327,9 @@ def collect_scenario_parts(
             variables.setdefault(key, value)
 
     precheck = precheck_case_package(
-        [script for script, _ in case_scripts], project_root=PROJECT_ROOT
+        [script for script, _ in case_scripts],
+        project_root=PROJECT_ROOT,
+        platform=platform,
     )
     if missing:
         precheck = dict(precheck)
@@ -424,7 +428,9 @@ def build_case_bundle(
     """单用例的 JSON 脚本包（App 直跑）。"""
     case_script = build_case_script(session, case, env_id=env_id, platform=platform)
     module_file = f"cases/case_{case.id}.js"
-    precheck = precheck_case_package([case_script], project_root=PROJECT_ROOT)
+    precheck = precheck_case_package(
+        [case_script], project_root=PROJECT_ROOT, platform=platform
+    )
     manifest = _build_manifest(
         kind="case",
         name=case.name,
@@ -481,6 +487,7 @@ def build_batch_package(
     *,
     env_id: Optional[int] = None,
     batch_name: str = "batch",
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """批量导出：多个独立用例打进一个包（入口按顺序执行，失败不中断）。"""
     case_scripts: List[Tuple[Dict[str, Any], str]] = []
@@ -489,7 +496,7 @@ def build_batch_package(
     variables: Dict[str, str] = {}
 
     for order, case in enumerate(cases, start=1):
-        case_script = build_case_script(session, case, env_id=env_id)
+        case_script = build_case_script(session, case, env_id=env_id, platform=platform)
         module_file = f"cases/case_{case.id}.js"
         case_scripts.append((case_script, module_file))
         case_entries.append({
@@ -506,7 +513,9 @@ def build_batch_package(
             variables.setdefault(key, value)
 
     precheck = precheck_case_package(
-        [script for script, _ in case_scripts], project_root=PROJECT_ROOT
+        [script for script, _ in case_scripts],
+        project_root=PROJECT_ROOT,
+        platform=platform,
     )
     manifest = _build_manifest(
         kind="batch",
@@ -515,6 +524,7 @@ def build_batch_package(
         variables=variables,
         scenario_id=None,
         precheck=precheck,
+        platform=platform,
     )
     content = _write_zip(manifest, case_scripts, template_refs)
     return {
@@ -530,13 +540,16 @@ def build_single_file(
     case: TestCase,
     *,
     env_id: Optional[int] = None,
+    platform: str = "android",
 ) -> Dict[str, Any]:
     """单文件模式：runtime + 用例清单 + 模板图 base64 内嵌为一个 .js。
 
     适合无图像步骤或图像极少的用例快速分享；图像多时请用 zip 脚本包。
     """
-    case_script = build_case_script(session, case, env_id=env_id)
-    precheck = precheck_case_package([case_script], project_root=PROJECT_ROOT)
+    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
+    precheck = precheck_case_package(
+        [case_script], project_root=PROJECT_ROOT, platform=platform
+    )
 
     embedded: Dict[str, str] = {}
     for asset_name, rel_path in case_script.get("template_refs") or []:
@@ -556,6 +569,7 @@ def build_single_file(
         variables=case_script.get("variables") or {},
         scenario_id=None,
         precheck=precheck,
+        platform=platform,
     )
 
     runtime_source = _load_runtime_source()

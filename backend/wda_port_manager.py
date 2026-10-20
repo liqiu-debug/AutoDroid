@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -177,7 +178,8 @@ class WDARelayManager:
             sock.close()
 
     def _spawn_relay(self, udid: str, local_port: int, remote_port: int) -> subprocess.Popen:
-        cmd = ["tidevice", "-u", udid, "relay", str(local_port), str(remote_port)]
+        # Use the backend environment; PATH may resolve to an unrelated pyenv shim.
+        cmd = [sys.executable, "-m", "tidevice", "-u", udid, "relay", str(local_port), str(remote_port)]
         logger.info("start wda relay: %s", " ".join(cmd))
         try:
             process = subprocess.Popen(

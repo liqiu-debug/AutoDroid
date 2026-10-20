@@ -31,6 +31,7 @@ from backend.autojs_export.generator import load_case_steps
 from backend.autojs_export.packager import PROJECT_ROOT
 from backend.autojs_export.precheck import precheck_case_script
 from backend.database import get_session
+from backend.device_presence import is_app_device
 from backend.execution_errors import suggestion_for
 from backend.models import (
     CaseFolder,
@@ -67,6 +68,7 @@ class BatchExportRequest(BaseModel):
     folder_id: Optional[int] = None
     name: Optional[str] = None
     env_id: Optional[int] = None
+    platform: Optional[str] = None
 
 
 class DeviceRunTaskCreate(BaseModel):
@@ -76,9 +78,11 @@ class DeviceRunTaskCreate(BaseModel):
     env_id: Optional[int] = None
     device_serial: Optional[str] = None
     name: Optional[str] = None
+    platform: Optional[str] = None
 
 
 class DeviceRegisterPayload(BaseModel):
+    executor_status: Optional[str] = None
     platform: Optional[str] = None  # android（默认）| ios
     android_id: Optional[str] = None
     serial: Optional[str] = None
@@ -159,6 +163,7 @@ def _load_case(session: Session, case_id: int) -> TestCase:
 def precheck_case(
     case_id: int,
     env_id: Optional[int] = None,
+    platform: str = Query(default="android"),
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
@@ -166,8 +171,9 @@ def precheck_case(
     from backend.autojs_export.generator import build_case_script
 
     case = _load_case(session, case_id)
-    case_script = build_case_script(session, case, env_id=env_id)
-    return precheck_case_script(case_script, project_root=PROJECT_ROOT)
+    platform = normalize_platform(platform)
+    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
+    return precheck_case_script(case_script, project_root=PROJECT_ROOT, platform=platform)
 
 
 @router.post("/cases/{case_id}/export")
@@ -175,15 +181,17 @@ def export_case(
     case_id: int,
     format: str = Query(default="zip", pattern="^(zip|file)$"),
     env_id: Optional[int] = None,
+    platform: str = Query(default="android"),
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
     """导出单用例脚本包（zip 目录包或单文件 .js）。"""
     case = _load_case(session, case_id)
+    platform = normalize_platform(platform)
     if format == "file":
-        result = packager.build_single_file(session, case, env_id=env_id)
+        result = packager.build_single_file(session, case, env_id=env_id, platform=platform)
         return _file_response(result["content"], result["filename"], "application/javascript")
-    result = packager.build_case_package(session, case, env_id=env_id)
+    result = packager.build_case_package(session, case, env_id=env_id, platform=platform)
     return _file_response(result["content"], result["filename"], "application/zip")
 
 
@@ -232,7 +240,7 @@ def export_cases_batch(
 
     batch_name = request.name or (f"folder_{request.folder_id}" if request.folder_id else "batch")
     result = packager.build_batch_package(
-        session, cases, env_id=request.env_id, batch_name=batch_name
+        session, cases, env_id=request.env_id, batch_name=batch_name, platform=normalize_platform(request.platform)
     )
     return _file_response(result["content"], result["filename"], "application/zip")
 
@@ -241,13 +249,14 @@ def export_cases_batch(
 def precheck_scenario(
     scenario_id: int,
     env_id: Optional[int] = None,
+    platform: str = Query(default="android"),
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="场景不存在")
-    result = packager.build_scenario_package(session, scenario, env_id=env_id)
+    result = packager.build_scenario_package(session, scenario, env_id=env_id, platform=normalize_platform(platform))
     return result["precheck"]
 
 
@@ -255,13 +264,14 @@ def precheck_scenario(
 def export_scenario(
     scenario_id: int,
     env_id: Optional[int] = None,
+    platform: str = Query(default="android"),
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="场景不存在")
-    result = packager.build_scenario_package(session, scenario, env_id=env_id)
+    result = packager.build_scenario_package(session, scenario, env_id=env_id, platform=normalize_platform(platform))
     return _file_response(result["content"], result["filename"], "application/zip")
 
 
@@ -298,6 +308,11 @@ def register_device(
         device = Device(serial=serial, platform=platform, status="IDLE")
     device.platform = platform
     device.connection_type = "wda" if platform == "ios" else "autojs6"
+    device.app_last_seen_at = now
+    device.app_logged_out_at = None
+    device.app_owner_id = current_user.id
+    device.app_executor_status = payload.executor_status if payload.executor_status in {"READY", "NOT_READY", "RUNNING"} else "UNKNOWN"
+    device.status = "BUSY" if device.app_executor_status == "RUNNING" else "IDLE"
     if payload.model:
         device.model = str(payload.model)
     if payload.brand:
@@ -320,6 +335,21 @@ def register_device(
         "device_serial": serial,
         "server_time": now.isoformat(),
     }
+
+
+@device_router.post("/logout")
+def logout_device(payload: DeviceRegisterPayload, session: Session = Depends(get_session),
+                  current_user: User = Depends(deps.get_current_user)):
+    device = session.exec(select(Device).where(Device.serial == _device_serial_for(payload))).first()
+    if device and is_app_device(device):
+        if device.app_owner_id != current_user.id:
+            raise HTTPException(403, "只能退出当前账号注册的 App 设备")
+        device.app_logged_out_at = datetime.now()
+        device.status = "OFFLINE"
+        device.app_executor_status = "UNKNOWN"
+        session.add(device)
+        session.commit()
+    return {"ok": True}
 
 
 @device_router.get("/pending")
@@ -657,6 +687,10 @@ def _process_device_report(
         batch_name = "App 设备端执行"
         executor_id = current_user.id
 
+    report_platform = normalize_platform(payload.platform)
+    if not payload.platform and task is not None and str(task.device_serial or "").startswith(DEVICE_SERIAL_PREFIX_IOS):
+        report_platform = "ios"
+
     execution = TestExecution(
         scenario_id=scenario.id if scenario else 0,
         scenario_name=display_name,
@@ -664,7 +698,7 @@ def _process_device_report(
         executor_id=executor_id,
         executor_name=current_user.full_name or current_user.username,
         device_serial=device_serial,
-        platform="android",
+        platform=report_platform,
         device_info=_device_display(payload),
         batch_id=batch_id,
         batch_name=batch_name,
@@ -846,17 +880,22 @@ def create_device_run_task(
 ):
     """创建 AutoDroid 设备端任务（生成脚本包等待设备领取）。"""
     kind = str(request.kind or "").strip().lower()
+    platform = normalize_platform(request.platform)
+    if request.device_serial:
+        device = session.exec(select(Device).where(Device.serial == request.device_serial)).first()
+        if device is not None:
+            platform = normalize_platform(device.platform)
     if kind == "case":
         case = session.get(TestCase, request.case_id) if request.case_id else None
         if not case:
             raise HTTPException(status_code=404, detail="用例不存在")
-        package = packager.build_case_package(session, case, env_id=request.env_id)
+        package = packager.build_case_package(session, case, env_id=request.env_id, platform=platform)
         display_name = request.name or f"用例: {case.name}"
     elif kind == "scenario":
         scenario = session.get(TestScenario, request.scenario_id) if request.scenario_id else None
         if not scenario:
             raise HTTPException(status_code=404, detail="场景不存在")
-        package = packager.build_scenario_package(session, scenario, env_id=request.env_id)
+        package = packager.build_scenario_package(session, scenario, env_id=request.env_id, platform=platform)
         display_name = request.name or f"场景: {scenario.name}"
     else:
         raise HTTPException(status_code=400, detail="kind 仅支持 case/scenario")

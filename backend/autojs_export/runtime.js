@@ -146,9 +146,17 @@ function captureScreen(ctx) {
     return holder.img;
 }
 
+// Native iOS image handles need explicit lifetime management. Android owns its
+// own image wrappers and does not expose these optional scope hooks.
+function withImageScope(work) {
+    var scope = images.__beginScope ? images.__beginScope() : null;
+    try { return work(); }
+    finally { if (scope !== null) images.__endScope(scope); }
+}
+
 function screenshotBase64Jpeg(ctx) {
     try {
-        return images.toBase64(captureScreen(ctx), "jpeg", 60);
+        return withImageScope(function () { return images.toBase64(captureScreen(ctx), "jpeg", 60); });
     } catch (e) {
         return null;
     }
@@ -261,6 +269,14 @@ function pageSignature() {
 // 图像匹配（复刻 PC find_template_match：多尺度 + TM_CCOEFF_NORMED + 可选 SSIM）
 // ---------------------------------------------------------------------------
 function matchTemplateMultiScale(shot, template, threshold, ssimThreshold) {
+    try {
+        return withImageScope(function () { return matchTemplateMultiScaleInner(shot, template, threshold, ssimThreshold); });
+    } finally {
+        if (images.__endScope) images.release(shot);
+    }
+}
+
+function matchTemplateMultiScaleInner(shot, template, threshold, ssimThreshold) {
     var shotGray = images.grayscale(shot);
     var tplGray = images.grayscale(template);
     var best = null;
@@ -593,13 +609,17 @@ ACTIONS.click_image = function (ctx, step) {
     var matchElapsed = (Date.now() - startedAt) / 1000;
 
     var before = pageSignature();
-    click(Math.round(match.x), Math.round(match.y));
+    if (!click(Math.round(match.x), Math.round(match.y))) {
+        fail(ERR.E2009, "图像已匹配，但点击返回失败");
+    }
     sleepMs(120);
     var after = pageSignature();
 
     // 匹配耗时很长且点击后页面无变化时，同位重试一次（镜像 PC tap-no-effect 检测）
     if (before && after && before === after && matchElapsed >= 3.0) {
-        click(Math.round(match.x), Math.round(match.y));
+        if (!click(Math.round(match.x), Math.round(match.y))) {
+            fail(ERR.E2009, "图像已匹配，但重试点击返回失败");
+        }
         sleepMs(120);
         var retry = pageSignature();
         if (retry && retry === before) {
@@ -648,6 +668,7 @@ ACTIONS.extract_by_ocr = function (ctx, step) {
         }
         var crop = images.clip(shot, rx1, ry1, rx2 - rx1, ry2 - ry1);
         var texts = ocr.recognizeText(crop);
+        if (images.__endScope) { images.release(crop); images.release(shot); }
         var lines = [];
         for (var i = 0; i < (texts || []).length; i++) {
             var line = String(texts[i] || "").replace(/^\s+|\s+$/g, "");
@@ -690,21 +711,22 @@ ACTIONS.swipe = function (ctx, step) {
     } else {
         x1 = w * 0.1; y1 = h * 0.5; x2 = w * 0.9; y2 = h * 0.5;
     }
-    swipe(x1, y1, x2, y2, 300);
+    if (!swipe(x1, y1, x2, y2, 300)) { fail(ERR.E2999, "滑动返回失败"); }
 };
 
 ACTIONS.back = function () {
-    back();
+    if (!back()) { fail(ERR.E2999, "返回操作失败，未检测到页面变化"); }
 };
 
 ACTIONS.home = function () {
-    home();
+    if (!home()) { fail(ERR.E2999, "返回桌面失败"); }
 };
 
 ACTIONS.start_app = function (ctx, step) {
-    var pkg = step.args.package;
+    var isIOS = String(ctx.platform || "").toLowerCase() === "ios";
+    var pkg = isIOS ? (step.args.bundle_id || step.args.app_id || step.args.package) : (step.args.package || step.args.app_id);
     if (!pkg) {
-        fail(ERR.E2008, "start_app 缺少可用的包名（app_key 未映射）");
+        fail(ERR.E2008, "start_app 缺少可用的应用标识（app_key 未映射）: " + (step.args.app_key || ""));
     }
     if (!app.launchPackage(pkg)) {
         fail(ERR.E2008, "启动应用失败: " + pkg);
@@ -724,6 +746,7 @@ ACTIONS.start_app = function (ctx, step) {
         sleepMs(200);
     }
     if (!sawForeground) {
+        if (isIOS) { fail(ERR.E2008, "启动应用后无法确认前台应用: " + pkg); }
         // currentPackage() 依赖无障碍服务；服务不可用时无法校验前台，
         // 不应误判为启动失败（后续步骤会因无障碍不可用而给出真实错误）。
         logLine(ctx, "start_app 无法校验前台（无障碍服务不可用），按启动成功继续: " + pkg);
@@ -733,9 +756,10 @@ ACTIONS.start_app = function (ctx, step) {
 };
 
 ACTIONS.stop_app = function (ctx, step) {
-    var pkg = step.args.package;
+    var isIOS = String(ctx.platform || "").toLowerCase() === "ios";
+    var pkg = isIOS ? (step.args.bundle_id || step.args.app_id || step.args.package) : (step.args.package || step.args.app_id);
     if (!pkg) {
-        fail(ERR.E2008, "stop_app 缺少可用的包名（app_key 未映射）");
+        fail(ERR.E2008, "stop_app 缺少可用的应用标识（app_key 未映射）: " + (step.args.app_key || ""));
     }
     // 策略 1：app.kill（需要 root 或 Shizuku）
     var killed = false;
@@ -747,6 +771,7 @@ ACTIONS.stop_app = function (ctx, step) {
     if (killed) {
         return;
     }
+    if (isIOS) { fail(ERR.E2008, "停止 iOS 应用失败: " + pkg); }
     // 策略 2：无障碍回退——打开应用详情页点击「强行停止」（无需 root）
     try {
         app.openAppSetting(pkg);
@@ -788,7 +813,7 @@ function executeStepOnce(ctx, step) {
     if (!handler) {
         fail(ERR.P1002, "不支持的动作: " + action);
     }
-    return handler(ctx, step);
+    return withImageScope(function () { return handler(ctx, step); });
 }
 
 var UNRESOLVED_VAR_RE = /\{\{\s*([A-Z0-9_]+)\s*\}\}/g;
@@ -834,6 +859,14 @@ function stepPlatformAllowed(ctx, step) {
     return false;
 }
 
+function stopRequested(ctx) {
+    if (typeof global !== "undefined" && typeof global.__AUTODROID_SHOULD_STOP__ === "function"
+        && global.__AUTODROID_SHOULD_STOP__()) {
+        ctx.aborted = true;
+    }
+    return !!ctx.aborted;
+}
+
 function runStep(ctx, rawStep) {
     var step = renderStep(ctx, rawStep);
     var order = step.order;
@@ -867,6 +900,13 @@ function runStep(ctx, rawStep) {
     var lastOutput = null;
 
     for (var attempt = 1; attempt <= totalAttempts; attempt++) {
+        if (stopRequested(ctx)) {
+            result.error = "用户请求停止执行";
+            result.error_code = "USER_STOPPED";
+            result.error_strategy = "ABORT";
+            logLine(ctx, "执行已停止，未执行步骤 " + order);
+            return result;
+        }
         try {
             lastOutput = executeStepOnce(ctx, step);
             result.status = "PASS";
@@ -921,6 +961,10 @@ function runCase(ctx, caseScript, entry) {
         var step = steps[i];
         var stepResult = runStep(ctx, step);
         caseResult.steps.push(stepResult);
+        if (ctx.aborted) {
+            caseResult.success = false;
+            break;
+        }
         if (stepResult.status === "FAIL") {
             caseResult.success = false;
             var strategy = String(step.error_strategy || "ABORT").toUpperCase();
@@ -947,6 +991,7 @@ function runScenario(ctx, entries, modules) {
     var forceContinue = !!(ctx.manifest && ctx.manifest.kind === "batch");
     for (var i = 0; i < entries.length; i++) {
         var result = runCase(ctx, modules[i], entries[i]);
+        if (ctx.aborted) break;
         if (!result.success) {
             var strategy = "ABORT";
             for (var j = result.steps.length - 1; j >= 0; j--) {
@@ -994,7 +1039,7 @@ function deviceInfo(ctx) {
 
 function buildReportPayload(ctx) {
     var success = true;
-    var aborted = false;
+    var aborted = !!ctx.aborted;
     for (var i = 0; i < ctx.caseResults.length; i++) {
         if (!ctx.caseResults[i].success) success = false;
     }
@@ -1041,10 +1086,16 @@ function uploadReport(ctx, payload) {
             }
             return true;
         }
-        logLine(ctx, "上报失败: HTTP " + (res ? res.statusCode : "?"));
+        var detail = "";
+        if (res && res.statusCode === 0) {
+            try { detail = String(res.body.string() || "").substring(0, 500); } catch (ignored) { }
+        }
+        ctx.uploadError = "HTTP " + (res ? res.statusCode : "?") + (detail ? "：" + detail : "");
+        logLine(ctx, "上报失败: " + ctx.uploadError);
         return false;
     } catch (e) {
-        logLine(ctx, "上报失败: " + (e.message || e));
+        ctx.uploadError = String(e.message || e);
+        logLine(ctx, "上报失败: " + ctx.uploadError);
         return false;
     }
 }
@@ -1066,14 +1117,15 @@ function finish(ctx) {
     if (uploadOk && ctx.uploadResponse) {
         // 回写上报响应（execution_id / report_id），供 App 端展示与跳转报告
         payload.upload_response = ctx.uploadResponse;
-        try {
-            files.write(reportPath, JSON.stringify(payload));
-        } catch (e) {
-            logLine(ctx, "回写上报响应失败: " + (e.message || e));
-        }
     }
+    // Persist upload diagnostics on failure too; the app can retry this report.
+    payload.upload_error = ctx.uploadError || null;
+    try { files.write(reportPath, JSON.stringify(payload)); }
+    catch (e) { logLine(ctx, "回写上报结果失败: " + (e.message || e)); }
     var summary = {
+        aborted: payload.aborted,
         upload_ok: uploadOk,
+        upload_error: ctx.uploadError || null,
         report_path: reportPath,
         success: payload.success,
         cases: payload.cases.length
@@ -1116,7 +1168,7 @@ function createContext(manifest, baseDir, embeddedAssets) {
         // 是否发送飞书通知（默认发送；App 可逐次关闭）
         notify: runtimeConfig.notify !== false,
         // 目标平台：android（默认，兼容既有 App）/ ios（WDA fork）
-        platform: String(runtimeConfig.platform || "android"),
+        platform: String(runtimeConfig.platform || (manifest && manifest.platform) || "android").toLowerCase(),
         caseResults: [],
         exportedVariables: {},
         logLines: [],

@@ -5,6 +5,7 @@ import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleCl
 import { useRouter } from 'vue-router'
 import api from '@/api'
 import ScrcpyPlayer from '@/components/ScrcpyPlayer.vue'
+import { isAppDevice, isUsbDevice, connectionBadge, appStatusBadge } from '@/utils/deviceAccess'
 import { useClientMode } from '@/composables/useClientMode'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 
@@ -13,6 +14,22 @@ const router = useRouter()
 
 // ==================== 状态 ====================
 const devices = ref([])
+const bindingDevice = ref(null)
+const bindingSerial = ref('')
+const bindingBusy = ref(false)
+const bindingOptions = computed(() => devices.value.filter(d => !isAppDevice(d) && d.platform === bindingDevice.value?.platform &&
+  (!d.app_presence || d.app_presence.serial === bindingDevice.value?.app_presence?.serial)))
+const openBinding = (device) => { bindingDevice.value = device; bindingSerial.value = device.app_presence.bound_device_serial || '' }
+const saveBinding = async () => {
+  bindingBusy.value = true
+  try {
+    await api.bindAppDevice(bindingDevice.value.app_presence.serial, bindingSerial.value)
+    bindingDevice.value = null
+    await fetchDevices()
+    ElMessage.success('设备绑定已更新，两条连接的状态仍独立显示')
+  } catch (e) { ElMessage.error(e.response?.data?.detail || e.message) }
+  finally { bindingBusy.value = false }
+}
 const loading = ref(false)
 const loadError = ref('')
 const agentsExpanded = ref(false)
@@ -190,6 +207,7 @@ const confirmUnlock = async (device) => {
   } catch { /* User dismissed the confirmation. */ }
 }
 const handleMaintenance = (command, device) => {
+  if (command === 'binding') return openBinding(device)
   const actions = { unlock: confirmUnlock, reboot: handleReboot, wda: handleCheckWda, wirelessOn: handleEnableWireless, wirelessOff: handleDisableWireless, delete: handleDeleteDevice }
   actions[command]?.(device)
 }
@@ -235,19 +253,6 @@ const handleReboot = async (device) => {
 }
 
 const isDeviceOffline = (device) => String(device?.status || '').trim().toUpperCase() === 'OFFLINE'
-
-/** 连接方式徽标：Android 远程USB > iOS 无线直连 > iOS WiFi 已配对 > iOS USB */
-const connectionBadge = (device) => {
-  if (!device) return null
-  if (device.connection_type === 'remote_usb') {
-    const suffix = device.agent_name ? ` · ${device.agent_name}` : ''
-    return { label: `🔌 远程USB${suffix}`, type: 'warning' }
-  }
-  if (device.platform !== 'ios') return null
-  if (device.wireless_enabled) return { label: '📶 无线', type: 'success' }
-  if (device.connection_type === 'network') return { label: '📶 WiFi已配对', type: 'info' }
-  return { label: '🔌 USB', type: 'info' }
-}
 
 // ==================== 远程接入点 ====================
 
@@ -480,9 +485,18 @@ onBeforeUnmount(() => {
             <el-tag v-if="connectionBadge(device)" :type="connectionBadge(device).type" size="small" effect="plain">
               {{ connectionBadge(device).label }}
             </el-tag>
-            <el-tag :type="statusTagType(device.status)" size="small" effect="light">
+            <el-tag v-if="!isAppDevice(device) && !isUsbDevice(device)" :type="statusTagType(device.status)" size="small" effect="light">
               {{ statusLabel(device.status) }}
             </el-tag>
+            <el-tag v-if="!isAppDevice(device) && device.app_presence" :type="appStatusBadge(device).type" size="small" effect="plain">
+              {{ appStatusBadge(device).label }}
+            </el-tag>
+            <el-dropdown v-if="device.app_presence" trigger="click" @command="command => handleMaintenance(command, device)">
+              <el-button link aria-label="App 设备操作">更多</el-button>
+              <template #dropdown><el-dropdown-menu>
+                <el-dropdown-item command="binding">{{ device.app_presence.bound_device_serial ? '管理同机绑定' : '绑定有线／无线设备' }}</el-dropdown-item>
+              </el-dropdown-menu></template>
+            </el-dropdown>
           </div>
         </header>
 
@@ -501,15 +515,15 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" class="mobile-ios-hint">
+        <div v-if="!isAppDevice(device) && device.platform === 'ios' && device.status === 'WDA_DOWN'" class="mobile-ios-hint">
           WDA 未就绪：请插线点「启动WDA」；无线使用请在 WDA 正常后点「启用无线」再拔线。
         </div>
 
-        <div class="mobile-device-actions">
+        <div v-if="!isAppDevice(device)" class="mobile-device-actions">
           <el-button
             :icon="Picture"
             @click="handleScreenshot(device)"
-            :disabled="device.status === 'OFFLINE'"
+            :disabled="!device.host_control_available"
           >
             快照
           </el-button>
@@ -729,8 +743,11 @@ onBeforeUnmount(() => {
                 <el-tag v-if="connectionBadge(device)" :type="connectionBadge(device).type" size="small" effect="plain">
                   {{ connectionBadge(device).label }}
                 </el-tag>
-                <el-tag :type="statusTagType(device.status)" size="small" effect="light">
+                <el-tag v-if="!isAppDevice(device) && !isUsbDevice(device)" :type="statusTagType(device.status)" size="small" effect="light">
                   {{ statusLabel(device.status) }}
+                </el-tag>
+                <el-tag v-if="!isAppDevice(device) && device.app_presence" :type="appStatusBadge(device).type" size="small" effect="plain">
+                  {{ appStatusBadge(device).label }}
                 </el-tag>
               </div>
             </div>
@@ -758,24 +775,25 @@ onBeforeUnmount(() => {
               <span class="info-label">屏幕分辨率</span>
               <span class="info-value">{{ device.resolution || '—' }}</span>
             </div>
-            <div v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" class="ios-hint down">
+            <div v-if="!isAppDevice(device) && device.platform === 'ios' && device.status === 'WDA_DOWN'" class="ios-hint down">
               <span>WDA 未就绪：请插线点「启动WDA」；无线使用请在 WDA 正常后点「启用无线」再拔线。</span>
             </div>
           </div>
 
           <!-- Footer -->
           <div class="card-footer">
-            <el-button link :icon="Picture" @click="handleScreenshot(device)" :disabled="device.status === 'OFFLINE'">查看屏幕</el-button>
-            <el-button v-if="device.status === 'BUSY'" link type="danger" :loading="stopLoadingSerial === device.serial" @click="handleStopExecution(device)">终止执行</el-button>
-            <el-button v-if="device.platform === 'ios' && device.status === 'WDA_DOWN'" link type="primary" :loading="wdaCheckingSerial === device.serial" @click="handleCheckWda(device)">启动 WDA</el-button>
-            <el-dropdown trigger="click" @command="command => handleMaintenance(command, device)">
+            <el-button v-if="!isAppDevice(device)" link :icon="Picture" @click="handleScreenshot(device)" :disabled="!device.host_control_available">查看屏幕</el-button>
+            <el-button v-if="!isAppDevice(device) && device.status === 'BUSY'" link type="danger" :loading="stopLoadingSerial === device.serial" @click="handleStopExecution(device)">终止执行</el-button>
+            <el-button v-if="!isAppDevice(device) && device.platform === 'ios' && device.status === 'WDA_DOWN'" link type="primary" :loading="wdaCheckingSerial === device.serial" @click="handleCheckWda(device)">启动 WDA</el-button>
+            <el-dropdown v-if="!isAppDevice(device) || isDeviceOffline(device) || device.app_presence" trigger="click" @command="command => handleMaintenance(command, device)">
               <el-button link aria-label="设备维护操作">更多</el-button>
               <template #dropdown><el-dropdown-menu>
-                <el-dropdown-item command="unlock" :disabled="device.status === 'OFFLINE'">释放设备锁</el-dropdown-item>
-                <el-dropdown-item v-if="device.platform !== 'ios'" command="reboot" :disabled="device.status === 'OFFLINE'">重启设备</el-dropdown-item>
-                <el-dropdown-item v-if="device.platform === 'ios'" command="wda" :disabled="['OFFLINE', 'BUSY'].includes(device.status) || wdaCheckingSerial === device.serial">启动 WDA</el-dropdown-item>
-                <el-dropdown-item v-if="device.platform === 'ios' && !device.wireless_enabled" command="wirelessOn" :disabled="['OFFLINE', 'BUSY'].includes(device.status) || wirelessLoadingSerial === device.serial">启用无线</el-dropdown-item>
-                <el-dropdown-item v-if="device.platform === 'ios' && device.wireless_enabled" command="wirelessOff" :disabled="device.status === 'BUSY' || wirelessLoadingSerial === device.serial">关闭无线</el-dropdown-item>
+                <el-dropdown-item v-if="device.app_presence" command="binding">{{ device.app_presence.bound_device_serial ? '管理同机绑定' : '绑定有线／无线设备' }}</el-dropdown-item>
+                <el-dropdown-item v-if="!isAppDevice(device)" command="unlock" :disabled="device.status === 'OFFLINE'">释放设备锁</el-dropdown-item>
+                <el-dropdown-item v-if="!isAppDevice(device) && device.platform !== 'ios'" command="reboot" :disabled="device.status === 'OFFLINE'">重启设备</el-dropdown-item>
+                <el-dropdown-item v-if="!isAppDevice(device) && device.platform === 'ios'" command="wda" :disabled="['OFFLINE', 'BUSY'].includes(device.status) || wdaCheckingSerial === device.serial">启动 WDA</el-dropdown-item>
+                <el-dropdown-item v-if="!isAppDevice(device) && device.platform === 'ios' && !device.wireless_enabled" command="wirelessOn" :disabled="['OFFLINE', 'BUSY'].includes(device.status) || wirelessLoadingSerial === device.serial">启用无线</el-dropdown-item>
+                <el-dropdown-item v-if="!isAppDevice(device) && device.platform === 'ios' && device.wireless_enabled" command="wirelessOff" :disabled="device.status === 'BUSY' || wirelessLoadingSerial === device.serial">关闭无线</el-dropdown-item>
                 <el-dropdown-item v-if="isDeviceOffline(device)" command="delete" divided :disabled="deleteLoadingSerial === device.serial">删除离线设备</el-dropdown-item>
               </el-dropdown-menu></template>
             </el-dropdown>
@@ -878,6 +896,18 @@ onBeforeUnmount(() => {
     </el-dialog>
 
   </div>
+  <el-dialog :model-value="!!bindingDevice" title="绑定同一台手机" width="min(480px, 92vw)" @close="bindingDevice = null">
+    <p>请确认两条记录属于同一台手机。绑定只合并展示，App 与 USB／WDA 状态独立判断。</p>
+    <el-select v-model="bindingSerial" placeholder="选择同平台设备" clearable style="width: 100%">
+      <el-option label="不绑定（分别显示）" value="" />
+      <el-option v-for="item in bindingOptions" :key="item.serial" :value="item.serial"
+        :label="`${item.custom_name || item.market_name || item.model} · ${item.serial}`" />
+    </el-select>
+    <template #footer>
+      <el-button @click="bindingDevice = null">取消</el-button>
+      <el-button type="primary" :loading="bindingBusy" @click="saveBinding">保存</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>

@@ -539,6 +539,9 @@ export default {
     syncDevices() {
         return api.post('/devices/sync')
     },
+    bindAppDevice(serial, physicalSerial) {
+        return api.post(`/devices/${encodeURIComponent(serial)}/app-binding`, { physical_serial: physicalSerial || null })
+    },
     getDeviceScreenshot(serial) {
         return api.get(`/devices/${serial}/screenshot`, { timeout: 30000 })
     },
@@ -650,16 +653,16 @@ export default {
 
     // AutoDroid 脚本导出与设备端执行任务
     autojs: {
-        precheckCase: (id, envId) => api.get(`/autojs/cases/${id}/precheck`, { params: envId ? { env_id: envId } : {} }),
-        exportCase: (id, format = 'zip', envId) => api.post(`/autojs/cases/${id}/export`, null, {
-            params: { format, ...(envId ? { env_id: envId } : {}) },
+        precheckCase: (id, envId, platform) => api.get(`/autojs/cases/${id}/precheck`, { params: { ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) } }),
+        exportCase: (id, format = 'zip', envId, platform) => api.post(`/autojs/cases/${id}/export`, null, {
+            params: { format, ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) },
             responseType: 'blob',
             timeout: 120000
         }),
         exportBatch: (data) => api.post('/autojs/cases/export-batch', data, { responseType: 'blob', timeout: 120000 }),
-        precheckScenario: (id, envId) => api.get(`/autojs/scenarios/${id}/precheck`, { params: envId ? { env_id: envId } : {} }),
-        exportScenario: (id, envId) => api.post(`/autojs/scenarios/${id}/export`, null, {
-            params: envId ? { env_id: envId } : {},
+        precheckScenario: (id, envId, platform) => api.get(`/autojs/scenarios/${id}/precheck`, { params: { ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) } }),
+        exportScenario: (id, envId, platform) => api.post(`/autojs/scenarios/${id}/export`, null, {
+            params: { ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) },
             responseType: 'blob',
             timeout: 120000
         }),

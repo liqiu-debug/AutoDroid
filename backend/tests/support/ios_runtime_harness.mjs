@@ -55,6 +55,13 @@ const logs = [];
 const apiCalls = [];
 let elementSeq = 1;
 let imageSeq = 1;
+const imageHandles = new Map();
+function makeImage(width, height) {
+  const handle = { id: imageSeq++, width, height };
+  imageHandles.set(handle.id, handle);
+  record('createImage', null, handle);
+  return handle;
+}
 const elementRegistry = new Map();
 let reportPayload = null;
 
@@ -98,33 +105,32 @@ const adt = {
     return info;
   },
   screenshot() {
-    const handle = { id: imageSeq, width: 1170, height: 2532 };
-    imageSeq += 1;
+    const handle = makeImage(1170, 2532);
     record('screenshot', null, handle);
     return handle;
   },
   imageFromFile(filePath) {
-    const handle = { id: imageSeq, width: 40, height: 40 };
-    imageSeq += 1;
+    const handle = makeImage(40, 40);
     record('imageFromFile', { filePath }, handle);
     return fs.existsSync(resolvePath(filePath)) ? handle : null;
   },
   imageFromBase64() {
-    const handle = { id: imageSeq, width: 40, height: 40 };
-    imageSeq += 1;
+    const handle = makeImage(40, 40);
     return handle;
   },
   imageGrayscale(handle) {
     record('imageGrayscale', { handle });
-    return { id: imageSeq++, width: 1170, height: 2532 };
+    const source = imageHandles.get(handle);
+    return makeImage(source.width, source.height);
   },
   imageClip(handle, x, y, width, height) {
     record('imageClip', { handle, x, y, width, height });
-    return { id: imageSeq++, width: Math.max(1, width), height: Math.max(1, height) };
+    return makeImage(Math.max(1, width), Math.max(1, height));
   },
   imageScale(handle, sx, sy) {
     record('imageScale', { handle, sx, sy });
-    return { id: imageSeq++, width: 200, height: 100 };
+    const source = imageHandles.get(handle);
+    return makeImage(Math.round(source.width * sx), Math.round(source.height * sy));
   },
   imageToBase64() {
     record('imageToBase64');
@@ -133,7 +139,7 @@ const adt = {
   imageSave() {
     return true;
   },
-  releaseImage() {},
+  releaseImage(id) { record('releaseImage', { id }); imageHandles.delete(id); },
   matchTemplate() {
     record('matchTemplate');
     return null;
@@ -262,7 +268,8 @@ const adt = {
     return true;
   },
   fsEnsureDir(target) {
-    fs.mkdirSync(resolvePath(target), { recursive: true });
+    const full = resolvePath(target);
+    fs.mkdirSync(String(target).endsWith('/') ? full : path.dirname(full), { recursive: true });
     return true;
   },
   fsRemove(target) {
@@ -310,7 +317,7 @@ const sandbox = {
   }
 };
 sandbox.globalThis = sandbox;
-sandbox.global = sandbox;
+// Match a fresh JavaScriptCore context: the adapter must provide `global`.
 sandbox.setTimeout = (fn) => { try { fn(); } catch (error) { logs.push(`[harness-error] ${error}`); } return 0; };
 const context = vm.createContext(sandbox);
 
@@ -333,6 +340,7 @@ console.log(JSON.stringify({
   ok: exception === null && result !== null,
   exception,
   logs,
+  apiCalls,
   apiCallNames: [...new Set(apiCalls.map((call) => call.name))],
   apiCallCount: apiCalls.length,
   result,

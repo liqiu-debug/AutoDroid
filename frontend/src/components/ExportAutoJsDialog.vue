@@ -8,6 +8,8 @@ const props = defineProps({
     // { type: 'case'|'scenario'|'batch', caseId?, scenarioId?, caseIds?, folderId?, name? }
     target: { type: Object, default: null },
     envId: { type: [Number, String], default: null },
+    deviceSerial: { type: String, default: "" },
+    platform: { type: String, default: "" },
 })
 const emit = defineEmits(['update:modelValue'])
 
@@ -41,10 +43,10 @@ const loadPrecheck = async () => {
     loading.value = true
     try {
         if (targetType.value === 'case') {
-            const { data } = await api.autojs.precheckCase(props.target.caseId, props.envId)
+            const { data } = await api.autojs.precheckCase(props.target.caseId, props.envId, (props.platform || props.target?.platform || "android"))
             precheck.value = data
         } else if (targetType.value === 'scenario') {
-            const { data } = await api.autojs.precheckScenario(props.target.scenarioId, props.envId)
+            const { data } = await api.autojs.precheckScenario(props.target.scenarioId, props.envId, (props.platform || props.target?.platform || "android"))
             precheck.value = data
         }
     } catch (err) {
@@ -87,9 +89,9 @@ const handleDownload = async () => {
     try {
         let response
         if (targetType.value === 'case') {
-            response = await api.autojs.exportCase(props.target.caseId, format.value, props.envId)
+            response = await api.autojs.exportCase(props.target.caseId, format.value, props.envId, props.platform || props.target?.platform || "android")
         } else if (targetType.value === 'scenario') {
-            response = await api.autojs.exportScenario(props.target.scenarioId, props.envId)
+            response = await api.autojs.exportScenario(props.target.scenarioId, props.envId, props.platform || props.target?.platform || "android")
         } else {
             response = await api.autojs.exportBatch({
                 case_ids: props.target.caseIds || [],
@@ -117,6 +119,8 @@ const handleCreateTask = async () => {
             scenario_id: targetType.value === 'scenario' ? props.target.scenarioId : null,
             env_id: props.envId || null,
             name: props.target.name || null,
+            device_serial: props.deviceSerial || props.target.device_serial || null,
+            platform: props.platform || props.target.platform || null,
         }
         const { data } = await api.autojs.createTask(payload)
         taskCreated.value = data

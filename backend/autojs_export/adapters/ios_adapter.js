@@ -22,6 +22,10 @@
 (function (global) {
     "use strict";
 
+    // JavaScriptCore has no Node/AutoJs-style `global` alias. Generated main.js
+    // and runtime.js use it for configuration and the final execution result.
+    global.global = global;
+
     var ADT = global.__adt;
     if (!ADT) {
         throw new Error("AutoDroid 适配层缺少原生原语 global.__adt");
@@ -253,12 +257,22 @@
     // ------------------------------------------------------------------ //
     //  images / ocr
     // ------------------------------------------------------------------ //
+    var imageScopes = {}, imageSequence = 0;
     function wrapImage(handle) {
         if (!handle) return null;
+        imageScopes[handle.id] = ++imageSequence;
         return { __h: handle.id, width: Number(handle.width) || 0, height: Number(handle.height) || 0 };
     }
 
     global.images = {
+        __beginScope: function () { return imageSequence; },
+        __endScope: function (scope) {
+            Object.keys(imageScopes).forEach(function (id) {
+                if (imageScopes[id] > scope) {
+                    ADT.releaseImage(Number(id)); delete imageScopes[id];
+                }
+            });
+        },
         captureScreen: function () { return wrapImage(ADT.screenshot()); },
         requestScreenCapture: function () { return true; },
         read: function (path) { return wrapImage(ADT.imageFromFile(String(path))); },
@@ -298,7 +312,11 @@
         },
         ssim: function (a, b) { return Number(ADT.ssim(a.__h, b.__h)) || 0; },
         findImage: function () { return null; },
-        release: function (image) { if (image && image.__h) ADT.releaseImage(image.__h); }
+        release: function (image) {
+            if (image && image.__h !== undefined && imageScopes[image.__h] !== undefined) {
+                ADT.releaseImage(image.__h); delete imageScopes[image.__h];
+            }
+        }
     };
 
     global.ocr = {

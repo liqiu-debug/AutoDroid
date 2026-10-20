@@ -26,6 +26,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from backend.database import get_session
+from backend.device_presence import app_presence, is_app_device, refresh_app_presence, require_host_device
+from sqlalchemy.exc import IntegrityError
 from backend.device_sorting import sort_devices_for_display
 from backend.device_transport_metrics import device_transport_metrics
 from backend.feature_flags import delete_setting_value, get_setting_value, set_setting_value
@@ -33,6 +35,7 @@ from backend.models import Device, SystemSetting, TestExecution
 from backend.paths import project_path
 from backend.schemas import (
     DeviceRead,
+    DeviceAppBindingRequest,
     DeviceRenameRequest,
     DeviceSyncResponse,
     DeviceWirelessEnableRequest,
@@ -65,6 +68,7 @@ def _get_android_screenshot_task_lock() -> asyncio.Lock:
 
 def _ensure_android_device(device: Device, action: str) -> None:
     """ADB 操作仅支持 Android 设备。"""
+    require_host_device(device)
     platform = str(device.platform or "android").strip().lower()
     if platform != "android":
         raise HTTPException(
@@ -1218,13 +1222,31 @@ def _get_wireless_url_map(session: Session) -> Dict[str, str]:
     return result
 
 
+def _is_ios_app_device(device: Device) -> bool:
+    """App registrations use IDFV-based ios: identities, not USB UDIDs."""
+    return (
+        str(device.platform or "").lower() == "ios"
+        and str(device.connection_type or "").lower() == "wda"
+        and str(device.serial or "").startswith("ios:")
+    )
+
+
 def _build_device_reads(session: Session, devices: List[Device]) -> List[DeviceRead]:
     """ORM Device -> DeviceRead，并补充 wireless_enabled 计算字段。"""
     wireless_map = _get_wireless_url_map(session)
     payloads: List[DeviceRead] = []
+    physical_serials = {d.serial for d in devices if not is_app_device(d)}
+    bindings = {d.bound_device_serial: d for d in devices if is_app_device(d) and d.bound_device_serial in physical_serials}
     for device in devices:
+        if is_app_device(device) and device.bound_device_serial in physical_serials:
+            continue
         payload = DeviceRead.model_validate(device)
         payload.wireless_enabled = device.serial in wireless_map
+        payload.is_app_device = is_app_device(device)
+        payload.host_control_available = not payload.is_app_device and device.status in {"IDLE", "BUSY"}
+        app = device if payload.is_app_device else bindings.get(device.serial)
+        if app:
+            payload.app_presence = app_presence(app)
         payloads.append(payload)
     return payloads
 
@@ -1259,6 +1281,7 @@ async def list_devices(
     session: Session = Depends(get_session),
 ):
     """获取所有设备列表，并在需要时刷新设备在线/WDA 状态。"""
+    refresh_app_presence(session)
     devices = sort_devices_for_display(session.exec(select(Device)).all())
     
     # 实时检查哪些 Android 设备在线（iOS 设备默认保持上次同步状态）
@@ -1274,7 +1297,7 @@ async def list_devices(
         # 更新设备状态（仅 Android）
         status_updated = False
         for device in devices:
-            if getattr(device, "platform", "android") == "ios":
+            if getattr(device, "platform", "android") == "ios" or is_app_device(device):
                 continue  # iOS 设备跳过 ADB 检测
             if device.serial in online_serials:
                 if device.status == "OFFLINE":
@@ -1301,7 +1324,7 @@ async def list_devices(
         wireless_map = _get_wireless_url_map(session)
         for device in devices:
             platform = str(getattr(device, "platform", "android") or "android").strip().lower()
-            if platform != "ios":
+            if platform != "ios" or _is_ios_app_device(device):
                 continue
             is_offline = str(device.status or "").strip().upper() == "OFFLINE"
             if is_offline and device.serial not in wireless_map:
@@ -1323,6 +1346,28 @@ async def list_devices(
             devices = sort_devices_for_display(session.exec(select(Device)).all())
 
     return _build_device_reads(session, devices)
+
+
+@router.post("/{serial}/app-binding")
+def bind_app_device(serial: str, payload: DeviceAppBindingRequest, session: Session = Depends(get_session),
+                    current_user=Depends(get_current_user)):
+    app = session.exec(select(Device).where(Device.serial == serial)).first()
+    if not app or not is_app_device(app):
+        raise HTTPException(400, "请选择 App 接入的设备")
+    if app.app_owner_id != current_user.id:
+        raise HTTPException(403, "请使用注册此 App 的账号绑定；旧客户端需重新登录注册")
+    if payload.physical_serial:
+        physical = session.exec(select(Device).where(Device.serial == payload.physical_serial)).first()
+        if not physical or is_app_device(physical) or physical.platform != app.platform:
+            raise HTTPException(400, "只能绑定同平台的 USB 或 WDA 无线设备")
+    app.bound_device_serial = payload.physical_serial or None
+    session.add(app)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(409, "这台设备已绑定其他 App，请先解除原绑定")
+    return {"ok": True}
 
 
 @router.put("/{serial}/name", response_model=DeviceRead)
@@ -1351,6 +1396,7 @@ def delete_device(
     current_user=Depends(get_current_user),
 ):
     """删除离线设备信息。"""
+    refresh_app_presence(session)
     device = session.exec(select(Device).where(Device.serial == serial)).first()
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -1358,6 +1404,8 @@ def delete_device(
     if str(device.status or "").strip().upper() != "OFFLINE":
         raise HTTPException(status_code=400, detail="仅离线设备支持删除")
 
+    if session.exec(select(Device).where(Device.bound_device_serial == serial)).first():
+        raise HTTPException(409, "请先解除 App 绑定再删除设备")
     session.delete(device)
     session.commit()
     return {"message": f"设备 {serial} 已删除"}
@@ -1369,6 +1417,7 @@ def check_ios_wda(serial: str, session: Session = Depends(get_session)):
     手动启动/修复指定 iOS 设备 WDA，并同步回写设备状态。
     """
     device = session.exec(select(Device).where(Device.serial == serial)).first()
+    require_host_device(device)
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
 
@@ -1426,6 +1475,7 @@ def enable_ios_wireless(
     前置条件：WDA 当前健康（通常先插线「启动WDA」）；校验失败不落库。
     """
     device = session.exec(select(Device).where(Device.serial == serial)).first()
+    require_host_device(device)
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
     if str(device.platform or "android").strip().lower() != "ios":
@@ -1524,6 +1574,7 @@ def disable_ios_wireless(
 ):
     """关闭 iOS 无线模式：删除 ios_wda_url.{serial}，回归默认本地 relay 策略（幂等）。"""
     device = session.exec(select(Device).where(Device.serial == serial)).first()
+    require_host_device(device)
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
     if str(device.platform or "android").strip().lower() != "ios":
@@ -1565,6 +1616,7 @@ async def sync_devices(
     2. 并发获取每个设备的型号、版本、分辨率
     3. 与数据库 Merge（新增/更新/标记离线）
     """
+    refresh_app_presence(session)
     # Step 1: 解析 adb devices 输出
     try:
         raw = await _run_adb_command("devices")
@@ -1700,7 +1752,7 @@ async def sync_devices(
     for db_dev in all_db_devices:
         if db_dev.serial in all_online:
             continue
-        if str(db_dev.connection_type or "").strip().lower() == "autojs6":
+        if str(db_dev.connection_type or "").strip().lower() == "autojs6" or _is_ios_app_device(db_dev):
             # AutoDroid 设备端设备不依赖 adb，在线状态由 Agent 心跳维护（register 接口）
             continue
         is_ios = str(db_dev.platform or "android").strip().lower() == "ios"
@@ -1726,13 +1778,14 @@ async def sync_devices(
 
     # 查询最终结果
     all_devices = sort_devices_for_display(session.exec(select(Device)).all())
-    total_offline = sum(1 for d in all_devices if d.status == "OFFLINE")
+    payloads = _build_device_reads(session, all_devices)
+    total_online = sum(1 for d in payloads if d.status != "OFFLINE" or (d.app_presence or {}).get("status") == "ONLINE")
 
     return DeviceSyncResponse(
         synced=synced_count,
-        online=len(all_online),
-        offline=total_offline,
-        devices=_build_device_reads(session, all_devices),
+        online=total_online,
+        offline=len(payloads) - total_online,
+        devices=payloads,
     )
 
 
@@ -1778,6 +1831,7 @@ async def get_screenshot(serial: str, session: Session = Depends(get_session)):
     （最长边 ≤1280 的 JPEG）再转 Base64，全程不写磁盘。
     """
     db_device = session.exec(select(Device).where(Device.serial == serial)).first()
+    require_host_device(db_device)
     is_ios_device = bool(
         db_device and str(db_device.platform or "android").strip().lower() == "ios"
     )
@@ -1844,6 +1898,7 @@ async def unlock_device(
     - iOS: 根据 WDA 健康度恢复为 IDLE 或 WDA_DOWN
     """
     device = session.exec(select(Device).where(Device.serial == serial)).first()
+    require_host_device(device)
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
     platform = str(device.platform or "android").strip().lower()

@@ -301,6 +301,11 @@ class Device(SQLModel, table=True):
     connection_type: Optional[str] = Field(default=None)
     agent_name: Optional[str] = Field(default=None)  # 远程接入点（Agent）名称
     source_serial: Optional[str] = Field(default=None)  # 远程设备在接入机上的真实 USB serial
+    app_last_seen_at: Optional[datetime] = None
+    app_logged_out_at: Optional[datetime] = None
+    app_executor_status: str = Field(default="UNKNOWN")
+    app_owner_id: Optional[int] = None
+    bound_device_serial: Optional[str] = Field(default=None, unique=True)
     custom_name: Optional[str] = Field(default=None)  # 用户自定义设备名称
     market_name: Optional[str] = Field(default=None)  # 设备市场型号
     created_at: datetime = Field(default_factory=datetime.now)

@@ -44,6 +44,18 @@ class DeviceListWdaStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(device)
         self.assertEqual(device.status, "WDA_DOWN")
 
+    async def test_app_registered_ios_device_does_not_require_host_wda_relay(self):
+        device = self._add_device("ios:IDFV-123", "ios")
+        device.connection_type = "wda"
+        self.session.add(device)
+        self.session.commit()
+        with patch("backend.api.devices._run_adb_command", return_value=b"List of devices attached\n\n"), patch(
+            "backend.api.devices._check_ios_wda_health"
+        ) as health:
+            payload = await list_devices(refresh_ios_wda=True, session=self.session)
+        health.assert_not_called()
+        self.assertEqual(payload[0].status, "IDLE")
+
     async def test_list_devices_refresh_ios_wda_marks_down_when_action_probe_fails(self):
         self._add_device("ios-1", "ios", status="IDLE")
 

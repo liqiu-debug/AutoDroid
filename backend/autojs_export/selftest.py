@@ -4,7 +4,7 @@
 
   1. 会话可用      —— WDA 是否在手机上活着（GET /status）；
   2. 脚本包可下发  —— 把本地生成的自检脚本包 POST 到 /autodroid/run；
-  3. 步骤可执行    —— 自检包会启动设置应用、截图 + OCR、滑动手势、返回/回桌面；
+  3. 步骤可执行    —— 自检包会启动设置应用、截图 + OCR、滑动手势、回桌面；
   4. 结果可回传    —— 轮询 /autodroid/status 拿到执行摘要与日志。
 
 自检脚本包与平台导出器同源：manifest / runtime.js / main.js / cases/*.js 的组装
@@ -86,7 +86,11 @@ def build_selftest_steps(
             _step(
                 order,
                 "start_app",
-                args={"app_key": None, "package": target_app},
+                args={
+                    "app_key": None,
+                    "bundle_id": target_app if platform == "ios" else None,
+                    "package": target_app if platform != "ios" else None,
+                },
                 description=f"启动应用 {target_app}",
             )
         )
@@ -106,7 +110,7 @@ def build_selftest_steps(
                 "output_var": "SELFTEST_TEXT",
             },
             timeout=15,
-            error_strategy="WARNING" if not expect_text else "ABORT",
+            error_strategy="IGNORE" if not expect_text else "ABORT",
             description="截图 + OCR 自检（整屏任意文本）",
         )
     )
@@ -138,8 +142,12 @@ def build_selftest_steps(
         )
         order += 1
 
-    steps.append(_step(order, "back", description="返回自检"))
-    order += 1
+    # iOS Settings starts at its root and has no system Back button. A back
+    # action here has no valid destination and must not be treated as success.
+    # Back is tested separately after entering a known navigation child page.
+    if platform != "ios":
+        steps.append(_step(order, "back", description="返回自检"))
+        order += 1
     steps.append(_step(order, "home", description="回桌面自检"))
     return steps
 
@@ -220,7 +228,12 @@ def _http(method: str, url: str, payload: Optional[dict] = None, timeout: float 
         parsed = json.loads(body) if body else None
     except Exception:
         parsed = None
-    return {"ok": 200 <= status < 300, "status": status, "body": parsed, "raw": body}
+    # WDA wraps route payloads in a WebDriver `value` envelope.
+    if isinstance(parsed, dict) and isinstance(parsed.get("value"), dict):
+        parsed = parsed["value"]
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    return {"ok": 200 <= status < 300 and not error, "status": status,
+            "body": parsed, "raw": body, "error": error}
 
 
 def run_selftest(
@@ -302,7 +315,7 @@ def run_selftest(
             print(f"      {line}")
         print(f"[4/4] 执行摘要: {json.dumps(result, ensure_ascii=False)}")
 
-    ok = bool(result) and not result.get("error")
+    ok = result.get("success") is True and not result.get("error")
     return {
         "ok": ok,
         "stage": "finished",
@@ -310,7 +323,7 @@ def run_selftest(
         "status": last_status,
         "result": result,
         "logs": logs,
-        "message": "自检通过" if ok else f"自检失败: {result.get('error') or '未取得执行摘要'}",
+        "message": "自检通过" if ok else f"自检失败: {result.get('error') or ('用例未成功完成' if 'success' in result else '未取得执行摘要')}",
     }
 
 
