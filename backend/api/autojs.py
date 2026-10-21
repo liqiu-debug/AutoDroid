@@ -563,6 +563,27 @@ def _process_device_report(
     payload: DeviceReportPayload,
     current_user: User,
 ) -> Dict[str, Any]:
+    # Authentication may have opened a read transaction. Acquire SQLite's write
+    # reservation before looking up the run, including across server processes.
+    # Keep persistence atomic so simultaneous uploads cannot both create it.
+    session.commit()
+    try:
+        connection = session.connection()
+        if connection.dialect.name == "sqlite":
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        result = _persist_device_report(session, payload, current_user)
+        session.commit()
+        return result
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _persist_device_report(
+    session: Session,
+    payload: DeviceReportPayload,
+    current_user: User,
+) -> Dict[str, Any]:
     # 两种上报来源：
     # 1) Agent 领取的任务（task_id）：任务状态收尾 + 报告 + 通知；
     # 2) App 直跑（run_id，无任务）：按 run_id 幂等落库，不涉及任务表。
@@ -587,6 +608,22 @@ def _process_device_report(
             raise HTTPException(status_code=400, detail="App 直跑上报需要 case_id 或 scenario_id")
         ref_case_id = payload.case_id
         ref_scenario_id = payload.scenario_id
+
+    # A lost HTTP response can make either app upload the same completed run
+    # again. Return the original record without generating a second notification.
+    previous = []
+    if task is not None and task.execution_id:
+        existing = session.get(TestExecution, task.execution_id)
+        previous = [existing] if existing else []
+    elif task is None:
+        previous = session.exec(
+            select(TestExecution).where(TestExecution.batch_id == payload.run_id)
+        ).all()
+        if any(item.executor_id != current_user.id for item in previous):
+            raise HTTPException(status_code=409, detail="运行编号已被其他账号使用")
+    completed = next((item for item in previous if item.status != "RUNNING"), None)
+    if completed is not None:
+        return {"execution_id": completed.id, "status": completed.status, "report_id": completed.report_id}
 
     scenario: Optional[TestScenario] = None
     case: Optional[TestCase] = None
@@ -615,26 +652,23 @@ def _process_device_report(
             .where(ScenarioStep.scenario_id == scenario.id)
             .order_by(ScenarioStep.order)
         ).all()
-        by_case_id = {
-            int(item.case_id): item for item in reported_cases if item.case_id is not None
-        }
-        consumed: List[int] = []
+        remaining = list(reported_cases)
         for scenario_step in scenario_steps:
-            matched = by_case_id.get(int(scenario_step.case_id))
-            if matched is None and len(reported_cases) > len(consumed):
-                # 兜底：按顺序取未被消费的上报结果
-                for candidate in reported_cases:
-                    key = int(candidate.case_id or 0)
-                    if key not in consumed:
-                        matched = candidate
-                        break
-            if matched is not None:
-                consumed.append(int(matched.case_id or 0))
+            # Each scenario occurrence consumes one result, including repeated
+            # references to the same case. Never borrow another case's result.
+            index = next((i for i, item in enumerate(remaining)
+                          if item.case_id == scenario_step.case_id), None)
+            if index is None:
+                index = next((i for i, item in enumerate(remaining) if item.case_id is None), None)
+            matched = remaining.pop(index) if index is not None else None
+            if matched is not None and not matched.alias:
+                matched = matched.model_copy(update={"alias": scenario_step.alias})
             target_case = session.get(TestCase, scenario_step.case_id)
             if matched is None and target_case is not None:
                 matched = DeviceReportCase(
                     case_id=target_case.id,
                     name=target_case.name,
+                    alias=scenario_step.alias,
                     success=False,
                     steps=[DeviceReportStep(
                         order=0,
@@ -663,29 +697,22 @@ def _process_device_report(
         if old_execution:
             session.delete(old_execution)
 
-    # 幂等：任务重报按 task.execution_id 重置；App 直跑按 batch_id == run_id 重置
-    if task is not None and task.execution_id:
-        _delete_execution_with_results(task.execution_id)
-        session.commit()
-    elif task is None and payload.run_id:
-        previous = session.exec(
-            select(TestExecution).where(TestExecution.batch_id == payload.run_id)
-        ).all()
-        for old_execution in previous:
-            _delete_execution_with_results(old_execution.id)
-        if previous:
-            session.commit()
+    # Only incomplete records are rebuilt; completed runs returned above.
+    for old_execution in previous:
+        _delete_execution_with_results(old_execution.id)
+    if previous:
+        session.flush()
 
     if task is not None:
         device_serial = task.device_serial
         batch_id = None
-        batch_name = "AutoDroid 设备端执行"
         executor_id = task.created_by or current_user.id
     else:
         device_serial = _serial_from_device(payload)
         batch_id = payload.run_id
-        batch_name = "App 设备端执行"
         executor_id = current_user.id
+    # 报告中心标题展示用例/场景名；执行方式（App/平台）由 run_source 表达。
+    batch_name = display_name
 
     report_platform = normalize_platform(payload.platform)
     if not payload.platform and task is not None and str(task.device_serial or "").startswith(DEVICE_SERIAL_PREFIX_IOS):
@@ -702,10 +729,11 @@ def _process_device_report(
         device_info=_device_display(payload),
         batch_id=batch_id,
         batch_name=batch_name,
+        run_source="app",
     )
     execution.start_time = start_time
     session.add(execution)
-    session.commit()
+    session.flush()
     session.refresh(execution)
 
     case_entries: List[Dict[str, Any]] = []
@@ -723,7 +751,7 @@ def _process_device_report(
             global_step_order=global_step_order,
         )
         case_entries.append(entry)
-    session.commit()
+    session.flush()
 
     overall_status = _aggregate_status(case_entries, bool(payload.aborted))
 

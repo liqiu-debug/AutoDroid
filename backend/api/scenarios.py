@@ -444,7 +444,8 @@ async def run_scenario_api(
                 platform=meta.get("platform"),
                 device_info=meta.get("device_info"),
                 batch_id=batch_id,
-                batch_name=f"{scenario.name} 并发运行"
+                batch_name=f"{scenario.name} 并发运行",
+                run_source="platform",
             )
             session.add(execution)
             session.commit()
@@ -788,6 +789,7 @@ async def websocket_run_scenario(websocket: WebSocket, scenario_id: int, env_id:
                 device_info=ws_init_meta.get("device_info"),
                 batch_id=batch_id,
                 batch_name=f"{scenario.name} 实时运行",
+                run_source="platform",
             )
             session.add(execution)
             session.commit()

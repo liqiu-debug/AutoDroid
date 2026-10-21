@@ -6,7 +6,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
-import { runStatusTagType } from '@/utils/statusMeta'
+import { runStatusTagType, runSourceLabel } from '@/utils/statusMeta'
 import { useUserStore } from '@/stores/useUserStore'
 import { compatibilityExecutionMode, packageSnapshotLabel } from '@/utils/compatibilityReplay'
 import {
@@ -750,8 +750,8 @@ onUnmounted(() => {
             >
                 <header class="mobile-report-card-header">
                     <div class="mobile-report-title">
-                        <button type="button" class="ad-name-button" @click="handleBatchView(group)">{{ group.batch_name }}</button>
-                        <span>{{ formatDate(group.start_time) }} · {{ group.executions.length }} 台设备</span>
+                        <button type="button" class="ad-name-button" @click="handleBatchView(group)">{{ group.scenario_name || group.batch_name }}</button>
+                        <span>{{ formatDate(group.start_time) }} · {{ group.executions.length }} 台设备 · {{ runSourceLabel(group.executions[0] || group) }}</span>
                     </div>
                     <el-tag :type="runStatusTagType(group.status)" size="small">
                         {{ group.status === 'RUNNING' ? '运行中' : group.status }}
@@ -852,8 +852,8 @@ onUnmounted(() => {
                             <el-table-column label="运行批次 / 场景" min-width="200">
                                 <template #default="{ row }">
                                     <div class="batch-name-cell">
-                                        <button type="button" class="ad-name-button" @click="handleBatchView(row)">{{ row.batch_name }}</button>
-                                        <span class="ad-metadata">{{ row.executions.length }} 台设备</span>
+                                        <button type="button" class="ad-name-button" @click="handleBatchView(row)">{{ row.scenario_name || row.batch_name }}</button>
+                                        <span class="ad-metadata">{{ row.executions.length }} 台设备 · {{ runSourceLabel(row.executions[0] || row) }}</span>
                                     </div>
                                 </template>
                             </el-table-column>
@@ -1306,7 +1306,7 @@ onUnmounted(() => {
     </div>
         <el-drawer v-model="batchDrawerVisible" :title="selectedBatch?.batch_name || '设备执行结果'" size="min(760px, 100vw)">
             <template v-if="selectedBatch">
-                <p class="batch-summary">{{ selectedBatch.executions.length }} 台设备 · {{ formatDate(selectedBatch.start_time) }} · {{ selectedBatch.executor_name || '—' }}</p>
+                <p class="batch-summary">{{ selectedBatch.executions.length }} 台设备 · {{ formatDate(selectedBatch.start_time) }} · {{ selectedBatch.executor_name || '—' }} · {{ runSourceLabel(selectedBatch.executions[0] || selectedBatch) }}</p>
                 <el-table :data="selectedBatch.executions" class="ad-table" row-key="id">
                     <el-table-column label="设备" min-width="160">
                         <template #default="{ row }"><button type="button" class="ad-name-button" @click="handleView(row.id)">{{ formatDeviceName(row.device_serial, row.device_info) }}</button></template>

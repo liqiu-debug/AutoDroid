@@ -1,8 +1,8 @@
 # AutoDroid App 接口契约
 
-Android 客户端 [AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)（内置 AutoJs6 引擎，`com.autodroid.runner`）通过以下接口与平台交互。所有请求需登录态（`Authorization: Bearer <access_token>` 或 API Token）。
+Android 客户端 [AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)（内置 AutoJs6 引擎，`com.autodroid.runner`）和 [AutoDroid-iOS](https://github.com/liqiu-debug/AutoDroid-iOS)（SwiftUI，通过同机 AutoDroid-WDA 执行）通过以下接口与平台交互。所有请求需登录态（`Authorization: Bearer <access_token>` 或 API Token）。
 
-> 本文档是平台与 App 之间的契约：改动 `/app-runs/*` 与 `/device-runs/*` 的路径、字段或语义时，需同步 App 客户端。iOS 客户端将复用同一套接口。
+> 本文档是平台与 App 之间的契约：改动 `/app-runs/*` 与 `/device-runs/*` 的路径、字段或语义时，需同步两个 App 客户端。
 
 ## 1. 登录
 
@@ -54,7 +54,7 @@ GET /app-runs/scenarios/{scenario_id}/script?env_id=<可选>
 ```
 
 App 侧处理：把 `manifest.json / runtime.js / main.js / case_files / assets` 原样写入运行目录，
-再写 `task_config.json`（见下），最后执行 `main.js`（经 AutoJs6 引擎，`Scripts.run`）。
+再写 `task_config.json`（见下），最后经 AutoJs6 引擎执行 `main.js`。Android App 对准备与执行阶段统一互斥，并等待引擎和上报结束后读取结果。
 
 **task_config.json（App 写入运行目录）**：
 ```json
@@ -89,7 +89,8 @@ POST /device-runs/report
 ```
 
 语义：
-- 幂等：同一 `run_id` 重复上报会覆盖同一条执行记录（不会产生重复记录）；
+- 幂等：同一 `run_id` 的已完成结果重复上报时返回原 `execution_id / status / report_id`，不重新落库或再次发送飞书通知；当前 SQLite 实现对并发回传也串行处理。其他账号复用该 `run_id` 返回 409；
+- 场景中重复引用同一个用例时，每次引用分别消费一条结果；缺失的引用记为执行中断，不复用前一次成功结果；
 - 步骤状态：`PASS / FAIL / WARNING / SKIP`；`error_code` 使用 E2xxx 语义；
 - 该接口即 App 与 Agent 共用的回传入口（Agent 任务带 `task_id`，App 直跑带 `run_id`）。
 

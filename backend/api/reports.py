@@ -51,6 +51,7 @@ class TestExecutionRead(BaseModel):
     duration: Optional[float] = None # Calculated duration in seconds
     batch_id: Optional[str] = None
     batch_name: Optional[str] = None
+    run_source: Optional[str] = None # app | platform
 
     def __init__(self, **data):
         super().__init__(**data)

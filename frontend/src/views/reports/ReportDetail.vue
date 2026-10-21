@@ -6,7 +6,7 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
-import { runStatusTagType as getStatusTagType } from '@/utils/statusMeta'
+import { runStatusTagType as getStatusTagType, runSourceLabel } from '@/utils/statusMeta'
 import { useClientMode } from '@/composables/useClientMode'
 import ExecutionCompareDialog from './ExecutionCompareDialog.vue'
 
@@ -319,6 +319,7 @@ onMounted(() => {
         <div v-if="execution" class="mobile-detail-meta">
             <span><el-icon><User /></el-icon>{{ execution.executor_name || 'System' }}</span>
             <span><el-icon><Timer /></el-icon>{{ formatDate(execution.start_time) }}</span>
+            <span>{{ runSourceLabel(execution) }}</span>
         </div>
 
 
@@ -418,6 +419,7 @@ onMounted(() => {
                  <span class="meta-item"><el-icon><User /></el-icon> {{ execution.executor_name || 'System' }}</span>
                  <span class="meta-item"><el-icon><Timer /></el-icon> {{ formatDate(execution.start_time) }}</span>
                  <span class="meta-item"><el-icon><Monitor /></el-icon> {{ formatDeviceName(execution.device_serial, execution.device_info) || 'Unknown Device' }}</span>
+                 <span class="meta-item">{{ runSourceLabel(execution) }}</span>
                  <el-button
                     type="primary"
                     plain

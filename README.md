@@ -93,9 +93,9 @@ Web 前端支持 PC、移动和自动识别三种客户端模式。自动模式�
 
 移动端还支持巡检报告列表与详情查看。用例编辑、场景复杂编排、变量与安装包管理、定时任务、专项测试配置、用户管理和系统配置仍需使用 PC 模式。
 
-## 移动端 App（Android）
+## 移动端 App（Android / iOS）
 
-除了 Web 端，平台提供原生 Android 客户端 **[AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)**（应用名 AutoDroid，`com.autodroid.runner`）：登录后直接在手机上执行用例与场景，结果回传平台生成报告，支持设备侧定时任务与执行完成通知；iOS 客户端规划中，将另建仓库。
+除了 Web 端，平台提供原生 Android 客户端 **[AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)**（应用名 AutoDroid，`com.autodroid.runner`）和 SwiftUI 客户端 **[AutoDroid-iOS](https://github.com/liqiu-debug/AutoDroid-iOS)**：登录后可在手机上执行用例与场景，结果回传平台生成报告，支持设备侧定时任务与执行完成通知。Android 内置 AutoJs6 引擎，iOS 将脚本交给同机 AutoDroid-WDA 执行。
 
 - 脚本下发与上报走 App 直跑接口（`/app-runs/cases/{id}/script`、`/app-runs/scenarios/{id}/script`、`/device-runs/report`），契约见 [App 接口契约](docs/APP_RUNNER_API.md)。
 - App 内置 AutoJs6 引擎，导出脚本与设备端执行说明见 [设备端脚本执行](docs/AUTOJS6_EXECUTION.md)。

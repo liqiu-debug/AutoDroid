@@ -71,6 +71,19 @@ export const deviceStatusTagType = (status) => DEVICE_STATUS_META[status]?.tagTy
 export const deviceStatusLabel = (status) => DEVICE_STATUS_META[status]?.label || status
 
 /**
+ * 执行方式标签：App（设备端 App 直跑/领取任务）| 平台（平台控机执行）。
+ * 兼容未回填 run_source 的历史数据（旧 batch_name 为固定设备端批次名）。
+ */
+export const runSourceLabel = (execution) => {
+    const source = String(execution?.run_source || '').trim().toLowerCase()
+    if (source === 'app') return 'App 执行'
+    if (source === 'platform') return '平台执行'
+    const batchName = String(execution?.batch_name || '')
+    if (batchName === 'App 设备端执行' || batchName === 'AutoDroid 设备端执行' || batchName === 'AutoJs6 设备端执行') return 'App 执行'
+    return '—'
+}
+
+/**
  * 执行对比 diff 分类元信息（延伸自执行状态映射）：
  * regressed 新失败(红) / fixed 已修复(绿) / still-failing 持续失败(灰红) /
  * unchanged 无变化(灰) / added 新增步骤 / removed 移除步骤

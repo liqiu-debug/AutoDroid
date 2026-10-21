@@ -1545,6 +1545,32 @@ def _migrate_app_device_presence(cursor) -> None:
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_device_app_binding ON device(bound_device_serial)")
 
 
+def _migrate_testexecution_run_source(cursor) -> None:
+    """testexecution.run_source：执行方式（app 设备端 App / platform 平台控机）。
+
+    历史设备端执行的批次名固定为「App 设备端执行」/「AutoDroid 设备端执行」/
+    「AutoJs6 设备端执行」，报告中心标题看不到用例/场景名；回填时改写为用例/场景名并标记来源。
+    """
+    if not _table_exists(cursor, "testexecution"):
+        return
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(testexecution)").fetchall()}
+    if "run_source" not in columns:
+        cursor.execute("ALTER TABLE testexecution ADD COLUMN run_source VARCHAR")
+        logger.info("Migration: ALTER TABLE testexecution ADD COLUMN run_source")
+
+    cursor.execute(
+        """
+        UPDATE testexecution
+        SET run_source = 'app',
+            batch_name = COALESCE(NULLIF(scenario_name, ''), batch_name)
+        WHERE batch_name IN ('App 设备端执行', 'AutoDroid 设备端执行', 'AutoJs6 设备端执行')
+        """
+    )
+    cursor.execute(
+        "UPDATE testexecution SET run_source = 'platform' WHERE run_source IS NULL OR run_source = ''"
+    )
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys")
@@ -1630,6 +1656,10 @@ def _run_migrations_with_conn(conn) -> None:
             ("20260930_028_api_testing", _migrate_api_testing_schema),
             ("20260930_029_api_testing_owners", _migrate_api_testing_owners),
             ("20261020_031_app_device_presence", _migrate_app_device_presence),
+            ("20261021_032_testexecution_run_source", _migrate_testexecution_run_source),
+            # 032 上线时历史标签清单不含「AutoJs6 设备端执行」，已被 032 错标为 platform；
+            # 重跑同一回填（按批次名匹配，幂等）修正这批记录。
+            ("20261021_033_testexecution_run_source_autojs6", _migrate_testexecution_run_source),
         ]
 
         for version, migration_func in migration_plan:

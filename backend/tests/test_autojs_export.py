@@ -3,6 +3,10 @@ import io
 import json
 import unittest
 import zipfile
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import FastAPI
@@ -83,6 +87,54 @@ class _Base(unittest.TestCase):
         self.session.add(step)
         self.session.commit()
         return step
+
+
+class DeviceReportConcurrencyTests(unittest.TestCase):
+    def test_simultaneous_retries_keep_one_execution_and_one_notification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = create_engine(f"sqlite:///{Path(directory) / 'reports.db'}",
+                                   connect_args={"check_same_thread": False})
+            SQLModel.metadata.create_all(engine)
+            with Session(engine) as session:
+                user = User(username="concurrent", hashed_password="unused")
+                case = TestCase(name="并发回传", steps=[])
+                session.add(user); session.add(case); session.commit()
+                user_id, case_id = user.id, case.id
+            payload = autojs_api.DeviceReportPayload(
+                run_id="same-run", case_id=case_id, notify=True,
+                cases=[autojs_api.DeviceReportCase(case_id=case_id, success=True, steps=[
+                    autojs_api.DeviceReportStep(order=1, action="sleep", status="PASS")])],
+            )
+            generating, release = threading.Event(), threading.Event()
+
+            def report(**kwargs):
+                generating.set()
+                if not release.wait(5):
+                    raise RuntimeError("Concurrent report test timed out")
+                return "concurrent.html"
+
+            def upload():
+                with Session(engine) as session:
+                    return autojs_api._process_device_report(session, payload, session.get(User, user_id))
+
+            with patch.object(autojs_api.report_generator, "generate_report", side_effect=report) as generate, \
+                 patch.object(autojs_api.NotificationService, "send_report_card") as notify, \
+                 ThreadPoolExecutor(max_workers=2) as workers:
+                first = workers.submit(upload)
+                try:
+                    self.assertTrue(generating.wait(5))
+                    second = workers.submit(upload)
+                    # The first upload holds persistence until its report is durable.
+                    with self.assertRaises(FutureTimeout):
+                        second.result(timeout=0.15)
+                finally:
+                    release.set()
+                self.assertEqual(first.result(timeout=5), second.result(timeout=5))
+                generate.assert_called_once()
+                notify.assert_called_once()
+            with Session(engine) as session:
+                self.assertEqual(len(session.exec(select(TestExecution)).all()), 1)
+            engine.dispose()
 
 
 class GeneratorTests(_Base):
@@ -397,7 +449,8 @@ class DeviceFlowTests(_Base):
         self.assertIsNotNone(execution)
         self.assertEqual(execution.device_serial, "autojs6:abc123")
         self.assertEqual(execution.platform, "android")
-        self.assertEqual(execution.batch_name, "AutoDroid 设备端执行")
+        self.assertEqual(execution.batch_name, execution.scenario_name)
+        self.assertEqual(execution.run_source, "app")
         results = self.session.exec(
             select(TestResult).where(TestResult.execution_id == execution.id).order_by(TestResult.step_order)
         ).all()
@@ -492,17 +545,58 @@ class DeviceFlowTests(_Base):
 
         execution = self.session.get(TestExecution, body["execution_id"])
         self.assertEqual(execution.batch_id, run_id)
-        self.assertEqual(execution.batch_name, "App 设备端执行")
+        self.assertEqual(execution.batch_name, case.name)
+        self.assertEqual(execution.run_source, "app")
         self.assertEqual(execution.device_serial, "autojs6:abc123")
         self.assertEqual(execution.scenario_name, case.name)
 
         # 重报同一 run_id：不产生重复执行记录
         with patch.object(autojs_api.report_generator, "generate_report", return_value="report-app-2.html"), \
-             patch.object(autojs_api.NotificationService, "send_report_card"):
+             patch.object(autojs_api.NotificationService, "send_report_card") as repeated_notify:
             resp2 = self.client.post("/api/device-runs/report", json=payload, headers=self.headers)
         self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.json(), body)
+        repeated_notify.assert_not_called()
         executions = self.session.exec(select(TestExecution)).all()
         self.assertEqual(len(executions), 1)
+
+    def test_scenario_report_consumes_each_repeated_case_result_once(self):
+        case = self._make_case_with_steps()
+        scenario = TestScenario(name="重复登录")
+        self.session.add(scenario)
+        self.session.commit()
+        self.session.refresh(scenario)
+        for order in (1, 2):
+            self.session.add(ScenarioStep(scenario_id=scenario.id, case_id=case.id,
+                                          order=order, alias=f"登录-{order}"))
+        self.session.commit()
+        payload = self._app_report_payload(case, "repeated-case", notify=False)
+        payload.pop("case_id")
+        payload.update(kind="scenario", scenario_id=scenario.id)
+        payload["cases"] = [
+            {"case_id": case.id, "success": True,
+             "steps": [{"order": 1, "action": "click", "status": "PASS"}]},
+            {"case_id": case.id, "success": False,
+             "steps": [{"order": 1, "action": "click", "status": "FAIL", "error": "第二次失败"}]},
+        ]
+        with patch.object(autojs_api.report_generator, "generate_scenario_report", return_value="repeated.html") as report:
+            response = self.client.post("/api/device-runs/report", json=payload, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        entries = report.call_args.kwargs["cases_results"]
+        self.assertEqual([entry["alias"] for entry in entries], ["登录-1", "登录-2"])
+        self.assertEqual([entry["steps"][0]["status"] for entry in entries], ["success", "failed"])
+        self.assertEqual(response.json()["status"], "FAIL")
+
+        # An omitted second occurrence must be a failure, not a duplicate PASS.
+        payload["run_id"] = "missing-repeated-case"
+        payload["cases"] = payload["cases"][:1]
+        with patch.object(autojs_api.report_generator, "generate_scenario_report", return_value="missing.html") as report:
+            response = self.client.post("/api/device-runs/report", json=payload, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        entries = report.call_args.kwargs["cases_results"]
+        self.assertEqual(entries[0]["steps"][0]["status"], "success")
+        self.assertIn("未上报", entries[1]["steps"][0]["error"])
+        self.assertEqual(response.json()["status"], "FAIL")
 
     def test_notify_flag_controls_feishu(self):
         case = self._make_case_with_steps()

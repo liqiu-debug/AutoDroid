@@ -627,9 +627,10 @@ const getStepTitle = (step) => {
   if (step.action === 'sleep') {
     target = step.value ? `${step.value}s` : '5s'
   } else if (step.action === 'assert_text') {
-    target = step.value || '-'
+    const matchMode = (step.options?.match_mode || step.args?.match_mode) === 'not_contains' ? '不包含' : '包含'
+    target = `${matchMode} ${step.value || step.args?.expected_text || '-'}`
   } else if (step.action === 'assert_image') {
-    const matchMode = step.options?.match_mode === 'not_exists' ? '不存在' : '存在'
+    const matchMode = (step.options?.match_mode || step.args?.match_mode) === 'not_exists' ? '不存在' : '存在'
     target = `${matchMode} ${target}`
   } else if (step.action === 'extract_by_ocr') {
     target = step.value || 'OCR_VAR'

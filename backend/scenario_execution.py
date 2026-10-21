@@ -690,7 +690,8 @@ def execute_scenario_batch_background(scenario_id: int, executor_name: str, env_
                 platform=meta.get("platform"),
                 device_info=meta.get("device_info"),
                 batch_id=batch_id,
-                batch_name=f"{scenario.name} 定时执行"
+                batch_name=f"{scenario.name} 定时执行",
+                run_source="platform",
             )
             session.add(execution)
             session.commit()

@@ -108,6 +108,7 @@ class TestExecution(SQLModel, table=True):
     report_id: Optional[str] = None # Filename of the generated HTML report
     batch_id: Optional[str] = Field(default=None, index=True) # UUID correlating multiple device runs
     batch_name: Optional[str] = None # Display name for the batch
+    run_source: Optional[str] = None # app（App/设备端执行）| platform（平台控机执行）
 
 
 class TestResult(SQLModel, table=True):
