@@ -12,6 +12,8 @@ from backend.core.security import SECRET_KEY, ALGORITHM
 from backend.core.api_tokens import hash_api_token, is_api_token, verify_api_token
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
+# 下载类接口兼容 ?token= 查询参数（浏览器 <a href> 直接触发下载无法携带 Authorization 头）
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/auth/token", auto_error=False)
 
 # last_used_at 写库节流：距上次更新超过该秒数才写，避免每个请求都写库
 API_TOKEN_LAST_USED_THROTTLE_SECONDS = 60
@@ -56,17 +58,21 @@ def _authenticate_api_token(
     return user
 
 
-async def get_current_user(
-    request: Request = None,
-    token: str = Depends(oauth2_scheme),
-    session: Session = Depends(get_session),
-) -> User:
-    credentials_exception = HTTPException(
+def _credentials_exception() -> HTTPException:
+    return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="登录状态无效或已过期，请重新登录",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
+
+def _authenticate_token(
+    request: Optional[Request],
+    token: str,
+    session: Session,
+    credentials_exception: HTTPException,
+) -> User:
+    """校验 Bearer 令牌（JWT 或 API Token）并返回属主用户。"""
     # API Token（机器凭证）路径：Bearer adk_...
     if is_api_token(token):
         return _authenticate_api_token(request, token, session, credentials_exception)
@@ -85,6 +91,30 @@ async def get_current_user(
     if user is None:
         raise credentials_exception
     return user
+
+
+async def get_current_user(
+    request: Request = None,
+    token: str = Depends(oauth2_scheme),
+    session: Session = Depends(get_session),
+) -> User:
+    return _authenticate_token(request, token, session, _credentials_exception())
+
+
+async def get_current_user_allow_query_token(
+    request: Request = None,
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    session: Session = Depends(get_session),
+) -> User:
+    """下载类接口专用：除 Authorization 头外兼容 ?token= 查询参数。
+
+    浏览器通过 <a href> 直接触发文件下载时无法携带 Authorization 头，
+    前端在 URL 查询参数附带登录态；仅限下载接口使用，勿用于普通写接口。
+    """
+    raw_token = token or (request.query_params.get("token") if request is not None else None)
+    if not raw_token:
+        raise _credentials_exception()
+    return _authenticate_token(request, raw_token, session, _credentials_exception())
 
 
 def is_api_token_auth(request: Optional[Request]) -> bool:

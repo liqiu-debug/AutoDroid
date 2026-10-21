@@ -27,7 +27,7 @@ from backend.execution_limiter import get_execution_limiter
 from backend.models import AppPackage, Device, User
 from backend.paths import project_path, project_relative_path, resolve_project_path
 from backend.schemas import AppPackageRead, PaginatedAppPackageRead
-from backend.api.deps import get_current_user
+from backend.api.deps import get_current_user, get_current_user_allow_query_token
 from backend.utils.apk_parser import parse_apk_info
 from backend.utils.ipa_parser import (
     IpaParseError,
@@ -936,9 +936,12 @@ def list_packages(
 def download_package(
     package_id: int,
     session: Session = Depends(get_session),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_allow_query_token),
 ):
-    """根据 ID 下载 APK 或 IPA 文件。"""
+    """根据 ID 下载 APK 或 IPA 文件。
+
+    浏览器直接导航下载（<a href>）无法携带 Authorization 头，允许 ?token= 兜底认证。
+    """
     pkg = session.get(AppPackage, package_id)
     if not pkg:
         raise HTTPException(status_code=404, detail="安装包不存在")
