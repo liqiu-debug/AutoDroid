@@ -900,10 +900,15 @@ def list_packages(
     page_size: int = Query(20, ge=1, le=100),
     keyword: Optional[str] = Query(None, description="按应用名/包名搜索"),
     platform: Optional[str] = Query(None, description="按 android/ios 平台过滤"),
+    package_name: Optional[str] = Query(None, description="按包名精确过滤"),
+    latest_only: bool = Query(False, description="仅返回最新版本"),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """分页返回安装包列表，按上传时间倒序排列。"""
+    """分页返回安装包列表，按上传时间倒序排列。
+
+    package_name + latest_only 组合即客户端「检查更新」的自查询形态。
+    """
     query = select(AppPackage)
 
     if keyword:
@@ -917,6 +922,12 @@ def list_packages(
         if normalized_platform not in {"android", "ios"}:
             raise HTTPException(status_code=400, detail="platform 仅支持 android 或 ios")
         query = query.where(AppPackage.platform == normalized_platform)
+
+    if package_name and package_name.strip():
+        query = query.where(AppPackage.package_name == package_name.strip())
+
+    if latest_only:
+        query = query.where(col(AppPackage.is_latest) == True)  # noqa: E712
 
     # 总数
     count_query = select(func.count()).select_from(query.subquery())
