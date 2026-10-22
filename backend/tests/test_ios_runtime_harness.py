@@ -79,8 +79,15 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
         for action, primitive in failures.items():
             with self.subTest(action=action):
                 empty = "[]" if primitive in ("ocr", "findElements") else "false"
+                # click 会退到坐标点击（tap），仅 elementClick 失败视为点击生效；
+                # 真正点不中需两条路径都失败。
+                extra = (
+                    "global.__adt.tap = function () { return false; };\n"
+                    if action == "click" and primitive != "tap" else ""
+                )
                 overrides = (
                     f"global.__adt.{primitive} = function () {{ return {empty}; }};\n"
+                    + extra +
                     "global.__adt.typeText = function () { return false; };\n"
                     # Advance timeout loops without sleeping in the native stub.
                     "var testClock = Date.now(); Date.now = function () { return testClock += 1000; };\n"
@@ -191,7 +198,10 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
                 selftest._step(2, "home"),
             ],
         })
-        bundle["main_js"] = "global.__adt.elementClick = function () { return false; };\n" + bundle["main_js"]
+        bundle["main_js"] = (
+            "global.__adt.elementClick = function () { return false; };\n"
+            "global.__adt.tap = function () { return false; };\n"
+        ) + bundle["main_js"]
         outcome = self._run_harness(bundle)
         self.assertIsNone(outcome["exception"])
         self.assertFalse(outcome["result"]["success"])
@@ -201,6 +211,23 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(steps[0]["status"], "FAIL")
         self.assertIn("点击", steps[0]["error"])
         self.assertTrue(outcome["reportJson"]["upload_response"])
+
+    def test_click_falls_back_to_coordinate_tap_when_element_click_fails(self):
+        """三星等机型 ACTION_CLICK 返回 false 时，退到元素中心坐标点击，步骤应判成功。"""
+        bundle = selftest.build_selftest_bundle("ios")
+        bundle["case_files"][0]["content"] = _case_module_source({
+            "case_id": 0, "name": "点击坐标兜底", "steps": [
+                selftest._step(1, "click", locators=[{"by": "text", "selector": "我的"}]),
+            ],
+        })
+        bundle["main_js"] = "global.__adt.elementClick = function () { return false; };\n" + bundle["main_js"]
+        outcome = self._run_harness(bundle)
+        self.assertIsNone(outcome["exception"])
+        self.assertTrue(outcome["result"]["success"], outcome["logs"])
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["status"], "PASS")
+        taps = [call for call in outcome["apiCalls"] if call["name"] == "tap"]
+        self.assertTrue(taps, "兜底应走坐标点击")
 
     def test_network_failure_keeps_report_and_diagnostic_for_retry(self):
         bundle = selftest.build_selftest_bundle("ios")

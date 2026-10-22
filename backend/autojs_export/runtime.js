@@ -465,9 +465,67 @@ function applyExtractRule(rawText, rule) {
 // ---------------------------------------------------------------------------
 var ACTIONS = {};
 
+// 点击兜底链（镜像 PC 侧 u2「取可见区域中心点发坐标点击」语义）：
+// 三星 One UI 等机型上文本节点常为 clickable=false，ACTION_CLICK 直接返回 false
+// （元素能找到但点不中）；此时依次尝试可点击父级容器、元素中心坐标。
+function resolveElementCenter(el) {
+    try {
+        var b = el.bounds();
+        if (!b) return null;
+        var cx = typeof b.centerX === "function" ? b.centerX() : b.centerX;
+        var cy = typeof b.centerY === "function" ? b.centerY() : b.centerY;
+        if (typeof cx !== "number" || typeof cy !== "number") return null;
+        if (!(cx > 0) && !(cy > 0)) return null; // 无效/零矩阵
+        return { x: cx, y: cy };
+    } catch (e) {
+        return null;
+    }
+}
+
+function clickNodeRobust(el) {
+    try {
+        if (el && el.click()) return true;
+    } catch (e) { /* 落入兜底 */ }
+
+    // 兜底 1：向上找可点击的父级容器（最多 3 层）
+    var node = el;
+    for (var i = 0; i < 3; i++) {
+        try {
+            node = node && typeof node.parent === "function" ? node.parent() : null;
+            if (node && node.click()) return true;
+        } catch (e2) {
+            break;
+        }
+    }
+
+    // 兜底 2：点击元素中心坐标
+    var center = resolveElementCenter(el);
+    if (center) {
+        try {
+            if (typeof click === "function") {
+                var ok = click(center.x, center.y);
+                if (ok !== false) return true;
+            }
+        } catch (e3) { /* 尝试下一个 API */ }
+        try {
+            if (typeof automator !== "undefined" && typeof automator.click === "function") {
+                var ok2 = automator.click(center.x, center.y);
+                if (ok2 !== false) return true;
+            }
+        } catch (e4) { /* 尝试下一个 API */ }
+        try {
+            if (typeof press === "function") {
+                press(center.x, center.y, 80);
+                return true;
+            }
+        } catch (e5) { /* 全部失败 */ }
+    }
+    return false;
+}
+
 ACTIONS.click = function (ctx, step) {
     var found = findElement(ctx, step.locators, CLICK_TIMEOUT_SECONDS, "click");
-    if (!found.el.click()) {
+    if (!clickNodeRobust(found.el)) {
         fail(ERR.E2001, "click 点击返回失败: " + found.selector);
     }
 };
@@ -585,7 +643,7 @@ ACTIONS.click_image = function (ctx, step) {
     if (hint) {
         try {
             var el = text(hint).findOne(2000) || textContains(hint).findOne(1000);
-            if (el && el.click()) {
+            if (el && clickNodeRobust(el)) {
                 logLine(ctx, "click_image 文本提示命中: " + hint);
                 return;
             }
@@ -781,13 +839,13 @@ ACTIONS.stop_app = function (ctx, step) {
             || text("Force stop").findOne(2000)
             || textContains("强行停止").findOne(2000);
         if (stopBtn) {
-            stopBtn.click();
+            clickNodeRobust(stopBtn);
             sleepMs(900);
             var confirm = text("确定").findOne(2000)
                 || text("强行停止").findOne(1000)
                 || text("OK").findOne(1000);
             if (confirm) {
-                confirm.click();
+                clickNodeRobust(confirm);
                 sleepMs(500);
             }
             logLine(ctx, "stop_app 通过应用详情页「强行停止」完成: " + pkg);
