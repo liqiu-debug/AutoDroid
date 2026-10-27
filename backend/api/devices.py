@@ -1473,6 +1473,22 @@ async def list_devices(
     if refresh_ios_wda:
         status_updated = False
         wireless_map = _get_wireless_url_map(session)
+        # USB 在场判定：设备没连接任何机器时 WDA 必然不通——此前只转 WDA_DOWN，
+        # 而 WDA_DOWN 在「在线」口径（status != OFFLINE）里算在线，形成
+        # 「幽灵在线 + WDA 不在线」的矛盾显示。先查 usbmux 实际在场：
+        # 不在场直接判 OFFLINE（顺带省掉无意义的 WDA 探测）；在场才走 WDA 逻辑。
+        # get_ios_devices 内部吞异常返回 []（usbmux 不可用视同无设备），
+        # 对「服务端没插任何手机」的常态判定是正确的。
+        present_udids: Optional[set] = None
+        try:
+            from backend.ios_scanner import get_ios_devices
+
+            present_udids = {
+                str(item.get("device_id") or "").strip()
+                for item in (get_ios_devices() or [])
+            }
+        except Exception as exc:  # pragma: no cover - scanner 自带兜底，防御性
+            logger.warning("iOS USB 在场检查失败，跳过离线判定: %s", exc)
         for device in devices:
             platform = str(getattr(device, "platform", "android") or "android").strip().lower()
             if platform != "ios" or _is_ios_app_device(device):
@@ -1480,6 +1496,15 @@ async def list_devices(
             if is_client_managed_device(device):
                 # 客户端注册的 iOS 设备：WDA 在客户端机器上，服务端探测无意义
                 if apply_client_presence_status(device):
+                    session.add(device)
+                    status_updated = True
+                continue
+            is_wireless = device.serial in wireless_map
+            if present_udids is not None and not is_wireless and device.serial not in present_udids:
+                # 非无线且不在 USB 在场列表：设备未连接任何机器 → 直接离线
+                if str(device.status or "").strip().upper() != "OFFLINE":
+                    device.status = "OFFLINE"
+                    device.updated_at = datetime.now()
                     session.add(device)
                     status_updated = True
                 continue
