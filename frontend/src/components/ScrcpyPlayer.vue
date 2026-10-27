@@ -18,6 +18,7 @@ import api from '@/api'
 import { findBestRecordableNode } from '@/utils/recordableNode'
 import { useWebCodecsDecoder, isWebCodecsSupported } from '@/composables/useWebCodecsDecoder'
 import { shouldRestoreStoredStreamProfile } from '@/utils/streamProfile'
+import { buildScrcpyWsUrl, withCurrentStreamToken } from '@/utils/streamAuth'
 
 const props = defineProps({
   /** 设备序列号 */
@@ -549,16 +550,17 @@ function handleWebCodecsFallback(reason) {
 }
 
 function resolveWebSocketUrl() {
+  // 云端直连要求 WS 握手携带 token（浏览器无法带 Authorization 头，走 ?token= 查询通道）；
+  // 桌面引擎本地端点忽略 query，无害。巡检票据 URL 亦复用同套拼接（ticket 不受影响）。
   const raw = String(props.streamUrl || '').trim()
   if (!raw) {
     if (!props.serial) return ''
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    return `${protocol}//${window.location.host}/ws/scrcpy/${encodeURIComponent(props.serial)}`
+    return buildScrcpyWsUrl(props.serial)
   }
-  if (/^wss?:\/\//i.test(raw)) return raw
+  if (/^wss?:\/\//i.test(raw)) return withCurrentStreamToken(raw)
   const parsed = new URL(raw, window.location.origin)
   parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
-  return parsed.toString()
+  return withCurrentStreamToken(parsed.toString())
 }
 
 function connect() {

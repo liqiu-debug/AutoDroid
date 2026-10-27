@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from fastapi.responses import HTMLResponse
 from sqlalchemy import update
 from sqlmodel import Session, select, func, delete
@@ -274,6 +275,47 @@ def update_interface(interface_id: int, payload: DefinitionWrite, session: Sessi
     session.commit()
     session.expire_all()
     return definition_read(session, require(session, ApiDefinition, interface_id))
+
+
+
+class FolderMoveBody(BaseModel):
+    folder_id: Optional[int] = None
+
+
+@router.patch("/interfaces/{interface_id}/move")
+def move_interface(
+    interface_id: int,
+    payload: FolderMoveBody,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_active_user),
+):
+    """移动接口到目录（folder_id 为空 = 移出到未分组根节点）——目录树拖拽用。"""
+    row = require(session, ApiDefinition, interface_id)
+    check_folder(session, payload.folder_id, "interface")
+    row.folder_id = payload.folder_id
+    row.updater_id = user.id
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return definition_read(session, row)
+
+
+@router.patch("/scenarios/{scenario_id}/move")
+def move_scenario(
+    scenario_id: int,
+    payload: FolderMoveBody,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_active_user),
+):
+    """移动场景到目录（folder_id 为空 = 移出到未分组根节点）——目录树拖拽用。"""
+    row = require(session, ApiScenario, scenario_id)
+    check_folder(session, payload.folder_id, "scenario")
+    row.folder_id = payload.folder_id
+    row.updater_id = user.id
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return scenario_read(session, row)
 
 
 @router.delete("/interfaces/{interface_id}")

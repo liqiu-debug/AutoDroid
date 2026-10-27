@@ -573,23 +573,23 @@ onUnmounted(stopActiveRunPolling)
 
     <div v-else class="scenario-list-container">
         <el-container class="main-layout">
-            <!-- Left: Folder Tree -->
-            <el-aside v-show="foldersVisible" width="176px" class="folder-aside">
-                <FolderTreePanel
-                    ref="treePanelRef"
-                    title="场景目录"
-                    all-label="所有场景"
-                    item-id-key="scenario_id"
-                    :fetch-tree="fetchScenarioFolderTree"
-                    :create-folder="api.createScenarioFolder"
-                    :rename-folder="api.renameScenarioFolder"
-                    :delete-folder="api.deleteScenarioFolder"
-                    :move-item="api.moveScenario"
-                    @select-folder="handleFolderSelect"
-                    @open-item="handleOpenScenario"
-                    @item-moved="fetchScenarios"
-                />
-            </el-aside>
+            <!-- Left: Folder Tree（宽度由 FolderTreePanel 外壳拖拽调整，localStorage 持久化） -->
+            <FolderTreePanel
+                v-show="foldersVisible"
+                ref="treePanelRef"
+                class="folder-aside"
+                title="场景目录"
+                all-label="所有场景"
+                item-id-key="scenario_id"
+                :fetch-tree="fetchScenarioFolderTree"
+                :create-folder="api.createScenarioFolder"
+                :rename-folder="api.renameScenarioFolder"
+                :delete-folder="api.deleteScenarioFolder"
+                :move-item="api.moveScenario"
+                @select-folder="handleFolderSelect"
+                @open-item="handleOpenScenario"
+                @item-moved="fetchScenarios"
+            />
 
             <el-main class="list-main">
                 <div class="content-wrapper">

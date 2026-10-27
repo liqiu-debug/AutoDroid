@@ -101,6 +101,14 @@ async def get_current_user(
     return _authenticate_token(request, token, session, _credentials_exception())
 
 
+def authenticate_token(token: str, session: Session, request: Optional[Request] = None) -> User:
+    """按给定 token 鉴权并返回用户（WS 握手等非依赖注入场景用）。
+
+    与 get_current_user 同口径（JWT / API Token）；失败抛 401。
+    """
+    return _authenticate_token(request, token, session, _credentials_exception())
+
+
 async def get_current_user_allow_query_token(
     request: Request = None,
     token: Optional[str] = Depends(oauth2_scheme_optional),

@@ -156,6 +156,26 @@ class SchedulerService:
             return job.next_run_time
         return None
 
+    def preview_next_run(self, strategy: str, config: Dict[str, Any]):
+        """仅计算下次触发时间、不注册 job。
+
+        供「客户端本地调度」的任务展示 next_run_time（云端不注册 job，但列表
+        「下次运行」不失真）。带时区的 ONCE run_date 用同 tz 的 now 比较，
+        避免 aware/naive 比较 TypeError；失败回退 None。
+        """
+        try:
+            trigger = self.create_trigger(strategy, config)
+        except Exception:
+            return None
+        now = datetime.now()
+        run_date = getattr(trigger, "run_date", None)
+        if isinstance(run_date, datetime) and run_date.tzinfo is not None:
+            now = datetime.now(run_date.tzinfo)
+        try:
+            return trigger.get_next_fire_time(None, now)
+        except Exception:
+            return None
+
     def shutdown(self):
         """关闭调度器"""
         self.scheduler.shutdown(wait=False)

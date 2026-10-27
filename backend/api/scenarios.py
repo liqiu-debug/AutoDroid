@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from sqlmodel import Session, select, func
 from datetime import datetime
 
@@ -35,6 +35,11 @@ from backend.schemas import (
     TestScenarioRead,
 )
 from backend.api import deps
+from backend.version_lock import (
+    set_version_header,
+    version_state_payload,
+    write_with_version_lock,
+)
 import uuid
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -173,46 +178,91 @@ def delete_scenario(
 # ---- Steps Management ----
 
 @router.get("/{scenario_id}/steps", response_model=List[ScenarioStepRead])
-def get_scenario_steps(scenario_id: int, session: Session = Depends(get_session)):
+def get_scenario_steps(
+    scenario_id: int,
+    response: Response = None,
+    session: Session = Depends(get_session),
+):
     """Get steps for a scenario"""
+    scenario = session.get(TestScenario, scenario_id)
+    if not scenario:
+        raise HTTPException(status_code=404, detail="场景不存在")
+    set_version_header(response, int(scenario.version or 1), scenario.updated_at)
     steps = session.exec(select(ScenarioStep).where(ScenarioStep.scenario_id == scenario_id).order_by(ScenarioStep.order)).all()
     return steps
 
+
 @router.post("/{scenario_id}/steps")
+@router.put("/{scenario_id}/steps")
 def update_scenario_steps(
     scenario_id: int,
     steps: List[ScenarioStepCreate],
+    response: Response = None,
     session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user)
+    current_user: User = Depends(deps.get_current_user),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+    version: Optional[int] = Query(None),
+    expected_updated_at: Optional[str] = Query(None),
 ):
-    """Replace all steps in a scenario"""
+    """Replace all steps in a scenario.
+
+    乐观锁（P4 功能1，三端契约见 backend/version_lock.py）：If-Match /
+    ?version= / ?expected_updated_at= 任一存在即校验（AND），冲突 409
+    detail=「保存冲突：内容已被其他端修改，请重新拉取后再保存」；都缺失跳过
+    校验（旧客户端兼容）。响应体 {success, count, version, updated_at} 携带新
+    令牌供前端回填。POST 与 PUT 同一契约（前端历史调用 POST）。
+
+    终验修正（必修缺陷 1）：校验 + 写入 + 递增是一条原子 CAS UPDATE（
+    write_with_version_lock），step_count / updated_at 与 version=version+1
+    同一 UPDATE、步骤行同事务替换，中途失败 rollback 不得半写；真并发同令牌
+    双发恰一胜一 409。
+    """
     scenario = session.get(TestScenario, scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail="场景不存在")
 
-    # 1. Delete old steps
-    old_steps = session.exec(select(ScenarioStep).where(ScenarioStep.scenario_id == scenario_id)).all()
-    for s in old_steps:
-        session.delete(s)
-
-    # 2. Add new steps
-    for s_in in steps:
-        new_step = ScenarioStep(
-            scenario_id=scenario_id,
-            case_id=s_in.case_id,
-            order=s_in.order,
-            alias=s_in.alias
+    try:
+        # 原子 CAS：stats + version=version+1 + updated_at 同一条 UPDATE
+        write_with_version_lock(
+            session,
+            scenario,
+            values={
+                "step_count": len(steps),
+                "updated_at": datetime.now(),
+                "updater_id": current_user.id,
+            },
+            if_match=if_match,
+            version=version,
+            expected_updated_at=expected_updated_at,
+            missing_detail="场景不存在",
         )
-        session.add(new_step)
 
-    # 3. Update scenario stats
-    scenario.step_count = len(steps)
-    scenario.updated_at = datetime.now()
-    scenario.updater_id = current_user.id
-    session.add(scenario)
+        # 1. Delete old steps
+        old_steps = session.exec(select(ScenarioStep).where(ScenarioStep.scenario_id == scenario_id)).all()
+        for s in old_steps:
+            session.delete(s)
 
-    session.commit()
-    return {"success": True, "count": len(steps)}
+        # 2. Add new steps
+        for s_in in steps:
+            new_step = ScenarioStep(
+                scenario_id=scenario_id,
+                case_id=s_in.case_id,
+                order=s_in.order,
+                alias=s_in.alias
+            )
+            session.add(new_step)
+
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+
+    set_version_header(response, int(scenario.version or 1), scenario.updated_at)
+    return {
+        "success": True,
+        "count": len(steps),
+        **version_state_payload(int(scenario.version or 1), scenario.updated_at),
+    }
 
 # ---- Execution ----
 

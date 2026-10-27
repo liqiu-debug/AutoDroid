@@ -1,6 +1,7 @@
 import os
 import unittest
 from queue import Empty
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -310,12 +311,16 @@ class StreamProfileEndpointTests(unittest.TestCase):
 
     def setUp(self):
         self.addCleanup(set_stream_profile_override, self.SERIAL, None)
+        # R6'：端点签名含鉴权/归属参数（admin 越过归属过滤，session 不参与判定）
+        self.admin = SimpleNamespace(id=1, role="admin")
 
     def test_set_profile_reconnects_managed_device(self):
         request = stream_router.StreamProfileRequest(profile=STREAM_PROFILE_HD)
         with patch.object(stream_router.device_manager, "get_device", return_value={"serial": self.SERIAL}), \
              patch.object(stream_router.device_manager, "reconnect_device") as reconnect:
-            payload = stream_router.set_stream_profile(self.SERIAL, request)
+            payload = stream_router.set_stream_profile(
+                self.SERIAL, request, session=None, current_user=self.admin
+            )
 
         reconnect.assert_called_once_with(self.SERIAL)
         self.assertEqual(payload["status"], "reconnecting")
@@ -326,7 +331,9 @@ class StreamProfileEndpointTests(unittest.TestCase):
         request = stream_router.StreamProfileRequest(profile=STREAM_PROFILE_STANDARD)
         with patch.object(stream_router.device_manager, "get_device", return_value=None), \
              patch.object(stream_router.device_manager, "reconnect_device") as reconnect:
-            payload = stream_router.set_stream_profile(self.SERIAL, request)
+            payload = stream_router.set_stream_profile(
+                self.SERIAL, request, session=None, current_user=self.admin
+            )
 
         reconnect.assert_not_called()
         self.assertEqual(payload["status"], "saved")
@@ -336,7 +343,9 @@ class StreamProfileEndpointTests(unittest.TestCase):
         set_stream_profile_override(self.SERIAL, STREAM_PROFILE_HD)
         request = stream_router.StreamProfileRequest(profile="auto")
         with patch.object(stream_router.device_manager, "get_device", return_value=None):
-            payload = stream_router.set_stream_profile(self.SERIAL, request)
+            payload = stream_router.set_stream_profile(
+                self.SERIAL, request, session=None, current_user=self.admin
+            )
 
         self.assertEqual(payload["source"], "default")
         self.assertEqual(payload["profile"], STREAM_PROFILE_SMOOTH)
@@ -344,11 +353,15 @@ class StreamProfileEndpointTests(unittest.TestCase):
     def test_set_profile_rejects_unknown_value(self):
         request = stream_router.StreamProfileRequest(profile="ultra")
         with self.assertRaises(HTTPException) as ctx:
-            stream_router.set_stream_profile(self.SERIAL, request)
+            stream_router.set_stream_profile(
+                self.SERIAL, request, session=None, current_user=self.admin
+            )
         self.assertEqual(ctx.exception.status_code, 400)
 
     def test_get_profile_returns_state(self):
-        payload = stream_router.get_stream_profile(self.SERIAL)
+        payload = stream_router.get_stream_profile(
+            self.SERIAL, session=None, current_user=self.admin
+        )
         self.assertEqual(payload["serial"], self.SERIAL)
         self.assertEqual(payload["profile"], STREAM_PROFILE_SMOOTH)
 

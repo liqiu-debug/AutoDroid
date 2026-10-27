@@ -17,8 +17,27 @@
           <p class="subtitle">开始与团队一起构建可靠的测试。</p>
         </div>
 
+        <!-- 注册入口 clientProbeDone 门控：探测落定前不渲染注册入口/提示，避免误闪 -->
         <el-alert
-          v-if="!registrationAllowed"
+          v-if="clientProbeDone && isClientApp"
+          title="客户端模式请通过平台开号，请联系管理员开号。"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="registration-alert"
+        />
+
+        <el-alert
+          v-else-if="clientProbeDone && probeFailed"
+          title="暂时无法确认注册通道，请联系管理员开号。"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="registration-alert"
+        />
+
+        <el-alert
+          v-else-if="clientProbeDone && !registrationAllowed"
           title="当前已关闭公开注册，请联系管理员创建账号。"
           type="warning"
           show-icon
@@ -27,7 +46,7 @@
         />
 
         <el-form
-          v-if="registrationAllowed"
+          v-if="clientProbeDone && registrationAllowed && !isClientApp && !probeFailed"
           ref="formRef"
           :model="form"
           :rules="rules"
@@ -115,6 +134,32 @@ const { isMobileMode } = useClientMode()
 const formRef = ref(null)
 const loading = ref(false)
 const registrationAllowed = ref(true)
+// 客户端（桌面引擎）模式：GET /api/client/info 返回 200 才启用；
+// 该模式下注册链路不可用（无 X-AutoDroid-Server/upstream），提示平台开号并阻止提交。
+const isClientApp = ref(false)
+// 注册入口 clientProbeDone 门控：探测落定前不渲染注册入口，探测失败维持「请联系管理员开号」。
+const clientProbeDone = ref(false)
+// 探测失败（非 404，无法判定注册通道）：不放行注册，维持「请联系管理员开号」。
+const probeFailed = ref(false)
+
+const detectClientApp = async () => {
+  try {
+    const res = await api.getClientInfo()
+    isClientApp.value = res?.data?.clientMode === true
+    probeFailed.value = false
+  } catch (error) {
+    // 404 = 明确无客户端端点 → 纯 Web 模式；其余（网络/5xx）无法判定 → 维持「请联系管理员开号」。
+    if (error?.response?.status === 404) {
+      isClientApp.value = false
+      probeFailed.value = false
+    } else {
+      isClientApp.value = false
+      probeFailed.value = true
+    }
+  } finally {
+    clientProbeDone.value = true
+  }
+}
 
 const form = reactive({
   username: '',
@@ -153,6 +198,14 @@ const loadRegistrationStatus = async () => {
 }
 
 const handleRegister = async () => {
+  if (isClientApp.value) {
+    ElMessage.warning('客户端模式请通过平台开号，请联系管理员开号')
+    return
+  }
+  if (probeFailed.value) {
+    ElMessage.warning('暂时无法确认注册通道，请联系管理员开号')
+    return
+  }
   if (!registrationAllowed.value) {
     ElMessage.warning('当前已关闭公开注册，请联系管理员创建账号')
     return
@@ -179,7 +232,10 @@ const handleRegister = async () => {
   })
 }
 
-onMounted(loadRegistrationStatus)
+onMounted(async () => {
+  await detectClientApp()
+  await loadRegistrationStatus()
+})
 </script>
 
 <style scoped src="../account/auth.css"></style>

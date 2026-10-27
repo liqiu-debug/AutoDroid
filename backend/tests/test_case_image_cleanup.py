@@ -148,7 +148,9 @@ class CaseImageCleanupTests(unittest.TestCase):
         self.assertFalse(old_file.exists())
         self.assertTrue(new_file.exists())
 
-    def test_cleanup_also_removes_existing_orphan_template_images(self):
+    def test_cleanup_on_delete_removes_only_case_referenced_images(self):
+        """编辑/删除路径只清「被删用例此前引用」的图，绝不全盘扫孤儿——
+        全盘扫曾把测试库查不到引用的真实模板图批量误删。"""
         orphan_path = "static/images/element_feedface.png"
         used_path = "static/images/element_deadbabe.png"
         orphan_file = self._write_image(orphan_path)
@@ -161,7 +163,69 @@ class CaseImageCleanupTests(unittest.TestCase):
         case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
 
         self.assertFalse(used_file.exists())
+        self.assertTrue(orphan_file.exists(), "无关孤儿图不应在用例编辑路径被删除")
+
+    def test_sweep_orphan_template_images_age_gated(self):
+        """显式孤儿清扫：无引用的旧图删除、有引用的保留、新图受年龄门槛保护。"""
+        orphan_path = "static/images/element_feedface.png"
+        used_path = "static/images/element_deadbabe.png"
+        fresh_path = "static/images/element_f00d1234.png"
+        orphan_file = self._write_image(orphan_path)
+        used_file = self._write_image(used_path)
+        fresh_file = self._write_image(fresh_path)
+        self._create_case(
+            "case-sweep-ref",
+            steps=[Step(action="click_image", selector=used_path, selector_type="image", description="used")],
+        )
+
+        # 年龄门槛默认 24h：全部文件都是新的，一个都不该删
+        swept = case_api.sweep_orphan_template_images(self.session)
+        self.assertEqual(swept, [])
+        self.assertTrue(orphan_file.exists())
+        self.assertTrue(fresh_file.exists())
+
+        # 门槛放开后：无引用的旧图/新图都会被清，被引用的保留
+        swept = case_api.sweep_orphan_template_images(self.session, min_age_seconds=0)
+        self.assertEqual(sorted(swept), sorted([orphan_path, fresh_path]))
         self.assertFalse(orphan_file.exists())
+        self.assertTrue(used_file.exists())
+        self.assertFalse(fresh_file.exists(), "min_age_seconds=0 时同样年龄的无引用新图会被清")
+
+    def test_cleanup_accepts_pipe_separated_multi_template_paths(self):
+        """`|` 连接的多模板兜底引用必须被识别——否则清理器会把两张都当孤儿。"""
+        first = "static/images/element_aaaa1111.png"
+        second = "static/images/element_bbbb2222.png"
+        first_file = self._write_image(first)
+        second_file = self._write_image(second)
+        case = self._create_case(
+            "case-multi-template",
+            steps=[Step(action="click_image", selector=f"{first}|{second}", selector_type="image", description="multi")],
+        )
+
+        case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
+
+        self.assertFalse(first_file.exists())
+        self.assertFalse(second_file.exists(), "多路径引用的兜底模板应随用例删除一并清理")
+
+    def test_cleanup_accepts_locator_candidates_image_refs(self):
+        """args.locator_candidates 里的 image 候选也计入引用。"""
+        path = "static/images/element_cccc3333.png"
+        image_file = self._write_image(path)
+        case = self._create_case("case-locator-candidates", steps=[])
+        self.session.add(
+            CaseStepModel(
+                case_id=case.id,
+                order=1,
+                action="click_image",
+                args={"locator_candidates": [{"by": "image", "selector": path}]},
+                execute_on=["android", "ios"],
+            )
+        )
+        self.session.commit()
+
+        case_api.delete_test_case(case.id, session=self.session, current_user=self.user)
+
+        self.assertFalse(image_file.exists(), "locator_candidates 引用的模板应被识别并在删除用例时清理")
 
     def test_cleanup_skips_non_generated_image_paths(self):
         custom_path = "static/images/custom_login.png"

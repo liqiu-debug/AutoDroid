@@ -36,6 +36,33 @@ from backend.utils.template_match import find_template_match, image_to_bgr, load
 logger = logging.getLogger(__name__)
 
 
+def _call_bounded(fn: Any, timeout_seconds: float, label: str = "rpc") -> Any:
+    """在守护线程内执行可能长阻塞的设备 RPC，超时抛 TimeoutError。
+
+    uiautomator2 的 jsonrpc 调用（el.info / get_text / click / set_text…）在部分
+    控件（WebView 输入框、动效页面）与 ROM 上会出现长阻塞甚至不返回；输入步骤的
+    「定位与输入成功但一直执行中」就是校验阶段的 el.info 无保护挂死。所有可能
+    长阻塞的调用统一走本护栏（线程遗留为 daemon，不阻塞进程退出）。
+    """
+    box: Dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            box["value"] = fn()
+        except Exception as exc:  # noqa: BLE001 - 原样转交调用方处理
+            box["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(max(float(timeout_seconds), 0.1))
+    if thread.is_alive():
+        logger.warning("Android device RPC timeout after %.2fs: %s", timeout_seconds, label)
+        raise TimeoutError(f"{label} timeout after {timeout_seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 class AndroidDriver(BaseDriver):
     """
     Android 设备驱动，使用 uiautomator2 库操控设备。
@@ -48,6 +75,13 @@ class AndroidDriver(BaseDriver):
     """
     _ocr_engine: Any = None
     _GET_TEXT_TIMEOUT_SECONDS = 0.8
+    # 可能长阻塞的设备 RPC 超时上限（秒），走 _call_bounded 护栏
+    _RPC_TIMEOUT_INFO = 5.0
+    _RPC_TIMEOUT_EXISTS = 8.0
+    _RPC_TIMEOUT_CLICK = 8.0
+    _RPC_TIMEOUT_CLEAR = 8.0
+    _RPC_TIMEOUT_STRATEGY = 20.0
+    _RPC_TIMEOUT_FOCUSED = 4.0
     _CONFIRM_HINT_TOKENS = (
         "我知道了",
         "知道了",
@@ -354,7 +388,7 @@ class AndroidDriver(BaseDriver):
         logger.info("Android.click start: selector=%s by=%s", selector, by)
         try:
             el = self._find_element(selector, by)
-            if not el.exists(timeout=5):
+            if not _call_bounded(lambda: el.exists(timeout=5), self._RPC_TIMEOUT_EXISTS, label="element.exists"):
                 raise ExecutionStepRuntimeError(
                     E2001_ELEMENT_NOT_FOUND,
                     f"元素未找到: selector={selector!r}, by={by!r}",
@@ -377,14 +411,23 @@ class AndroidDriver(BaseDriver):
             )
             raise
 
-    def _safe_element_info(self, el: Any) -> Dict[str, Any]:
+    def _safe_element_info_ex(self, el: Any) -> Tuple[Dict[str, Any], bool]:
+        """读取元素 info（带护栏）；返回 (info, 读取是否成功)。
+
+        RPC 长阻塞/异常时返回 ({}, False)——调用方据此区分「读到的值为空」
+        与「根本读不到」，避免把输入成功误判为校验失败。"""
         try:
-            info = el.info or {}
+            info = _call_bounded(
+                lambda: el.info, self._RPC_TIMEOUT_INFO, label="element.info"
+            ) or {}
             if isinstance(info, dict):
-                return info
+                return info, True
         except Exception:
             pass
-        return {}
+        return {}, False
+
+    def _safe_element_info(self, el: Any) -> Dict[str, Any]:
+        return self._safe_element_info_ex(el)[0]
 
     def _resolve_input_target(self, el: Any) -> Any:
         info = self._safe_element_info(el)
@@ -402,11 +445,12 @@ class AndroidDriver(BaseDriver):
                 pass
         return el
 
-    def _collect_input_candidates(self, el: Any) -> Tuple[List[str], bool]:
-        info = self._safe_element_info(el)
+    def _collect_input_candidates(self, el: Any) -> Tuple[List[str], bool, bool]:
+        info, info_ok = self._safe_element_info_ex(el)
         candidates: List[str] = []
         class_name = str(info.get("className") or "")
         is_edit_text = class_name == "android.widget.EditText"
+        read_ok = info_ok
 
         for key in ("text", "contentDescription", "hint"):
             value = info.get(key)
@@ -419,6 +463,7 @@ class AndroidDriver(BaseDriver):
             value = self._safe_get_text(el, timeout_seconds=self._GET_TEXT_TIMEOUT_SECONDS)
             if value is not None:
                 candidates.append(str(value))
+                read_ok = True
 
         unique_candidates: List[str] = []
         seen = set()
@@ -430,7 +475,7 @@ class AndroidDriver(BaseDriver):
             unique_candidates.append(normalized)
 
         is_password = bool(info.get("password"))
-        return unique_candidates, is_password
+        return unique_candidates, is_password, read_ok
 
     def _safe_get_text(self, el: Any, timeout_seconds: float) -> Optional[str]:
         getter = getattr(el, "get_text", None)
@@ -476,7 +521,7 @@ class AndroidDriver(BaseDriver):
         password_hint: bool = False,
     ) -> Tuple[Optional[bool], str]:
         expected = "" if expected_text is None else str(expected_text)
-        candidates, is_password = self._collect_input_candidates(el)
+        candidates, is_password, read_ok = self._collect_input_candidates(el)
         info = self._safe_element_info(el)
         class_name = str(info.get("className") or "").lower()
         if "secure" in class_name or "password" in class_name:
@@ -506,17 +551,24 @@ class AndroidDriver(BaseDriver):
             return None, f"password-unverifiable actual={candidates!r}"
 
         if not candidates:
+            if not read_ok:
+                # 读取通道全部失败（RPC 超时/异常）：无法判定，按「不可验证」放行，
+                # 与 masked-password 的 unverifiable 语义一致——输入已发生，不误杀。
+                return None, "unreadable-unverifiable"
             return False, "actual-empty"
         return False, f"actual={candidates!r}"
 
     def _get_focused_element(self, timeout: int = 1) -> Optional[Any]:
-        try:
+        def _lookup() -> Optional[Any]:
             focused = self._device(focused=True)
             if focused is not None and focused.exists(timeout=timeout):
                 return focused
+            return None
+
+        try:
+            return _call_bounded(_lookup, self._RPC_TIMEOUT_FOCUSED + float(timeout), label="input.focused")
         except Exception:
             return None
-        return None
 
     def _verify_input_result_with_focused(
         self,
@@ -551,11 +603,11 @@ class AndroidDriver(BaseDriver):
         return False, "; ".join(details)
 
     def _capture_input_state(self, el: Any) -> Dict[str, List[str]]:
-        target_candidates, _ = self._collect_input_candidates(el)
+        target_candidates, _, _ = self._collect_input_candidates(el)
         focused_candidates: List[str] = []
         focused = self._get_focused_element(timeout=0)
         if focused is not None:
-            focused_candidates, _ = self._collect_input_candidates(focused)
+            focused_candidates, _, _ = self._collect_input_candidates(focused)
         return {
             "target": target_candidates,
             "focused": focused_candidates,
@@ -624,7 +676,7 @@ class AndroidDriver(BaseDriver):
         logger.info("Android.input start: selector=%s by=%s text_len=%s", selector, by, text_len)
         try:
             el = self._find_element(selector, by)
-            if not el.exists(timeout=5):
+            if not _call_bounded(lambda: el.exists(timeout=5), self._RPC_TIMEOUT_EXISTS, label="element.exists"):
                 raise ExecutionStepRuntimeError(
                     E2001_ELEMENT_NOT_FOUND,
                     f"元素未找到: selector={selector!r}, by={by!r}",
@@ -660,16 +712,16 @@ class AndroidDriver(BaseDriver):
             for strategy_name, strategy in strategies:
                 try:
                     try:
-                        target.click()
+                        _call_bounded(target.click, self._RPC_TIMEOUT_CLICK, label="input.click")
                     except Exception:
                         pass
                     try:
-                        target.clear_text()
+                        _call_bounded(target.clear_text, self._RPC_TIMEOUT_CLEAR, label="input.clear_text")
                     except Exception:
                         pass
 
                     state_before = self._capture_input_state(target)
-                    strategy()
+                    _call_bounded(strategy, self._RPC_TIMEOUT_STRATEGY, label=f"input.strategy[{strategy_name}]")
                     verified, verify_detail = self._verify_input_result_with_focused(
                         target,
                         text_value,

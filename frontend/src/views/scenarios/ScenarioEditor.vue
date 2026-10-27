@@ -15,6 +15,12 @@ import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
+import {
+  VERSION_CONFLICT_MESSAGE,
+  extractVersionState,
+  isVersionConflict,
+  versionStateFrom,
+} from '@/utils/versionToken'
 
 const route = useRoute()
 const router = useRouter()
@@ -23,6 +29,9 @@ const router = useRouter()
 const createdScenarioId = ref(null)
 const scenarioId = computed(() => route.params.id || createdScenarioId.value)
 const currentScenario = ref({ name: '' })
+// 场景步骤乐观锁令牌（{version, updated_at}）：load 时取自场景实体，保存成功
+// 回填新令牌，供下一次步骤写入的 If-Match/version 使用。
+const scenarioVersion = ref(null)
 const caseLibrary = ref([])
 const scenarioSteps = ref([])
 const caseSearchQuery = ref('')
@@ -170,6 +179,7 @@ const fetchScenarioDetails = async () => {
     try {
         const res = await api.getScenario(scenarioId.value)
         currentScenario.value = res.data
+        scenarioVersion.value = versionStateFrom(res.data)
     } catch (err) {
         ElMessage.error('加载场景详情失败')
     }
@@ -218,20 +228,41 @@ const saveSteps = async () => {
       targetId = res.data.id
       if (!targetId) throw new Error('服务未返回场景 ID')
       createdScenarioId.value = targetId
+      scenarioVersion.value = versionStateFrom(res.data) || scenarioVersion.value
     } else {
-      await api.updateScenario(targetId, { name: draftName })
+      const res = await api.updateScenario(targetId, { name: draftName })
+      // 名称写入也会刷新实体令牌，先回填再写步骤，避免拿旧令牌必然 409。
+      scenarioVersion.value = versionStateFrom(res?.data) || scenarioVersion.value
     }
-    await api.updateScenarioSteps(targetId, payload)
+    const stepsRes = await api.updateScenarioSteps(targetId, payload, scenarioVersion.value)
+    // 保存成功回填新令牌；响应体/ETag 都拿不到时重拉场景实体兜底。
+    scenarioVersion.value = extractVersionState(stepsRes)
+      || (scenarioVersion.value ? await pullScenarioVersion(targetId) : null)
     savedSnapshot.value = submittedSnapshot
     ElMessage.success('保存成功')
     return true
   } catch (err) {
     savedSnapshot.value = '__incomplete_save__'
-    ElMessage.error('保存未完成，草稿已保留，请重试: ' + err.message)
+    if (isVersionConflict(err)) {
+      // 冲突：提示刷新重拉，草稿保留、不覆盖他人修改。
+      ElMessage.warning(VERSION_CONFLICT_MESSAGE)
+    } else {
+      ElMessage.error('保存未完成，草稿已保留，请重试: ' + err.message)
+    }
     return false
   } finally {
     isSaving.value = false
     loading.value = false
+  }
+}
+
+/** 重拉场景实体的版本令牌（保存响应未带新令牌时的兜底）。 */
+const pullScenarioVersion = async (id) => {
+  try {
+    const res = await api.getScenario(id)
+    return versionStateFrom(res?.data)
+  } catch (err) {
+    return null
   }
 }
 

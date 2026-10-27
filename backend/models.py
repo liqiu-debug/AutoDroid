@@ -52,8 +52,11 @@ class TestCase(TestCaseBase, SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
     user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     updater_id: Optional[int] = Field(default=None, foreign_key="user.id")
-    updated_at: Optional[datetime] = None
+    # 建档即打点：乐观锁 updated_at 令牌（version_lock）要求 GET 始终可读
+    updated_at: Optional[datetime] = Field(default_factory=datetime.now)
     folder_id: Optional[int] = Field(default=None, foreign_key="casefolder.id")
+    # 步骤写入乐观锁版本（P4 功能1）：每次步骤写入 +1，PUT steps 用 If-Match 校验
+    version: int = Field(default=1)
 
     # Use the custom PydanticListType
     steps: List[Step] = Field(default=[], sa_column=Column(PydanticListType(Step)))
@@ -78,8 +81,11 @@ class TestScenario(SQLModel, table=True):
     user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     updater_id: Optional[int] = Field(default=None, foreign_key="user.id")
     created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: Optional[datetime] = None
+    # 建档即打点：乐观锁 updated_at 令牌（version_lock）要求 GET 始终可读
+    updated_at: Optional[datetime] = Field(default_factory=datetime.now)
     folder_id: Optional[int] = Field(default=None, foreign_key="scenariofolder.id")
+    # 场景步骤写入乐观锁版本（P4 功能1）：每次步骤替换 +1
+    version: int = Field(default=1)
     
     # Statistics
     step_count: int = Field(default=0)
@@ -109,6 +115,7 @@ class TestExecution(SQLModel, table=True):
     batch_id: Optional[str] = Field(default=None, index=True) # UUID correlating multiple device runs
     batch_name: Optional[str] = None # Display name for the batch
     run_source: Optional[str] = None # app（App/设备端执行）| platform（平台控机执行）
+    env_id: Optional[int] = None # 执行时使用的全局变量环境（桌面 client-runs 上报）
 
 
 class TestResult(SQLModel, table=True):
@@ -254,6 +261,8 @@ class ApiStepResult(SQLModel, table=True):
 class FastbotTask(SQLModel, table=True):
     """Fastbot 智能探索任务"""
     id: Optional[int] = Field(default=None, primary_key=True)
+    # 桌面客户端本地执行上报的幂等键（client-fastbot）；服务端自跑任务为 NULL
+    run_id: Optional[str] = Field(default=None, index=True)
     package_name: str
     duration: int = 600  # 探索时长(秒)
     throttle: int = 500  # 操作频率(ms)
@@ -306,6 +315,12 @@ class Device(SQLModel, table=True):
     app_logged_out_at: Optional[datetime] = None
     app_executor_status: str = Field(default="UNKNOWN")
     app_owner_id: Optional[int] = None
+    # 桌面端认领归属（物理设备）：列表按此过滤，admin 可见全部；
+    # NULL = 历史/未认领设备，仅 admin 可见。
+    owner_id: Optional[int] = Field(default=None, index=True)
+    # 桌面客户端实例标识（本地引擎上报）；last_seen_at 为客户端心跳时间。
+    client_instance_id: Optional[str] = Field(default=None, index=True)
+    last_seen_at: Optional[datetime] = None
     bound_device_serial: Optional[str] = Field(default=None, unique=True)
     custom_name: Optional[str] = Field(default=None)  # 用户自定义设备名称
     market_name: Optional[str] = Field(default=None)  # 设备市场型号
@@ -375,7 +390,7 @@ class GlobalVariable(SQLModel, table=True):
 class AppPackage(SQLModel, table=True):
     """APP 安装包管理"""
     id: Optional[int] = Field(default=None, primary_key=True)
-    platform: str = Field(default="android", index=True)  # "android" | "ios"
+    platform: str = Field(default="android", index=True)  # "android" | "ios" | "windows" | "macos"
     app_name: str = Field(default="Unknown")         # 应用名称
     package_name: str = Field(default="", index=True) # Android 包名 / iOS Bundle ID
     version_name: str = Field(default="")             # 版本号
@@ -463,6 +478,9 @@ class CompatibilityRun(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    # P4 功能2：桌面客户端本地执行回放（POST /api/client-compatibility/runs 创建，
+    # 结果经 /runs/{id}/report 上报落库；云端不派发后台 worker）
+    client_executed: bool = Field(default=False)
 
 
 class CompatibilityCell(SQLModel, table=True):

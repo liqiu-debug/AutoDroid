@@ -22,10 +22,11 @@ const pageSize = ref(20)
 const total = ref(0)
 const userStore = useUserStore()
 const canUseInspection = computed(() => Boolean(userStore.featureFlags?.model_inspection))
+// 列表不再展示运行环境信息（用户要求），因此这里不传 environments 查找表；
+// 编辑表单里的运行环境选择与 env_id 保存逻辑保持不变。
 const taskRows = computed(() => tasks.value.map(task => ({
     ...task,
     _execution: scheduledTaskExecution(task, {
-        environments: environments.value,
         inspectionProfiles: inspectionProfiles.value,
         packages: androidPackages.value,
     }),
@@ -504,11 +505,13 @@ watch(() => taskRoute.fullPath, () => {
 
                 <el-table-column label="操作" width="120" align="center" fixed="right">
                     <template #default="{ row }">
-                        <el-button link type="primary" @click="handleEdit(row)">编辑</el-button>
-                        <el-dropdown trigger="click" @command="handleDelete(row)">
-                            <el-button :icon="MoreFilled" link aria-label="更多任务操作" />
-                            <template #dropdown><el-dropdown-menu><el-dropdown-item command="delete">删除任务</el-dropdown-item></el-dropdown-menu></template>
-                        </el-dropdown>
+                        <div class="task-actions">
+                            <el-button link type="primary" @click="handleEdit(row)">编辑</el-button>
+                            <el-dropdown trigger="click" @command="handleDelete(row)">
+                                <el-button :icon="MoreFilled" link aria-label="更多任务操作" />
+                                <template #dropdown><el-dropdown-menu><el-dropdown-item command="delete">删除任务</el-dropdown-item></el-dropdown-menu></template>
+                            </el-dropdown>
+                        </div>
                     </template>
                 </el-table-column>
                 </el-table>
@@ -868,6 +871,30 @@ watch(() => taskRoute.fullPath, () => {
 }
 
 .text-gray { color: var(--ad-muted); }
+
+/* 操作列：编辑按钮与「更多」三点必须垂直居中对齐。
+   el-dropdown 触发器是 inline-block，基线与 link 按钮不齐，
+   这里用 flex 统一交叉轴中线，并让下拉触发器内部按钮同样居中。 */
+.task-actions {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    height: 100%;
+}
+
+.task-actions :deep(.el-dropdown) {
+    display: inline-flex;
+    align-items: center;
+}
+
+.task-actions :deep(.el-button) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    margin: 0;
+}
 
 .pagination-footer {
     flex-shrink: 0;

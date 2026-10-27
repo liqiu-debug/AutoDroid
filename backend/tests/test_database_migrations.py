@@ -81,6 +81,12 @@ class DatabaseMigrationsTests(unittest.TestCase):
                 created_at TIMESTAMP
             );
 
+            CREATE TABLE fastbottask (
+                id INTEGER PRIMARY KEY,
+                package_name VARCHAR,
+                device_serial VARCHAR
+            );
+
             CREATE TABLE scheduledtask (
                 id INTEGER PRIMARY KEY,
                 name VARCHAR NOT NULL,
@@ -98,6 +104,8 @@ class DatabaseMigrationsTests(unittest.TestCase):
             """
         )
         cursor.execute('INSERT INTO testcasestep(id, "order") VALUES (1, 7)')
+        cursor.execute("INSERT INTO testcase(id) VALUES (1)")
+        cursor.execute("INSERT INTO testscenario(id) VALUES (1)")
         conn.commit()
 
     def _table_columns(self, table: str):
@@ -125,6 +133,18 @@ class DatabaseMigrationsTests(unittest.TestCase):
 
         testcase_cols = {c[1] for c in self._table_columns("testcase")}
         self.assertIn("folder_id", testcase_cols)
+        # P4 功能1：步骤乐观锁 version 列（历史行默认回填 1）
+        self.assertIn("version", testcase_cols)
+        self.assertEqual(
+            self.conn.execute("SELECT version FROM testcase WHERE id = 1").fetchone()[0],
+            1,
+        )
+        testscenario_cols = {c[1] for c in self._table_columns("testscenario")}
+        self.assertIn("version", testscenario_cols)
+        self.assertEqual(
+            self.conn.execute("SELECT version FROM testscenario WHERE id = 1").fetchone()[0],
+            1,
+        )
 
         testexecution_cols = {c[1] for c in self._table_columns("testexecution")}
         self.assertIn("device_serial", testexecution_cols)
@@ -202,6 +222,9 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("connection_type", device_cols)
         self.assertIn("agent_name", device_cols)
         self.assertIn("source_serial", device_cols)
+        self.assertIn("owner_id", device_cols)
+        self.assertIn("client_instance_id", device_cols)
+        self.assertIn("last_seen_at", device_cols)
 
         scenario_folder_table = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name = 'scenariofolder'"
@@ -211,9 +234,21 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 29)
+        self.assertEqual(len(rows), 38)
         self.assertIn(("20260930_028_api_testing",), rows)
         self.assertIn(("20260930_029_api_testing_owners",), rows)
+        self.assertIn(("20261026_034_device_owner_id",), rows)
+        self.assertIn(("20261026_035_device_client_presence",), rows)
+        self.assertIn(("20261026_036_testexecution_env_id",), rows)
+        self.assertIn("env_id", {c[1] for c in self._table_columns("testexecution")})
+        self.assertIn(("20261026_037_fastbottask_run_id",), rows)
+        self.assertIn("run_id", {c[1] for c in self._table_columns("fastbottask")})
+        self.assertIn(("20261026_038_steps_version",), rows)
+        self.assertIn(("20261026_039_compatibility_client_executed",), rows)
+        self.assertIn(
+            "client_executed",
+            {c[1] for c in self._table_columns("compatibilityrun")},
+        )
 
         # Re-run should be no-op and keep same version records.
         _run_migrations_with_conn(self.conn)

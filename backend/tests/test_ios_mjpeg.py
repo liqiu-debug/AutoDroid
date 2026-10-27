@@ -11,8 +11,12 @@ from unittest.mock import Mock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from jose import jwt
+from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from backend.core.security import ALGORITHM, SECRET_KEY
+from backend.database import get_session
 from backend.device_stream import ios_mjpeg
 from backend.device_stream.ios_mjpeg import (
     DEFAULT_MJPEG_DEVICE_PORT,
@@ -24,7 +28,7 @@ from backend.device_stream.ios_mjpeg import (
     resolve_ios_mjpeg_stream_settings,
     resolve_ios_mjpeg_upstream,
 )
-from backend.models import SystemSetting
+from backend.models import SystemSetting, User
 from backend.wda_port_manager import (
     MJPEG_PORT_RANGE_END,
     MJPEG_PORT_RANGE_START,
@@ -574,10 +578,27 @@ class MjpegEndpointTests(unittest.TestCase):
     def setUp(self):
         from backend.device_stream.router import rest_router, ws_router
 
+        # R6'：端点已收口鉴权（admin 越过归属过滤），token 走 ?token=/Authorization
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(self.engine)
+        self.session = Session(self.engine)
+        admin = User(username="admin", hashed_password="x", role="admin", full_name="admin")
+        self.session.add(admin)
+        self.session.commit()
+        self.token = jwt.encode({"sub": "admin"}, SECRET_KEY, algorithm=ALGORITHM)
+
         app = FastAPI()
         app.include_router(rest_router, prefix="/api/stream")
         app.include_router(ws_router)
+        app.dependency_overrides[get_session] = lambda: self.session
         self.client = TestClient(app)
+        # LIFO：先关 session 再 dispose engine（StaticPool 单连接，顺序反了会二次关闭）
+        self.addCleanup(self.engine.dispose)
+        self.addCleanup(self.session.close)
 
     def test_websocket_streams_jpeg_frames_then_closes(self):
         frames = [_jpeg(b"ws-1" * 10), _jpeg(b"ws-2" * 10)]
@@ -587,7 +608,9 @@ class MjpegEndpointTests(unittest.TestCase):
             "backend.device_stream.router._open_ios_mjpeg_client",
             return_value=fake_client,
         ):
-            with self.client.websocket_connect("/ws/ios-mjpeg/ios-1") as websocket:
+            with self.client.websocket_connect(
+                f"/ws/ios-mjpeg/ios-1?token={self.token}"
+            ) as websocket:
                 self.assertEqual(websocket.receive_bytes(), frames[0])
                 self.assertEqual(websocket.receive_bytes(), frames[1])
                 message = websocket.receive()
@@ -601,7 +624,9 @@ class MjpegEndpointTests(unittest.TestCase):
             "backend.device_stream.router._open_ios_mjpeg_client",
             side_effect=IOSMjpegStreamError("failed to connect MJPEG upstream 127.0.0.1:9300"),
         ):
-            with self.client.websocket_connect("/ws/ios-mjpeg/ios-1") as websocket:
+            with self.client.websocket_connect(
+                f"/ws/ios-mjpeg/ios-1?token={self.token}"
+            ) as websocket:
                 message = websocket.receive()
 
         self.assertEqual(message["type"], "websocket.close")
@@ -616,7 +641,7 @@ class MjpegEndpointTests(unittest.TestCase):
             "backend.device_stream.router._open_ios_mjpeg_client",
             return_value=fake_client,
         ):
-            response = self.client.get("/api/stream/ios-mjpeg/ios-1")
+            response = self.client.get(f"/api/stream/ios-mjpeg/ios-1?token={self.token}")
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(
@@ -633,10 +658,16 @@ class MjpegEndpointTests(unittest.TestCase):
             "backend.device_stream.router._open_ios_mjpeg_client",
             side_effect=IOSMjpegStreamError("failed to establish MJPEG relay for device ios-1"),
         ):
-            response = self.client.get("/api/stream/ios-mjpeg/ios-1")
+            response = self.client.get(f"/api/stream/ios-mjpeg/ios-1?token={self.token}")
 
         self.assertEqual(response.status_code, 503)
         self.assertIn("P1005_WDA_UNAVAILABLE", response.json()["detail"])
+
+    def test_http_stream_requires_auth(self):
+        with patch("backend.device_stream.router._open_ios_mjpeg_client") as open_client:
+            response = self.client.get("/api/stream/ios-mjpeg/ios-1")
+        self.assertEqual(response.status_code, 401)
+        open_client.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import FolderTreePanel from '@/components/FolderTreePanel.vue'
 import AssetMetadata from '@/components/api-testing/AssetMetadata.vue'
 import AddToScenarioDialog from '@/components/api-testing/AddToScenarioDialog.vue'
 import ImportSpecDialog from '@/components/api-testing/ImportSpecDialog.vue'
@@ -17,7 +18,7 @@ const isInterface = computed(() => route.path.includes('/interfaces'))
 const kind = computed(() => isInterface.value ? 'interface' : 'scenario')
 const endpoint = computed(() => isInterface.value ? '/interfaces' : '/scenarios')
 const title = computed(() => isInterface.value ? '接口管理' : '自动化场景')
-const rows = ref([]), folders = ref([]), keyword = ref(''), folderId = ref(null), loading = ref(false), page = ref(1), total = ref(0)
+const rows = ref([]), keyword = ref(''), folderId = ref(null), loading = ref(false), page = ref(1), total = ref(0)
 const pageSize = ref(20),joinOpen=ref(false),joinId=ref(null),importOpen=ref(false)
 const foldersVisible=ref(true), detailsOpen=ref(false), details=ref(null), openingRun=ref(false), runStage=ref(''), loadError=ref('')
 function showDetails(row){details.value=row;detailsOpen.value=true}
@@ -52,37 +53,92 @@ async function run(){
 const canDelete = row => user.isAdmin || user.userInfo?.id === row.user_id
 const time = value => value ? dayjs(value).format('YYYY-MM-DD HH:mm:ss') : '-'
 function create() { router.push({ path: `/api-testing${endpoint.value}/create`, query: { folder_id: folderId.value || undefined } }) }
-const folderTree = computed(() => {
-  const build = parent => folders.value.filter(f => f.kind === kind.value && f.parent_id === parent).map(f => ({ ...f, children: build(f.id) }))
-  return [{ id: null, name: '全部', children: [{ id: 0, name: '未分组' }, ...build(null)] }]
-})
+// ---- 目录面板（共享 FolderTreePanel，样式与 UI 自动化一致）----
+// api-testing 的目录接口是扁平列表（GET /folders + 分页条目），这里适配成
+// fetchTree 的 { tree, items } 形状：叶子即接口/场景条目，根节点列出全部条目。
+// 目录树拖拽移动：PATCH /{kind}/{id}/move { folder_id }（与 UI 自动化的
+// move-case/move-scenario 同语义；folder_id 为空 = 移出到未分组根节点）。
+async function moveAssetItem(itemId, folderId) {
+  await api.apiTesting.patch(`${endpoint.value}/${itemId}/move`, { folder_id: folderId ?? null })
+}
+const folderPanelRef = ref(null)
+const folderMetaById = new Map()
+function assetLeafNode(item) {
+  return { id: `${kind.value}-${item.id}`, item_id: item.id, name: item.name, type: kind.value, is_leaf: true, children: [] }
+}
+function buildAssetFolderTree(folderRows, items) {
+  const leafMap = new Map()
+  for (const item of items) {
+    if (item.folder_id == null) continue
+    if (!leafMap.has(item.folder_id)) leafMap.set(item.folder_id, [])
+    leafMap.get(item.folder_id).push(assetLeafNode(item))
+  }
+  const nodeMap = new Map()
+  for (const folder of folderRows) {
+    folderMetaById.set(folder.id, { kind: folder.kind, parent_id: folder.parent_id ?? null })
+    nodeMap.set(folder.id, { id: `folder-${folder.id}`, folder_id: folder.id, name: folder.name, parent_id: folder.parent_id ?? null, type: 'folder', children: leafMap.get(folder.id) || [] })
+  }
+  const roots = []
+  for (const folder of folderRows) {
+    const node = nodeMap.get(folder.id)
+    const parent = folder.parent_id != null ? nodeMap.get(folder.parent_id) : null
+    if (parent) parent.children.unshift(node)
+    else roots.push(node)
+  }
+  return roots
+}
+async function fetchAllAssets() {
+  const collected = []
+  const limit = 1000
+  for (let skip = 0; ; skip += limit) {
+    const { data } = await api.apiTesting.get(endpoint.value, { keyword: '', skip, limit })
+    collected.push(...(data.items || []))
+    if (!data.items?.length || collected.length >= (data.total ?? collected.length) || skip >= 100 * limit) break
+  }
+  return collected
+}
+async function fetchAssetFolderTree() {
+  // meta 只在拉取成功后整体替换：失败时保留旧映射，避免重命名/移动把
+  // 目录静默写到根节点（update_folder 会真实落 parent_id=None）。
+  const [dirs, items] = await Promise.all([api.apiTesting.get('/folders'), fetchAllAssets()])
+  const folderRows = (dirs.data || []).filter(folder => folder.kind === kind.value)
+  folderMetaById.clear()
+  return { tree: buildAssetFolderTree(folderRows, items), items: items.map(assetLeafNode) }
+}
+async function createAssetFolder({ name, parent_id }) {
+  await api.apiTesting.post('/folders', { name, kind: kind.value, parent_id: parent_id ?? null })
+}
+async function renameAssetFolder(target, { name }) {
+  const meta = folderMetaById.get(target)
+  if (!meta) {
+    // 目录元数据缺失（目录树未成功加载/已过期）：宁可报错也不回退 parent_id=null，
+    // 防止重命名把目录静默挪到根节点。
+    ElMessage.error('目录信息未加载，请刷新目录后重试')
+    throw new Error('folder meta missing')
+  }
+  await api.apiTesting.put(`/folders/${target}`, { name, kind: meta.kind, parent_id: meta.parent_id })
+}
+async function deleteAssetFolder(target) {
+  await api.apiTesting.delete(`/folders/${target}`)
+}
+function handleFolderSelect(value) {
+  folderId.value = value
+  page.value = 1
+  load()
+}
+function handleOpenItem(node) {
+  if (!node?.item_id) return
+  router.push(`/api-testing${endpoint.value}/${node.item_id}/edit`)
+}
 async function load() {
   loading.value = true
   loadError.value = ''
   try {
-    const [items, dirs] = await Promise.all([api.apiTesting.get(endpoint.value, { keyword: keyword.value, folder_id: folderId.value, skip: (page.value - 1) * pageSize.value, limit: pageSize.value }), api.apiTesting.get('/folders')])
-    rows.value = items.data.items; total.value = items.data.total; folders.value = dirs.data
+    const items = await api.apiTesting.get(endpoint.value, { keyword: keyword.value, folder_id: folderId.value, skip: (page.value - 1) * pageSize.value, limit: pageSize.value })
+    rows.value = items.data.items; total.value = items.data.total
   } catch (err) { loadError.value=apiError(err);ElMessage.error(loadError.value) } finally { loading.value = false }
 }
 function search() { page.value = 1; load() }
-async function createFolder() {
-  try {
-    const { value } = await ElMessageBox.prompt('目录名称（创建在当前选中目录下）', '新增目录', { inputPattern: /\S/, inputErrorMessage: '请输入名称' })
-    await api.apiTesting.post('/folders', { name: value, kind: kind.value, parent_id: folderId.value || null }); load()
-  } catch (err) { if (!['cancel','close'].includes(err)) ElMessage.error(apiError(err)) }
-}
-async function folderAction(action, folder) {
-  try {
-    if (action === 'rename') {
-      const { value } = await ElMessageBox.prompt('目录名称', '重命名目录', { inputValue: folder.name, inputPattern: /\S/ })
-      await api.apiTesting.put(`/folders/${folder.id}`, { name: value, kind: folder.kind, parent_id: folder.parent_id })
-    } else {
-      await ElMessageBox.confirm(`删除目录「${folder.name}」？非空目录不会被删除。`, '删除目录', { type: 'warning' })
-      await api.apiTesting.delete(`/folders/${folder.id}`); folderId.value = null
-    }
-    load()
-  } catch (err) { if (!['cancel','close'].includes(err)) ElMessage.error(apiError(err)) }
-}
 function edit(row) { router.push(`/api-testing${endpoint.value}/${row.id}/edit`) }
 async function duplicate(row) {
   try {
@@ -99,18 +155,29 @@ async function remove(row) {
     await api.apiTesting.delete(`${endpoint.value}/${row.id}`); load()
   } catch (err) { if (!['cancel','close'].includes(err)) ElMessage.error(apiError(err)) }
 }
-watch(endpoint, () => { folderId.value = null; keyword.value = ''; search() })
+watch(endpoint, () => { folderId.value = null; keyword.value = ''; folderPanelRef.value?.refresh(); search() })
 onMounted(async()=>{await load();try{environments.value=(await api.getEnvironments()).data}catch{/* list remains usable */}})
 </script>
 <template>
   <div class="api-assets ad-page">
     <div class="main-layout">
-      <aside v-if="foldersVisible" class="folder-aside ad-surface" aria-label="资产目录">
-        <div class="folder-heading"><b>{{ isInterface ? '接口目录' : '场景目录' }}</b><el-button link :icon="Plus" aria-label="新建目录" @click="createFolder" /></div>
-        <el-tree :data="folderTree" node-key="id" :props="{label:'name'}" default-expand-all highlight-current @node-click="folderId = $event.id; search()">
-          <template #default="{data}"><div class="folder-node"><el-icon><FolderOpened /></el-icon><span :title="data.name">{{ data.name }}</span><el-dropdown v-if="data.id" trigger="click" @command="folderAction($event, data)"><el-button link size="small" :aria-label="data.name+'目录操作'" @click.stop>···</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="rename">重命名</el-dropdown-item><el-dropdown-item command="delete" :disabled="!canDelete(data)">删除</el-dropdown-item></el-dropdown-menu></template></el-dropdown></div></template>
-        </el-tree>
-      </aside>
+      <FolderTreePanel
+        v-show="foldersVisible"
+        ref="folderPanelRef"
+        class="folder-aside ad-surface"
+        :aria-label="isInterface ? '接口目录' : '场景目录'"
+        :title="isInterface ? '接口目录' : '场景目录'"
+        :all-label="isInterface ? '所有接口' : '所有场景'"
+        item-id-key="item_id"
+        :fetch-tree="fetchAssetFolderTree"
+        :create-folder="createAssetFolder"
+        :rename-folder="renameAssetFolder"
+        :delete-folder="deleteAssetFolder"
+        :move-item="moveAssetItem"
+        @select-folder="handleFolderSelect"
+        @open-item="handleOpenItem"
+        @item-moved="load"
+      />
       <main class="content-wrapper ad-surface">
         <div class="toolbar ad-toolbar">
           <div class="left-tools"><el-button :icon="FolderOpened" :aria-expanded="foldersVisible" aria-label="切换目录" @click="foldersVisible=!foldersVisible" /><h1>{{ title }}</h1><el-input v-model="keyword" clearable :placeholder="isInterface ? '搜索接口名称' : '搜索场景名称'" :prefix-icon="Search" class="search-input" aria-label="搜索资产" @keyup.enter="search" @clear="search" /><el-button :icon="Refresh" aria-label="刷新列表" @click="load" /></div>
@@ -143,10 +210,9 @@ onMounted(async()=>{await load();try{environments.value=(await api.getEnvironmen
 <style scoped>
 .api-assets{height:100%;display:flex;flex-direction:column;background:var(--ad-bg);padding:16px;box-sizing:border-box;min-width:0}
 .main-layout{display:flex;flex:1;min-height:0;gap:12px;overflow:hidden}
-.folder-aside{width:176px;flex-shrink:0;background:var(--ad-surface);border:1px solid var(--ad-border);border-radius:var(--ad-panel-radius);padding:12px 8px;overflow:auto}
-.folder-heading,.folder-node{display:flex;align-items:center;gap:8px;width:100%}.folder-heading{justify-content:space-between;margin-bottom:8px;padding:0 4px;font-size:13px}.folder-node span{flex:1;overflow:hidden;text-overflow:ellipsis;font-size:12px}.folder-node .el-icon{color:var(--ad-muted)}
+.folder-aside{flex-shrink:0;background:var(--ad-surface);border:1px solid var(--ad-border);border-radius:var(--ad-panel-radius);overflow:hidden}
 .content-wrapper{flex:1;min-width:0;background:var(--ad-surface);border:1px solid var(--ad-border);border-radius:var(--ad-panel-radius);display:flex;flex-direction:column;padding:12px;overflow:hidden}
 .toolbar,.left-tools,.right-tools{display:flex;align-items:center;gap:8px}.toolbar{justify-content:space-between;margin-bottom:12px;flex-wrap:wrap}.toolbar h1{font-size:20px;line-height:32px;margin:0;font-weight:600;white-space:nowrap}.search-input{width:200px}.table-container{flex:1;min-height:0;margin-top:0}.method{font-family:var(--ad-font-mono,monospace);font-size:12px;font-weight:600;color:var(--ad-muted)}.request-url{font-family:var(--ad-font-mono,monospace);font-size:12px;color:var(--ad-muted)}.description,.metadata-trigger{font-size:12px;color:var(--ad-muted);line-height:1.6}.el-pagination{margin-top:12px;justify-content:flex-end;flex-shrink:0}.detail-name{font-size:20px;overflow-wrap:anywhere}.asset-metadata{margin-top:16px}.ad-name-button{max-width:100%;overflow:hidden;text-overflow:ellipsis;display:block;font-size:12px;text-align:left;height:24px;padding:0}.name-cell{display:flex;align-items:center;gap:8px;min-width:0}.name-cell .ad-name-button{flex:0 1 auto;min-width:0}.name-cell .el-button+.el-button{margin:0;flex:none}.ad-row-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}.ad-row-actions .el-button{margin:0}
-@media(max-width:1100px){.search-input{width:160px}.toolbar h1{font-size:18px}.folder-aside{width:152px}}
-@media(max-width:760px){.api-assets{padding:12px}.main-layout{flex-direction:column}.folder-aside{width:auto;max-height:160px;flex-shrink:0}.toolbar,.left-tools,.right-tools{flex-wrap:wrap}.search-input{width:100%;min-width:120px;flex:1}.left-tools,.right-tools{width:100%}.right-tools{justify-content:flex-end}.el-pagination{justify-content:flex-start;overflow:auto}.description,.metadata-trigger,.request-url,.folder-node span,.method{font-size:14px}.ad-name-button{font-size:14px;height:44px}.ad-row-actions{gap:8px}}
+@media(max-width:1100px){.search-input{width:160px}.toolbar h1{font-size:18px}}
+@media(max-width:760px){.api-assets{padding:12px}.main-layout{flex-direction:column}.folder-aside{width:auto !important;max-height:160px;flex-shrink:0}.folder-aside :deep(.aside-resizer){display:none}.toolbar,.left-tools,.right-tools{flex-wrap:wrap}.search-input{width:100%;min-width:120px;flex:1}.left-tools,.right-tools{width:100%}.right-tools{justify-content:flex-end}.el-pagination{justify-content:flex-start;overflow:auto}.description,.metadata-trigger,.request-url,.method{font-size:14px}.ad-name-button{font-size:14px;height:44px}.ad-row-actions{gap:8px}}
 </style>
