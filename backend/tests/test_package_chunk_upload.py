@@ -93,7 +93,7 @@ class PackageChunkUploadTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(context.exception.status_code, 400)
-        self.assertEqual(context.exception.detail, "仅支持 .apk 或 .ipa 文件")
+        self.assertEqual(context.exception.detail, "仅支持 .apk、.ipa、.exe、.msi 或 .dmg 文件")
 
     async def test_upload_ipa_chunk_and_complete(self):
         data = b"fake-ipa"

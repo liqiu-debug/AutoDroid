@@ -68,7 +68,7 @@ const handleMobileLogout = () => {
     cancelButtonText: '取消',
     type: 'warning',
   }).then(() => {
-    userStore.logout()
+    userStore.logout(true)
     router.push('/login')
   }).catch(() => {})
 }

@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 DEFAULT_IOS_WDA_BUNDLE_ID = "com.facebook.WebDriverAgentRunner.xctrunner"
+# 桌面客户端设备存活容忍窗口：3×心跳周期（心跳 60s），超时判 OFFLINE
+CLIENT_HEARTBEAT_TIMEOUT_SECONDS = 180
 DEFAULT_IOS_WDA_SCHEME = "WebDriverAgentRunner"
 DEFAULT_IOS_WDA_START_RETRY_ATTEMPTS = 8
 DEFAULT_IOS_WDA_START_RETRY_INTERVAL_SECONDS = 1.0
@@ -1231,6 +1233,74 @@ def _is_ios_app_device(device: Device) -> bool:
     )
 
 
+def filter_devices_for_user(devices: List[Device], current_user) -> List[Device]:
+    """按归属过滤设备列表。
+
+    - admin：全部设备；
+    - 普通用户：owner_id == 自己（桌面端/同步认领）或 app_owner_id == 自己（App 注册）的设备；
+    - owner_id IS NULL 的历史/未认领设备仅 admin 可见；
+    - current_user 缺失（内部直接调用，如单元测试）不过滤。
+    """
+    uid = getattr(current_user, "id", None)
+    role = getattr(current_user, "role", None)
+    if uid is None or role == "admin":
+        return devices
+    return [d for d in devices if d.owner_id == uid or d.app_owner_id == uid]
+
+
+def is_client_managed_device(device: Device) -> bool:
+    """桌面客户端（本地引擎）注册的设备：在线状态由客户端心跳维护。
+
+    判定口径：client_instance_id 非空（客户端 register 上报）或已有心跳时间
+    last_seen_at。服务端 adb 刷新不翻转这类设备的状态（设备插在客户端机器上，
+    服务端 adb 天然看不到），改由 last_seen_at 超时判定。
+    """
+    if str(getattr(device, "client_instance_id", "") or "").strip():
+        return True
+    return getattr(device, "last_seen_at", None) is not None
+
+
+def client_presence_expired(device: Device, now: Optional[datetime] = None) -> bool:
+    """客户端心跳是否已过期（超过 CLIENT_HEARTBEAT_TIMEOUT_SECONDS 判离线）。"""
+    seen_at = getattr(device, "last_seen_at", None)
+    if seen_at is None:
+        return True
+    current = now or datetime.now()
+    return (current - seen_at).total_seconds() > CLIENT_HEARTBEAT_TIMEOUT_SECONDS
+
+
+def apply_client_presence_status(device: Device, now: Optional[datetime] = None) -> bool:
+    """客户端设备超时判定：心跳过期 -> OFFLINE（不在此复活，复活由 register/heartbeat 负责）。
+
+    返回是否发生状态变更。
+    """
+    if not is_client_managed_device(device):
+        return False
+    if not client_presence_expired(device, now):
+        return False
+    if str(device.status or "").strip().upper() == "OFFLINE":
+        return False
+    device.status = "OFFLINE"
+    device.updated_at = datetime.now()
+    return True
+
+
+def _sweep_client_presence(session: Session, devices: Optional[List[Device]] = None) -> bool:
+    """客户端设备心跳超时判定扫描（R3：与 adb 成败解耦，独立执行、独立 commit）。
+
+    adb 缺失/失败时同样生效，避免心跳过期设备永远停在 IDLE。
+    """
+    rows = list(devices) if devices is not None else list(session.exec(select(Device)).all())
+    changed = False
+    for device in rows:
+        if apply_client_presence_status(device):
+            session.add(device)
+            changed = True
+    if changed:
+        session.commit()
+    return changed
+
+
 def _build_device_reads(session: Session, devices: List[Device]) -> List[DeviceRead]:
     """ORM Device -> DeviceRead，并补充 wireless_enabled 计算字段。"""
     wireless_map = _get_wireless_url_map(session)
@@ -1275,15 +1345,83 @@ def _get_live_usbmux_conn_type(udid: str) -> Optional[str]:
 # ==================== API 端点 ====================
 
 
+async def _discover_new_adb_devices(
+    session: Session,
+    online_serials: set,
+    known_serials: set,
+    current_user: Optional[Any],
+) -> bool:
+    """自愈登记：adb 在线但库中不存在的 Android 设备直接入库。
+
+    消除「必须先去设备中心一键同步，用例编辑器才看得到设备」的体验断点；
+    字段口径与 sync 的 _fetch_device_info 一致，无主新设备由发现者认领。
+    """
+    new_serials = sorted(s for s in online_serials if s and s not in known_serials)
+    if not new_serials:
+        return False
+
+    created = False
+    now = datetime.now()
+    for serial in new_serials:
+        props = await _get_device_props_batch(serial)
+        model = props["ro.product.model"]
+        version = props["ro.build.version.release"]
+
+        market_name = ""
+        for prop in _MARKET_NAME_PROPS:
+            val = props.get(prop) or ""
+            if val and val.lower() not in ["null", "unknown"]:
+                market_name = val
+                break
+        if not market_name or market_name == model:
+            market_name = None
+
+        remote_fields = _remote_usb_fields(serial)
+        device = Device(
+            serial=serial,
+            platform="android",
+            model=model or "Unknown",
+            brand=(props["ro.product.brand"] or "").upper(),
+            android_version=version,
+            os_version=version,
+            resolution=props["resolution"],
+            market_name=market_name,
+            status="IDLE",
+            connection_type=remote_fields.get("connection_type"),
+            agent_name=remote_fields.get("agent_name"),
+            source_serial=remote_fields.get("source_serial"),
+            owner_id=getattr(current_user, "id", None),
+            updated_at=now,
+        )
+        try:
+            session.add(device)
+            session.commit()
+            created = True
+            logger.info("auto-discovered adb device: %s", serial)
+        except Exception:
+            # 并发发现同一 serial（多端轮询）时跳过，保留先到者
+            session.rollback()
+            logger.debug("skip duplicate discovery for %s", serial)
+    return created
+
+
 @router.get("/", response_model=List[DeviceRead])
+
 async def list_devices(
     refresh_ios_wda: bool = False,
     session: Session = Depends(get_session),
+    current_user=Depends(get_current_user),
 ):
-    """获取所有设备列表，并在需要时刷新设备在线/WDA 状态。"""
+    """获取设备列表（按归属过滤：admin 全量，普通用户仅自己的），并在需要时刷新设备在线/WDA 状态。"""
     refresh_app_presence(session)
     devices = sort_devices_for_display(session.exec(select(Device)).all())
-    
+    devices = filter_devices_for_user(devices, current_user)
+
+    # R3：客户端设备超时判定独立于服务端 adb（adb 缺失/失败同样生效），独立执行、独立提交
+    if _sweep_client_presence(session):
+        devices = sort_devices_for_display(session.exec(select(Device)).all())
+        devices = filter_devices_for_user(devices, current_user)
+
     # 实时检查哪些 Android 设备在线（iOS 设备默认保持上次同步状态）
     try:
         raw = await _run_adb_command("devices")
@@ -1293,10 +1431,22 @@ async def list_devices(
             parts = line.strip().split()
             if len(parts) >= 2 and parts[1] == "device":
                 online_serials.add(parts[0])
-        
+
+        # 自愈发现：adb 在线但库里没有的设备直接登记（无需先去设备中心一键同步）；
+        # 已知集合必须取全量行（未过滤），否则他人设备会被反复"再发现"。
+        known_serials = {
+            str(d.serial) for d in session.exec(select(Device)).all()
+        }
+        if await _discover_new_adb_devices(session, online_serials, known_serials, current_user):
+            devices = sort_devices_for_display(session.exec(select(Device)).all())
+            devices = filter_devices_for_user(devices, current_user)
+
         # 更新设备状态（仅 Android）
         status_updated = False
         for device in devices:
+            if is_client_managed_device(device):
+                # 客户端注册设备不归服务端 adb 管：仅按心跳超时判定（已在上方独立处理）
+                continue
             if getattr(device, "platform", "android") == "ios" or is_app_device(device):
                 continue  # iOS 设备跳过 ADB 检测
             if device.serial in online_serials:
@@ -1311,11 +1461,12 @@ async def list_devices(
                     device.updated_at = datetime.now()
                     session.add(device)
                     status_updated = True
-        
+
         if status_updated:
             session.commit()
-            # 重新查询以获取最新状态
+            # 重新查询以获取最新状态（重新应用归属过滤，避免越权返回他人设备）
             devices = sort_devices_for_display(session.exec(select(Device)).all())
+            devices = filter_devices_for_user(devices, current_user)
     except Exception as e:
         logger.warning(f"检查设备在线状态失败: {e}")
 
@@ -1325,6 +1476,12 @@ async def list_devices(
         for device in devices:
             platform = str(getattr(device, "platform", "android") or "android").strip().lower()
             if platform != "ios" or _is_ios_app_device(device):
+                continue
+            if is_client_managed_device(device):
+                # 客户端注册的 iOS 设备：WDA 在客户端机器上，服务端探测无意义
+                if apply_client_presence_status(device):
+                    session.add(device)
+                    status_updated = True
                 continue
             is_offline = str(device.status or "").strip().upper() == "OFFLINE"
             if is_offline and device.serial not in wireless_map:
@@ -1344,6 +1501,7 @@ async def list_devices(
         if status_updated:
             session.commit()
             devices = sort_devices_for_display(session.exec(select(Device)).all())
+            devices = filter_devices_for_user(devices, current_user)
 
     return _build_device_reads(session, devices)
 
@@ -1622,6 +1780,8 @@ async def sync_devices(
         raw = await _run_adb_command("devices")
         lines = raw.decode("utf-8", errors="replace").strip().splitlines()
     except Exception as e:
+        # R3：adb 失败与客户端心跳判定解耦——先跑超时判定（独立 commit），再如实回报失败
+        _sweep_client_presence(session)
         raise HTTPException(status_code=500, detail=f"执行 adb devices 失败: {e}")
 
     online_serials = []
@@ -1674,6 +1834,9 @@ async def sync_devices(
             select(Device).where(Device.serial == info["serial"])
         ).first()
         if existing:
+            # 认领语义：未认领设备由本次同步者认领；他人已认领不覆盖
+            if existing.owner_id is None and getattr(current_user, "id", None) is not None:
+                existing.owner_id = current_user.id
             existing.platform = info.get("platform", "android")
             existing.model = info["model"]
             existing.brand = info["brand"]
@@ -1700,6 +1863,7 @@ async def sync_devices(
                 connection_type=info.get("connection_type"),
                 agent_name=info.get("agent_name"),
                 source_serial=info.get("source_serial"),
+                owner_id=getattr(current_user, "id", None),
                 status="IDLE",
             )
             session.add(device)
@@ -1718,6 +1882,8 @@ async def sync_devices(
                 select(Device).where(Device.serial == udid)
             ).first()
             if existing:
+                if existing.owner_id is None and getattr(current_user, "id", None) is not None:
+                    existing.owner_id = current_user.id
                 existing.platform = "ios"
                 existing.model = ios_dev["model"]
                 existing.brand = "APPLE"
@@ -1736,6 +1902,7 @@ async def sync_devices(
                     os_version=ios_dev["os_version"],
                     market_name=ios_dev["name"],
                     connection_type=ios_dev.get("connection_type"),
+                    owner_id=getattr(current_user, "id", None),
                     status=_resolve_ios_device_status(None, wda_healthy),
                 )
                 session.add(device)
@@ -1750,6 +1917,11 @@ async def sync_devices(
     wireless_map = _get_wireless_url_map(session)
     all_db_devices = session.exec(select(Device)).all()
     for db_dev in all_db_devices:
+        if is_client_managed_device(db_dev):
+            # 客户端注册设备不归服务端 adb 管：仅按心跳超时判定（与列表口径一致）
+            if apply_client_presence_status(db_dev):
+                session.add(db_dev)
+            continue
         if db_dev.serial in all_online:
             continue
         if str(db_dev.connection_type or "").strip().lower() == "autojs6" or _is_ios_app_device(db_dev):
@@ -1776,8 +1948,9 @@ async def sync_devices(
 
     session.commit()
 
-    # 查询最终结果
+    # 查询最终结果（按归属过滤，与列表口径一致）
     all_devices = sort_devices_for_display(session.exec(select(Device)).all())
+    all_devices = filter_devices_for_user(all_devices, current_user)
     payloads = _build_device_reads(session, all_devices)
     total_online = sum(1 for d in payloads if d.status != "OFFLINE" or (d.app_presence or {}).get("status") == "ONLINE")
 

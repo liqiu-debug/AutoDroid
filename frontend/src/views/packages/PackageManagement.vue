@@ -3,9 +3,16 @@ import { ref, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { UploadFilled, Download, Delete, Box, Cellphone } from '@element-plus/icons-vue'
 import api from '@/api'
+import { useClientApp } from '@/composables/useClientApp'
 
 const CHUNK_SIZE = 20 * 1024 * 1024
 const MAX_CHUNK_RETRIES = 2
+
+// 客户端（桌面引擎）模式：iOS IPA 一键安装恒 501（P2 仅 Android adb install 本地化），
+// 隐藏/禁用 iOS 安装入口并降级提示，避免点进死路；纯 Web 模式行为零变化。
+const { isClientApp, detectClientApp } = useClientApp()
+
+const isIosInstallBlocked = (row) => isClientApp.value && (row?.platform || 'android') === 'ios'
 
 // ==================== 状态 ====================
 const packages = ref([])
@@ -75,18 +82,28 @@ const fetchPackages = async () => {
   }
 }
 
-/** 上传前校验 */
+/** 上传前校验（与平台 SUPPORTED_PACKAGE_EXTENSIONS 同步：.apk/.ipa + 桌面包 .exe/.msi/.dmg） */
 const beforeUpload = (file) => {
   if (uploadInProgress.value) {
     ElMessage.warning('已有上传任务进行中')
     return false
   }
   const extension = file.name.toLowerCase().split('.').pop()
-  const supported = extension === 'apk' || extension === 'ipa'
+  const supported = ['apk', 'ipa', 'exe', 'msi', 'dmg'].includes(extension)
   if (!supported) {
-    ElMessage.warning('仅支持 .apk 或 .ipa 文件')
+    ElMessage.warning('仅支持 .apk、.ipa、.exe、.msi 或 .dmg 文件')
   }
   return supported
+}
+
+// 桌面包（windows/macos）：无对应设备可推送，隐藏「安装」入口；下载扩展按平台映射
+const isDesktopPackage = (row) => ['windows', 'macos'].includes((row?.platform || '').toLowerCase())
+const platformLabel = (platform) => ({ ios: 'iOS', android: 'Android', windows: 'Windows', macos: 'macOS' }[(platform || 'android').toLowerCase()] || platform)
+const packageExtension = (row) => {
+  const match = /\.([A-Za-z0-9]+)$/.exec(String(row?.file_path || ''))
+  const ext = match ? match[1].toLowerCase() : ''
+  if (['apk', 'ipa', 'exe', 'msi', 'dmg'].includes(ext)) return ext
+  return { ios: 'ipa', windows: 'exe', macos: 'dmg' }[(row?.platform || '').toLowerCase()] || 'apk'
 }
 
 const getErrorMessage = (error, fallback = '上传失败') => (
@@ -246,8 +263,7 @@ const handleDownload = (row) => {
   // 通过动态 a 标签触发浏览器下载
   const link = document.createElement('a')
   link.href = `${url}?token=${token}`
-  const extension = row.platform === 'ios' ? 'ipa' : 'apk'
-  link.download = `${row.app_name}_${row.version_name}.${extension}`
+  link.download = `${row.app_name}_${row.version_name}.${packageExtension(row)}`
   link.target = '_blank'
   document.body.appendChild(link)
   link.click()
@@ -274,6 +290,12 @@ const handleDelete = async (row) => {
 
 /** 打开安装弹窗 */
 const openInstallDialog = async (row) => {
+  // 先落定客户端模式探测（幂等缓存），避免探测完成前的竞态点击漏进 501 死路
+  await detectClientApp()
+  if (isIosInstallBlocked(row)) {
+    ElMessage.info('iOS 安装请用平台/后续版本')
+    return
+  }
   installTarget.value = row
   selectedSerial.value = ''
   installDialogVisible.value = true
@@ -352,6 +374,7 @@ const handlePageChange = (page) => {
 
 // ==================== 生命周期 ====================
 onMounted(() => {
+  detectClientApp()
   fetchPackages()
 })
 </script>
@@ -378,13 +401,13 @@ onMounted(() => {
         :before-upload="beforeUpload"
         :show-file-list="false"
         :disabled="uploadInProgress"
-        accept=".apk,.ipa"
+        accept=".apk,.ipa,.exe,.msi,.dmg"
         drag
         name="file"
       >
         <el-icon class="upload-icon"><UploadFilled /></el-icon>
-        <div class="upload-text">将 APK 或 IPA 文件拖到此处，或 <em>点击上传</em></div>
-        <div class="upload-tip">支持 Android .apk 与 Ad Hoc 签名的 iOS .ipa</div>
+        <div class="upload-text">将安装包文件拖到此处，或 <em>点击上传</em></div>
+        <div class="upload-tip">支持 Android .apk、Ad Hoc 签名的 iOS .ipa，以及桌面安装包 .exe/.msi/.dmg（文件名需含版本号，如 AutoDroid Setup 1.2.3.exe）</div>
       </el-upload>
     </el-card>
 
@@ -435,7 +458,7 @@ onMounted(() => {
         v-loading="loading"
         class="ad-table"
         style="width: 100%;"
-        empty-text="暂无安装包，请上传 APK 或 IPA 文件"
+        empty-text="暂无安装包，请上传 APK、IPA 或桌面安装包"
       >
         <!-- 应用名称 + 最新标签 -->
         <el-table-column label="应用名称" min-width="180">
@@ -447,7 +470,7 @@ onMounted(() => {
                 size="small"
                 effect="plain"
                 round
-              >{{ row.platform === 'ios' ? 'iOS' : 'Android' }}</el-tag>
+              >{{ platformLabel(row.platform) }}</el-tag>
               <el-tag
                 v-if="row.is_latest"
                 type="success"
@@ -494,7 +517,17 @@ onMounted(() => {
         <!-- 操作 -->
         <el-table-column label="操作" width="120" align="center" fixed="right">
           <template #default="{ row }">
-            <el-button type="primary" link :icon="Cellphone" @click="openInstallDialog(row)">
+            <el-button
+              v-if="isIosInstallBlocked(row)"
+              type="info"
+              link
+              :icon="Cellphone"
+              disabled
+              title="iOS 安装请用平台/后续版本"
+            >
+              安装
+            </el-button>
+            <el-button v-else-if="!isDesktopPackage(row)" type="primary" link :icon="Cellphone" @click="openInstallDialog(row)">
               安装
             </el-button>
             <el-dropdown trigger="click" @command="$event==='download' ? handleDownload(row) : handleDelete(row)"><el-button link :aria-label="row.app_name+'的更多操作'">更多</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="download">下载</el-dropdown-item><el-dropdown-item command="delete" divided>删除</el-dropdown-item></el-dropdown-menu></template></el-dropdown>

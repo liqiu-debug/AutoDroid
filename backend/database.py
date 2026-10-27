@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Optional
 from sqlalchemy import event
 from sqlmodel import Session, SQLModel, col, create_engine, select
 
@@ -88,6 +89,7 @@ def _migration_add_columns(cursor) -> None:
         ("device", "platform", "VARCHAR DEFAULT 'android'"),
         ("device", "os_version", "VARCHAR DEFAULT ''"),
         ("device", "connection_type", "VARCHAR"),
+        ("device", "owner_id", "INTEGER REFERENCES user(id)"),
         ("testscenario", "updater_id", "INTEGER REFERENCES user(id)"),
         ("testscenario", "last_run_duration", "INTEGER"),
         ("testscenario", "last_report_id", "VARCHAR"),
@@ -102,6 +104,8 @@ def _migration_add_columns(cursor) -> None:
         ("testcasestep", "description", "VARCHAR"),
         ("testexecution", "device_serial", "VARCHAR"),
         ("testexecution", "platform", "VARCHAR"),
+        ("testexecution", "env_id", "INTEGER"),
+        ("fastbottask", "run_id", "VARCHAR"),
         ("testresult", "report_display", "JSON"),
         ("compatibilityrun", "compare_mode", "VARCHAR DEFAULT 'version'"),
         ("compatibilityrun", "baseline_device_serial", "VARCHAR"),
@@ -1557,6 +1561,9 @@ def _migrate_testexecution_run_source(cursor) -> None:
     if "run_source" not in columns:
         cursor.execute("ALTER TABLE testexecution ADD COLUMN run_source VARCHAR")
         logger.info("Migration: ALTER TABLE testexecution ADD COLUMN run_source")
+    # 极简/历史表无批次列时跳过回填（生产表始终带 batch_name/scenario_name）
+    if "batch_name" not in columns or "scenario_name" not in columns:
+        return
 
     cursor.execute(
         """
@@ -1569,6 +1576,55 @@ def _migrate_testexecution_run_source(cursor) -> None:
     cursor.execute(
         "UPDATE testexecution SET run_source = 'platform' WHERE run_source IS NULL OR run_source = ''"
     )
+
+
+def _migrate_device_client_presence(cursor) -> None:
+    """device 客户端归属三列：owner_id / client_instance_id / last_seen_at。
+
+    owner_id 的加列由 034 复用 _migration_add_columns 完成；这里补
+    client_instance_id / last_seen_at，并为归属列补建索引（含历史库）。
+    """
+    if not _table_exists(cursor, "device"):
+        return
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(device)").fetchall()}
+    for name, kind in [("client_instance_id", "VARCHAR"), ("last_seen_at", "TIMESTAMP")]:
+        if name not in columns:
+            cursor.execute(f"ALTER TABLE device ADD COLUMN {name} {kind}")
+            logger.info("Migration: ALTER TABLE device ADD COLUMN %s", name)
+    cursor.execute("CREATE INDEX IF NOT EXISTS ix_device_owner_id ON device(owner_id)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS ix_device_client_instance_id ON device(client_instance_id)"
+    )
+
+
+def _migrate_steps_version_columns(cursor) -> None:
+    """testcase / testscenario 乐观锁 version 列（P4 功能1：步骤写入并发防护）。
+
+    历史行默认回填 1（ALTER ... DEFAULT 1 对既有行生效），与新建行同起点。
+    """
+    for table in ("testcase", "testscenario"):
+        if not _table_exists(cursor, table):
+            continue
+        columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "version" not in columns:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN version INTEGER DEFAULT 1")
+            logger.info("Migration: ALTER TABLE %s ADD COLUMN version", table)
+
+
+def _migrate_compatibility_client_executed(cursor) -> None:
+    """compatibilityrun.client_executed：桌面本地执行回放标记（P4 功能2）。
+
+    标记 run 由客户端本地执行并经 /api/client-compatibility/runs/{id}/report
+    上报结果；云端不派发后台执行 worker。历史行默认 0（云端执行语义不变）。
+    """
+    if not _table_exists(cursor, "compatibilityrun"):
+        return
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(compatibilityrun)").fetchall()}
+    if "client_executed" not in columns:
+        cursor.execute(
+            "ALTER TABLE compatibilityrun ADD COLUMN client_executed BOOLEAN DEFAULT 0"
+        )
+        logger.info("Migration: ALTER TABLE compatibilityrun ADD COLUMN client_executed")
 
 
 def _run_migrations_with_conn(conn) -> None:
@@ -1660,6 +1716,18 @@ def _run_migrations_with_conn(conn) -> None:
             # 032 上线时历史标签清单不含「AutoJs6 设备端执行」，已被 032 错标为 platform；
             # 重跑同一回填（按批次名匹配，幂等）修正这批记录。
             ("20261021_033_testexecution_run_source_autojs6", _migrate_testexecution_run_source),
+            # 复用 _migration_add_columns（幂等按列检查），补 device.owner_id（桌面端设备归属）
+            ("20261026_034_device_owner_id", _migration_add_columns),
+            # 补 device.client_instance_id / last_seen_at 并为归属列建索引
+            ("20261026_035_device_client_presence", _migrate_device_client_presence),
+            # 复用 _migration_add_columns（幂等按列检查），补 testexecution.env_id（client-runs 环境记录）
+            ("20261026_036_testexecution_env_id", _migration_add_columns),
+            # 复用 _migration_add_columns（幂等按列检查），补 fastbottask.run_id（client-fastbot 幂等键）
+            ("20261026_037_fastbottask_run_id", _migration_add_columns),
+            # 补 testcase / testscenario 乐观锁 version 列（步骤写入并发防护）
+            ("20261026_038_steps_version", _migrate_steps_version_columns),
+            # 补 compatibilityrun.client_executed（桌面本地回放执行标记）
+            ("20261026_039_compatibility_client_executed", _migrate_compatibility_client_executed),
         ]
 
         for version, migration_func in migration_plan:
@@ -1803,6 +1871,34 @@ def backfill_legacy_asset_owners(session: Session, admin_user_id: int) -> dict:
         session.commit()
 
     return {"cases": len(cases), "scenarios": len(scenarios)}
+
+
+def backfill_legacy_device_owners(session: Session, admin_user_id: Optional[int] = None) -> dict:
+    """Assign legacy devices without owner_id to the default admin.
+
+    无 admin 用户时回填给最早创建的用户；两者皆无则跳过。幂等，可随启动执行。
+    """
+    from backend.models import Device, User
+
+    target_id = admin_user_id
+    if not target_id:
+        admin = session.exec(select(User).where(User.role == "admin").order_by(User.id)).first()
+        if admin is None:
+            admin = session.exec(select(User).order_by(User.id)).first()
+        target_id = admin.id if admin else None
+
+    if not target_id:
+        return {"devices": 0}
+
+    devices = session.exec(select(Device).where(col(Device.owner_id).is_(None))).all()
+    for device in devices:
+        device.owner_id = target_id
+        session.add(device)
+
+    if devices:
+        session.commit()
+
+    return {"devices": len(devices)}
 
 
 def get_session():

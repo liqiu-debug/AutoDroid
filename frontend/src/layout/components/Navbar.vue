@@ -1,19 +1,32 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useUserStore } from '@/stores/useUserStore'
 import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
-import { ArrowDown, Lock, SwitchButton } from '@element-plus/icons-vue'
+import { ArrowDown, Lock, Refresh, SwitchButton } from '@element-plus/icons-vue'
+import { useClientApp } from '@/composables/useClientApp'
+import { useAppUpdate } from '@/composables/useAppUpdate'
 
 const userStore = useUserStore()
 const router = useRouter()
+// 「检查更新」仅 clientMode 显示（复用 useClientApp）；纯 Web 无入口无检查
+const { isClientApp } = useClientApp()
+const { startUpdateCheck, initSilentUpdateCheck, subscribeCheckUpdateRequest } = useAppUpdate()
 const userName = computed(() => userStore.userInfo?.full_name || userStore.userInfo?.username || '账户')
+
+// 启动静默检查（clientMode 启动后一次，有新版弹通知，不阻塞）+ 托盘「检查更新」同一检查流程
+onMounted(() => {
+  initSilentUpdateCheck()
+  subscribeCheckUpdateRequest()
+})
+
 const handleCommand = async command => {
   if (command === 'password') return router.push('/account/password')
+  if (command === 'check-update') return startUpdateCheck()
   if (command !== 'logout') return
   try {
     await ElMessageBox.confirm('确定要退出登录吗？', '退出登录', { confirmButtonText: '退出', cancelButtonText: '取消' })
-    userStore.logout()
+    userStore.logout(true)
     router.push('/login')
   } catch { /* User kept the current session. */ }
 }
@@ -28,7 +41,9 @@ const handleCommand = async command => {
     <template #dropdown>
       <el-dropdown-menu>
         <el-dropdown-item command="password" :icon="Lock">修改密码</el-dropdown-item>
-        <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
+        <!-- 「检查更新」与「退出登录」同组（客户端模式才出现；分隔线上移至检查更新，Web 分组不变） -->
+        <el-dropdown-item v-if="isClientApp" command="check-update" :icon="Refresh" divided>检查更新</el-dropdown-item>
+        <el-dropdown-item command="logout" :icon="SwitchButton" :divided="!isClientApp">退出登录</el-dropdown-item>
       </el-dropdown-menu>
     </template>
   </el-dropdown>

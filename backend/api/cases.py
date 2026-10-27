@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
@@ -37,6 +37,12 @@ from backend.schemas import (
     TestCaseRead,
     TestCaseStepRead,
     TestCaseStepWrite,
+)
+from backend.version_lock import (
+    bump_version,
+    set_version_header,
+    version_state_payload,
+    write_with_version_lock,
 )
 from backend.step_contract import (
     build_legacy_from_standard_steps,
@@ -126,6 +132,34 @@ def _extract_template_paths_from_platform_overrides(raw: Any) -> List[str]:
     return refs
 
 
+def _iter_normalized_template_paths(*values: Any) -> List[str]:
+    """候选值可能为单路径或 `|` 连接的多路径（点击失败兜底模板），逐段归一化。"""
+    refs: List[str] = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        for part in str(value).split("|"):
+            normalized = _normalize_auto_template_image_path(part)
+            if normalized:
+                refs.append(normalized)
+    return refs
+
+
+def _extract_template_paths_from_locator_candidates(raw: Any) -> List[str]:
+    """args.locator_candidates 里的有序多候选也可能引用模板图。"""
+    refs: List[str] = []
+    if not isinstance(raw, list):
+        return refs
+    for candidate in raw:
+        if not isinstance(candidate, dict):
+            continue
+        by = str(candidate.get("by") or "").strip().lower()
+        if by and by != "image":
+            continue
+        refs.extend(_iter_normalized_template_paths(candidate.get("selector")))
+    return refs
+
+
 def _collect_template_paths_from_legacy_steps(steps: List[Any]) -> List[str]:
     refs: List[str] = []
     for step in steps or []:
@@ -143,10 +177,8 @@ def _collect_template_paths_from_legacy_steps(steps: List[Any]) -> List[str]:
         if action in IMAGE_TEMPLATE_ACTIONS or selector_type == "image":
             candidates.extend([raw.get("selector"), raw.get("value")])
 
-        for candidate in candidates:
-            normalized = _normalize_auto_template_image_path(candidate)
-            if normalized:
-                refs.append(normalized)
+        refs.extend(_iter_normalized_template_paths(*candidates))
+        refs.extend(_extract_template_paths_from_locator_candidates(options.get("locator_candidates")))
 
         refs.extend(_extract_template_paths_from_platform_overrides(raw.get("platform_overrides")))
 
@@ -166,10 +198,8 @@ def _collect_template_paths_from_standard_steps(steps: List[Any]) -> List[str]:
         if action in IMAGE_TEMPLATE_ACTIONS:
             candidates.extend([raw.get("selector"), raw.get("value")])
 
-        for candidate in candidates:
-            normalized = _normalize_auto_template_image_path(candidate)
-            if normalized:
-                refs.append(normalized)
+        refs.extend(_iter_normalized_template_paths(*candidates))
+        refs.extend(_extract_template_paths_from_locator_candidates(args.get("locator_candidates")))
 
         refs.extend(_extract_template_paths_from_platform_overrides(raw.get("platform_overrides")))
 
@@ -218,12 +248,18 @@ def _list_generated_template_images_on_disk() -> set:
 
 
 def _cleanup_unused_template_images(session: Session, candidate_paths: List[Any]) -> List[str]:
+    """删除「本次编辑不再引用」的模板图。
+
+    候选**仅限**调用方传入的路径（被编辑/删除用例此前引用的图），绝不全盘扫
+    static/images——全盘扫会把其它尚未被引用收集器识别的图（如测试环境、
+    新引用形态）当成孤儿误删，历史上已造成模板图批量丢失。
+    孤儿模板的清理请走显式维护接口 sweep_orphan_template_images。
+    """
     normalized_candidates = {
         normalized
         for normalized in (_normalize_auto_template_image_path(item) for item in candidate_paths or [])
         if normalized
     }
-    normalized_candidates.update(_list_generated_template_images_on_disk())
     if not normalized_candidates:
         return []
 
@@ -250,6 +286,49 @@ def _cleanup_unused_template_images(session: Session, candidate_paths: List[Any]
 
     if deleted_paths:
         logger.info("deleted unused template images: %s", deleted_paths)
+    return deleted_paths
+
+
+def sweep_orphan_template_images(
+    session: Session, min_age_seconds: float = 24 * 3600
+) -> List[str]:
+    """显式孤儿清扫（维护用途）：删除「无任何引用且足够老」的模板图。
+
+    与编辑路径的清理分开：这里才做全盘扫描，且带最小年龄门槛
+    （默认 24h）——新裁剪/新上传的图即使暂未被引用也不会被秒删。
+    """
+    normalized_candidates = _list_generated_template_images_on_disk()
+    if not normalized_candidates:
+        return []
+
+    active_refs = _list_all_referenced_template_images(session)
+    stale_paths = sorted(normalized_candidates - active_refs)
+    deleted_paths: List[str] = []
+    import time
+
+    now = time.time()
+    for relative_path in stale_paths:
+        file_path = (PROJECT_ROOT / relative_path).resolve()
+        try:
+            file_path.relative_to(AUTO_TEMPLATE_IMAGE_DIR.resolve())
+        except Exception:
+            continue
+        if not file_path.exists() or not file_path.is_file():
+            continue
+        try:
+            age = now - file_path.stat().st_mtime
+        except OSError:
+            continue
+        if age < min_age_seconds:
+            continue
+        try:
+            file_path.unlink()
+            deleted_paths.append(relative_path)
+        except OSError:
+            logger.exception("failed to sweep orphan template image: %s", file_path)
+
+    if deleted_paths:
+        logger.info("swept orphan template images: %s", deleted_paths)
     return deleted_paths
 
 
@@ -496,6 +575,11 @@ def _replace_standard_steps(
     case_id: int,
     step_items: List[Dict[str, Any]],
 ) -> List[TestCaseStep]:
+    """全量替换 standard 步骤行（flush-only，不在中途 commit）。
+
+    事务边界由调用方掌控：与乐观锁 CAS / 旧 steps 列写入同事务一次 commit，
+    中途失败调用方 rollback，不得半写（P4 终验必修缺陷 1）。
+    """
     old_steps = session.exec(select(TestCaseStep).where(TestCaseStep.case_id == case_id)).all()
     for old_step in old_steps:
         session.delete(old_step)
@@ -518,7 +602,7 @@ def _replace_standard_steps(
             )
         )
 
-    session.commit()
+    session.flush()
     return _list_standard_steps(session, case_id)
 
 
@@ -604,6 +688,7 @@ def create_test_case(
 
     if is_flag_enabled(session, FLAG_NEW_STEP_MODEL):
         _sync_standard_steps_from_legacy(session, db_case.id, db_case.steps or [])
+        session.commit()
 
     return _enrich_case_read(db_case, session)
 
@@ -717,6 +802,8 @@ def update_test_case(
     db_case.folder_id = test_case.folder_id
     db_case.updater_id = current_user.id
     db_case.updated_at = datetime.now()
+    # 整体更新同样写步骤：bump 乐观锁版本，避免他端 steps PUT 用旧版本静默覆盖
+    db_case.version = bump_version(db_case.version)
 
     session.add(db_case)
     session.commit()
@@ -724,6 +811,7 @@ def update_test_case(
 
     if is_flag_enabled(session, FLAG_NEW_STEP_MODEL):
         _sync_standard_steps_from_legacy(session, db_case.id, db_case.steps or [])
+        session.commit()
 
     _cleanup_unused_template_images(session, previous_image_paths)
 
@@ -768,12 +856,17 @@ def duplicate_test_case(
             session.commit()
         else:
             _sync_standard_steps_from_legacy(session, new_case.id, new_case.steps or [])
+            session.commit()
 
     return _enrich_case_read(new_case, session)
 
 
 @router.get("/{case_id}/steps", response_model=List[TestCaseStepRead])
-def get_case_standard_steps(case_id: int, session: Session = Depends(get_session)):
+def get_case_standard_steps(
+    case_id: int,
+    response: Response = None,
+    session: Session = Depends(get_session),
+):
     """Read standard cross-platform steps for a case."""
     case = session.get(TestCase, case_id)
     if not case:
@@ -786,18 +879,34 @@ def get_case_standard_steps(case_id: int, session: Session = Depends(get_session
         and case.steps
     ):
         standard_steps = _sync_standard_steps_from_legacy(session, case_id, case.steps)
+        session.commit()
 
+    set_version_header(response, int(case.version or 1), case.updated_at)
     return [_row_to_standard_step_read(item) for item in standard_steps]
 
 
-@router.put("/{case_id}/steps", response_model=List[TestCaseStepRead])
+@router.put("/{case_id}/steps")
 def replace_case_standard_steps(
     case_id: int,
     steps: List[TestCaseStepWrite],
+    response: Response = None,
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
+    if_match: Optional[str] = Header(None, alias="If-Match"),
+    version: Optional[int] = Query(None),
+    expected_updated_at: Optional[str] = Query(None),
 ):
-    """Replace all standard steps for a case (source of truth for new model)."""
+    """Replace all standard steps for a case (source of truth for new model).
+
+    乐观锁（P4 功能1，三端契约见 backend/version_lock.py）：If-Match /
+    ?version= / ?expected_updated_at= 任一存在即校验（AND），冲突 409
+    detail=「保存冲突：内容已被其他端修改，请重新拉取后再保存」；都缺失跳过
+    校验（旧客户端兼容）。
+
+    终验修正（必修缺陷 1）：校验 + 写入 + 递增是一条原子 CAS UPDATE——
+    steps JSON 列与 version=version+1 同一 UPDATE、standard 步骤行同事务替换，
+    中途失败 rollback 不得半写；真并发同令牌双发恰一胜一 409。
+    """
     case = session.get(TestCase, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="用例不存在")
@@ -811,22 +920,42 @@ def replace_case_standard_steps(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    saved_steps = _replace_standard_steps(session, case_id, validated)
+    try:
+        # standard 步骤行先落事务（flush-only），供旧 steps 列双写取材
+        saved_steps = _replace_standard_steps(session, case_id, validated)
+        # 原子 CAS：旧 steps 列 + version=version+1 + updated_at 同一条 UPDATE
+        write_with_version_lock(
+            session,
+            case,
+            values={
+                # Double-write back to legacy steps for existing frontend compatibility.
+                "steps": _to_legacy_step_models(saved_steps),
+                "updater_id": current_user.id,
+                "updated_at": datetime.now(),
+            },
+            if_match=if_match,
+            version=version,
+            expected_updated_at=expected_updated_at,
+            missing_detail="用例不存在",
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
 
-    # Double-write back to legacy steps for existing frontend compatibility.
-    case.steps = _to_legacy_step_models(saved_steps)
-    case.updater_id = current_user.id
-    case.updated_at = datetime.now()
-    session.add(case)
-    session.commit()
     _cleanup_unused_template_images(session, previous_image_paths)
 
-    return [_row_to_standard_step_read(item) for item in saved_steps]
+    set_version_header(response, int(case.version or 1), case.updated_at)
+    return {
+        "steps": [_row_to_standard_step_read(item) for item in saved_steps],
+        **version_state_payload(int(case.version or 1), case.updated_at),
+    }
 
 
 @router.post("/{case_id}/steps/sync-legacy", response_model=List[TestCaseStepRead])
 def sync_case_standard_steps_from_legacy(
     case_id: int,
+    response: Response = None,
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
@@ -841,10 +970,12 @@ def sync_case_standard_steps_from_legacy(
 
     case.updater_id = current_user.id
     case.updated_at = datetime.now()
+    case.version = bump_version(case.version)
     session.add(case)
     session.commit()
     _cleanup_unused_template_images(session, previous_image_paths)
 
+    set_version_header(response, int(case.version or 1), case.updated_at)
     return [_row_to_standard_step_read(item) for item in saved_steps]
 
 

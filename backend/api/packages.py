@@ -1,7 +1,9 @@
 """
 APP 安装包管理 API
 
-提供 APK/IPA 文件的上传、解析、列表查询、下载、删除和设备安装功能。
+提供 APK/IPA/桌面包（.exe/.msi/.dmg）文件的上传、解析、列表查询、下载、删除和设备安装功能。
+桌面包（AutoDroid 桌面客户端）走同一通道：package_name 固定为 autodroid-desktop，
+版本号从文件名中的 semver 解析，供客户端「检查更新」自查询（package_name + latest_only）使用。
 """
 import os
 import shlex
@@ -48,7 +50,19 @@ CHUNK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 PACKAGE_UPLOAD_CHUNK_SIZE = 20 * 1024 * 1024
 UPLOAD_SESSION_TTL_SECONDS = 24 * 60 * 60
 UPLOAD_READ_SIZE = 1024 * 1024
-SUPPORTED_PACKAGE_EXTENSIONS = {".apk": "android", ".ipa": "ios"}
+SUPPORTED_PACKAGE_EXTENSIONS = {
+    ".apk": "android",
+    ".ipa": "ios",
+    ".exe": "windows",
+    ".msi": "windows",
+    ".dmg": "macos",
+}
+SUPPORTED_PLATFORMS = {"android", "ios", "windows", "macos"}
+# 桌面客户端安装包走独立通道（不做 apk/ipa 二进制解析）
+DESKTOP_PACKAGE_EXTENSIONS = {".exe", ".msi", ".dmg"}
+DESKTOP_PACKAGE_NAME = "autodroid-desktop"
+DESKTOP_APP_NAME = "AutoDroid"
+DESKTOP_VERSION_PATTERN = re.compile(r"\d+(?:\.\d+)+")
 IOS_INSTALL_TIMEOUT_SECONDS = 300
 
 
@@ -156,7 +170,10 @@ def _expected_total_chunks(file_size: int, chunk_size: int) -> int:
 def _package_extension(filename: str) -> str:
     extension = Path(str(filename or "")).suffix.lower()
     if extension not in SUPPORTED_PACKAGE_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持 .apk 或 .ipa 文件")
+        raise HTTPException(
+            status_code=400,
+            detail="仅支持 .apk、.ipa、.exe、.msi 或 .dmg 文件",
+        )
     return extension
 
 
@@ -190,23 +207,53 @@ async def _write_upload_file(file: UploadFile, saved_path: Path) -> int:
     return total_bytes
 
 
+def _parse_desktop_package_info(filename: str) -> Dict[str, str]:
+    """从桌面包文件名解析元数据（不解析安装包二进制）。
+
+    版本号取文件名中首个 semver（如 AutoDroid Setup 1.2.3.exe -> 1.2.3）；
+    解析不到版本号时明确报 400，避免产生无法比较版本的更新记录。
+    """
+    basename = os.path.basename(str(filename or ""))
+    version_match = DESKTOP_VERSION_PATTERN.search(basename)
+    if not version_match:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "桌面包文件名中未找到版本号，文件名需包含形如 1.2.3 的版本号"
+                "（如 AutoDroid Setup 1.2.3.exe）"
+            ),
+        )
+    version_name = version_match.group(0)
+    return {
+        "app_name": DESKTOP_APP_NAME,
+        "package_name": DESKTOP_PACKAGE_NAME,
+        "version_name": version_name,
+        "version_code": version_name.replace(".", ""),
+    }
+
+
 def _record_uploaded_package(
     *,
     saved_path: Path,
     file_size_bytes: int,
     session: Session,
     current_user: User,
+    original_filename: Optional[str] = None,
 ) -> AppPackage:
     extension = _package_extension(saved_path.name)
     package_platform = SUPPORTED_PACKAGE_EXTENSIONS[extension]
-    try:
-        package_info = (
-            parse_apk_info(str(saved_path))
-            if package_platform == "android"
-            else parse_ipa_info(str(saved_path))
-        )
-    except IpaParseError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if extension in DESKTOP_PACKAGE_EXTENSIONS:
+        # 桌面包：版本元数据从原始文件名解析，不走 apk/ipa 解析
+        package_info = _parse_desktop_package_info(original_filename or saved_path.name)
+    else:
+        try:
+            package_info = (
+                parse_apk_info(str(saved_path))
+                if package_platform == "android"
+                else parse_ipa_info(str(saved_path))
+            )
+        except IpaParseError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if package_info.get("package_name"):
         stmt = select(AppPackage).where(
@@ -715,6 +762,7 @@ async def upload_package(
             file_size_bytes=file_size_bytes,
             session=session,
             current_user=current_user,
+            original_filename=file.filename,
         )
     except Exception:
         _remove_path(saved_path)
@@ -872,6 +920,7 @@ def complete_package_upload(
             file_size_bytes=file_size,
             session=session,
             current_user=current_user,
+            original_filename=str(meta.get("filename") or ""),
         )
     except HTTPException:
         _remove_path(saved_path)
@@ -899,7 +948,7 @@ def list_packages(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     keyword: Optional[str] = Query(None, description="按应用名/包名搜索"),
-    platform: Optional[str] = Query(None, description="按 android/ios 平台过滤"),
+    platform: Optional[str] = Query(None, description="按 android/ios/windows/macos 平台过滤"),
     package_name: Optional[str] = Query(None, description="按包名精确过滤"),
     latest_only: bool = Query(False, description="仅返回最新版本"),
     session: Session = Depends(get_session),
@@ -919,8 +968,11 @@ def list_packages(
 
     if platform:
         normalized_platform = str(platform).strip().lower()
-        if normalized_platform not in {"android", "ios"}:
-            raise HTTPException(status_code=400, detail="platform 仅支持 android 或 ios")
+        if normalized_platform not in SUPPORTED_PLATFORMS:
+            raise HTTPException(
+                status_code=400,
+                detail="platform 仅支持 android、ios、windows 或 macos",
+            )
         query = query.where(AppPackage.platform == normalized_platform)
 
     if package_name and package_name.strip():
@@ -964,12 +1016,16 @@ def download_package(
     package_platform = str(pkg.platform or "android").strip().lower()
     extension = Path(pkg.file_path or "").suffix.lower()
     if extension not in SUPPORTED_PACKAGE_EXTENSIONS:
-        extension = ".ipa" if package_platform == "ios" else ".apk"
+        extension = {
+            "ios": ".ipa",
+            "windows": ".exe",
+            "macos": ".dmg",
+        }.get(package_platform, ".apk")
     download_name = f"{pkg.app_name}_{pkg.version_name}{extension}"
     media_type = (
-        "application/octet-stream"
-        if extension == ".ipa"
-        else "application/vnd.android.package-archive"
+        "application/vnd.android.package-archive"
+        if extension == ".apk"
+        else "application/octet-stream"
     )
     return FileResponse(
         path=str(file_path),

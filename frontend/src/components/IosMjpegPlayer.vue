@@ -20,6 +20,7 @@
  */
 import { computed, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Loading, Refresh } from '@element-plus/icons-vue'
+import { buildIosMjpegWsUrl } from '@/utils/streamAuth'
 
 const props = defineProps({
   /** 设备序列号（iOS UDID） */
@@ -173,9 +174,9 @@ function connect() {
   status.value = autoReconnectAttempt > 0 ? 'reconnecting' : 'connecting'
   statusDetail.value = ''
 
-  // WS URL 拼接方式与 ScrcpyPlayer 保持一致（同源 + /ws 前缀，开发态由 vite 代理）
-  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${wsProtocol}//${window.location.host}/ws/ios-mjpeg/${encodeURIComponent(props.serial)}`
+  // WS URL 拼接方式与 ScrcpyPlayer 保持一致（同源 + /ws 前缀，开发态由 vite 代理）；
+  // 云端直连走 ?token= 查询通道鉴权（桌面引擎本地端点忽略 query，无害）
+  const wsUrl = buildIosMjpegWsUrl(props.serial)
 
   const socket = new WebSocket(wsUrl)
   socket.binaryType = 'arraybuffer'

@@ -591,23 +591,23 @@ onUnmounted(stopActiveRunPolling)
 
     <div v-else class="case-list-container">
         <el-container class="main-layout">
-            <!-- Left: Folder Tree -->
-            <el-aside v-show="foldersVisible" width="176px" class="folder-aside">
-                <FolderTreePanel
-                    ref="treePanelRef"
-                    title="用例目录"
-                    all-label="所有用例"
-                    item-id-key="case_id"
-                    :fetch-tree="fetchCaseFolderTree"
-                    :create-folder="api.createFolder"
-                    :rename-folder="api.renameFolder"
-                    :delete-folder="api.deleteFolder"
-                    :move-item="api.moveCase"
-                    @select-folder="handleFolderSelect"
-                    @open-item="handleOpenCase"
-                    @item-moved="fetchCases"
-                />
-            </el-aside>
+            <!-- Left: Folder Tree（宽度由 FolderTreePanel 外壳拖拽调整，localStorage 持久化） -->
+            <FolderTreePanel
+                v-show="foldersVisible"
+                ref="treePanelRef"
+                class="folder-aside"
+                title="用例目录"
+                all-label="所有用例"
+                item-id-key="case_id"
+                :fetch-tree="fetchCaseFolderTree"
+                :create-folder="api.createFolder"
+                :rename-folder="api.renameFolder"
+                :delete-folder="api.deleteFolder"
+                :move-item="api.moveCase"
+                @select-folder="handleFolderSelect"
+                @open-item="handleOpenCase"
+                @item-moved="fetchCases"
+            />
 
             <!-- Right: Case Table -->
             <el-main class="table-main">

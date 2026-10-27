@@ -712,20 +712,39 @@ def get_fastbot_replay_file(task_id: int, filename: str):
     return FileResponse(replay_path, media_type=media_type, filename=filename)
 
 @router.get("/devices", response_model=List[DeviceRead])
-async def list_devices_with_status(session: Session = Depends(get_session)):
-    """获取所有设备，包含下线设备并动态附加 Fastbot 占用状态，实时检查设备在线状态"""
+async def list_devices_with_status(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """获取所有设备，包含下线设备并动态附加 Fastbot 占用状态，实时检查设备在线状态。
+
+    归属过滤与 GET /api/devices/ 同口径（admin 全量，普通用户仅本人设备）；
+    客户端注册设备（client_instance_id）不参与 adb 翻转，按心跳超时判定。
+    """
+    from backend.api.devices import (
+        apply_client_presence_status,
+        filter_devices_for_user,
+        is_client_managed_device,
+    )
+
     devices = sort_devices_for_display(session.exec(select(Device)).all())
+    devices = filter_devices_for_user(devices, current_user)
     devices = [
         d for d in devices if str(d.platform or "android").strip().lower() == "android"
     ]
-    
+
     # 实时检查哪些设备在线
     try:
         online_serials = await _get_online_devices()
-        
+
         # 更新设备状态
         status_updated = False
         for device in devices:
+            if is_client_managed_device(device):
+                if apply_client_presence_status(device):
+                    session.add(device)
+                    status_updated = True
+                continue
             if device.serial in online_serials:
                 if device.status == "OFFLINE":
                     device.status = "IDLE"
@@ -738,11 +757,12 @@ async def list_devices_with_status(session: Session = Depends(get_session)):
                     device.updated_at = datetime.now()
                     session.add(device)
                     status_updated = True
-        
+
         if status_updated:
             session.commit()
-            # 重新查询以获取最新状态
+            # 重新查询以获取最新状态（重新应用归属过滤）
             devices = sort_devices_for_display(session.exec(select(Device)).all())
+            devices = filter_devices_for_user(devices, current_user)
             devices = [
                 d for d in devices if str(d.platform or "android").strip().lower() == "android"
             ]

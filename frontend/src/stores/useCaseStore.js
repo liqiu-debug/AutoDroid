@@ -3,6 +3,12 @@ import { ref, computed, nextTick } from 'vue'
 import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
+import {
+    VERSION_CONFLICT_MESSAGE,
+    extractVersionState,
+    isVersionConflict,
+    versionStateFrom,
+} from '@/utils/versionToken'
 
 const SELECTOR_TYPE_TO_BY = {
     resourceId: 'id',
@@ -392,6 +398,9 @@ export const useCaseStore = defineStore('case', () => {
     const saving = ref(false)
     const lastAddedStepUuid = ref(null)
     const savedSnapshot = ref(null)
+    // 步骤乐观锁令牌（{version, updated_at}）：load 时从用例实体取，保存成功
+    // 回填新令牌，供下一次 PUT /cases/{id}/steps 的 If-Match 使用。
+    const caseVersion = ref(null)
 
     function takeSnapshot() {
         return JSON.stringify({
@@ -448,6 +457,7 @@ export const useCaseStore = defineStore('case', () => {
                 variables: normalizeVariablePlaceholders(caseData.variables || []),
                 steps: uiSteps
             }
+            caseVersion.value = versionStateFrom(caseData)
             // StepBuilder normalizes platform/options in its Vue watcher. Wait
             // for that initialization before declaring the loaded draft saved.
             await nextTick()
@@ -480,11 +490,22 @@ export const useCaseStore = defineStore('case', () => {
             const savedCase = res.data || {}
             const savedCaseId = savedCase.id || draft.id
             if (!savedCaseId) throw new Error('服务未返回用例 ID')
+            // 乐观锁令牌回填：实体写入返回的新令牌覆盖缓存（否则下一步骤写入
+            // 拿旧令牌必然 409）。
+            caseVersion.value = versionStateFrom(savedCase) || caseVersion.value
             // Keep the new identity even if the second save fails, so retry updates
             // this case instead of creating a duplicate and preserves the draft.
             currentCase.value.id = savedCaseId
             const standardPayload = normalizedSteps.map((step, index) => uiStepToStandardStep(step, index + 1))
-            const { data: savedStandardSteps } = await api.replaceCaseStandardSteps(savedCaseId, standardPayload)
+            const stepsRes = await api.replaceCaseStandardSteps(savedCaseId, standardPayload, caseVersion.value)
+            const stepsPayload = stepsRes?.data
+            // 保存成功回填新令牌：优先响应实体/ETag；拿不到就重拉用例实体，
+            // 绝不留下过期令牌导致下次保存误 409。
+            caseVersion.value = extractVersionState(stepsRes)
+                || (caseVersion.value ? await pullCaseVersion(savedCaseId) : null)
+            const savedStandardSteps = Array.isArray(stepsPayload)
+                ? stepsPayload
+                : (Array.isArray(stepsPayload?.steps) ? stepsPayload.steps : null)
             const finalSteps = Array.isArray(savedStandardSteps)
                 ? savedStandardSteps.map(standardStepToUiStep)
                 : normalizedSteps
@@ -502,11 +523,26 @@ export const useCaseStore = defineStore('case', () => {
             return true
         } catch (err) {
             savedSnapshot.value = '__incomplete_save__'
-            ElMessage.error('保存未完成，草稿已保留，请重试: ' + err.message)
+            if (isVersionConflict(err)) {
+                // 冲突：提示刷新重拉，草稿保留、不覆盖他人修改。
+                ElMessage.warning(VERSION_CONFLICT_MESSAGE)
+            } else {
+                ElMessage.error('保存未完成，草稿已保留，请重试: ' + err.message)
+            }
             return false
         } finally {
             saving.value = false
             loading.value = false
+        }
+    }
+
+    /** 重拉用例实体的版本令牌（保存响应未带新令牌时的兜底）。 */
+    async function pullCaseVersion(id) {
+        try {
+            const res = await api.getTestCase(id)
+            return versionStateFrom(res?.data)
+        } catch (err) {
+            return null
         }
     }
 
@@ -550,6 +586,7 @@ export const useCaseStore = defineStore('case', () => {
 
     function newCase(opts = {}) {
         lastAddedStepUuid.value = null
+        caseVersion.value = null
         currentCase.value = {
             id: null,
             name: '未命名用例',
@@ -568,6 +605,7 @@ export const useCaseStore = defineStore('case', () => {
         running,
         saving,
         lastAddedStepUuid,
+        caseVersion,
         // Getters
         hasUnsavedChanges,
         // Actions

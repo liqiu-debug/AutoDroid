@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 from fastapi.middleware.cors import CORSMiddleware
 
-from .database import backfill_legacy_asset_owners, engine, create_db_and_tables, get_session
+from .database import backfill_legacy_asset_owners, backfill_legacy_device_owners, engine, create_db_and_tables, get_session
 from .device_stream.router import rest_router as stream_rest_router
 from .device_stream.router import ws_router as stream_ws_router
 from .device_stream.manager import device_manager
@@ -71,6 +71,10 @@ from backend.api import settings
 from backend.api import fastbot
 from backend.api import log_analysis
 from backend.api import devices
+from backend.api import client_devices
+from backend.api import client_runs
+from backend.api import client_fastbot
+from backend.api import client_compatibility
 from backend.api import packages
 from backend.api import compatibility
 from backend.api import inspections
@@ -106,11 +110,17 @@ def _register_http_routers(
     target.include_router(reports.router, prefix=reports_prefix, tags=["reports"], include_in_schema=include_in_schema)
     target.include_router(runs.router, prefix="/runs", tags=["runs"], include_in_schema=include_in_schema)
     target.include_router(tasks.router, prefix="/tasks", tags=["tasks"], include_in_schema=include_in_schema)
+    target.include_router(tasks.client_router, prefix="/client-tasks", tags=["client-tasks"], include_in_schema=include_in_schema)
     if include_settings_alias:
         target.include_router(settings.router, prefix="/settings", tags=["settings"], include_in_schema=include_in_schema)
     target.include_router(fastbot.router, prefix="/fastbot", tags=["fastbot"], include_in_schema=include_in_schema)
     target.include_router(log_analysis.router, prefix="/fastbot", tags=["log_analysis"], include_in_schema=include_in_schema)
     target.include_router(devices.router, prefix="/devices", tags=["devices"], include_in_schema=include_in_schema)
+    target.include_router(client_devices.router, prefix="/client-devices", tags=["client-devices"], include_in_schema=include_in_schema)
+    target.include_router(client_runs.router, prefix="/client-runs", tags=["client-runs"], include_in_schema=include_in_schema)
+    target.include_router(client_runs.template_router, prefix="/client-templates", tags=["client-templates"], include_in_schema=include_in_schema)
+    target.include_router(client_fastbot.router, prefix="/client-fastbot", tags=["client-fastbot"], include_in_schema=include_in_schema)
+    target.include_router(client_compatibility.router, prefix="/client-compatibility", tags=["client-compatibility"], include_in_schema=include_in_schema)
     target.include_router(packages.router, prefix="/packages", tags=["packages"], include_in_schema=include_in_schema)
     target.include_router(compatibility.router, prefix="/compatibility", tags=["compatibility"], include_in_schema=include_in_schema)
     target.include_router(inspections.router, prefix="/inspections", tags=["inspections"], include_in_schema=include_in_schema)
@@ -211,6 +221,7 @@ def on_startup():
             session.commit()
             session.refresh(user)
         backfill_legacy_asset_owners(session, user.id)
+        backfill_legacy_device_owners(session, user.id)
 
     # 初始化定时任务调度器并恢复活跃任务
     _restore_scheduled_tasks()
@@ -286,32 +297,26 @@ def on_shutdown():
 
 
 def _restore_scheduled_tasks():
-    """从数据库恢复所有活跃的定时任务到调度器"""
+    """从数据库恢复所有活跃的定时任务到调度器（应由客户端调度的任务跳过，T1）"""
     import json
-    from backend.scheduler_service import get_scheduler
     from backend.models import ScheduledTask
-    from backend.api.tasks import _run_scheduled_scenario
+    from backend.api.tasks import _sync_cloud_schedule
 
-    scheduler = get_scheduler()
     with Session(engine) as session:
         active_tasks = session.exec(
             select(ScheduledTask).where(ScheduledTask.is_active == True)
         ).all()
+        restored = 0
         for task in active_tasks:
             try:
                 config = json.loads(task.strategy_config) if task.strategy_config else {}
-                next_run = scheduler.add_task(
-                    task_id=task.id,
-                    strategy=task.strategy,
-                    config=config,
-                    job_func=_run_scheduled_scenario,
-                )
-                task.next_run_time = next_run
+                _sync_cloud_schedule(session, task, config)
                 session.add(task)
+                restored += 1
             except Exception as e:
                 logger.error("恢复定时任务失败: task_id=%s error=%s", task.id, e)
         session.commit()
-    logger.info("已恢复 %s 个定时任务", len(active_tasks))
+    logger.info("已恢复 %s/%s 个定时任务", restored, len(active_tasks))
 
 
 @app.post("/api/run/{case_id}", include_in_schema=False)

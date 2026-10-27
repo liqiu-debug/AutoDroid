@@ -1012,6 +1012,20 @@ def _delete_execution_artifacts(execution: TestExecution, results):
             full_path = os.path.join(reports_dir, result.screenshot_path)
             if os.path.exists(full_path):
                 os.remove(full_path)
+    # client-runs 用例报告暂存侧车（reports/client_runs/exec_<id>.json）一并清理；
+    # retention 定时清理复用本函数，保证保留策略覆盖该产物
+    try:
+        from backend.api.client_runs import _run_state_path
+
+        state_path = _run_state_path(execution.id)
+        if state_path.is_file():
+            state_path.unlink()
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "client-runs 侧车清理失败: execution=%s error=%s", execution.id, exc
+        )
 
 
 @router.delete("/executions/{execution_id}")

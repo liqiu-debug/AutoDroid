@@ -6,8 +6,15 @@ import { VideoPlay, Refresh, View } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
 import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
+import { useClientApp } from '@/composables/useClientApp'
 
 const router = useRouter()
+
+// T6：客户端（桌面引擎）模式下冷热启动本地化采集未落地，/api/fastbot/startup/*
+// 透传云端只会报「设备不在线」误导用户。对齐 S9 修法：useClientApp 门控
+// 隐藏/禁用入口 + 明确降级提示。
+const CLIENT_COLLECT_HINT = '本地化采集后续版本提供'
+const { isClientApp, detectClientApp } = useClientApp()
 
 const form = reactive({
     package_name: '',
@@ -131,6 +138,10 @@ const buildPayload = () => ({
 })
 
 const submit = async () => {
+    if (isClientApp.value) {
+        ElMessage.info(CLIENT_COLLECT_HINT)
+        return
+    }
     if (submitting.value) return
     if (!form.package_name.trim()) {
         revealStartupError('请输入目标包名', '目标包名')
@@ -218,6 +229,7 @@ const deactivatePage = () => {
 }
 
 onMounted(async () => {
+    detectClientApp()
     await refreshAll()
     activatePage()
 })
@@ -245,10 +257,19 @@ onUnmounted(() => {
                         <span class="card-title">冷热启动配置</span>
                         <div class="header-actions">
                             <el-button :icon="Refresh" @click="refreshAll">刷新</el-button>
-                            <el-button type="primary" :icon="VideoPlay" :loading="submitting" @click="submit">开始测试</el-button>
+                            <el-button type="primary" :icon="VideoPlay" :loading="submitting" :disabled="isClientApp" :title="isClientApp ? CLIENT_COLLECT_HINT : undefined" @click="submit">开始测试</el-button>
                         </div>
                     </div>
                 </template>
+
+                <el-alert
+                    v-if="isClientApp"
+                    type="info"
+                    :closable="false"
+                    class="collect-alert"
+                    :title="CLIENT_COLLECT_HINT"
+                    description="桌面客户端暂不支持冷热启动本地化采集，请在平台 Web 端使用该能力。"
+                />
 
                 <div ref="startupFormElement"><el-form label-width="110px" label-position="left" :disabled="submitting">
                     <div class="form-grid">
@@ -438,6 +459,11 @@ onUnmounted(() => {
 
 .config-card,
 .tasks-card {
+    border-radius: var(--ad-radius);
+}
+
+.collect-alert {
+    margin-bottom: 12px;
     border-radius: var(--ad-radius);
 }
 

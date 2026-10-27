@@ -5,6 +5,7 @@ import { ref, computed, reactive, nextTick, watch } from 'vue'
 import { describeRunSubmission } from '../src/utils/uiRunPresentation.js'
 import * as actionConstants from '../src/utils/actionConstants.js'
 import * as statusMeta from '../src/utils/statusMeta.js'
+import * as versionToken from '../src/utils/versionToken.js'
 
 const copy = value => JSON.parse(JSON.stringify(value))
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
@@ -22,7 +23,7 @@ function storeSetup(overrides = {}) {
   }
   const source = stripImports(readFileSync(new URL('../src/stores/useCaseStore.js', import.meta.url), 'utf8')).replace('export const useCaseStore', 'const useCaseStore')
   let serial = 0
-  const dependencies = { defineStore: (_name, factory) => factory, ref, computed, nextTick, api, ElMessage: messages(), createUuid: () => `step-${++serial}` }
+  const dependencies = { defineStore: (_name, factory) => factory, ref, computed, nextTick, api, ElMessage: messages(), createUuid: () => `step-${++serial}`, ...versionToken }
   const store = new Function(...Object.keys(dependencies), source + '\nreturn useCaseStore()')(...Object.values(dependencies))
   store.newCase(); store.currentCase.value.name = '最新用例'; store.addStep({ action: 'wait', value: '1' })
   return { store, calls, api }
@@ -37,6 +38,7 @@ function editorSetup(name, extra = {}) {
     ElMessage: messages(), ElMessageBox: { confirm: async () => {} }, createUuid: () => 'ui-step',
     setInterval: () => 1, clearInterval: () => {}, window: { location: { protocol: 'http:', host: 'test.local' } },
     WebSocket: class { constructor(url) { connections.push(url) } close() {} },
+    ...versionToken,
     ...extra,
   }
   if (name.startsWith('Case')) Object.assign(dependencies, statusMeta)

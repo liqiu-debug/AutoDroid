@@ -5,8 +5,15 @@ import { ElMessage } from 'element-plus'
 import { VideoPlay, VideoPause, Position, Timer } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { useClientApp } from '@/composables/useClientApp'
 
 const router = useRouter()
+
+// T6：客户端（桌面引擎）模式下流畅度本地化采集未落地（fluency 5 端点 + 会话
+// 生命周期为遗留 B 项），/api/fastbot/fluency/* 只会透传云端并报「设备不在线」
+// 误导用户。对齐 S9 修法：useClientApp 门控隐藏/禁用入口 + 明确降级提示。
+const CLIENT_COLLECT_HINT = '本地化采集后续版本提供'
+const { isClientApp, detectClientApp } = useClientApp()
 
 const form = reactive({
     package_name: '',
@@ -82,6 +89,10 @@ const refreshAll = async () => {
 }
 
 const startSession = async () => {
+    if (isClientApp.value) {
+        ElMessage.info(CLIENT_COLLECT_HINT)
+        return
+    }
     if (starting.value) return
     if (!form.package_name.trim()) {
         ElMessage.warning('请输入目标包名')
@@ -116,6 +127,10 @@ const startSession = async () => {
 }
 
 const submitMarker = async (label = '') => {
+    if (isClientApp.value) {
+        ElMessage.info(CLIENT_COLLECT_HINT)
+        return
+    }
     if (marking.value) return
     const session = activeSession.value
     const finalLabel = String(label || markerLabel.value || '').trim()
@@ -143,6 +158,10 @@ const submitMarker = async (label = '') => {
 }
 
 const stopSession = async () => {
+    if (isClientApp.value) {
+        ElMessage.info(CLIENT_COLLECT_HINT)
+        return
+    }
     if (stopping.value) return
     const session = activeSession.value
     if (!session) {
@@ -212,6 +231,7 @@ const deactivatePage = () => {
 }
 
 onMounted(async () => {
+    detectClientApp()
     await refreshAll()
     activatePage()
 })
@@ -241,7 +261,8 @@ onUnmounted(() => {
                         type="primary"
                         :icon="VideoPlay"
                         :loading="starting"
-                        :disabled="Boolean(activeSession)"
+                        :disabled="Boolean(activeSession) || isClientApp"
+                        :title="isClientApp ? CLIENT_COLLECT_HINT : undefined"
                         @click="startSession"
                     >
                         开始录制
@@ -249,13 +270,23 @@ onUnmounted(() => {
                     <el-button
                         :icon="VideoPause"
                         :loading="stopping"
-                        :disabled="!activeSession"
+                        :disabled="!activeSession || isClientApp"
+                        :title="isClientApp ? CLIENT_COLLECT_HINT : undefined"
                         @click="stopSession"
                     >
                         结束录制
                     </el-button>
                 </div>
             </div>
+
+            <el-alert
+                v-if="isClientApp"
+                type="info"
+                :closable="false"
+                class="collect-alert"
+                :title="CLIENT_COLLECT_HINT"
+                description="桌面客户端暂不支持流畅度本地化采集与会话生命周期，请在平台 Web 端使用该能力。"
+            />
 
             <div class="fluency-grid">
                 <el-card shadow="never" class="config-card">
@@ -359,7 +390,7 @@ onUnmounted(() => {
                             class="marker-input"
                         >
                             <template #append>
-                                <el-button :icon="Position" :loading="marking" @click="submitMarker()">记录打点</el-button>
+                                <el-button :icon="Position" :loading="marking" :disabled="isClientApp" :title="isClientApp ? CLIENT_COLLECT_HINT : undefined" @click="submitMarker()">记录打点</el-button>
                             </template>
                         </el-input>
 
@@ -481,6 +512,10 @@ onUnmounted(() => {
     display: flex;
     gap: 12px;
     flex-shrink: 0;
+}
+
+.collect-alert {
+    border-radius: var(--ad-radius);
 }
 
 .fluency-grid {

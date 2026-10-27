@@ -1,12 +1,14 @@
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { FolderAdd, EditPen, Delete, Document, FolderOpened, MoreFilled } from '@element-plus/icons-vue'
+import { useResizableAside } from '@/composables/useResizableAside'
 
 /**
- * 通用目录树面板（用例/场景列表页共用）。
+ * 通用目录树面板（用例/场景/接口列表页共用）。
  * 数据源与 API 通过 props 注入：fetchTree 返回 { tree, items }，
- * 叶子节点由后端目录树接口生成（type 为 'case' / 'scenario' 等）。
+ * 叶子节点由后端目录树接口生成（type 为 'case' / 'scenario' / 'interface' 等）。
+ * 面板外壳自带宽度拖拽（默认 260px，200–480px，localStorage 持久化）。
  */
 const props = defineProps({
     /** 面板标题，如「用例目录」 */
@@ -23,11 +25,20 @@ const props = defineProps({
     renameFolder: { type: Function, required: true },
     /** async (folderId) */
     deleteFolder: { type: Function, required: true },
-    /** async (itemId, folderId) 将叶子移动到目录 */
-    moveItem: { type: Function, required: true }
+    /**
+     * async (itemId, folderId) 将叶子移动到目录。
+     * 传 null 表示后端无移动接口（如 api-testing），此时隐藏拖拽移动能力。
+     */
+    moveItem: { type: Function, default: null }
 })
 
 const emit = defineEmits(['select-folder', 'open-item', 'item-moved'])
+
+// 宽度拖拽 + localStorage 持久化（共享 composable，三处页面不重复实现）
+const { width: panelWidth, startResize } = useResizableAside()
+
+// 无移动接口的目录（api-testing）隐藏拖拽移动
+const canMoveItems = computed(() => typeof props.moveItem === 'function')
 
 const treeData = ref([])
 const treeRef = ref(null)
@@ -64,14 +75,16 @@ const handleNodeClick = (data) => {
 }
 
 // ---- Drag & Drop ----
-const allowDrag = (draggingNode) => isLeafNode(draggingNode.data)
+const allowDrag = (draggingNode) => canMoveItems.value && isLeafNode(draggingNode.data)
 
 const allowDrop = (draggingNode, dropNode, type) => {
+    if (!canMoveItems.value) return false
     if (dropNode.data.type !== 'folder') return false
     return type === 'inner'
 }
 
 const handleNodeDrop = async (draggingNode, dropNode) => {
+    if (!props.moveItem) return
     const itemId = draggingNode.data[props.itemIdKey]
     const targetFolderId = dropNode.data.folder_id
     if (!itemId || !targetFolderId) return
@@ -164,7 +177,7 @@ defineExpose({ refresh })
 </script>
 
 <template>
-    <div class="folder-tree-panel">
+    <div class="folder-tree-panel" :style="{ width: panelWidth + 'px' }">
         <div class="aside-header">
             <span class="aside-title">{{ title }}</span>
             <el-tooltip content="新建根目录" placement="top">
@@ -181,7 +194,7 @@ defineExpose({ refresh })
                 highlight-current
                 :default-expanded-keys="[]"
                 :expand-on-click-node="false"
-                draggable
+                :draggable="canMoveItems"
                 :allow-drag="allowDrag"
                 :allow-drop="allowDrop"
                 @node-click="handleNodeClick"
@@ -224,6 +237,16 @@ defineExpose({ refresh })
                 </template>
             </el-tree>
         </div>
+
+        <!-- 右侧拖拽把手：左右调整目录宽度 -->
+        <div
+            class="aside-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖拽调整目录宽度"
+            title="拖拽调整宽度"
+            @mousedown="startResize"
+        ></div>
     </div>
 </template>
 
@@ -233,6 +256,24 @@ defineExpose({ refresh })
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    position: relative;
+    flex-shrink: 0;
+}
+
+.aside-resizer {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 10;
+    background: transparent;
+    transition: background 0.2s ease;
+}
+
+.aside-resizer:hover {
+    background: var(--ad-primary-soft, rgba(64, 158, 255, 0.25));
 }
 
 .aside-header {
@@ -254,6 +295,9 @@ defineExpose({ refresh })
     flex: 1;
     overflow-y: auto;
     padding: 8px 0;
+    /* 右侧让出 6px 给拖拽把手：滚动条贴容器边缘，若不让位会被把手
+       截获点击（Windows 经典滚动条尤其明显） */
+    margin-right: 6px;
 }
 
 :deep(.el-tree-node__content) {

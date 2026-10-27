@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { normalizeError } from '@/utils/errors'
+import { versionRequestConfig } from '@/utils/versionToken'
 
 export const LOGIN_NOTICE_KEY = 'autodroid.login_notice'
 
@@ -12,6 +13,25 @@ const buildReportAssetUrl = (path) => {
     const normalized = String(path || '').trim().replace(/^\/+/, '')
     const encodedPath = normalized.split('/').map(encodeURIComponent).join('/')
     return encodedPath ? `/api/report-assets/${encodedPath}` : ''
+}
+
+// window.desktop preload bridge (Electron). Missing in pure web mode, where every
+// desktop helper below degrades to a no-op / null so call sites never branch on it.
+const desktopBridge = () => {
+    if (typeof window === 'undefined') return null
+    return window.desktop || null
+}
+
+// Manual sign-out flag: marks the saved login (loggedOut=true, autoLogin cleared) so
+// auto-login stays off across restarts until the user logs in again with 自动登录.
+// Bridge method is markLoggedOut (IPC desktop:mark-logged-out); when it is absent or
+// fails this degrades to a silent no-op — logout is never blocked by it.
+// manual=true (传参) marks the user-initiated sign-out; the flag is only ever set
+// explicitly, never inferred. The preload's markLoggedOut() is zero-arg.
+const markLoggedLogout = (manual = true) => {
+    const bridge = desktopBridge()
+    if (!bridge?.markLoggedOut || manual !== true) return Promise.resolve()
+    return Promise.resolve().then(() => bridge.markLoggedOut()).catch(() => {})
 }
 
 // Request interceptor
@@ -53,12 +73,18 @@ export default {
         get: (path, params) => api.get(`/api-testing${path}`, { params }),
         post: (path, data, config) => api.post(`/api-testing${path}`, data, config),
         put: (path, data) => api.put(`/api-testing${path}`, data),
+        patch: (path, data) => api.patch(`/api-testing${path}`, data),
         delete: path => api.delete(`/api-testing${path}`),
         download: id => api.get(`/api-testing/runs/${id}/download`, { responseType: 'blob' }),
     },
     // Auth
-    login(data) {
-        return api.post('/auth/token', data)
+    // options.server: 客户端（桌面引擎）模式下的上游服务器地址，随 X-AutoDroid-Server
+    // 头交给本地引擎归一化后反代；纯 Web 模式不传该头，行为不变。
+    login(data, options = {}) {
+        const config = {}
+        const server = typeof options?.server === 'string' ? options.server.trim() : ''
+        if (server) config.headers = { 'X-AutoDroid-Server': server }
+        return api.post('/auth/token', data, config)
     },
     register(data) {
         return api.post('/auth/register', data)
@@ -72,6 +98,28 @@ export default {
     changePassword(data) {
         return api.put('/auth/password', data)
     },
+
+    // Desktop client (local engine): GET /api/client/info returns 200 with
+    // {clientMode:true,...} only in the local engine; 404/transport failure = web mode.
+    getClientInfo() {
+        return api.get('/client/info')
+    },
+    // Saved login (window.desktop preload). Returns null when absent or unbridged.
+    getSavedLogin() {
+        const bridge = desktopBridge()
+        return bridge?.getSavedLogin ? Promise.resolve(bridge.getSavedLogin()) : Promise.resolve(null)
+    },
+    // data=null clears the saved login; password is only handed to the preload,
+    // which encrypts it with safeStorage before anything touches disk.
+    saveLogin(data) {
+        const bridge = desktopBridge()
+        return bridge?.saveLogin ? Promise.resolve(bridge.saveLogin(data)) : Promise.resolve()
+    },
+    // Manual sign-out flag → bridge markLoggedOut (IPC desktop:mark-logged-out).
+    // Silent no-op when the bridge method is missing or fails (see markLoggedLogout).
+    markLoggedLogout,
+    // Alias for the `api.markLoggedOut()` spelling; same behavior.
+    markLoggedOut: markLoggedLogout,
 
     // Cases
     getTestCases(params) {
@@ -119,8 +167,10 @@ export default {
     getCaseStandardSteps(id) {
         return api.get(`/cases/${id}/steps`)
     },
-    replaceCaseStandardSteps(id, steps) {
-        return api.put(`/cases/${id}/steps`, steps)
+    // 步骤全量替换带乐观锁令牌（If-Match + version/expected_updated_at），
+    // 并发修改服务端返回 409，调用方提示刷新重拉而不是静默覆盖。
+    replaceCaseStandardSteps(id, steps, versionState = null) {
+        return api.put(`/cases/${id}/steps`, steps, versionRequestConfig(versionState))
     },
 
     // Folders
@@ -203,8 +253,9 @@ export default {
     getScenarioSteps(id) {
         return api.get(`/scenarios/${id}/steps`)
     },
-    updateScenarioSteps(id, steps) {
-        return api.post(`/scenarios/${id}/steps`, steps)
+    // 场景步骤替换与用例步骤同一乐观锁契约（versionState 见 utils/versionToken.js）。
+    updateScenarioSteps(id, steps, versionState = null) {
+        return api.post(`/scenarios/${id}/steps`, steps, versionRequestConfig(versionState))
     },
     updateScenario(id, data) {
         return api.put(`/scenarios/${id}`, data)

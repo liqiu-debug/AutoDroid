@@ -21,10 +21,12 @@ from backend.models import (
     Device,
     InspectionProfile,
     ScheduledTask,
+    TestExecution,
     TestScenario,
     User,
 )
 from backend.schemas import (
+    PaginatedClientScheduledTaskRead,
     PaginatedScheduledTaskRead,
     ScheduledTaskCreate,
     ScheduledTaskRead,
@@ -143,6 +145,151 @@ def _validate_scheduled_target(
     return None
 
 
+def _task_serials(task: ScheduledTask) -> List[str]:
+    return [item.strip() for item in (task.device_serial or "").split(",") if item.strip()]
+
+
+def _client_managed_serials(session: Session, serials: List[str]) -> set:
+    """serials 中「认领/心跳」客户端设备集合（devices.is_client_managed_device 口径）。"""
+    from backend.api.devices import is_client_managed_device
+
+    if not serials:
+        return set()
+    rows = session.exec(select(Device).where(col(Device.serial).in_(list(serials)))).all()
+    return {row.serial for row in rows if is_client_managed_device(row)}
+
+
+def client_scheduled_serials(session: Session, task: ScheduledTask) -> List[str]:
+    """统一谓词（T1，P4 终验必修缺陷 2）：任务绑定中「应由客户端本地调度」的 serial。
+
+    云端触发过滤（_run_scheduled_scenario）与 GET /api/client-tasks 下发过滤共用
+    同一实现，消除两侧口径漂移：
+    - 仅 ui 类型 + scenario_id（桌面 LOCAL_TASK_TYPES={"ui"} 且 execute_task 需要
+      场景）；fastbot/inspection/api 桌面不接管；
+    - serial 命中「认领/心跳」客户端设备（client_instance_id / last_seen_at，见
+      devices.is_client_managed_device）；
+    - 空列表 = 该任务没有任何 serial 归客户端调度（桌面不调度，云端执行）。
+    """
+    try:
+        config = json.loads(task.strategy_config or "{}")
+    except (json.JSONDecodeError, TypeError):
+        config = {}
+    try:
+        task_type = _task_type(config)
+    except HTTPException:
+        return []
+    if task_type != "ui" or task.scenario_id is None:
+        return []
+    serials = _task_serials(task)
+    if not serials:
+        return []
+    managed = _client_managed_serials(session, serials)
+    return [item for item in serials if item in managed]
+
+
+def is_client_scheduled_task(session: Session, task: ScheduledTask) -> bool:
+    """T1 双触发协调：云端是否完全让位（该任务全部 serial 由客户端本地调度）。
+
+    判定与 GET /api/client-tasks ∩ 桌面 should_schedule_locally 口径一致（统一
+    谓词 client_scheduled_serials 同源）：
+    - 仅 ui 类型 + scenario_id（桌面 LOCAL_TASK_TYPES={"ui"}；fastbot/inspection/api
+      桌面不接管，云端必须保留注册）；
+    - device_serials 非空且全部命中「认领/心跳」客户端设备（client_instance_id /
+      last_seen_at，见 devices.is_client_managed_device）。混合绑定时云端保留 job，
+      触发时只跑非客户端设备（_run_scheduled_scenario 过滤），客户端设备按同一
+      谓词交桌面（GET /api/client-tasks 下发），不双跑不漏跑；
+    - 无绑定设备任务桌面 execute_task 不触发，保留云端注册。
+    """
+    serials = _task_serials(task)
+    return bool(serials) and set(serials) <= set(client_scheduled_serials(session, task))
+
+
+def _sync_cloud_schedule(session: Session, task: ScheduledTask, config: dict):
+    """统一的云端调度注册入口（create / update / toggle / _restore 共用，T1）。
+
+    P4 终验修正（必修缺陷 2）：「应由客户端调度」的任务同样注册云端 job——触发时
+    走 _run_scheduled_scenario 的客户端过滤 + 心跳观测（不执行）：桌面心跳在线 →
+    静默交本地引擎；无客户端心跳 → warning + SKIPPED 执行记录，杜绝「云端跳过
+    注册 + 桌面缺席 = 静默漏跑无记录」。next_run_time 与物理任务同源（add_task
+    返回值），列表「下次运行」展示不失真。
+    """
+    scheduler = get_scheduler()
+    if not task.is_active:
+        scheduler.remove_task(task.id)
+        task.next_run_time = None
+        return None
+    if is_client_scheduled_task(session, task):
+        logger.info(
+            "[定时任务] 任务 #%s 应由客户端本地调度，云端注册观测 job（触发时不执行）",
+            task.id,
+        )
+    next_run = scheduler.add_task(
+        task_id=task.id,
+        strategy=task.strategy,
+        config=config,
+        job_func=_run_scheduled_scenario,
+    )
+    task.next_run_time = next_run
+    return next_run
+
+
+def _observe_client_scheduled_serials(
+    session: Session,
+    task: ScheduledTask,
+    serials: List[str],
+) -> None:
+    """「应由客户端调度」serial 的触发时刻可观测（T1，P4 终验必修缺陷 2）。
+
+    桌面心跳在线（client_presence_expired 未过期）→ 本地引擎会跑：静默跳过，
+    不重复执行、不重复记账；无客户端心跳（引擎缺席）→ warning 日志 + 落一条
+    SKIPPED 执行记录，杜绝「云端让位 + 桌面缺席 = 静默漏跑无记录」。
+    """
+    from backend.api.devices import client_presence_expired
+
+    absent: List[str] = []
+    for serial in serials:
+        device = session.exec(select(Device).where(Device.serial == serial)).first()
+        if device is None or client_presence_expired(device):
+            absent.append(serial)
+
+    if not absent:
+        logger.info(
+            "[定时任务] 任务 #%s 客户端设备 %s 心跳在线，由桌面本地引擎执行",
+            task.id,
+            serials,
+        )
+        return
+
+    logger.warning(
+        "[定时任务] 任务 #%s 应由客户端调度的设备无心跳（桌面引擎缺席），落 SKIPPED 记录: %s",
+        task.id,
+        absent,
+    )
+    if task.scenario_id is None:
+        return
+
+    scenario = session.get(TestScenario, task.scenario_id)
+    scenario_name = scenario.name if scenario else task.name
+    now = datetime.now()
+    for serial in absent:
+        session.add(
+            TestExecution(
+                scenario_id=task.scenario_id,
+                scenario_name=scenario_name,
+                status="SKIPPED",
+                executor_id=task.user_id,
+                executor_name=f"定时任务: {task.name}",
+                device_serial=serial,
+                start_time=now,
+                end_time=now,
+                duration=0.0,
+                batch_name=f"定时任务: {task.name}",
+                run_source="platform",
+            )
+        )
+    session.commit()
+
+
 def _run_scheduled_scenario(task_id: int):
     """调度器回调：根据任务类型执行 UI 场景、Fastbot 或模型化巡检。"""
     from backend.database import engine
@@ -188,6 +335,27 @@ def _run_scheduled_scenario(task_id: int):
                 config = {}
         task_type = str(config.get("_task_type") or "ui").strip().lower()
         env_id = config.get("env_id")
+
+        # T1 双触发防御：认领/心跳客户端设备由桌面本地调度执行，云端跳过
+        # （覆盖「注册后设备才被桌面认领」的残留 job 场景，不双跑）。
+        # P4 终验修正（必修缺陷 2）：跳过前做心跳观测——桌面缺席不得静默漏跑。
+        if task_type == "ui" and device_serials:
+            client_serials = _client_managed_serials(session, device_serials)
+            if client_serials:
+                remaining = [s for s in device_serials if s not in client_serials]
+                logger.info(
+                    "[定时任务] 任务 #%s 跳过客户端本地调度设备: %s",
+                    task_id,
+                    sorted(client_serials),
+                )
+                _observe_client_scheduled_serials(session, task, sorted(client_serials))
+                if not remaining:
+                    logger.info(
+                        "[定时任务] 任务 #%s 全部设备由客户端本地调度，云端取消执行",
+                        task_id,
+                    )
+                    return
+                device_serials = remaining
 
         # UI 场景任务：执行前按设备做预检，过滤明显不可执行设备。
         runnable_device_serials = list(device_serials)
@@ -678,15 +846,8 @@ def create_task(
     session.commit()
     session.refresh(task)
 
-    # 注册到调度器
-    scheduler = get_scheduler()
-    next_run = scheduler.add_task(
-        task_id=task.id,
-        strategy=task.strategy,
-        config=config,
-        job_func=_run_scheduled_scenario,
-    )
-    task.next_run_time = next_run
+    # 注册到调度器（应由客户端调度的任务跳过云端注册，T1）
+    _sync_cloud_schedule(session, task, config)
     session.add(task)
     session.commit()
 
@@ -756,19 +917,11 @@ def update_task(
     session.commit()
     session.refresh(task)
 
-    # 重新注册调度
+    # 重新注册调度（应由客户端调度的任务跳过云端注册并清残留 job，T1）
     config = json.loads(task.strategy_config) if task.strategy_config else {}
-    scheduler = get_scheduler()
-    if task.is_active:
-        next_run = scheduler.add_task(
-            task_id=task.id,
-            strategy=task.strategy,
-            config=config,
-            job_func=_run_scheduled_scenario,
-        )
-        task.next_run_time = next_run
-        session.add(task)
-        session.commit()
+    _sync_cloud_schedule(session, task, config)
+    session.add(task)
+    session.commit()
 
     return _task_to_read(
         task,
@@ -790,19 +943,9 @@ def toggle_task(
     task.is_active = not task.is_active
     task.updated_at = datetime.now()
 
-    scheduler = get_scheduler()
-    if task.is_active:
-        config = json.loads(task.strategy_config) if task.strategy_config else {}
-        next_run = scheduler.add_task(
-            task_id=task.id,
-            strategy=task.strategy,
-            config=config,
-            job_func=_run_scheduled_scenario,
-        )
-        task.next_run_time = next_run
-    else:
-        scheduler.remove_task(task.id)
-        task.next_run_time = None
+    # 注册/移除云端调度（应由客户端调度的任务不注册云端 job，T1）
+    config = json.loads(task.strategy_config) if task.strategy_config else {}
+    _sync_cloud_schedule(session, task, config)
 
     session.add(task)
     session.commit()
@@ -829,3 +972,89 @@ def delete_task(
     session.delete(task)
     session.commit()
     return {"success": True}
+
+
+# ==================== 客户端任务拉取（桌面引擎本地调度） ====================
+
+client_router = APIRouter()
+
+
+def _client_task_item(task: ScheduledTask) -> dict:
+    """ScheduledTask 全字段条目：strategy_config 解析为字典、device_serials 为列表。"""
+    try:
+        config = json.loads(task.strategy_config or "{}")
+    except (json.JSONDecodeError, TypeError):
+        config = {}
+    device_serials = [
+        item.strip() for item in (task.device_serial or "").split(",") if item.strip()
+    ]
+    return {
+        "id": task.id,
+        "name": task.name,
+        "scenario_id": task.scenario_id,
+        "device_serial": task.device_serial,
+        "device_serials": device_serials,
+        "strategy": task.strategy,
+        "strategy_config": config,
+        "is_active": task.is_active,
+        "enable_notification": task.enable_notification,
+        "next_run_time": task.next_run_time,
+        "user_id": task.user_id,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
+def _client_owned_serials(session: Session, user_id: int) -> set:
+    """本人设备 serial 集合（owner_id / app_owner_id，与 filter_devices_for_user 同口径）。"""
+    devices = session.exec(
+        select(Device).where(or_(Device.owner_id == user_id, Device.app_owner_id == user_id))
+    ).all()
+    return {d.serial for d in devices if d.serial}
+
+
+@client_router.get("", response_model=PaginatedClientScheduledTaskRead)
+@client_router.get("/", response_model=PaginatedClientScheduledTaskRead)
+def list_client_tasks(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """拉取「应由客户端调度」的定时任务（桌面引擎本地 APScheduler 消费）。
+
+    统一谓词（P4 终验必修缺陷 2，与云端 is_client_scheduled_task / 触发过滤
+    同源 client_scheduled_serials）：仅下发 ui + scenario_id + 绑定中存在
+    认领/心跳客户端设备的任务——「本人创建 + 未认领 serial」不下发（云端执行），
+    否则两端都调度（真双跑窗口）；无绑定设备 / fastbot/inspection/api 不下发
+    （桌面 LOCAL_TASK_TYPES={'ui'} 且 execute_task 需要绑定设备）。
+
+    可见性过滤：创建者=本人 或 device_serials 命中本人设备（owner_id /
+    app_owner_id == 本人）；仅返回 is_active 任务（暂停任务不进本地调度，对齐
+    _restore_scheduled_tasks 仅恢复活跃任务的语义）。
+
+    admin 语义按 tasks.py 现状对齐：任务侧无 admin 全量可见语义（列表不做归属
+    放大、创建仅打 user_id），admin 与普通用户同规则。
+
+    任务 CRUD 照旧走 /api/tasks/（云端透传）；本地只在引擎存活时触发，重启后
+    重新拉取本接口重排。返回 {total, items}，条目含 ScheduledTask 全字段
+    （user_id / device_serial 原始 CSV 也在，strategy_config 解析为字典）。
+    """
+    uid = current_user.id
+    mine_serials = _client_owned_serials(session, uid)
+    rows = session.exec(
+        select(ScheduledTask)
+        .where(ScheduledTask.is_active == True)  # noqa: E712 — 与 _restore_scheduled_tasks 同口径
+        .order_by(ScheduledTask.id.desc())
+    ).all()
+
+    items = []
+    for task in rows:
+        bound_serials = {
+            item.strip() for item in (task.device_serial or "").split(",") if item.strip()
+        }
+        if not (task.user_id == uid or (bound_serials & mine_serials)):
+            continue
+        # 统一谓词：无客户端应调度 serial 的任务桌面不接管（云端执行），避免双跑
+        if not client_scheduled_serials(session, task):
+            continue
+        items.append(_client_task_item(task))
+    return PaginatedClientScheduledTaskRead(total=len(items), items=items)

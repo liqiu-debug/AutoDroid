@@ -105,6 +105,8 @@ class TestCaseRead(TestCaseBase):
     updated_at: Any = None # datetime
     creator_name: Optional[str] = None
     updater_name: Optional[str] = None
+    # 步骤乐观锁版本（P4 功能1）：保存 steps 时经 If-Match / ?version= 回传
+    version: int = 1
 
     class Config:
         from_attributes = True
@@ -162,6 +164,8 @@ class TestScenarioRead(TestScenarioBase):
     last_failed_step: Optional[str] = None
     creator_name: Optional[str] = None
     updater_name: Optional[str] = None
+    # 场景步骤乐观锁版本（P4 功能1）：保存场景步骤时经 If-Match / ?version= 回传
+    version: int = 1
 
     class Config:
         from_attributes = True
@@ -219,6 +223,34 @@ class ScheduledTaskUpdate(BaseModel):
 class PaginatedScheduledTaskRead(BaseModel):
     total: int
     items: List[ScheduledTaskRead]
+
+class ClientScheduledTaskRead(BaseModel):
+    """桌面客户端拉取的定时任务（GET /api/client-tasks 条目）。
+
+    覆盖 ScheduledTask 全字段（含 user_id / device_serial 原始 CSV），
+    strategy_config 解析为字典、device_serials 为解析后的列表，供本地
+    APScheduler 直接消费。
+    """
+    id: int
+    name: str
+    scenario_id: Optional[int] = None
+    device_serial: Optional[str] = None
+    device_serials: List[str] = []
+    strategy: str
+    strategy_config: Dict[str, Any] = {}
+    is_active: bool = True
+    enable_notification: bool = True
+    next_run_time: Any = None
+    user_id: Optional[int] = None
+    created_at: Any
+    updated_at: Any = None
+
+    class Config:
+        from_attributes = True
+
+class PaginatedClientScheduledTaskRead(BaseModel):
+    total: int
+    items: List[ClientScheduledTaskRead]
 
 class UserRead(BaseModel):
     id: int
@@ -566,6 +598,9 @@ class DeviceRead(BaseModel):
     source_serial: Optional[str] = None  # 远程设备在接入机上的真实 USB serial
     custom_name: Optional[str] = None
     market_name: Optional[str] = None
+    owner_id: Optional[int] = None
+    client_instance_id: Optional[str] = None
+    last_seen_at: Any = None
     created_at: Any
     updated_at: Any = None
 
