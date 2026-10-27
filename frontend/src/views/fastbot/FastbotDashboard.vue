@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { CaretRight } from '@element-plus/icons-vue'
 import api from '@/api'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
+import { createGatedTask, createPollingLoop } from '@/utils/polling'
 
 const router = useRouter()
 
@@ -53,16 +54,16 @@ const submitting = ref(false)
 
 // ---- 最近一次任务状态 ----
 const latestTask = ref(null)
-let pollTimer = null
 let pageActive = false
 
-const fetchLatestTask = async () => {
+// 在途门闩：轮询/提交后刷新共用，慢网络不叠加请求（照抄 DashboardView 模式）
+const fetchLatestTask = createGatedTask(async () => {
     try {
         const res = await api.getFastbotTasks({ limit: 1 })
         const list = res.data?.items || []
         latestTask.value = list.length > 0 ? list[0] : null
     } catch { /* ignore */ }
-}
+})
 
 const fetchDevices = async () => {
     devicesLoading.value = true
@@ -114,15 +115,19 @@ const goToReports = () => {
     router.push({ path: '/execution/reports', query: { tab: 'fastbot' } })
 }
 
+// 最近任务 15s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const LATEST_TASK_POLL_INTERVAL_MS = 15000
+const latestTaskPollLoop = createPollingLoop({
+    intervalMs: LATEST_TASK_POLL_INTERVAL_MS,
+    tick: fetchLatestTask
+})
+
 const startPolling = () => {
-    if (pollTimer) return
-    pollTimer = setInterval(fetchLatestTask, 15000)
+    latestTaskPollLoop.start()
 }
 
 const stopPolling = () => {
-    if (!pollTimer) return
-    clearInterval(pollTimer)
-    pollTimer = null
+    latestTaskPollLoop.stop()
 }
 
 const activatePage = () => {

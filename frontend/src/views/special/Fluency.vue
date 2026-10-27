@@ -6,6 +6,7 @@ import { VideoPlay, VideoPause, Position, Timer } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
 import { useClientApp } from '@/composables/useClientApp'
+import { createPollingLoop } from '@/utils/polling'
 
 const router = useRouter()
 
@@ -32,7 +33,6 @@ const markerLabel = ref('')
 const starting = ref(false)
 const stopping = ref(false)
 const marking = ref(false)
-let pollTimer = null
 let pageActive = false
 
 const quickMarkers = [
@@ -207,15 +207,19 @@ const formatDeviceName = (serial) => {
     return device.custom_name || device.market_name || device.model || device.serial
 }
 
+// 录制会话 8s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const SESSION_POLL_INTERVAL_MS = 8000
+const sessionPollLoop = createPollingLoop({
+    intervalMs: SESSION_POLL_INTERVAL_MS,
+    tick: fetchSessions
+})
+
 const startPolling = () => {
-    if (pollTimer) return
-    pollTimer = setInterval(fetchSessions, 8000)
+    sessionPollLoop.start()
 }
 
 const stopPolling = () => {
-    if (!pollTimer) return
-    clearInterval(pollTimer)
-    pollTimer = null
+    sessionPollLoop.stop()
 }
 
 const activatePage = () => {

@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import { activeStatus, apiError, statusLabel, statusType, downloadReport, failureSummary } from '@/utils/apiTesting'
+import { pollRequestConfig } from '@/utils/polling'
 import { useUserStore } from '@/stores/useUserStore'
 import ResultPanel from '@/components/api-testing/ResultPanel.vue'
 import AiFailureExplanation from '@/components/api-testing/AiFailureExplanation.vue'
@@ -18,9 +19,12 @@ function editStep(stepId){router.push({path:`/api-testing/scenarios/${run.value.
 const notificationLabels = { DISABLED: '未启用', PENDING: '待发送', SENT: '已发送', FAILED: '发送失败', SKIPPED: '未发送' }
 async function load() {
   clearTimeout(timer)
+  // 页面隐藏：暂停出票（不发 XHR），定时复查、可见即恢复
+  if (typeof document !== 'undefined' && document.hidden) { timer = setTimeout(load, 2000); return }
   loadError.value=''
   try {
-    const { data } = await api.apiTesting.get(`/runs/${route.params.id}`)
+    // 首载是大载荷报告详情：默认 30s；run 已有后的定时复查（真轮询）显式 8s
+    const { data } = await api.apiTesting.get(`/runs/${route.params.id}`, undefined, run.value ? pollRequestConfig() : undefined)
     if (!alive) return
     if (!run.value) expanded.value = data.steps.filter(s => ['ERROR','FAIL'].includes(s.status)).map(s => s.step_id)
     run.value = data

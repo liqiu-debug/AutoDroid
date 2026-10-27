@@ -4,15 +4,19 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import { apiError, activeStatus, statusLabel, statusType, downloadReport } from '@/utils/apiTesting'
+import { pollRequestConfig } from '@/utils/polling'
 import { useUserStore } from '@/stores/useUserStore'
 const router = useRouter(), user = useUserStore(), rows = ref([]), total = ref(0), page = ref(1), keyword = ref(''), status = ref(''), loading = ref(false), loadError = ref(''), downloading = ref(new Set())
 let timer, alive = true
 async function load(quiet = false) {
+  clearTimeout(timer)
+  // 页面隐藏：暂停出票（不发 XHR），定时复查、可见即恢复
+  if (typeof document !== 'undefined' && document.hidden) { timer = setTimeout(() => load(true), 2000); return }
   if (!quiet) loading.value = true
   loadError.value = ''
-  clearTimeout(timer)
   try {
-    const { data } = await api.apiTesting.get('/runs', { keyword: keyword.value, status: status.value || undefined, skip: (page.value - 1) * 20, limit: 20 })
+    // quiet=定时复查（真轮询）显式 8s 短超时；首次/手动加载走默认 30s
+    const { data } = await api.apiTesting.get('/runs', { keyword: keyword.value, status: status.value || undefined, skip: (page.value - 1) * 20, limit: 20 }, quiet ? pollRequestConfig() : undefined)
     if (!alive) return
     rows.value = data.items; total.value = data.total
     if (rows.value.some(r => activeStatus(r.status) || r.notification_status === 'PENDING')) timer = setTimeout(() => load(true), 2000)

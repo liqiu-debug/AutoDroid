@@ -18,6 +18,15 @@ export const useUserStore = defineStore('user', () => {
     const isLoggedIn = computed(() => !!token.value)
     const isAdmin = computed(() => userInfo.value?.role === 'admin')
 
+    // 鉴权失败（401 / 本地会话门闩 ERR_SESSION_EXPIRED）才被动登出；
+    // 瞬时网络失败/超时等非鉴权错误不得销毁有效会话（劣网抖动保 token）。
+    const isAuthFailure = (error) => {
+        if (!error) return false
+        if (error.authFailure === true) return true
+        if (error.response?.status === 401) return true
+        return error.sessionExpired === true || error.code === 'ERR_SESSION_EXPIRED'
+    }
+
     async function login(username, password, options = {}) {
         try {
             const params = new URLSearchParams()
@@ -28,7 +37,14 @@ export const useUserStore = defineStore('user', () => {
             const response = await api.login(params, { server: options?.server })
             token.value = response.data.access_token
             localStorage.setItem('token', token.value)
-            await fetchUserInfo()
+            try {
+                await fetchUserInfo()
+            } catch (error) {
+                // 登录已换到有效 token：用户信息拉取的非鉴权失败（网络抖动/超时）
+                // 不回滚登录，守卫/页面会惰性重试；鉴权失败则 fetchUserInfo 已
+                // logout 并标记 authFailure，照常整体失败。
+                if (error?.authFailure) throw error
+            }
             return true
         } catch (error) {
             console.error('Login failed:', error)
@@ -36,14 +52,24 @@ export const useUserStore = defineStore('user', () => {
         }
     }
 
-    async function fetchUserInfo() {
+    // options.silent401：路由守卫取 userInfo 的请求标记（拦截器对该请求不弹
+    // 「会话过期」框），由守卫静默 next('/login')；弹框只服务会话中途的后台 401。
+    async function fetchUserInfo(options = {}) {
         try {
-            const response = await api.getUserInfo()
+            const response = await api.getUserInfo({ silent401: options?.silent401 === true })
             userInfo.value = response.data
             await fetchFeatureFlags()
         } catch (error) {
             console.error('Fetch user info failed:', error)
-            logout()
+            const authFailure = isAuthFailure(error)
+            if (error && typeof error === 'object') {
+                // rethrow 时标记错误类别：守卫按 authFailure 分流（鉴权失败收口
+                // /login，非鉴权错误放行进入，页面级请求自报错）。
+                error.authFailure = authFailure
+            }
+            // 仅鉴权失败被动登出并向上抛（守卫 catch 生效）；非鉴权错误保会话。
+            if (authFailure) logout()
+            throw error
         }
     }
 

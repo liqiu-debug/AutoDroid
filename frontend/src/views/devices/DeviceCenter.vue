@@ -1,9 +1,11 @@
 <script setup>
-import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount, onActivated, onDeactivated } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection, Link, Download, CopyDocument } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import api from '@/api'
+import { hasSessionToken } from '@/utils/sessionExpiry'
+import { createPollingLoop } from '@/utils/polling'
 import ScrcpyPlayer from '@/components/ScrcpyPlayer.vue'
 import { isAppDevice, isUsbDevice, connectionBadge, appStatusBadge } from '@/utils/deviceAccess'
 import { useClientMode } from '@/composables/useClientMode'
@@ -61,7 +63,6 @@ const screenshotLiveMode = ref(false)
 // 就地编辑
 const editingSerial = ref(null)
 const editingName = ref('')
-const autoRefreshTimer = ref(null)
 const autoRefreshing = ref(false)
 const DEVICE_LIST_REFRESH_INTERVAL_MS = 5000
 
@@ -69,6 +70,8 @@ const DEVICE_LIST_REFRESH_INTERVAL_MS = 5000
 
 /** 获取当前设备列表 */
 const fetchDevices = async ({ refreshIosWda = false, silent = false } = {}) => {
+  // 会话已结束（401 处理/手动登出）：发起前静默停止，不发请求
+  if (!hasSessionToken()) return
   if (autoRefreshing.value) return
   autoRefreshing.value = true
   if (!silent) {
@@ -91,6 +94,7 @@ const fetchDevices = async ({ refreshIosWda = false, silent = false } = {}) => {
 
 /** 获取远程接入点列表（静默失败，不打扰设备主流程） */
 const fetchRemoteAgents = async () => {
+  if (!hasSessionToken()) return
   try {
     const { data } = await api.getDeviceAgents()
     remoteAgents.value = data.items || []
@@ -429,23 +433,43 @@ const cancelEditing = () => {
   editingSerial.value = null
 }
 
+// 设备列表 5s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const deviceListPollLoop = createPollingLoop({
+  intervalMs: DEVICE_LIST_REFRESH_INTERVAL_MS,
+  tick: () => {
+    // 401/登出后 token 已清：自动静默停表，不再空转轮询
+    if (!hasSessionToken()) {
+      stopAutoRefresh()
+      return
+    }
+    return fetchDevices({ refreshIosWda: true, silent: true })
+  }
+})
+
 const startAutoRefresh = () => {
-  if (autoRefreshTimer.value) return
-  autoRefreshTimer.value = setInterval(() => {
-    fetchDevices({ refreshIosWda: true, silent: true })
-  }, DEVICE_LIST_REFRESH_INTERVAL_MS)
+  // 会话已结束：不启动轮询
+  if (!hasSessionToken()) return
+  deviceListPollLoop.start()
 }
 
 const stopAutoRefresh = () => {
-  if (!autoRefreshTimer.value) return
-  clearInterval(autoRefreshTimer.value)
-  autoRefreshTimer.value = null
+  deviceListPollLoop.stop()
 }
 
 // ==================== 生命周期 ====================
 onMounted(() => {
   handleSync()
   startAutoRefresh()
+})
+
+// KeepAlive 下用 onActivated/onDeactivated 管理轮询：离开即停表（不留给隐藏页
+// 空转堆积请求），回到页面即恢复；onBeforeUnmount 兜底清理。
+onActivated(() => {
+  startAutoRefresh()
+})
+
+onDeactivated(() => {
+  stopAutoRefresh()
 })
 
 onBeforeUnmount(() => {

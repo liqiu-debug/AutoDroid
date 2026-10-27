@@ -10,6 +10,7 @@ import { deviceStatusLabel, deviceStatusTagType, runStatusColor } from '@/utils/
 import { useUserStore } from '@/stores/useUserStore'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
+import { createPollingLoop } from '@/utils/polling'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -45,7 +46,7 @@ const filterStatus = ref('all') // all, success, warning, failure
 const currentUser = computed(() => userStore.userInfo || {})
 const isAdmin = computed(() => currentUser.value.role === 'admin')
 const activeScenarioRuns = ref({})
-let activeRunTimer = null
+const ACTIVE_RUN_POLL_INTERVAL_MS = 3000
 
 // Pagination
 const currentPage = ref(1)
@@ -369,43 +370,48 @@ const restoreActiveScenarioRuns = async () => {
     if (Object.keys(next).length > 0) startActiveRunPolling()
 }
 
+const pollActiveScenarioRuns = async () => {
+    const entries = Object.entries(activeScenarioRuns.value)
+    if (entries.length === 0) {
+        stopActiveRunPolling()
+        return
+    }
+    const next = { ...activeScenarioRuns.value }
+    let changed = false
+    for (const [scenarioId] of entries) {
+        try {
+            const { data } = await api.getActiveRuns('scenario', Number(scenarioId))
+            const items = data?.items || []
+            if (items.length === 0) {
+                delete next[scenarioId]
+                changed = true
+                continue
+            }
+            next[scenarioId] = buildActiveScenarioEntry(items, next[scenarioId])
+            // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
+            const item = scenarios.value.find(s => s.id === Number(scenarioId))
+            if (item && normalizeRunStatus(item.last_run_status) === 'queued' && !next[scenarioId].queue) {
+                item.last_run_status = 'RUNNING'
+            }
+        } catch {}
+    }
+    activeScenarioRuns.value = next
+    if (changed) fetchScenarios()
+}
+
+// 运行状态轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const activeRunPollLoop = createPollingLoop({
+    intervalMs: ACTIVE_RUN_POLL_INTERVAL_MS,
+    tick: pollActiveScenarioRuns
+})
+
 const startActiveRunPolling = () => {
     stopActiveRunPolling()
-    activeRunTimer = setInterval(async () => {
-        const entries = Object.entries(activeScenarioRuns.value)
-        if (entries.length === 0) {
-            stopActiveRunPolling()
-            return
-        }
-        const next = { ...activeScenarioRuns.value }
-        let changed = false
-        for (const [scenarioId] of entries) {
-            try {
-                const { data } = await api.getActiveRuns('scenario', Number(scenarioId))
-                const items = data?.items || []
-                if (items.length === 0) {
-                    delete next[scenarioId]
-                    changed = true
-                    continue
-                }
-                next[scenarioId] = buildActiveScenarioEntry(items, next[scenarioId])
-                // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
-                const item = scenarios.value.find(s => s.id === Number(scenarioId))
-                if (item && normalizeRunStatus(item.last_run_status) === 'queued' && !next[scenarioId].queue) {
-                    item.last_run_status = 'RUNNING'
-                }
-            } catch {}
-        }
-        activeScenarioRuns.value = next
-        if (changed) fetchScenarios()
-    }, 3000)
+    activeRunPollLoop.start()
 }
 
 const stopActiveRunPolling = () => {
-    if (activeRunTimer) {
-        clearInterval(activeRunTimer)
-        activeRunTimer = null
-    }
+    activeRunPollLoop.stop()
 }
 
 const handleDelete = async (row) => {

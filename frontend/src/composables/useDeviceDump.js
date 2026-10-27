@@ -157,9 +157,9 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, isIosSt
       }
     } finally {
       release()
-      if (isStageActive.value) {
-        loading.value = false
-      }
+      // 无条件复位 loading：请求期间舞台失活（isStageActive 转 false）不再跳过复位，
+      // 避免「切设备/离台」把加载态永久卡住（地雷清理）。
+      loading.value = false
     }
   }
 
@@ -206,11 +206,10 @@ export function useDeviceDump({ stage, selectedSerial, isIosLivePreview, isIosSt
       }
     } finally {
       release()
-      if (isStageActive.value) {
-        liveHierarchyLoading.value = false
-        if (showLoading) {
-          loading.value = false
-        }
+      // 无条件复位加载态（同 fetchDump 的地雷清理）：舞台失活/会话切换不再卡 loading
+      liveHierarchyLoading.value = false
+      if (showLoading) {
+        loading.value = false
       }
     }
   }

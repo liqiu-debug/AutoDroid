@@ -14,6 +14,7 @@ import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import api from '@/api'
 import { describeRunSubmission } from '@/utils/uiRunPresentation'
+import { createPollingLoop } from '@/utils/polling'
 
 const route = useRoute()
 const router = useRouter()
@@ -30,7 +31,7 @@ const runBusy = computed(() => Boolean(runPhase.value) || saving.value)
 const runLabel = computed(() => ({ saving: '保存中', prechecking: '预检中', submitting: '启动中' }[runPhase.value] || (isRunning.value ? '终止' : (!currentCase.value.id || hasUnsavedChanges.value ? '保存并运行' : '运行'))))
 const activeRun = ref(null)
 const terminatingRun = ref(false)
-let activeRunTimer = null
+const ACTIVE_RUN_POLL_INTERVAL_MS = 3000
 const envId = ref(null)
 const environments = ref([])
 
@@ -313,26 +314,31 @@ const restoreActiveRun = async () => {
   } catch {}
 }
 
+const pollActiveRun = async () => {
+  if (!currentCase.value.id || !activeRun.value) return
+  try {
+    const { data } = await api.getActiveRuns('case', currentCase.value.id)
+    if ((data?.items || []).length === 0) {
+      isRunning.value = false
+      activeRun.value = null
+      stopActiveRunPolling()
+    }
+  } catch {}
+}
+
+// 运行状态轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const activeRunPollLoop = createPollingLoop({
+  intervalMs: ACTIVE_RUN_POLL_INTERVAL_MS,
+  tick: pollActiveRun
+})
+
 const startActiveRunPolling = () => {
   stopActiveRunPolling()
-  activeRunTimer = setInterval(async () => {
-    if (!currentCase.value.id || !activeRun.value) return
-    try {
-      const { data } = await api.getActiveRuns('case', currentCase.value.id)
-      if ((data?.items || []).length === 0) {
-        isRunning.value = false
-        activeRun.value = null
-        stopActiveRunPolling()
-      }
-    } catch {}
-  }, 3000)
+  activeRunPollLoop.start()
 }
 
 const stopActiveRunPolling = () => {
-  if (activeRunTimer) {
-    clearInterval(activeRunTimer)
-    activeRunTimer = null
-  }
+  activeRunPollLoop.stop()
 }
 
 const handleRefreshNeeded = (dumpData) => {

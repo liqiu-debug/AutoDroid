@@ -26,6 +26,7 @@ import {
   mergeInspectionLiveSnapshot,
   NON_NUMBERED_INSPECTION_ACTION_STATUSES,
 } from '@/utils/inspectionPresentation'
+import { createPollingLoop } from '@/utils/polling'
 
 const props = defineProps({
   runId: {
@@ -83,9 +84,22 @@ const loading = ref(false)
 
 let eventSocket = null
 let retryTimer = null
-let pollTimer = null
 let requestGeneration = 0
 let retryCount = 0
+
+// 快照轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const LIVE_SNAPSHOT_POLL_INTERVAL_MS = 2000
+const liveSnapshotPollLoop = createPollingLoop({
+  intervalMs: LIVE_SNAPSHOT_POLL_INTERVAL_MS,
+  isEnabled: () => Boolean(props.active),
+  tick: async () => {
+    await refreshSnapshot(true)
+    if (isTerminal.value) {
+      stopLiveSession()
+      await loadFallbackImage()
+    }
+  }
+})
 let fallbackObjectUrl = ''
 let fallbackRequestGeneration = 0
 let terminalEmitted = false
@@ -387,9 +401,8 @@ function closeEventSocket() {
 
 function clearTimers() {
   if (retryTimer) window.clearTimeout(retryTimer)
-  if (pollTimer) window.clearInterval(pollTimer)
   retryTimer = null
-  pollTimer = null
+  liveSnapshotPollLoop.stop()
 }
 
 function stopLiveSession() {
@@ -415,14 +428,8 @@ async function refreshSnapshot(quiet = true) {
 }
 
 function startPolling() {
-  if (pollTimer || !props.active) return
-  pollTimer = window.setInterval(async () => {
-    await refreshSnapshot(true)
-    if (isTerminal.value) {
-      stopLiveSession()
-      await loadFallbackImage()
-    }
-  }, 2000)
+  if (!props.active) return
+  liveSnapshotPollLoop.start()
 }
 
 function scheduleSessionRetry() {
@@ -511,7 +518,9 @@ async function startLiveSession(isRetry = false) {
     emit('error', lastError.value)
     scheduleSessionRetry()
   } finally {
-    if (generation === requestGeneration) loading.value = false
+    // 无条件复位 loading：会话切换（requestGeneration 前进）后旧请求不再跳过复位，
+    // 避免「停止会话/切换 run」把加载态永久卡住（地雷清理）。
+    loading.value = false
   }
 }
 

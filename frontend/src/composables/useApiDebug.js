@@ -3,6 +3,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import { createUuid } from '@/utils/uuid'
 import { apiError, copy, requestSignatures, assertionSignature } from '@/utils/apiTesting'
+import { pollRequestConfig } from '@/utils/polling'
 
 export function useApiDebug(envId, steps, { retainDisplay = false, envName = () => '' } = {}) {
   const id = ref(null), running = ref(false), rechecking = ref(false), error = ref(''), cache = ref({})
@@ -41,8 +42,14 @@ export function useApiDebug(envId, steps, { retainDisplay = false, envName = () 
   }
   const poll = async (token, sessionId, draft, environment, environmentName) => {
     if (!current(token) || id.value !== sessionId) return
+    // 页面隐藏：暂停出票（不发 XHR），定时复查、可见即恢复
+    if (typeof document !== 'undefined' && document.hidden) {
+      timer = setTimeout(() => poll(token, sessionId, draft, environment, environmentName), 1000)
+      return
+    }
     try {
-      const { data } = await api.apiTesting.get(`/debug-sessions/${sessionId}`)
+      // 真轮询（650ms 自续排）：显式 8s 短超时（apiTesting.get 默认 30s 只给一次性首载）
+      const { data } = await api.apiTesting.get(`/debug-sessions/${sessionId}`, undefined, pollRequestConfig())
       if (!current(token) || id.value !== sessionId) return
       remember(data.results, draft, environment, environmentName); error.value = data.error || ''
       running.value = data.status === 'RUNNING'

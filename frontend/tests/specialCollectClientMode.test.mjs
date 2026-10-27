@@ -44,6 +44,8 @@ function collectSetup(name, { clientMode = false, exports } = {}) {
     runStatusTagType: () => 'info',
     setInterval: () => 1,
     clearInterval: () => {},
+    // 轮询控制器桩：与 setInterval 桩同策略，测试不起真实定时器
+    createPollingLoop: () => ({ start() {}, stop() {}, runNow() {}, isActive: () => false, isInflight: () => false }),
   }
   const state = new Function(...Object.keys(deps), scriptOf(name) + `\nreturn {${exports}}`)(...Object.values(deps))
   return { state, apiCalls, notices, mounted, isClientApp }

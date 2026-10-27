@@ -1773,6 +1773,9 @@ async def sync_devices(
     1. 执行 adb devices 获取在线 serial 列表
     2. 并发获取每个设备的型号、版本、分辨率
     3. 与数据库 Merge（新增/更新/标记离线）
+
+    认领语义：只认无主设备，不抢他人已认领设备（服务器看到 ≠ 某人持有）；
+    区别于客户端 register 的「物理持有即接管」。
     """
     refresh_app_presence(session)
     # Step 1: 解析 adb devices 输出
@@ -1835,6 +1838,7 @@ async def sync_devices(
         ).first()
         if existing:
             # 认领语义：未认领设备由本次同步者认领；他人已认领不覆盖
+            # （register 的「物理持有即接管」不适用于服务端同步：服务器看到 ≠ 某人持有）
             if existing.owner_id is None and getattr(current_user, "id", None) is not None:
                 existing.owner_id = current_user.id
             existing.platform = info.get("platform", "android")

@@ -1,13 +1,22 @@
 """桌面客户端设备归属 API（客户端模式本地引擎上报）。
 
-- POST /register：按 serial upsert Device 并认领归属（owner_id）；
-  已被他人认领的设备返回 409。
+- POST /register：按 serial upsert Device 并认领归属（owner_id）。
+  物理持有即接管：register 只来自桌面客户端对**本机 adb** 的扫描，
+  插着设备就是持有证明——设备已被他人登记时不再 409，直接把 owner_id
+  转给当前用户（记录转移日志；model/custom_name 等元数据保留；
+  client_instance_id/last_seen_at 刷新为本次）。
 - POST /heartbeat：批量刷新本人设备 last_seen_at。
 - POST /logout：本人设备（或指定子集）status=OFFLINE。
 
+注意：服务端 /api/devices/sync 的认领语义保持不变——只认无主设备、
+不抢他人已认领设备（服务器看到 ≠ 某人持有）。
+
 设备归属：普通用户仅可见/可操作 owner_id 或 app_owner_id 为自己的设备，
 admin 可见全部；存量无主设备由 backfill_legacy_device_owners 回填给 admin。
+app_owner_id（App 形态登记）与 owner_id（桌面客户端物理持有）是两个独立
+归属维度：register 接管只转移 owner_id，app_owner_id 不随接管变化。
 """
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -22,6 +31,7 @@ from backend.models import Device, User
 from backend.schemas import DeviceRead
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class ClientDeviceRegisterRequest(BaseModel):
@@ -51,7 +61,18 @@ def register_client_device(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """按 serial 认领/刷新一台客户端设备，返回 DeviceRead（与列表口径一致）。"""
+    """按 serial 注册/接管一台客户端设备，返回 DeviceRead（与列表口径一致）。
+
+    物理持有即接管：register 只来自桌面客户端对本机 adb 的扫描，
+    插着设备就是持有证明——他人已登记的设备直接转移 owner_id（不 409），
+    并记录转移日志；model/custom_name 等元数据保留（不被本次上报覆盖），
+    client_instance_id/last_seen_at 刷新为本次。
+
+    注意：接管只转移 owner_id（桌面物理持有维度）。app_owner_id 是 App 形态
+    登记的独立归属（可见性过滤 owner_id / app_owner_id / admin 三者之一），
+    不随本次接管转移——同一设备若曾被原主以 App 形态登记，原主仍可经
+    app_owner_id 看到该设备；两套归属维度互不覆盖。
+    """
     serial = str(payload.serial or "").strip()
     if not serial:
         raise HTTPException(status_code=400, detail="设备序列号不能为空")
@@ -59,24 +80,36 @@ def register_client_device(
 
     now = datetime.now()
     device = session.exec(select(Device).where(Device.serial == serial)).first()
-    if device and device.owner_id is not None and device.owner_id != current_user.id:
-        raise HTTPException(status_code=409, detail="设备已被其他成员注册")
+    takeover = bool(device and device.owner_id is not None and device.owner_id != current_user.id)
 
     if not device:
         device = Device(serial=serial, status="IDLE")
 
-    # 归属 + 元数据刷新：必填字段直接覆盖，可选字段仅在显式提供时写入
-    device.owner_id = current_user.id
-    device.platform = platform
-    device.model = str(payload.model or "Unknown")
-    device.brand = str(payload.brand or "")
-    device.android_version = str(payload.android_version or "")
-    device.os_version = str(payload.os_version or "")
-    device.resolution = str(payload.resolution or "")
-    if payload.custom_name is not None:
-        device.custom_name = str(payload.custom_name)
-    if payload.connection_type is not None:
-        device.connection_type = str(payload.connection_type)
+    if takeover:
+        # G7 物理持有即接管：转移归属并记录转移日志；
+        # model/custom_name 等元数据保留（不被本次上报覆盖）。
+        logger.info(
+            "设备 %s 归属转移（客户端物理持有即接管）：owner_id %s → %s",
+            serial,
+            device.owner_id,
+            current_user.id,
+        )
+        device.owner_id = current_user.id
+    else:
+        # 归属 + 元数据刷新：必填字段直接覆盖，可选字段仅在显式提供时写入
+        device.owner_id = current_user.id
+        device.platform = platform
+        device.model = str(payload.model or "Unknown")
+        device.brand = str(payload.brand or "")
+        device.android_version = str(payload.android_version or "")
+        device.os_version = str(payload.os_version or "")
+        device.resolution = str(payload.resolution or "")
+        if payload.custom_name is not None:
+            device.custom_name = str(payload.custom_name)
+        if payload.connection_type is not None:
+            device.connection_type = str(payload.connection_type)
+
+    # 在线字段刷新为本次（接管与常规注册一致）：客户端实例 + 心跳时间
     if payload.client_instance_id is not None:
         device.client_instance_id = str(payload.client_instance_id)
     device.last_seen_at = now

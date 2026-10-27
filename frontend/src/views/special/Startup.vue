@@ -7,6 +7,7 @@ import dayjs from 'dayjs'
 import api from '@/api'
 import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useClientApp } from '@/composables/useClientApp'
+import { createPollingLoop } from '@/utils/polling'
 
 const router = useRouter()
 
@@ -53,7 +54,6 @@ const revealStartupError = async (message, label, advanced = false) => {
     field?.querySelector('input, textarea, button')?.focus({ preventScroll: true })
     ElMessage.warning(message)
 }
-let pollTimer = null
 let pageActive = false
 
 const availableDevices = computed(() => (
@@ -205,15 +205,19 @@ const goReportCenter = () => {
     router.push({ path: '/execution/reports', query: { tab: 'startup' } })
 }
 
+// 启动任务 8s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const TASK_POLL_INTERVAL_MS = 8000
+const taskPollLoop = createPollingLoop({
+    intervalMs: TASK_POLL_INTERVAL_MS,
+    tick: fetchTasks
+})
+
 const startPolling = () => {
-    if (pollTimer) return
-    pollTimer = setInterval(fetchTasks, 8000)
+    taskPollLoop.start()
 }
 
 const stopPolling = () => {
-    if (!pollTimer) return
-    clearInterval(pollTimer)
-    pollTimer = null
+    taskPollLoop.stop()
 }
 
 const activatePage = () => {

@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onActivated, onDeactivated, onUnmounted, reactive, computed } from 'vue'
+import { createPollingLoop } from '@/utils/polling'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, VideoPlay, CopyDocument, Delete, Search, Refresh, Edit, ArrowDown, CircleClose, FolderOpened, MoreFilled, Download } from '@element-plus/icons-vue'
@@ -46,7 +47,7 @@ const pageSize = ref(20)
 const currentUser = computed(() => userStore.userInfo || {})
 const isAdmin = computed(() => currentUser.value.role === 'admin')
 const activeCaseRuns = ref({})
-let activeRunTimer = null
+const ACTIVE_RUN_POLL_INTERVAL_MS = 3000
 
 const queryParams = reactive({
     keyword: ''
@@ -381,43 +382,48 @@ const restoreActiveCaseRuns = async () => {
     if (Object.keys(next).length > 0) startActiveRunPolling()
 }
 
+const pollActiveCaseRuns = async () => {
+    const entries = Object.entries(activeCaseRuns.value)
+    if (entries.length === 0) {
+        stopActiveRunPolling()
+        return
+    }
+    const next = { ...activeCaseRuns.value }
+    let changed = false
+    for (const [caseId] of entries) {
+        try {
+            const { data } = await api.getActiveRuns('case', Number(caseId))
+            const items = data?.items || []
+            if (items.length === 0) {
+                delete next[caseId]
+                changed = true
+                continue
+            }
+            next[caseId] = buildActiveCaseEntry(items, next[caseId])
+            // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
+            const caseItem = cases.value.find(c => c.id === Number(caseId))
+            if (caseItem && normalizeRunStatus(caseItem.last_run_status) === 'QUEUED' && !next[caseId].queue) {
+                caseItem.last_run_status = 'RUNNING'
+            }
+        } catch {}
+    }
+    activeCaseRuns.value = next
+    if (changed) fetchCases()
+}
+
+// 运行状态轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const activeRunPollLoop = createPollingLoop({
+    intervalMs: ACTIVE_RUN_POLL_INTERVAL_MS,
+    tick: pollActiveCaseRuns
+})
+
 const startActiveRunPolling = () => {
     stopActiveRunPolling()
-    activeRunTimer = setInterval(async () => {
-        const entries = Object.entries(activeCaseRuns.value)
-        if (entries.length === 0) {
-            stopActiveRunPolling()
-            return
-        }
-        const next = { ...activeCaseRuns.value }
-        let changed = false
-        for (const [caseId] of entries) {
-            try {
-                const { data } = await api.getActiveRuns('case', Number(caseId))
-                const items = data?.items || []
-                if (items.length === 0) {
-                    delete next[caseId]
-                    changed = true
-                    continue
-                }
-                next[caseId] = buildActiveCaseEntry(items, next[caseId])
-                // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
-                const caseItem = cases.value.find(c => c.id === Number(caseId))
-                if (caseItem && normalizeRunStatus(caseItem.last_run_status) === 'QUEUED' && !next[caseId].queue) {
-                    caseItem.last_run_status = 'RUNNING'
-                }
-            } catch {}
-        }
-        activeCaseRuns.value = next
-        if (changed) fetchCases()
-    }, 3000)
+    activeRunPollLoop.start()
 }
 
 const stopActiveRunPolling = () => {
-    if (activeRunTimer) {
-        clearInterval(activeRunTimer)
-        activeRunTimer = null
-    }
+    activeRunPollLoop.stop()
 }
 
 const handleClone = async (row) => {

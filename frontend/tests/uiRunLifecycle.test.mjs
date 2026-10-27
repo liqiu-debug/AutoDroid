@@ -36,7 +36,11 @@ function editorSetup(name, extra = {}) {
     useRoute: () => route, useRouter: () => ({ push: () => {}, replace: () => {} }), useUnsavedGuard: () => {},
     useUserStore: () => ({ userInfo: { id: 1, role: 'admin' } }), useClientMode: () => ({ isMobileMode: ref(false) }),
     ElMessage: messages(), ElMessageBox: { confirm: async () => {} }, createUuid: () => 'ui-step',
-    setInterval: () => 1, clearInterval: () => {}, window: { location: { protocol: 'http:', host: 'test.local' } },
+    setInterval: () => 1, clearInterval: () => {},
+    // 轮询控制器桩：与 setInterval 桩同策略，测试不起真实定时器
+    createPollingLoop: () => ({ start() {}, stop() {}, runNow() {}, isActive: () => false, isInflight: () => false }),
+    createGatedTask: fn => fn,
+    window: { location: { protocol: 'http:', host: 'test.local' } },
     WebSocket: class { constructor(url) { connections.push(url) } close() {} },
     ...versionToken,
     ...extra,

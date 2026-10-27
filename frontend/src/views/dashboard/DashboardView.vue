@@ -8,6 +8,7 @@ import { runStatusTagType as statusTagType, runStatusLabel as statusLabel } from
 import { useClientMode } from '@/composables/useClientMode'
 import VChart from 'vue-echarts'
 import { chartTheme, chartColors } from '@/utils/chartTheme'
+import { createPollingLoop } from '@/utils/polling'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { LineChart, PieChart } from 'echarts/charts'
@@ -64,7 +65,7 @@ const emptyOverview = () => ({
 })
 
 const overview = ref(emptyOverview())
-let pollTimer = null
+// fetch 级在途门闩（手动刷新与轮询共用，照抄本文件原有模式）
 let inflight = false
 let liveBindingsActive = false
 
@@ -171,19 +172,22 @@ const statusPieOption = computed(() => {
   }
 })
 
+// 大盘 15s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const DASHBOARD_POLL_INTERVAL_MS = 15000
+const dashboardPollLoop = createPollingLoop({
+  intervalMs: DASHBOARD_POLL_INTERVAL_MS,
+  isEnabled: () => autoRefresh.value,
+  tick: () => fetchOverview({ silent: true })
+})
+
 const stopPolling = () => {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+  dashboardPollLoop.stop()
 }
 
 const startPolling = () => {
-  stopPolling()
-  if (!autoRefresh.value || document.hidden) return
-  pollTimer = setInterval(() => {
-    fetchOverview({ silent: true })
-  }, 15000)
+  // 「自动刷新」取消勾选后不得复活循环（可见性恢复/筛选变更同守卫）
+  if (!autoRefresh.value) return
+  dashboardPollLoop.start()
 }
 
 const fetchOverview = async ({ silent = false } = {}) => {
@@ -268,7 +272,11 @@ watch(
 
 watch(
   () => autoRefresh.value,
-  () => startPolling()
+  (enabled) => {
+    // 按勾选状态 start/stop：取消勾选即停表，不得只 start 不 stop 留循环空转
+    if (enabled) startPolling()
+    else stopPolling()
+  }
 )
 
 onMounted(async () => {

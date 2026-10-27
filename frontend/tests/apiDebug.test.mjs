@@ -3,13 +3,14 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { ref, computed, watch, effectScope, nextTick } from 'vue'
 import { apiError, copy, requestSignatures, assertionSignature, localRequestStep, literal } from '../src/utils/apiTesting.js'
+import { pollRequestConfig } from '../src/utils/polling.js'
 
 // Load the production composable unchanged except for module dependencies.
 // Vue's actual reactive/watch implementation drives every race below.
 const source = readFileSync(new URL('../src/composables/useApiDebug.js', import.meta.url), 'utf8')
   .replace(/^import .*\n/gm, '').replace('export function useApiDebug', 'function useApiDebug')
 const loadComposable = new Function('ref', 'computed', 'watch', 'onBeforeUnmount', 'ElMessage', 'ElMessageBox',
-  'api', 'createUuid', 'apiError', 'copy', 'requestSignatures', 'assertionSignature', `${source}\nreturn useApiDebug;`)
+  'api', 'createUuid', 'apiError', 'copy', 'requestSignatures', 'assertionSignature', 'pollRequestConfig', `${source}\nreturn useApiDebug;`)
 const deferred = () => {
   let resolve, reject
   const promise = new Promise((yes, no) => { resolve = yes; reject = no })
@@ -39,7 +40,7 @@ function setup(t, overrides = {}) {
   const message = Object.fromEntries(['error', 'warning', 'success'].map(kind => [kind, text => messages.push({ kind, text })]))
   const confirm = overrides.confirm || (() => Promise.resolve())
   const useApiDebug = loadComposable(ref, computed, watch, callback => lifecycle.push(callback), message, { confirm },
-    api, () => 'editor-one', apiError, copy, requestSignatures, assertionSignature)
+    api, () => 'editor-one', apiError, copy, requestSignatures, assertionSignature, pollRequestConfig)
   const step = localRequestStep(); step.id = 'one'; step.snapshot.request.url = literal('https://old.example.test')
   const steps = ref([step]), env = ref(1)
   const debug = scope.run(() => useApiDebug(env, steps, { retainDisplay: true, envName: () => `环境${env.value}` }))

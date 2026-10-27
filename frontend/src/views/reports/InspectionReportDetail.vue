@@ -51,6 +51,7 @@ import {
 } from '@/utils/inspectionMindMap'
 import { runStatusTagType } from '@/utils/statusMeta'
 import { inspectionRunStatusLabel } from '@/utils/inspectionRunPresentation'
+import { createPollingLoop } from '@/utils/polling'
 import {
   inspectionActionStatus,
   inspectionActionStatusMeta,
@@ -127,7 +128,6 @@ const collapsePreferences = ref(new Map())
 const selectedMindMapNodeId = ref('')
 const diagnosticPanels = ref([])
 const detailImageSize = ref({ width: 0, height: 0 })
-let pollTimer = null
 let detailRequestId = 0
 let mindMapPointer = null
 let componentUnmounted = false
@@ -1488,18 +1488,25 @@ watch([mindMapCanvasWidth, mindMapCanvasHeight], async ([nextWidth, nextHeight],
   viewport.scrollTop = centered.scrollTop
 })
 
+// 运行中巡检报告 5s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const DETAIL_POLL_INTERVAL_MS = 5000
+const detailPollLoop = createPollingLoop({
+  intervalMs: DETAIL_POLL_INTERVAL_MS,
+  tick: async () => {
+    if (run.value && !terminal(run.value.status)) await fetchData(true)
+  }
+})
+
 onMounted(async () => {
   window.addEventListener('resize', updateResponsiveLayout, { passive: true })
   await fetchData()
-  pollTimer = window.setInterval(() => {
-    if (run.value && !terminal(run.value.status)) fetchData(true)
-  }, 5000)
+  detailPollLoop.start()
 })
 
 onBeforeUnmount(() => {
   componentUnmounted = true
   detailRequestId += 1
-  if (pollTimer) window.clearInterval(pollTimer)
+  detailPollLoop.stop()
   window.removeEventListener('resize', updateResponsiveLayout)
   thumbnailRetryTimers.forEach(timer => window.clearTimeout(timer))
   thumbnailRetryTimers.clear()
