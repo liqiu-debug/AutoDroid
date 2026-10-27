@@ -31,6 +31,9 @@ class DeviceListWdaStatusTests(unittest.IsolatedAsyncioTestCase):
             "backend.api.devices._run_adb_command",
             return_value=b"List of devices attached\n\n",
         ), patch(
+            "backend.ios_scanner.get_ios_devices",
+            return_value=[{"device_id": "ios-1"}],
+        ), patch(
             "backend.api.devices._check_ios_wda_health",
             return_value={"healthy": False, "wda_url": "http://127.0.0.1:8201", "error": "wda down"},
         ) as health_mock:
@@ -62,6 +65,9 @@ class DeviceListWdaStatusTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "backend.api.devices._run_adb_command",
             return_value=b"List of devices attached\n\n",
+        ), patch(
+            "backend.ios_scanner.get_ios_devices",
+            return_value=[{"device_id": "ios-1"}],
         ), patch(
             "backend.cross_platform_execution.resolve_ios_wda_url",
             return_value="http://127.0.0.1:8201",
