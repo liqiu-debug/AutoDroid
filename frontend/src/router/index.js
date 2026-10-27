@@ -309,6 +309,12 @@ router.beforeEach(async (to, from, next) => {
   if (token && !userStore.token) {
     userStore.token = token
   }
+  if (!token && userStore.token) {
+    // 双向同步：localStorage 已空（401 处理/其他标签页登出）时清 pinia，
+    // 消除「pinia 残留 + localStorage 空」的半迁移态（此时任何请求都会被
+    // 发起前门闩静默拒绝，页面按未登录收口到 /login）。
+    userStore.logout()
+  }
 
   if (to.path === '/login' || to.path === '/register') {
     if (userStore.token) {
@@ -320,7 +326,9 @@ router.beforeEach(async (to, from, next) => {
     if (userStore.token) {
       if (!userStore.userInfo) {
         try {
-          await userStore.fetchUserInfo()
+          // silent401：守卫取 userInfo 的 401 不弹「会话过期」框（弹框只服务
+          // 会话中途的后台 401），由守卫静默收口 /login。
+          await userStore.fetchUserInfo({ silent401: true })
           if ((requiresAdmin && !userStore.isAdmin)
             || (requiredFeature && !userStore.featureFlags?.[requiredFeature])) {
             next('/')
@@ -328,8 +336,22 @@ router.beforeEach(async (to, from, next) => {
             next()
           }
         } catch (e) {
-          userStore.logout()
-          next('/login')
+          if (e?.authFailure) {
+            // 鉴权失败（401/会话门闩）：fetchUserInfo 已被动清态，静默收口登录页
+            userStore.logout()
+            next('/login')
+          } else {
+            // 非鉴权错误（网络抖动/超时）：不销毁会话、不强制跳登录，普通路由
+            // 放行进入（页面级请求会自报错），下次导航再惰性重试 userInfo。
+            // 但 requiresAdmin / featureFlag 门禁要靠 userInfo 才能判定——
+            // 判不了就不能放行（否则网络抖动时任何人都能进管理员/灰度路由），
+            // 一律收口回首页。
+            if (requiresAdmin || requiredFeature) {
+              next('/')
+            } else {
+              next()
+            }
+          }
         }
       } else {
         if ((requiresAdmin && !userStore.isAdmin)

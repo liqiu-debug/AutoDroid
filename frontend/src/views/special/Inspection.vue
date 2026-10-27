@@ -1,11 +1,12 @@
 <script setup>
-import { computed, onActivated, onBeforeUnmount, onMounted, reactive, ref, watch, nextTick } from 'vue'
+import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Edit, Plus, Refresh, VideoPlay } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
 import { runStatusTagType } from '@/utils/statusMeta'
+import { createPollingLoop } from '@/utils/polling'
 import {
   inspectionRunCoverage,
   inspectionRunReplay,
@@ -44,7 +45,6 @@ watch(dialogVisible, visible => {
 const editingId = ref(null)
 const runAdvancedOpen = ref([])
 const profileManagerOpen = ref([])
-let pollTimer = null
 
 const blankBranch = (name, scope = 'full') => ({
   name,
@@ -437,15 +437,28 @@ const cancelRun = async (run) => {
 const statusText = status => String(status || 'PENDING').toUpperCase()
 const formatTime = value => value ? dayjs(value).format('MM-DD HH:mm:ss') : '-'
 
+// 巡检任务 5s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const RUN_POLL_INTERVAL_MS = 5000
+const runPollLoop = createPollingLoop({
+  intervalMs: RUN_POLL_INTERVAL_MS,
+  tick: async () => {
+    if (hasRunning.value) await fetchRuns()
+  }
+})
+
 onMounted(() => {
   bootstrap()
-  pollTimer = window.setInterval(() => {
-    if (hasRunning.value) fetchRuns()
-  }, 5000)
+  runPollLoop.start()
 })
-onActivated(() => Promise.all([fetchProfiles(), fetchRuns()]))
+onActivated(() => {
+  runPollLoop.start()
+  return Promise.all([fetchProfiles(), fetchRuns()])
+})
+onDeactivated(() => {
+  runPollLoop.stop()
+})
 onBeforeUnmount(() => {
-  if (pollTimer) window.clearInterval(pollTimer)
+  runPollLoop.stop()
 })
 </script>
 

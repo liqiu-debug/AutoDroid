@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { normalizeError } from '@/utils/errors'
 import { versionRequestConfig } from '@/utils/versionToken'
+import { createSessionExpiredController, SESSION_EXPIRED_MESSAGE, TOKEN_STORAGE_KEY } from '@/utils/sessionExpiry'
 
 export const LOGIN_NOTICE_KEY = 'autodroid.login_notice'
 
@@ -8,6 +9,15 @@ const api = axios.create({
     baseURL: '/api', // Proxy handles this
     timeout: 30000  // 30 seconds default
 })
+
+// 轮询类 GET 的显式短超时：闲置/劣化网络下慢请求快速失败，避免 pending XHR
+// 堆积打满同域连接池把点击请求饿死。全局默认 30s 保留；这些方法可在调用处
+// 用 config.timeout 覆盖（如确有更长的合法慢请求）。
+const POLL_GET_TIMEOUT_MS = 8000
+
+// 一次性大载荷 GET（报告/场景详情等首载）显式用全局 30s：8s 短超时只留给
+// 真轮询，不再误伤一次性的大响应首载。
+const DETAIL_GET_TIMEOUT_MS = 30000
 
 const buildReportAssetUrl = (path) => {
     const normalized = String(path || '').trim().replace(/^\/+/, '')
@@ -34,12 +44,80 @@ const markLoggedLogout = (manual = true) => {
     return Promise.resolve().then(() => bridge.markLoggedOut()).catch(() => {})
 }
 
+// ===== 会话过期（401）单飞处理 =====
+// 闲置劣化后在途请求会成批打回 401：无单飞门闩时每发一个 401 都弹一框、跳一次。
+// 这里模块级 redirecting 单飞，只处理首个；「会话过期」处理器可注入
+// （setSessionExpiredHandler，默认 ElMessageBox.confirm「登录状态已过期，请重新登录」
+// → 用户点击后 router.push('/login')，用户手势内跳转绕开桌面壳吞程序化跳转）；
+// 状态清理统一经 useUserStore.logout()（pinia token 与 localStorage 一并清）。
+// 控制器惰性创建、清理用动态 import，避免与 useUserStore/router 形成模块环。
+let sessionExpiredController = null
+let sessionExpiredHandler = null
+
+// 默认状态清理：经 useUserStore.logout() 统一清 pinia token 与 localStorage。
+const clearSessionOnExpiry = async () => {
+    try {
+        const { useUserStore } = await import('@/stores/useUserStore')
+        useUserStore().logout()
+    } catch {
+        try {
+            localStorage.removeItem(TOKEN_STORAGE_KEY)
+        } catch { /* 无可清时忽略 */ }
+    }
+}
+
+const getSessionExpiredController = () => {
+    if (!sessionExpiredController) {
+        sessionExpiredController = createSessionExpiredController({
+            // 显式传存储：控制器的「未登录不弹框」判定与请求门闩同一份 token
+            storage: typeof window !== 'undefined' ? window.localStorage : null,
+            handler: sessionExpiredHandler,
+            logout: clearSessionOnExpiry,
+        })
+    }
+    return sessionExpiredController
+}
+
+// 注入「会话过期」处理器（测试/自定义 UI）：只替换呈现与跳转，单飞与清理不变；
+// 传非函数恢复默认弹框流程。
+export const setSessionExpiredHandler = (handler) => {
+    sessionExpiredHandler = typeof handler === 'function' ? handler : null
+    sessionExpiredController?.setHandler(sessionExpiredHandler)
+}
+
+// 重置单飞状态与注入（测试隔离用）。
+export const resetSessionExpired = () => {
+    sessionExpiredHandler = null
+    sessionExpiredController = null
+}
+
+// 预登录端点（登录/注册/客户端模式探测）：无 token 也照常放行。
+const PRE_LOGIN_PATHS = ['/auth/token', '/auth/register', '/auth/registration-status', '/client/info']
+
+const isPreLoginRequest = (url) => {
+    const path = String(url || '').split('?')[0].replace(/\/+$/, '') || '/'
+    return PRE_LOGIN_PATHS.some(p => path === p)
+}
+
+// 无 token 时的本地快速拒绝：会话已结束（401 处理/手动登出），轮询/后台请求
+// 「发起前」即停，不再打网络堆积连接池；中文 message 让提示层不露英文。
+const createSessionExpiredAbort = (config) => {
+    const error = new Error(SESSION_EXPIRED_MESSAGE)
+    error.code = 'ERR_SESSION_EXPIRED'
+    error.sessionExpired = true
+    error.config = config
+    return error
+}
+
 // Request interceptor
 api.interceptors.request.use(
     (config) => {
         const token = localStorage.getItem('token')
         if (token) {
             config.headers.Authorization = `Bearer ${token}`
+        } else if (!isPreLoginRequest(config.url)) {
+            // 401/登出后 token 已清：发起前本地拒绝，轮询自动静默停止
+            throw createSessionExpiredAbort(config)
         }
         return config
     },
@@ -57,11 +135,13 @@ api.interceptors.response.use(
         // Every failure leaves here with Chinese `message` and `data.detail`,
         // so call sites that print either never show axios/English text.
         normalizeError(error)
-        if (error.response && error.response.status === 401) {
-            const expired = !!localStorage.getItem('token')
-            localStorage.removeItem('token')
-            if (expired) sessionStorage.setItem(LOGIN_NOTICE_KEY, '登录状态已失效，请重新登录')
-            if (!window.location.pathname.startsWith('/login')) window.location.href = '/login'
+        if (error.response && error.response.status === 401 && !error.config?.silent401) {
+            // 会话过期：单飞处理（弹框 + useUserStore.logout() 清态 + 确认后
+            // router.push('/login')），不再 window.location.href 硬跳（桌面壳
+            // 会吞跳转且无单飞时连环跳）；未登录时处理器静默放行。
+            // silent401（路由守卫取 userInfo 的请求）不弹框：由守卫静默收口
+            // /login，弹框只服务会话中途的后台 401（取消=留在当前页仍有效）。
+            getSessionExpiredController().handleSessionExpired()
         }
         return Promise.reject(error)
     }
@@ -70,7 +150,9 @@ api.interceptors.response.use(
 export default {
     // Typed, device-independent HTTP automation. Uses the same auth interceptors.
     apiTesting: {
-        get: (path, params) => api.get(`/api-testing${path}`, { params }),
+        // 一次性 GET（详情/首载大载荷）：默认全局 30s；真轮询调用处显式传
+        // pollRequestConfig() 用 8s 短超时（8s 只留给真轮询）
+        get: (path, params, config) => api.get(`/api-testing${path}`, { timeout: DETAIL_GET_TIMEOUT_MS, params, ...config }),
         post: (path, data, config) => api.post(`/api-testing${path}`, data, config),
         put: (path, data) => api.put(`/api-testing${path}`, data),
         patch: (path, data) => api.patch(`/api-testing${path}`, data),
@@ -92,8 +174,9 @@ export default {
     getRegistrationStatus() {
         return api.get('/auth/registration-status')
     },
-    getUserInfo() {
-        return api.get('/auth/users/me')
+    // config.silent401：该请求的 401 不触发「会话过期」弹框（路由守卫静默收口用）
+    getUserInfo(config = {}) {
+        return api.get('/auth/users/me', config)
     },
     changePassword(data) {
         return api.put('/auth/password', data)
@@ -278,8 +361,8 @@ export default {
     },
 
     // Scrcpy 设备流
-    getDevices() {
-        return api.get('/stream/devices')
+    getDevices(config = {}) {
+        return api.get('/stream/devices', { timeout: POLL_GET_TIMEOUT_MS, ...config })
     },
     getDevice(serial) {
         return api.get(`/stream/devices/${serial}`)
@@ -323,8 +406,8 @@ export default {
     compareExecutions(baseId, targetId) {
         return api.get('/reports/executions/compare', { params: { base_id: baseId, target_id: targetId } })
     },
-    getDashboardOverview(params) {
-        return api.get('/reports/dashboard/overview', { params })
+    getDashboardOverview(params, config = {}) {
+        return api.get('/reports/dashboard/overview', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
     deleteExecution(id) {
         return api.delete(`/reports/executions/${id}`)
@@ -335,8 +418,8 @@ export default {
     cancelRun(data) {
         return api.post('/runs/cancel', data)
     },
-    getActiveRuns(kind, targetId) {
-        return api.get('/runs/active', { params: { kind, target_id: targetId } })
+    getActiveRuns(kind, targetId, config = {}) {
+        return api.get('/runs/active', { timeout: POLL_GET_TIMEOUT_MS, params: { kind, target_id: targetId }, ...config })
     },
     // Limiter (执行限流/排队)
     getLimiterStats() {
@@ -406,8 +489,8 @@ export default {
     },
 
     // Fastbot (性能测试)
-    getFastbotTasks(params) {
-        return api.get('/fastbot/tasks', { params })
+    getFastbotTasks(params, config = {}) {
+        return api.get('/fastbot/tasks', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
     getFastbotTask(id) {
         return api.get(`/fastbot/tasks/${id}`)
@@ -427,11 +510,11 @@ export default {
             timeout: 120000,
         })
     },
-    getFluencySessions(params) {
-        return api.get('/fastbot/fluency/sessions', { params })
+    getFluencySessions(params, config = {}) {
+        return api.get('/fastbot/fluency/sessions', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
-    getStartupTasks(params) {
-        return api.get('/fastbot/startup/tasks', { params })
+    getStartupTasks(params, config = {}) {
+        return api.get('/fastbot/startup/tasks', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
     runStartupTest(data) {
         return api.post('/fastbot/startup/run', data)
@@ -465,8 +548,8 @@ export default {
     deleteCompatPageSet(id) {
         return api.delete(`/compatibility/page-sets/${id}`)
     },
-    getCompatibilityRuns(params) {
-        return api.get('/compatibility/runs', { params })
+    getCompatibilityRuns(params, config = {}) {
+        return api.get('/compatibility/runs', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
     createCompatibilityRun(data) {
         return api.post('/compatibility/runs', data)
@@ -474,8 +557,9 @@ export default {
     preflightCompatibilityReplay(data) {
         return api.post('/compatibility/replay-preflight', data, { timeout: 60000 })
     },
-    getCompatibilityRun(id) {
-        return api.get(`/compatibility/runs/${id}`)
+    getCompatibilityRun(id, config = {}) {
+        // 报告详情一次性大载荷：全局 30s（8s 只留给真轮询）
+        return api.get(`/compatibility/runs/${id}`, { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
     },
     getCompatibilityPageDiff(runId, pageResultId) {
         return api.get(`/compatibility/runs/${runId}/pages/${pageResultId}/diff`, {
@@ -505,11 +589,12 @@ export default {
     createInspectionRun(data) {
         return api.post('/inspections/runs', data)
     },
-    getInspectionRuns(params) {
-        return api.get('/inspections/runs', { params })
+    getInspectionRuns(params, config = {}) {
+        return api.get('/inspections/runs', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
-    getInspectionRun(id) {
-        return api.get(`/inspections/runs/${id}`)
+    getInspectionRun(id, config = {}) {
+        // 报告详情一次性大载荷：全局 30s（8s 只留给真轮询）
+        return api.get(`/inspections/runs/${id}`, { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
     },
     deleteInspectionRun(id) {
         return api.delete(`/inspections/runs/${id}`)
@@ -526,8 +611,8 @@ export default {
     createInspectionLiveSession(id) {
         return api.post(`/inspections/runs/${id}/live-session`)
     },
-    getInspectionLive(id) {
-        return api.get(`/inspections/runs/${id}/live`)
+    getInspectionLive(id, config = {}) {
+        return api.get(`/inspections/runs/${id}/live`, { timeout: POLL_GET_TIMEOUT_MS, ...config })
     },
     getInspectionActionMap(id, stateId) {
         return api.get(`/inspections/runs/${id}/states/${stateId}/action-map`)
@@ -585,7 +670,11 @@ export default {
         if (Object.prototype.hasOwnProperty.call(options, 'refreshIosWda')) {
             params.refresh_ios_wda = options.refreshIosWda
         }
-        return api.get('/devices/', { params })
+        // 设备列表是 2s 级轮询目标：默认短超时，options.timeout 可覆盖
+        return api.get('/devices/', {
+            timeout: options.timeout ?? POLL_GET_TIMEOUT_MS,
+            params
+        })
     },
     syncDevices() {
         return api.post('/devices/sync')

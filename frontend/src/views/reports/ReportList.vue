@@ -16,6 +16,7 @@ import {
 } from '@/utils/inspectionRunPresentation'
 import FlakyAnalysisDrawer from './FlakyAnalysisDrawer.vue'
 import ApiRunList from '../api-testing/RunList.vue'
+import { createPollingLoop } from '@/utils/polling'
 
 const router = useRouter()
 const route = useRoute()
@@ -292,7 +293,6 @@ const inspectionPage = ref(1)
 const inspectionPageSize = ref(20)
 const inspectionTotal = ref(0)
 const inspectionDeletingId = ref(null)
-let fbPollTimer = null
 let pageActive = false
 
 const fetchFbTasks = async () => {
@@ -556,20 +556,26 @@ const handleReportTabChange = tab => {
     handleTabChange(next)
 }
 
+const pollReportLists = async () => {
+    if (activeTab.value === 'fastbot') await fetchFbTasks()
+    if (activeTab.value === 'startup') await fetchStartupTasks()
+    if (activeTab.value === 'compatibility' && hasRunningCompatibilityRuns.value) await fetchCompatibilityRuns()
+    if (activeTab.value === 'inspection' && hasRunningInspectionRuns.value) await fetchInspectionRuns()
+}
+
+// 报告中心 15s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const REPORT_POLL_INTERVAL_MS = 15000
+const reportPollLoop = createPollingLoop({
+    intervalMs: REPORT_POLL_INTERVAL_MS,
+    tick: pollReportLists
+})
+
 const startFbPolling = () => {
-    if (fbPollTimer) return
-    fbPollTimer = setInterval(() => {
-        if (activeTab.value === 'fastbot') fetchFbTasks()
-        if (activeTab.value === 'startup') fetchStartupTasks()
-        if (activeTab.value === 'compatibility' && hasRunningCompatibilityRuns.value) fetchCompatibilityRuns()
-        if (activeTab.value === 'inspection' && hasRunningInspectionRuns.value) fetchInspectionRuns()
-    }, 15000)
+    reportPollLoop.start()
 }
 
 const stopFbPolling = () => {
-    if (!fbPollTimer) return
-    clearInterval(fbPollTimer)
-    fbPollTimer = null
+    reportPollLoop.stop()
 }
 
 const activatePage = () => {

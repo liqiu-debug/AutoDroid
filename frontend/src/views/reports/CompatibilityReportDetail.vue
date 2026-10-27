@@ -7,6 +7,7 @@ import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
 import api from '@/api'
 import { runStatusTagType } from '@/utils/statusMeta'
+import { createPollingLoop, pollRequestConfig } from '@/utils/polling'
 import {
   compatibilityStatusLabel,
   compatibilityExecutionMode,
@@ -38,7 +39,6 @@ const generatedDiffNotices = ref({})
 const assetRequests = new Set()
 const generatedDiffRequests = new Set()
 const ownedObjectUrls = new Set()
-let pollTimer = null
 let pageActive = false
 let assetLifecycleVersion = 0
 
@@ -334,13 +334,15 @@ const fetchDevices = async () => {
   const { data } = await api.getDeviceList()
   devices.value = data || []
 }
-const fetchRun = async () => {
+// config：真轮询传 pollRequestConfig()（8s 短超时，慢响应不挂满轮询周期）；
+// 一次性首载/取消后刷新/手动重载不传，走 api 层默认 30s（大载荷详情）。
+const fetchRun = async (config) => {
   const id = Number(route.params.id)
   if (!id) return
   loading.value = true
   loadError.value = ''
   try {
-    const { data } = await api.getCompatibilityRun(id)
+    const { data } = await api.getCompatibilityRun(id, config)
     run.value = data
   } catch (err) {
     loadError.value = '加载兼容性报告失败，请重试'
@@ -405,16 +407,20 @@ const goBack = () => {
   router.push('/execution/reports?tab=compatibility')
 }
 
+// 运行详情轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
+const RUN_POLL_INTERVAL_MS = 8000
+const runPollLoop = createPollingLoop({
+  intervalMs: RUN_POLL_INTERVAL_MS,
+  tick: async () => {
+    // 真轮询：8s 短超时（旧实现不传 config，每轮挂满 30s 默认超时）
+    if (hasRunningRun.value) await fetchRun(pollRequestConfig())
+  }
+})
 const startPolling = () => {
-  if (pollTimer) return
-  pollTimer = setInterval(() => {
-    if (hasRunningRun.value) fetchRun()
-  }, 8000)
+  runPollLoop.start()
 }
 const stopPolling = () => {
-  if (!pollTimer) return
-  clearInterval(pollTimer)
-  pollTimer = null
+  runPollLoop.stop()
 }
 const activatePage = () => {
   if (pageActive) return

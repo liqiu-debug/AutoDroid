@@ -1,4 +1,6 @@
 import { computed } from 'vue'
+// 相对路径导入：本模块被 node --test 直接 import（streamProfile.test），不能走 vite 的 @ 别名
+import { createPollingLoop } from '../utils/polling.js'
 
 export const LIVE_PREVIEW_POLL_CONFIG = Object.freeze({
   iosMs: 1500,
@@ -35,7 +37,6 @@ export function useLivePreviewPolling({
   quickImagePrompt,
   fetchLiveHierarchy
 }) {
-  let livePreviewPollTimer = null
   let livePreviewBoostUntil = 0
 
   const shouldPauseLivePreviewPolling = computed(() => {
@@ -62,27 +63,22 @@ export function useLivePreviewPolling({
       : ANDROID_LIVE_PREVIEW_POLL_IDLE_MS
   }
 
-  const clearLivePreviewPollTimer = () => {
-    if (!livePreviewPollTimer) return
-    clearTimeout(livePreviewPollTimer)
-    livePreviewPollTimer = null
-  }
+  // 层级轮询：自适应间隔 + 在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）。
+  // 条件不满足（框选/加载中/未选设备）时跳过本轮但仍续排，条件恢复即自动跟上。
+  const livePreviewPollLoop = createPollingLoop({
+    intervalMs: () => getLivePreviewPollInterval(),
+    isEnabled: () => isStageActive.value && shouldPollLivePreview.value && !shouldPauseLivePreviewPolling.value,
+    tick: () => fetchLiveHierarchy()
+  })
 
   const startLivePreviewPolling = ({ immediate = false } = {}) => {
-    if (!isStageActive.value || !shouldPollLivePreview.value || livePreviewPollTimer) return
-    const delay = immediate ? 0 : getLivePreviewPollInterval()
-    livePreviewPollTimer = setTimeout(async () => {
-      livePreviewPollTimer = null
-      if (!isStageActive.value || !shouldPollLivePreview.value) return
-      if (!shouldPauseLivePreviewPolling.value) {
-        await fetchLiveHierarchy()
-      }
-      startLivePreviewPolling()
-    }, delay)
+    if (!isStageActive.value || !shouldPollLivePreview.value) return
+    livePreviewPollLoop.start()
+    if (immediate) livePreviewPollLoop.runNow()
   }
 
   const stopLivePreviewPolling = () => {
-    clearLivePreviewPollTimer()
+    livePreviewPollLoop.stop()
   }
 
   const syncLivePreviewPolling = ({ immediate = false } = {}) => {

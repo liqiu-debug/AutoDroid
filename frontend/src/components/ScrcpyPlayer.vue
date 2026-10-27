@@ -121,6 +121,12 @@ let frameCount = 0
 let fpsTimer = null
 let liveEdgeTimer = null
 let reconnectTimer = null
+/** 自动重连已尝试次数（连接成功后清零） */
+let autoReconnectAttempts = 0
+/** 自动重连已达上限，等待用户「点击重连」 */
+const autoReconnectGaveUp = ref(false)
+/** 主动断开标记：disconnect()/组件卸载置位，onclose 不触发自动重连 */
+let closedIntentionally = false
 let resizeObserver = null
 /** WebCodecs 运行期降级标记（连续解码失败 / codec 不支持后置位，切换设备时重置） */
 let runtimeFallbackToJmuxer = false
@@ -136,6 +142,10 @@ const PROFILE_STORAGE_PREFIX = 'autodroid.scrcpyProfile.'
 /** 换档后服务端重启视频流的等待/重试节奏 */
 const PROFILE_RECONNECT_DELAY_MS = 1200
 const PROFILE_RECONNECT_MAX_RETRIES = 6
+/** 非主动断流后的有限退避自动重连：1s/2s/4s/8s 封顶，超限后改「点击重连」 */
+const AUTO_RECONNECT_BASE_DELAY_MS = 1000
+const AUTO_RECONNECT_MAX_DELAY_MS = 8000
+const AUTO_RECONNECT_MAX_ATTEMPTS = 5
 
 const streamProfile = ref('')
 const profileSwitching = ref(false)
@@ -565,6 +575,7 @@ function resolveWebSocketUrl() {
 
 function connect() {
   if (ws) disconnect()
+  closedIntentionally = false
 
   let wsUrl = ''
   try {
@@ -622,6 +633,9 @@ function connect() {
     status.value = 'connected'
     profileSwitching.value = false
     profileRetryCount = 0
+    // 出流成功：清零自动重连预算
+    autoReconnectAttempts = 0
+    autoReconnectGaveUp.value = false
     emit('connected')
     startFpsCounter()
     // 设备直连模式下同步清晰度档位（异步，不阻塞出流）
@@ -673,11 +687,37 @@ function connect() {
       if (!props.streamUrl) {
         emit('error', errorMsg.value)
       }
+      // 设备未就绪不做自动重试（大概率持续不可用），给「点击重连」逃生口
+      autoReconnectGaveUp.value = true
+      return
     }
+
+    // 非主动关闭（断流/网络抖动）：设备直连模式按 1s/2s/4s/8s 有限退避自动重连。
+    // 巡检视频票据是一次性票据，不能复用旧 URL 重建连接，交由调用方申请新会话。
+    if (closedIntentionally || props.streamUrl) return
+    if (autoReconnectAttempts < AUTO_RECONNECT_MAX_ATTEMPTS) {
+      autoReconnectAttempts++
+      status.value = 'connecting'
+      const delay = Math.min(
+        AUTO_RECONNECT_BASE_DELAY_MS * (2 ** (autoReconnectAttempts - 1)),
+        AUTO_RECONNECT_MAX_DELAY_MS,
+      )
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null
+        connect()
+      }, delay)
+      return
+    }
+    // 重连预算用尽：停留错误态并给出「点击重连」按钮
+    autoReconnectGaveUp.value = true
+    status.value = 'error'
+    errorMsg.value = '连接已断开'
   }
 }
 
 function disconnect() {
+  // 主动关闭：即使 close 事件在途，也不触发自动重连
+  closedIntentionally = true
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)
     reconnectTimer = null
@@ -707,6 +747,13 @@ function reconnect() {
     reconnectTimer = null
     connect()
   }, 300)
+}
+
+/** 用户主动重连（按钮）：清零退避预算后重建连接 */
+function handleManualReconnect() {
+  autoReconnectAttempts = 0
+  autoReconnectGaveUp.value = false
+  reconnect()
 }
 
 // ==================== FPS 计数器 ====================
@@ -808,6 +855,9 @@ watch(() => [props.serial, props.streamUrl], ([newSerial, newStreamUrl], [oldSer
   if (newSerial || newStreamUrl) {
     // 切换设备时重置运行期降级标记：新码流重新走自动检测
     runtimeFallbackToJmuxer = false
+    // 切换设备视为一次全新连接：清零自动重连预算
+    autoReconnectAttempts = 0
+    autoReconnectGaveUp.value = false
     if (props.autoConnect) reconnect()
   } else {
     disconnect()
@@ -854,7 +904,7 @@ defineExpose({ connect, disconnect, reconnect })
           circle
           size="small"
           type="success"
-          @click="connect"
+          @click="handleManualReconnect"
           title="连接"
         />
         <el-button
@@ -870,7 +920,7 @@ defineExpose({ connect, disconnect, reconnect })
           :icon="Refresh"
           circle
           size="small"
-          @click="reconnect"
+          @click="handleManualReconnect"
           title="重连"
         />
       </div>
@@ -954,18 +1004,18 @@ defineExpose({ connect, disconnect, reconnect })
         <div class="tip-row"><b>Class:</b> {{ hoveredNode.className }}</div>
       </div>
 
-      <!-- 未连接提示 -->
+      <!-- 未连接提示（pointer-events:none：遮罩不吞点击，按钮单独恢复响应） -->
       <div v-if="status !== 'connected'" class="player-overlay">
         <div v-if="status === 'connecting'" class="overlay-content">
           <el-icon class="is-loading" :size="32"><Loading /></el-icon>
-          <p>正在连接设备...</p>
+          <p>{{ autoReconnectAttempts > 0 ? `连接中断，正在自动重连（第 ${autoReconnectAttempts} 次）…` : '正在连接设备...' }}</p>
         </div>
         <div v-else-if="status === 'error'" class="overlay-content error">
           <p>{{ errorMsg }}</p>
-          <el-button v-if="!streamUrl" type="primary" size="small" @click="reconnect">重试</el-button>
+          <el-button v-if="!streamUrl" type="primary" size="small" @click="handleManualReconnect">{{ autoReconnectGaveUp ? '点击重连' : '重试' }}</el-button>
         </div>
         <div v-else class="overlay-content">
-          <el-button v-if="!streamUrl" type="primary" @click="connect">
+          <el-button v-if="!streamUrl" type="primary" @click="handleManualReconnect">
             <el-icon><VideoPlay /></el-icon>
             <span>开始投屏</span>
           </el-button>
@@ -1184,6 +1234,13 @@ defineExpose({ connect, disconnect, reconnect })
   justify-content: center;
   align-items: center;
   background: rgba(26, 26, 46, 0.85);
+  /* 遮罩不再吞点击：让底层视频/画布继续接收指针事件 */
+  pointer-events: none;
+}
+
+/* 遮罩上的按钮单独恢复响应 */
+.player-overlay :deep(.el-button) {
+  pointer-events: auto;
 }
 
 .overlay-content {

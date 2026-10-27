@@ -1,8 +1,9 @@
 """桌面客户端设备归属 API（client-devices）与归属过滤/回填测试。
 
-覆盖：register upsert、409 归属冲突、heartbeat、logout、
+覆盖：register upsert、他人已登记设备的接管转移（物理持有即接管）、heartbeat、logout、
 GET /api/devices/ 归属过滤（普通用户 / admin 全量）、存量 owner_id 回填、
-客户端注册设备的在线状态判定（不被服务端 adb 刷新误杀）、路由鉴权与裸别名。
+客户端注册设备的在线状态判定（不被服务端 adb 刷新误杀）、路由鉴权与裸别名、
+服务端 sync 认领语义回归（只认无主、不抢他人）。
 """
 import sqlite3
 import tempfile
@@ -125,36 +126,68 @@ class ClientDeviceTests(unittest.IsolatedAsyncioTestCase):
         device = self.session.exec(select(Device).where(Device.serial == "emulator-5554")).one()
         self.assertGreater(device.last_seen_at, datetime(2020, 1, 1))
 
-    def test_register_conflicts_when_owned_by_other_member(self):
-        # 客户端管理形态（client_instance_id 非空）：他人已注册 → 409，不得接管
+    def test_register_takes_over_device_owned_by_other_member(self):
+        # 物理持有即接管：register 只来自桌面客户端对本机 adb 的扫描，
+        # 插着设备就是持有证明——他人已登记的设备不再 409，直接转移归属；
+        # model/custom_name 等元数据保留，client_instance_id/last_seen_at 刷新为本次。
         self._add_device(
-            "emulator-5554", owner_id=self.alice.id, model="Alice", client_instance_id="desk-alice"
+            "emulator-5554",
+            owner_id=self.alice.id,
+            app_owner_id=self.alice.id,
+            model="Alice",
+            custom_name="客厅机",
+            client_instance_id="desk-alice",
         )
-
-        with self.assertRaises(HTTPException) as context:
-            register_client_device(_register_payload(), self.session, self.bob)
-
-        self.assertEqual(context.exception.status_code, 409)
-        self.assertEqual(context.exception.detail, "设备已被其他成员注册")
         device = self.session.exec(select(Device).where(Device.serial == "emulator-5554")).one()
-        self.assertEqual(device.owner_id, self.alice.id)
-        self.assertEqual(device.model, "Alice")
-
-    def test_register_conflicts_when_other_member_has_heartbeat_only(self):
-        # 仅 last_seen_at 非空也属客户端管理形态 → 409
-        self._add_device("emulator-5554", owner_id=self.alice.id, model="Alice")
-        device = self.session.exec(select(Device).where(Device.serial == "emulator-5554")).one()
-        device.last_seen_at = datetime.now()
+        device.last_seen_at = datetime(2020, 1, 1)
         self.session.add(device)
         self.session.commit()
 
-        with self.assertRaises(HTTPException) as context:
-            register_client_device(_register_payload(), self.session, self.bob)
+        with self.assertLogs("backend.api.client_devices", level="INFO") as logs:
+            read = register_client_device(
+                _register_payload(
+                    model="Pixel 7", custom_name="Bob 的机", client_instance_id="desk-bob"
+                ),
+                self.session,
+                self.bob,
+            )
 
-        self.assertEqual(context.exception.status_code, 409)
-        self.assertEqual(context.exception.detail, "设备已被其他成员注册")
+        # 转移日志：含 serial、原/新 owner 与「归属转移」字样（丢日志/改文案要能被测试发现）
+        joined = "\n".join(logs.output)
+        self.assertIn("归属转移", joined)
+        self.assertIn("emulator-5554", joined)
+        self.assertIn(str(self.alice.id), joined)
+        self.assertIn(str(self.bob.id), joined)
+
+        self.assertEqual(read.owner_id, self.bob.id)
+        rows = self.session.exec(select(Device).where(Device.serial == "emulator-5554")).all()
+        self.assertEqual(len(rows), 1, "接管不得另起新行")
+        device = rows[0]
+        self.assertEqual(device.owner_id, self.bob.id)
+        # App 归属独立于桌面持有：app_owner_id 不随本次接管转移（可见性过滤语义不变）
+        self.assertEqual(device.app_owner_id, self.alice.id)
+        # 元数据保留：不被本次上报覆盖
+        self.assertEqual(device.model, "Alice")
+        self.assertEqual(device.custom_name, "客厅机")
+        # 在线字段刷新为本次
+        self.assertEqual(device.client_instance_id, "desk-bob")
+        self.assertGreater(device.last_seen_at, datetime(2020, 1, 1))
+
+    def test_register_takes_over_when_other_member_has_heartbeat_only(self):
+        # 仅 last_seen_at 非空也属他人已登记 → 同样接管转移
+        self._add_device("emulator-5554", owner_id=self.alice.id, model="Alice")
+        device = self.session.exec(select(Device).where(Device.serial == "emulator-5554")).one()
+        device.last_seen_at = datetime(2020, 1, 1)
+        self.session.add(device)
+        self.session.commit()
+
+        read = register_client_device(_register_payload(), self.session, self.bob)
+
+        self.assertEqual(read.owner_id, self.bob.id)
         self.session.refresh(device)
-        self.assertEqual(device.owner_id, self.alice.id)
+        self.assertEqual(device.owner_id, self.bob.id)
+        self.assertEqual(device.model, "Alice")
+        self.assertGreater(device.last_seen_at, datetime(2020, 1, 1))
 
     def test_register_rejects_blank_serial(self):
         with self.assertRaises(HTTPException) as context:
@@ -339,6 +372,7 @@ class ClientDeviceStatusRefreshTests(unittest.TestCase):
         SQLModel.metadata.create_all(self.engine)
         self.session = Session(self.engine)
         self.alice = self._add_user("alice")
+        self.bob = self._add_user("bob")
 
         # hermetic：sync 内部会跑真机 iOS 扫描（tidevice），插着 iPhone 时会往
         # 测试库塞额外设备导致断言串扰；统一桩成无 iOS 设备。
@@ -469,6 +503,36 @@ class ClientDeviceStatusRefreshTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         statuses = {row["serial"]: row["status"] for row in resp.json()["devices"]}
         self.assertEqual(statuses, {"emulator-5554": "IDLE", "emulator-5556": "OFFLINE"})
+
+    def test_server_sync_does_not_steal_device_owned_by_other_member(self):
+        """G7 回归：register 的「物理持有即接管」不得改变服务端 sync 认领语义。
+
+        sync 只认无主设备（服务器看到 ≠ 某人持有），他人已认领不转移归属。
+        """
+        device = self._add_device("usb-1", owner_id=self.bob.id, model="Bob")
+
+        async def _adb_one(*args, **kwargs):
+            return b"List of devices attached\nusb-1\tdevice\n"
+
+        async def _props(serial: str):
+            return {
+                "ro.product.model": "Pixel 7",
+                "ro.product.brand": "google",
+                "ro.build.version.release": "14",
+                "resolution": "1080x2400",
+            }
+
+        with patch("backend.api.devices._run_adb_command", new=_adb_one), patch(
+            "backend.api.devices._get_device_props_batch", new=_props
+        ), patch(
+            "backend.api.devices._remote_usb_fields",
+            return_value={"connection_type": None, "agent_name": None, "source_serial": None},
+        ):
+            resp = self.client.post("/api/devices/sync")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.session.refresh(device)
+        self.assertEqual(device.owner_id, self.bob.id, "服务端 sync 不得抢走他人已认领设备")
 
     def test_heartbeat_revives_offline_client_device(self):
         """心跳到过即可复活：插拔回来后 heartbeat 把 OFFLINE 拉回 IDLE。"""
