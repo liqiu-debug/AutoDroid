@@ -1,6 +1,12 @@
 import json
 from typing import Any, Dict, List
 
+# LLM 调用的网络总时长上限（秒）。httpx 的 timeout 是逐次网络读之间的超时，
+# 上游慢速滴流（如无视 stream=false 仍返回 SSE）时总耗时无上限；而 Cloudflare
+# 等反代约 100s 即掐断回源连接并回错误页，前端只能看到「响应无效/不完整」。
+# 所有同步等 LLM 的请求都必须在此之前返回干净的 JSON。
+LLM_TOTAL_DEADLINE_S = 80.0
+
 
 def _flatten_content(content: Any) -> str:
     if isinstance(content, str):

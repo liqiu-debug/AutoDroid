@@ -8,6 +8,8 @@
 """
 import uuid
 import json
+import time
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,7 +19,7 @@ from pydantic import BaseModel
 from backend.schemas import ActionType, SelectorType, ErrorStrategy
 from backend.database import get_session
 from backend.api.log_analysis import _get_setting
-from backend.openai_compat import parse_chat_completion_payload
+from backend.openai_compat import LLM_TOTAL_DEADLINE_S, parse_chat_completion_payload
 from backend.step_contract import (
     SELECTOR_TYPE_TO_BY,
     normalize_action,
@@ -492,10 +494,14 @@ async def _call_llm_service(text: str, session: Session) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                request_url,
-                json=payload,
-                headers=headers,
+            # 总时长封顶（httpx timeout 只管逐次读），避免反代 ~100s 掐连接
+            resp = await asyncio.wait_for(
+                client.post(
+                    request_url,
+                    json=payload,
+                    headers=headers,
+                ),
+                timeout=LLM_TOTAL_DEADLINE_S,
             )
 
             raw_text = resp.text
@@ -522,7 +528,7 @@ async def _call_llm_service(text: str, session: Session) -> str:
             content = data["choices"][0]["message"]["content"]
             return content
 
-    except httpx.TimeoutException:
+    except (httpx.TimeoutException, asyncio.TimeoutError):
         logger.error("LLM API 调用超时")
         return None
     except httpx.ConnectError as e:
@@ -773,3 +779,108 @@ async def generate_steps(
             data=[],
             message=f"生成步骤时出错: {str(e)}"
         )
+
+
+# ==================== AI 连接测试 ====================
+
+class TestConnectionRequest(BaseModel):
+    # 可选：设置表单直传当前填写值（未保存也可测）；缺省回退到已保存配置
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
+    model: Optional[str] = None
+
+
+class TestConnectionResponse(BaseModel):
+    success: bool
+    model: str
+    latency_ms: int
+
+
+# 连接测试总时长上限：远小于反代（Cloudflare 等约 100s）掐断回源连接的窗口
+TEST_CONNECTION_DEADLINE_S = 25.0
+
+
+@router.post("/test-connection", response_model=TestConnectionResponse)
+async def test_ai_connection(
+    req: Optional[TestConnectionRequest] = None,
+    session: Session = Depends(get_session),
+):
+    """AI 连接测试：向配置的模型发一条极小请求，验证 key/base/model 可用。
+
+    刻意用轻量探针（max_tokens=4）而非完整日志分析：慢模型也能在秒级返回，
+    不会拖到反代的回源超时窗口（Cloudflare 约 100s）被掐断。
+    """
+    api_key = (req.api_key if req and req.api_key else None) or _get_setting(session, "ai_api_key", "")
+    api_base = (req.api_base if req and req.api_base else None) or _get_setting(session, "ai_api_base", "https://api.openai.com/v1")
+    model = (req.model if req and req.model else None) or _get_setting(session, "ai_model", "gpt-3.5-turbo")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置 AI API Key。请在系统设置中配置 ai_api_key。"
+        )
+
+    api_base = api_base.rstrip('/')
+    if api_base.endswith('/chat/completions'):
+        api_base = api_base[:-len('/chat/completions')]
+
+    request_url = f"{api_base}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0,
+        "max_tokens": 4,
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    logger.info(f"AI 连接测试: {request_url}, 模型: {model}")
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=TEST_CONNECTION_DEADLINE_S) as client:
+            resp = await asyncio.wait_for(
+                client.post(request_url, json=payload, headers=headers),
+                timeout=TEST_CONNECTION_DEADLINE_S,
+            )
+        latency_ms = int((time.monotonic() - started) * 1000)
+
+        raw_text = resp.text
+        if resp.status_code != 200:
+            logger.error(f"AI 连接测试失败: HTTP {resp.status_code} - {raw_text[:300]}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"AI 服务返回错误 (HTTP {resp.status_code}): {raw_text[:300]}"
+            )
+
+        try:
+            data = parse_chat_completion_payload(raw_text)
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=f"AI 服务返回无法解析的响应。当前请求地址: {request_url}"
+            )
+
+        if "choices" not in data or not data["choices"]:
+            raise HTTPException(
+                status_code=502,
+                detail=f"AI 服务返回格式异常（缺少 choices）: {str(data)[:200]}"
+            )
+
+        logger.info(f"AI 连接测试成功: model={model}, {latency_ms}ms")
+        return TestConnectionResponse(success=True, model=model, latency_ms=latency_ms)
+    except HTTPException:
+        raise
+    except (httpx.TimeoutException, asyncio.TimeoutError):
+        raise HTTPException(status_code=504, detail="AI 服务响应超时，请检查 API 地址或网络后重试")
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"无法连接 AI 服务。请检查 API 地址 ({api_base}) 是否可访问。"
+        )
+    except Exception as e:
+        logger.error(f"AI 连接测试异常: {e}")
+        raise HTTPException(status_code=500, detail=f"AI 连接测试失败: {str(e)}")
