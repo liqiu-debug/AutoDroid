@@ -125,7 +125,7 @@ class DeviceReportPayload(BaseModel):
     # App 直跑模式：无任务时用客户端生成的 run_id 做幂等标识
     run_id: Optional[str] = None
     # 是否发送飞书通知（默认发送；App 可逐次关闭）
-    notify: bool = True
+    notify: bool = False  # 默认不发（与 Web 一致）：仅显式开启/定时任务勾选才发飞书
     format_version: Optional[int] = None
     kind: Optional[str] = None
     case_id: Optional[int] = None
