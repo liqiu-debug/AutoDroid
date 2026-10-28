@@ -285,7 +285,7 @@ class ClientRunLifecycleTests(_ClientRunsBase):
              patch.object(client_runs_api.NotificationService, "send_report_card") as notify:
             resp = self.client.post(
                 f"/api/client-runs/{run['execution_id']}/finish",
-                json={"duration": 3.0},
+                json={"duration": 3.0, "notify": True},
                 headers=self._headers("alice"),
             )
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -307,7 +307,7 @@ class ClientRunLifecycleTests(_ClientRunsBase):
         ) as gen, patch.object(client_runs_api.NotificationService, "send_report_card") as notify:
             resp = self.client.post(
                 f"/api/client-runs/{run['execution_id']}/finish",
-                json={"duration": 5.5},
+                json={"duration": 5.5, "notify": True},
                 headers=self._headers("alice"),
             )
 
@@ -350,10 +350,10 @@ class ClientRunLifecycleTests(_ClientRunsBase):
         with patch.object(client_runs_api.report_generator, "generate_report", return_value="r.html"), \
              patch.object(client_runs_api.NotificationService, "send_report_card") as notify:
             first = self.client.post(
-                f"/api/client-runs/{run['execution_id']}/finish", json={}, headers=self._headers("alice")
+                f"/api/client-runs/{run['execution_id']}/finish", json={"notify": True}, headers=self._headers("alice")
             )
             second = self.client.post(
-                f"/api/client-runs/{run['execution_id']}/finish", json={}, headers=self._headers("alice")
+                f"/api/client-runs/{run['execution_id']}/finish", json={"notify": True}, headers=self._headers("alice")
             )
 
         self.assertEqual(first.status_code, 200)
@@ -362,6 +362,26 @@ class ClientRunLifecycleTests(_ClientRunsBase):
         self.assertFalse(second.json()["finished"])
         self.assertEqual(second.json()["status"], "PASS")
         notify.assert_called_once()
+
+    def test_finish_notify_omitted_defaults_to_silent(self):
+        """默认不发（与 Web 一致）：不带 notify 字段的收尾不发飞书——
+        手动/回归执行静默，仅显式 notify=true 或定时任务勾选才发。"""
+        run = self._start_run()
+        self.client.post(
+            f"/api/client-runs/{run['execution_id']}/steps",
+            json=self._step_payload(
+                steps=[{"order": 1, "action": "click", "status": "PASS", "duration": 1.0}]
+            ),
+            headers=self._headers("alice"),
+        )
+        with patch.object(client_runs_api.report_generator, "generate_report", return_value="r.html"), \
+             patch.object(client_runs_api.NotificationService, "send_report_card") as notify:
+            resp = self.client.post(
+                f"/api/client-runs/{run['execution_id']}/finish", json={"duration": 1.0},
+                headers=self._headers("alice"),
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        notify.assert_not_called()
 
     def test_finish_notify_false_skips_card(self):
         run = self._start_run()
@@ -498,7 +518,7 @@ class ClientRunScenarioTests(_ClientRunsBase):
         ) as gen, patch.object(client_runs_api.NotificationService, "send_report_card") as notify:
             resp = self.client.post(
                 f"/api/client-runs/{run['execution_id']}/finish",
-                json={"duration": 2.0},
+                json={"duration": 2.0, "notify": True},
                 headers=self._headers("alice"),
             )
 

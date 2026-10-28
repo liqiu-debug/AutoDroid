@@ -431,6 +431,7 @@ class DeviceFlowTests(_Base):
                 ],
             }],
             "logs": ["step1 ok"],
+            "notify": True,
         }
         with patch.object(autojs_api.report_generator, "generate_report", return_value="report-test.html") as report_mock, \
              patch.object(autojs_api.NotificationService, "send_report_card") as notify_mock:

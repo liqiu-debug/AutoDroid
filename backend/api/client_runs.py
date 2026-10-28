@@ -124,7 +124,7 @@ class ClientRunFinishPayload(BaseModel):
     aborted: bool = False
     duration: Optional[float] = None  # 秒；缺省用 now - start_time
     error: Optional[str] = None
-    notify: bool = True  # 与 device-runs 一致：默认发飞书卡片，可逐次关闭
+    notify: bool = False  # 默认不发（与 Web 一致）：仅显式开启/定时任务勾选才发飞书
     exported_variables: Optional[Dict[str, Any]] = None
 
 

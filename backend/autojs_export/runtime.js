@@ -1104,7 +1104,7 @@ function buildReportPayload(ctx) {
     return {
         task_id: ctx.taskId || null,
         run_id: ctx.runId || null,
-        notify: ctx.notify !== false,
+        notify: ctx.notify === true,
         format_version: FORMAT_VERSION,
         platform: ctx.platform || "android",
         kind: ctx.manifest.kind,
@@ -1224,7 +1224,7 @@ function createContext(manifest, baseDir, embeddedAssets) {
         // App 直跑模式：无 taskId，用客户端生成的 runId 做幂等标识
         runId: String(runtimeConfig.runId || ""),
         // 是否发送飞书通知（默认发送；App 可逐次关闭）
-        notify: runtimeConfig.notify !== false,
+        notify: runtimeConfig.notify === true,
         // 目标平台：android（默认，兼容既有 App）/ ios（WDA fork）
         platform: String(runtimeConfig.platform || (manifest && manifest.platform) || "android").toLowerCase(),
         caseResults: [],
