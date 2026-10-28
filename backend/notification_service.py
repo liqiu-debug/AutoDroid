@@ -14,6 +14,23 @@ from backend.models import SystemSetting
 logger = logging.getLogger(__name__)
 
 
+
+# system_base_url 应配「站点根」（如 https://autodroid.cc.cd）；若误配成带
+# 报表路径的地址（…/execution/reports），拼接出的飞书链接会重复路径：
+# …/execution/reports/execution/reports/66。以下后缀做容错纠正。
+_REPORT_PATH_SUFFIXES = ("/execution/reports", "/execution", "/fastbot/report")
+
+
+def _normalize_base_url(raw: Optional[str]) -> str:
+    """归一化系统访问地址：去尾斜杠与误配的报表路径后缀；合法子路径前缀保留。"""
+    base = str(raw or "").strip().rstrip("/")
+    lowered = base.lower()
+    for suffix in _REPORT_PATH_SUFFIXES:
+        if lowered.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    return base
+
 class NotificationService:
     """飞书群机器人通知服务。
 
@@ -29,7 +46,7 @@ class NotificationService:
         webhook = cls._get_setting("api_testing_webhook")
         if not webhook:
             return {"status": "SKIPPED", "error": "未配置接口自动化 Webhook，请在系统设置的通知推送中配置"}
-        base = cls._get_setting("system_base_url")
+        base = _normalize_base_url(cls._get_setting("system_base_url"))
         if not base:
             return {"status": "FAILED", "error": "请先配置系统访问地址，供飞书报告链接使用"}
         from urllib.parse import quote, urlsplit
@@ -222,7 +239,7 @@ class NotificationService:
             logger.info("飞书 Webhook 未配置，跳过通知")
             return
 
-        base_url = cls._get_setting("system_base_url") or "http://localhost:5173"
+        base_url = _normalize_base_url(cls._get_setting("system_base_url")) or "http://localhost:5173"
         report_url = f"{base_url.rstrip('/')}/execution/reports/{execution_id}"
 
         card = cls._build_card(
@@ -275,7 +292,7 @@ class NotificationService:
             logger.info("智能探索 Webhook 未配置，跳过通知")
             return
 
-        base_url = cls._get_setting("system_base_url") or "http://localhost:5173"
+        base_url = _normalize_base_url(cls._get_setting("system_base_url")) or "http://localhost:5173"
         report_url = f"{base_url.rstrip('/')}/fastbot/report/{fastbot_task_id}"
 
         is_ok = status == "COMPLETED"
