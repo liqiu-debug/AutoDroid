@@ -109,4 +109,16 @@ test('router 全部懒加载点已包装且注册 onError 兜底', () => {
   assert.ok(routerSrc.includes('lazyRoute(() => import('), '存在 lazyRoute 包装')
   assert.ok(routerSrc.includes('router.onError('), '注册路由级错误兜底')
   assert.ok(routerSrc.includes('setLazyRouteErrorHandler('), '注入可见错误提示')
+
+  // 括号平衡守卫：防「lazyRoute(() => import('x'), 少右括号」类语法错误
+  // 源码正则测试抓不到、只有 vite 编译才暴露——这里直接锁死
+  routerSrc.split('\n').forEach((line, index) => {
+    if (!line.includes('lazyRoute(')) return
+    const seg = line.slice(line.indexOf('lazyRoute('))
+    assert.equal(
+      (seg.match(/\(/g) || []).length,
+      (seg.match(/\)/g) || []).length,
+      `第 ${index + 1} 行 lazyRoute 括号不平衡: ${line.trim()}`,
+    )
+  })
 })
