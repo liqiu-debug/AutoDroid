@@ -51,7 +51,9 @@ def _frontend_build_missing_response():
 @router.get("/", include_in_schema=False)
 async def serve_frontend_index():
     if FRONTEND_INDEX_FILE.is_file():
-        return FileResponse(str(FRONTEND_INDEX_FILE))
+        # index.html 永不缓存：部署新前端后旧壳会因 chunk 文件名变化而
+        # 「点击无响应」（动态 import 失败被浏览器模块表缓存）——刷新必须拿到新壳
+        return FileResponse(str(FRONTEND_INDEX_FILE), headers={"Cache-Control": "no-cache"})
     return _frontend_build_missing_response()
 
 
@@ -76,12 +78,16 @@ async def serve_frontend_app(full_path: str):
             raise HTTPException(status_code=404, detail="Not found")
 
         if candidate.is_file():
-            return FileResponse(str(candidate))
+            # 构建产物带内容 hash，可长缓存
+            return FileResponse(
+                str(candidate),
+                headers={"Cache-Control": "public, max-age=31536000, immutable"},
+            )
 
         if Path(normalized_path).suffix:
             raise HTTPException(status_code=404, detail="Not found")
 
     if FRONTEND_INDEX_FILE.is_file():
-        return FileResponse(str(FRONTEND_INDEX_FILE))
+        return FileResponse(str(FRONTEND_INDEX_FILE), headers={"Cache-Control": "no-cache"})
 
     return _frontend_build_missing_response()
