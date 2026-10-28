@@ -27,14 +27,14 @@ const routes = [
   {
     path: '/register',
     name: 'register',
-    component: lazyRoute(() => import('../views/login/Register.vue'),
+    component: lazyRoute(() => import('../views/login/Register.vue')),
     meta: { mobileAvailable: true, mobileTitle: '注册' }
   },
 
   // ========== 主布局 ==========
   {
     path: '/',
-    component: lazyRoute(() => import('@/layout/Index.vue'),
+    component: lazyRoute(() => import('@/layout/Index.vue')),
     redirect: '/dashboard',
     children: [
       // ────── 🏠 运行大盘 ──────
@@ -129,12 +129,12 @@ const routes = [
         meta: { title: '接口自动化', icon: Collection },
         redirect: '/api-testing/interfaces',
         children: [
-          { path: 'interfaces', name: 'api-interface-list', meta: { title: '接口管理' }, component: lazyRoute(() => import('../views/api-testing/AssetList.vue') },
-          { path: 'interfaces/create', name: 'api-interface-create', meta: { title: '新建接口', hidden: true }, component: lazyRoute(() => import('../views/api-testing/InterfaceEditor.vue') },
-          { path: 'interfaces/:id/edit', name: 'api-interface-edit', meta: { title: '编辑接口', hidden: true }, component: lazyRoute(() => import('../views/api-testing/InterfaceEditor.vue') },
-          { path: 'scenarios', name: 'api-scenario-list', meta: { title: '自动化场景' }, component: lazyRoute(() => import('../views/api-testing/AssetList.vue') },
-          { path: 'scenarios/create', name: 'api-scenario-create', meta: { title: '新建接口场景', hidden: true }, component: lazyRoute(() => import('../views/api-testing/ScenarioEditor.vue') },
-          { path: 'scenarios/:id/edit', name: 'api-scenario-edit', meta: { title: '编辑接口场景', hidden: true }, component: lazyRoute(() => import('../views/api-testing/ScenarioEditor.vue') },
+          { path: 'interfaces', name: 'api-interface-list', meta: { title: '接口管理' }, component: lazyRoute(() => import('../views/api-testing/AssetList.vue')) },
+          { path: 'interfaces/create', name: 'api-interface-create', meta: { title: '新建接口', hidden: true }, component: lazyRoute(() => import('../views/api-testing/InterfaceEditor.vue')) },
+          { path: 'interfaces/:id/edit', name: 'api-interface-edit', meta: { title: '编辑接口', hidden: true }, component: lazyRoute(() => import('../views/api-testing/InterfaceEditor.vue')) },
+          { path: 'scenarios', name: 'api-scenario-list', meta: { title: '自动化场景' }, component: lazyRoute(() => import('../views/api-testing/AssetList.vue')) },
+          { path: 'scenarios/create', name: 'api-scenario-create', meta: { title: '新建接口场景', hidden: true }, component: lazyRoute(() => import('../views/api-testing/ScenarioEditor.vue')) },
+          { path: 'scenarios/:id/edit', name: 'api-scenario-edit', meta: { title: '编辑接口场景', hidden: true }, component: lazyRoute(() => import('../views/api-testing/ScenarioEditor.vue')) },
         ],
       },
 
@@ -229,7 +229,7 @@ const routes = [
           {
             path: 'reports/api/:id', name: 'api-report-detail',
             meta: { title: '接口测试报告', hidden: true },
-            component: lazyRoute(() => import('../views/api-testing/RunDetail.vue'),
+            component: lazyRoute(() => import('../views/api-testing/RunDetail.vue')),
           },
           {
             path: 'reports/inspection/:id',
