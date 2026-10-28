@@ -664,6 +664,11 @@ export default {
         return api.post('/fastbot/analyze_log', data, { timeout: 120000 })
     },
 
+    // AI 连接测试（轻量探针，秒级返回 { success, model, latency_ms }）
+    testAiConnection(data) {
+        return api.post('/ai/test-connection', data, { timeout: 30000 })
+    },
+
     // Device Management (设备管理)
     getDeviceList(options = {}) {
         const params = {}

@@ -1,6 +1,7 @@
 """
 基于结构化卡顿分析结果的 AI 总结服务。
 """
+import asyncio
 import hashlib
 import json
 import logging
@@ -13,7 +14,7 @@ from fastapi import HTTPException
 from sqlmodel import Session
 
 from backend.api.log_analysis import _get_setting
-from backend.openai_compat import parse_chat_completion_payload
+from backend.openai_compat import LLM_TOTAL_DEADLINE_S, parse_chat_completion_payload
 
 logger = logging.getLogger(__name__)
 
@@ -261,7 +262,11 @@ async def summarize_jank_analysis(
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(request_url, json=payload, headers=headers)
+            # 总时长封顶（httpx timeout 只管逐次读），避免反代 ~100s 掐连接
+            resp = await asyncio.wait_for(
+                client.post(request_url, json=payload, headers=headers),
+                timeout=LLM_TOTAL_DEADLINE_S,
+            )
             raw_text = resp.text
 
             if resp.status_code != 200:
@@ -286,7 +291,7 @@ async def summarize_jank_analysis(
             }
     except HTTPException:
         raise
-    except httpx.TimeoutException:
+    except (httpx.TimeoutException, asyncio.TimeoutError):
         raise HTTPException(status_code=504, detail="AI 服务响应超时，请稍后重试。")
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="无法连接 AI 服务，请检查 API 配置。")

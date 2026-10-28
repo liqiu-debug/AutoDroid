@@ -417,3 +417,4 @@ node --test tests/*.test.mjs
 - 不要提交 `database.db`、`.jwt_secret`、`reports/`、`asset_store/`、`uploads/`、运行日志、PID 文件、APK/IPA 等本地产物。
 - 默认管理员初始密码仅适用于本地首次启动，部署前必须修改；JWT 密钥已自动生成，可用 `AUTODROID_SECRET_KEY` 显式管理。
 - 公开部署时应通过 `AUTODROID_CORS_ORIGINS` 限制来源、启用 HTTPS，并通过网络策略限制设备控制接口的访问范围。
+- 经 Cloudflare / Cloudflare Tunnel 等反代部署时注意：反代回源约 100s 即掐断连接并回错误页（「The origin web server returned an invalid or incomplete response…」），前端只能看到这段英文。平台内所有同步等 LLM 的请求已内置总时长封顶（`backend/openai_compat.py` 的 `LLM_TOTAL_DEADLINE_S`，80s），保证在窗口内返回干净 JSON；「测试 AI 连接」走轻量探针（`POST /api/ai/test-connection`，25s 封顶）秒级返回。若模型本身很慢，请换更快的模型或直连源站使用 AI 功能。

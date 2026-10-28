@@ -7,6 +7,7 @@
 - MD5 缓存避免重复分析
 """
 import re
+import asyncio
 import hashlib
 import logging
 from typing import List, Optional, Set
@@ -16,7 +17,7 @@ from sqlmodel import Session, select
 
 from backend.database import get_session
 from backend.models import SystemSetting
-from backend.openai_compat import parse_chat_completion_payload
+from backend.openai_compat import LLM_TOTAL_DEADLINE_S, parse_chat_completion_payload
 from backend.schemas import LogAnalysisRequest, LogAnalysisResponse
 
 logger = logging.getLogger(__name__)
@@ -364,10 +365,15 @@ async def call_llm_service(
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                request_url,
-                json=payload,
-                headers=headers,
+            # httpx 的 timeout 是逐次读超时，慢速滴流时总耗时无上限；
+            # 用 wait_for 封顶总时长，保证在反代（如 Cloudflare ~100s）掐连接前返回。
+            resp = await asyncio.wait_for(
+                client.post(
+                    request_url,
+                    json=payload,
+                    headers=headers,
+                ),
+                timeout=LLM_TOTAL_DEADLINE_S,
             )
 
             # 统一读取原始响应文本，供状态校验与错误诊断复用
@@ -423,7 +429,7 @@ async def call_llm_service(
             }
     except HTTPException:
         raise  # 直接透传已处理的异常
-    except httpx.TimeoutException:
+    except (httpx.TimeoutException, asyncio.TimeoutError):
         logger.error("LLM API 调用超时")
         raise HTTPException(status_code=504, detail="AI 服务响应超时，请稍后重试")
     except httpx.ConnectError as e:

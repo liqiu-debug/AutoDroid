@@ -238,13 +238,15 @@ const handleTestAi = async () => {
   }
   testingAi.value = true
   try {
-    // 使用一个简短的测试日志调用 AI 分析接口
-    await api.analyzeLog({
-      log_text: 'FATAL EXCEPTION: main\nProcess: com.test.app, PID: 12345\njava.lang.NullPointerException: Attempt to invoke virtual method on a null object reference\n\tat com.test.app.MainActivity.onCreate(MainActivity.java:42)',
-      package_name: 'com.test.app',
-      device_info: 'Test Device',
+    // 轻量探针接口：直传表单当前值（未保存也可测），秒级返回
+    const res = await api.testAiConnection({
+      api_key: form.value.ai_api_key,
+      api_base: form.value.ai_api_base,
+      model: form.value.ai_model,
     })
-    ElMessage.success('AI 模型连接测试成功！')
+    const { model, latency_ms: latencyMs } = res.data || {}
+    const info = [model, latencyMs != null ? `${latencyMs}ms` : ''].filter(Boolean).join(', ')
+    ElMessage.success(info ? `AI 模型连接测试成功！(${info})` : 'AI 模型连接测试成功！')
   } catch (err) {
     ElMessage.error('测试失败: ' + (err.response?.data?.detail || err.message))
   } finally {
