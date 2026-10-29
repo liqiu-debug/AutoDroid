@@ -129,7 +129,11 @@ const ensureCrossPlatformConfig = (step) => {
   }
 
   if (!sameOverride(step.platform_overrides.android, androidOverride)) {
-    step.platform_overrides.android = androidOverride
+    if (androidOverride) {
+      step.platform_overrides.android = androidOverride
+    } else {
+      delete step.platform_overrides.android
+    }
   }
 
   if (!step.error_strategy) {
@@ -146,8 +150,8 @@ const ensureCrossPlatformConfig = (step) => {
   if (step.action === 'assert_text') {
     step.selector = ''
     step.selector_type = null
-    step.platform_overrides.android = null
-    step.platform_overrides.ios = null
+    delete step.platform_overrides.android
+    delete step.platform_overrides.ios
     ensureAssertTextOptions(step)
   } else if (step.action === 'click_image' || step.action === 'assert_image') {
     step.selector_type = 'image'
