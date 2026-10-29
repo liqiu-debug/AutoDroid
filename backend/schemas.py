@@ -1,7 +1,7 @@
 from typing import List, Optional, Any, Dict, Union
 from enum import Enum
 import re
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from backend.utils.variable_render import normalize_variable_placeholders
 
@@ -1982,6 +1982,15 @@ class PlatformOverrides(BaseModel):
     """
     android: Optional[PlatformSelector] = None
     ios: Optional[PlatformSelector] = None
+
+    @model_serializer(mode="wrap")
+    def omit_empty_members(self, handler):
+        # 序列化时剔除无覆盖的平台成员，与落库形态（normalize_platform_overrides
+        # 只存实值成员）对称；否则任何无 android 覆盖的步骤下发都会补发
+        # {"android": null}，Gson getAsJsonObject 型客户端直接强转崩溃。
+        # 请求侧不受影响，显式 null 仍合法表示「无覆盖」。
+        data = handler(self)
+        return {k: v for k, v in data.items() if v is not None}
 
 class TestCaseStepWrite(BaseModel):
     """跨端测试步骤 — 写入模型（不含 case_id）"""

@@ -135,10 +135,10 @@ function ensureCrossPlatformFields(step) {
         }
     }
 
-    normalized.platform_overrides = {
-        android,
-        ios
-    }
+    // 无覆盖的平台不落成员（而非显式 null），与后端落库形态对称
+    normalized.platform_overrides = {}
+    if (android) normalized.platform_overrides.android = android
+    if (ios) normalized.platform_overrides.ios = ios
 
     if (['click_image', 'assert_image'].includes(normalized.action)) {
         normalized.selector_type = 'image'

@@ -110,6 +110,8 @@ def autofill_step_for_ios(
     overrides = step.get("platform_overrides")
     if not isinstance(overrides, dict):
         overrides = {}
+    # 剔除显式 null 成员（如 {"android": null}），与落库形态对称
+    overrides = {k: v for k, v in overrides.items() if v is not None}
 
     changes: List[str] = []
     blockers: List[str] = []

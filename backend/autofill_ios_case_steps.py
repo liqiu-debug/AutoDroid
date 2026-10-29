@@ -47,7 +47,13 @@ def _replace_case_rows(
             row.args = item.get("args") or {}
             row.value = item.get("value")
             row.execute_on = item.get("execute_on") or ["android", "ios"]
-            row.platform_overrides = item.get("platform_overrides") or {}
+            # 历史脏行可能带 {"android": null} 成员，落库前剔除（与主写入路径的
+            # normalize_platform_overrides 形态一致）
+            raw_overrides = item.get("platform_overrides")
+            row.platform_overrides = (
+                {k: v for k, v in raw_overrides.items() if v is not None}
+                if isinstance(raw_overrides, dict) else {}
+            )
             row.timeout = int(item.get("timeout", row.timeout or 10))
             row.error_strategy = str(item.get("error_strategy") or row.error_strategy or "ABORT")
             row.description = item.get("description")
@@ -63,7 +69,10 @@ def _replace_case_rows(
                 args=item.get("args") or {},
                 value=item.get("value"),
                 execute_on=item.get("execute_on") or ["android", "ios"],
-                platform_overrides=item.get("platform_overrides") or {},
+                platform_overrides=(
+                    {k: v for k, v in (item.get("platform_overrides") or {}).items() if v is not None}
+                    if isinstance(item.get("platform_overrides"), dict) else {}
+                ),
                 timeout=int(item.get("timeout", 10)),
                 error_strategy=str(item.get("error_strategy") or "ABORT"),
                 retry_count=int(item.get("retry_count", 0) or 0),
