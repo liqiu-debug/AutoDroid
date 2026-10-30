@@ -93,7 +93,7 @@ Web 前端支持 PC、移动和自动识别三种客户端模式。自动模式�
 
 移动端还支持巡检报告列表与详情查看。用例编辑、场景复杂编排、变量与安装包管理、定时任务、专项测试配置、用户管理和系统配置仍需使用 PC 模式。
 
-## 移动端 App（Android / iOS）
+## 客户端（Android / iOS / 桌面）
 
 除了 Web 端，平台提供原生 Android 客户端 **[AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)**（应用名 AutoDroid，`com.autodroid.runner`）和 SwiftUI 客户端 **[AutoDroid-iOS](https://github.com/liqiu-debug/AutoDroid-iOS)**：登录后可在手机上执行用例与场景，结果回传平台生成报告，支持设备侧定时任务与执行完成通知。Android 内置 AutoJs6 引擎，iOS 将脚本交给同机 AutoDroid-WDA 执行。
 
@@ -102,6 +102,13 @@ Web 前端支持 PC、移动和自动识别三种客户端模式。自动模式�
 - 平台侧入口：用例列表 / 用例编辑器 / 场景编辑器均有「导出脚本」，可下载脚本包或直接推送到设备端 Agent。
 - 预编译 APK 见 App 仓库的 [Releases](https://github.com/liqiu-debug/AutoDroid-Android/releases)；发布包默认服务器地址为占位值，首次登录时改成平台地址即可。
 - iOS 客户端基于 WebDriverAgent 的 fork（[AutoDroid-WDA](https://github.com/liqiu-debug/AutoDroid-WDA)）：手机点图标启动 WDA 会话后，平台把脚本包下发到设备端执行器，在本机跑同一份 `runtime.js`；接口与自检方式见 [App 接口契约](docs/APP_RUNNER_API.md#8-ios设备端执行器autodroid-wda)。
+
+桌面客户端 **[AutoDroid-Desktop](https://github.com/liqiu-debug/AutoDroid-Desktop)**（Electron + 本地 Python 引擎网关，macOS / Windows）面向"手机插在自己电脑上"的团队成员：设备发现、录制、执行、投屏、Fastbot 全部在本机完成，用例 / 场景 / 报告等数据仍在平台。
+
+- 桌面端直接托管本仓库 `frontend/dist`，前端通过 `GET /api/client/info` 是否返回 200 识别客户端模式，并经 `window.desktop` 桥使用保存登录、应用内更新等桌面能力。
+- 依赖本仓库 `main` 分支的客户端接口：`/api/client-devices/*`（设备归属与心跳）、`/api/client-runs/*`、`/api/client-templates`、`/api/client-fastbot/*`、`/api/client-compatibility/*`、`/api/client-tasks` 与 `backend/version_lock.py`（并发编辑乐观锁）。
+- 桌面引擎的 `engine/core/` 是本仓库 `backend/` 中驱动、投屏、步骤契约、错误码等模块的 vendor 拷贝；改动这些模块时需同步到桌面仓库，详见其 README 的「已知限制」。
+- 构建、配置、排障见 AutoDroid-Desktop 的 README；出包需与本仓库并排 clone 并先构建前端。
 
 ## 项目结构
 
@@ -408,6 +415,8 @@ node --test tests/*.test.mjs
 - [远程设备接入指南](docs/REMOTE_DEVICE_AGENT.md)：设备接入助手 Agent、反向隧道架构、安全边界与排障
 - [App 接口契约](docs/APP_RUNNER_API.md)：Android 客户端（AutoDroid-Android）的登录、设备注册、脚本下发与结果上报接口
 - [设备端脚本执行](docs/AUTOJS6_EXECUTION.md)：AutoJs6 引擎脚本包结构、导出与设备端 Agent 执行链路
+- [App 跨端排查记录（2026-10-20）](docs/APP_AUDIT_2026-10-20.md)：Android / iOS / WDA 一轮修复清单与真机验收边界
+- [双端 App 与客户端改进审查（2026-10-30）](docs/APP_AND_CLIENT_REVIEW_2026-10-30.md)：Android / iOS / WDA / 桌面客户端的待改进项、跨端契约漂移与按阶段的排期建议
 - [改进路线图](docs/IMPROVEMENT_ROADMAP.md)：能力补充与架构治理清单（P0/P1/P2）
 - [历史优化实施总结](OPTIMIZATION_SUMMARY.md)：早期 OCR、查询与并发治理及其当前演进状态
 

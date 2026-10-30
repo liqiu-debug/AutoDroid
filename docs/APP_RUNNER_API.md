@@ -3,6 +3,10 @@
 Android 客户端 [AutoDroid-Android](https://github.com/liqiu-debug/AutoDroid-Android)（内置 AutoJs6 引擎，`com.autodroid.runner`）和 [AutoDroid-iOS](https://github.com/liqiu-debug/AutoDroid-iOS)（SwiftUI，通过同机 AutoDroid-WDA 执行）通过以下接口与平台交互。所有请求需登录态（`Authorization: Bearer <access_token>` 或 API Token）。
 
 > 本文档是平台与 App 之间的契约：改动 `/app-runs/*` 与 `/device-runs/*` 的路径、字段或语义时，需同步两个 App 客户端。
+>
+> 桌面客户端 [AutoDroid-Desktop](https://github.com/liqiu-debug/AutoDroid-Desktop) **不走本契约**：它在本机执行并经
+> `/api/client-devices/*`、`/api/client-runs/*`、`/api/client-templates`、`/api/client-fastbot/*`、`/api/client-compatibility/*`、`/api/client-tasks`
+> 上报（`backend/api/client_*.py`、`backend/api/tasks.py::client_router`），其余请求反代到平台。
 
 ## 1. 登录
 
@@ -41,7 +45,7 @@ GET /app-runs/cases/{case_id}/script?env_id=<可选>
 GET /app-runs/scenarios/{scenario_id}/script?env_id=<可选>
 → 200 {
   "format_version": 1,
-  "generator": "autodroid-autojs6/1",
+  "generator": "autodroid/1",           // backend/autojs_export/packager.py 的 GENERATOR_NAME
   "kind": "case" | "scenario",
   "manifest": {...},                    // 写入运行目录 manifest.json
   "runtime_js": "<源码>",               // 写入运行目录 runtime.js
@@ -137,16 +141,33 @@ GET /app-runs/scenarios/{scenario_id}/script?platform=ios
 
 ### 8.2 执行器端点（手机局域网地址，默认 8100 端口）
 
+执行器路由不要求 WebDriver 会话，也没有鉴权（只应暴露在可信局域网，或由 App 走 `127.0.0.1`）。
+
 ```
-GET  /autodroid/status            → {running, run_id, last_result, log_count, version}
-POST /autodroid/run               → {accepted, run_id}
-     body: {bundle, run_id, platform, target_bundle_id, server, token, notify}
+GET  /autodroid/status            → {running, run_id, last_result, log_count, version, stop_requested}
+POST /autodroid/run               → {accepted, run_id} | {accepted: false, error}
+     body: {bundle, run_id, platform, server, token, notify,
+            target_bundle_id?, device_serial?, name?,
+            notify_app?, completion_bundle_id?, system_notify?}
 GET  /autodroid/logs?since=N      → {lines, next}
 POST /autodroid/stop              → {stopped}
+POST /autodroid/report            → {found, report}        body: {run_id}   （补传用：取回落盘报告）
+GET  /autodroid/schedules         → {items, events, ...}   （WDA 内定时任务状态）
+POST /autodroid/schedules         → 整体替换定时任务       body: {items: [...], server, token, username}
+GET  /autodroid/notifications     → 执行器侧通知权限状态
+POST /autodroid/notifications     → 申请通知权限
 ```
 
-`bundle` 即 8.1 返回的 JSON 包；`server`/`token` 供 runtime.js 回传结果；
-`target_bundle_id` 指定被自动化应用（后续 `start_app` 也会更新它）。
+- `bundle` 即 8.1 返回的 JSON 包；`server`/`token` 供 runtime.js 回传结果，token 只驻留执行器内存。
+- `target_bundle_id` 指定被自动化应用，缺省则由 `start_app` 动态设置；**当前 iOS 客户端不发送该字段**，平台 `selftest` 会发送。
+- `notify` 缺省时，执行器为"脚本未产出报告"场景生成的兜底失败报告按 `true` 处理，客户端应始终显式传值。
+- `notify_app` + `completion_bundle_id`：执行结束后把客户端 App 拉回前台（执行器侧校验 bundle id）；`system_notify` 控制是否由 WDA 自己发系统通知（新版 App 关闭，改由 App 发）。
+- `logs` 的 `since/next` 游标在缓冲区截断（上限 6000 行，超出丢最旧 2000 行）后会错位，iOS 客户端每次取完整快照而不用游标。
+- 执行中再次 `POST /autodroid/run` 返回 `accepted: false`；`stop` 只置标志，脚本在下一个原语边界中止。
+- 执行器只保留最近 10 次运行目录（`Documents/autodroid_runs/<run_id>/`）。
+
+定时任务项字段：`id, enabled, rule(once|daily|weekly|interval), hour, minute, weekday, interval, fetch_url, next_run`；
+`fetch_url` 为触发时向平台取脚本的完整地址。
 
 ### 8.3 设备注册与上报
 
