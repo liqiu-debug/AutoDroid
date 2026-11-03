@@ -238,6 +238,34 @@ class ClientDeviceTests(unittest.IsolatedAsyncioTestCase):
         result = logout_client_devices(ClientDeviceLogoutRequest(serials=[]), self.session, self.alice)
         self.assertEqual(result, {"updated": 0})
 
+    def test_logout_scoped_to_client_instance(self):
+        """带 client_instance_id 只置本实例登记的设备：同一账号另一实例仍在线的不受影响。"""
+        self._add_device("mine-1", owner_id=self.alice.id, status="IDLE", client_instance_id="desk-A")
+        self._add_device("mine-2", owner_id=self.alice.id, status="IDLE", client_instance_id="desk-B")
+        self._add_device("mine-3", owner_id=self.alice.id, status="IDLE", client_instance_id=None)
+        self._add_device("other-1", owner_id=self.bob.id, status="IDLE", client_instance_id="desk-A")
+
+        result = logout_client_devices(
+            ClientDeviceLogoutRequest(client_instance_id="desk-A"), self.session, self.alice
+        )
+
+        self.assertEqual(result, {"updated": 1})
+        statuses = {row.serial: row.status for row in self.session.exec(select(Device)).all()}
+        self.assertEqual(
+            statuses, {"mine-1": "OFFLINE", "mine-2": "IDLE", "mine-3": "IDLE", "other-1": "IDLE"}
+        )
+
+    def test_logout_blank_client_instance_id_means_all_own_devices(self):
+        """client_instance_id 空白按未传处理（旧客户端语义：本人全部设备）。"""
+        self._add_device("mine-1", owner_id=self.alice.id, status="IDLE", client_instance_id="desk-A")
+        self._add_device("mine-2", owner_id=self.alice.id, status="IDLE")
+
+        result = logout_client_devices(
+            ClientDeviceLogoutRequest(client_instance_id="   "), self.session, self.alice
+        )
+
+        self.assertEqual(result, {"updated": 2})
+
     # ---------- 列表过滤 ----------
 
     def test_filter_devices_for_user_visibility(self):
