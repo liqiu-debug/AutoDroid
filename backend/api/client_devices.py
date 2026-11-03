@@ -6,7 +6,8 @@
   转给当前用户（记录转移日志；model/custom_name 等元数据保留；
   client_instance_id/last_seen_at 刷新为本次）。
 - POST /heartbeat：批量刷新本人设备 last_seen_at。
-- POST /logout：本人设备（或指定子集）status=OFFLINE。
+- POST /logout：本人设备（或指定子集；可再按 client_instance_id 限定本实例登记的）
+  status=OFFLINE。
 
 注意：服务端 /api/devices/sync 的认领语义保持不变——只认无主设备、
 不抢他人已认领设备（服务器看到 ≠ 某人持有）。
@@ -53,6 +54,9 @@ class ClientDeviceHeartbeatRequest(BaseModel):
 
 class ClientDeviceLogoutRequest(BaseModel):
     serials: Optional[List[str]] = None
+    # 传入时只置该客户端实例登记的设备：同一账号在另一台机器/另一实例仍在线的
+    # 设备不受影响（否则会被一并打成 OFFLINE，直到对方下一次心跳才恢复）
+    client_instance_id: Optional[str] = None
 
 
 @router.post("/register", response_model=DeviceRead)
@@ -164,17 +168,23 @@ def logout_client_devices(
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    """本人设备（serials 缺省=全部，指定则为子集）置 OFFLINE，返回 {updated: n}。"""
+    """本人设备（serials 缺省=全部，指定则为子集）置 OFFLINE，返回 {updated: n}。
+
+    client_instance_id 传入时进一步限定为该实例登记（register 上报）的设备。
+    """
     serials: Optional[List[str]] = None
     if payload.serials is not None:
         serials = [str(s).strip() for s in payload.serials if str(s).strip()]
         if not serials:
             return {"updated": 0}
+    client_instance_id = str(payload.client_instance_id or "").strip() or None
 
     now = datetime.now()
     statement = select(Device).where(Device.owner_id == current_user.id)
     if serials is not None:
         statement = statement.where(col(Device.serial).in_(serials))
+    if client_instance_id is not None:
+        statement = statement.where(Device.client_instance_id == client_instance_id)
     devices = session.exec(statement).all()
     for device in devices:
         device.status = "OFFLINE"
