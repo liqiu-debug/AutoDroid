@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { UploadFilled, Download, Delete, Box, Cellphone } from '@element-plus/icons-vue'
 import api from '@/api'
 import { useClientApp } from '@/composables/useClientApp'
@@ -257,13 +257,49 @@ const uploadPackageInChunks = async ({ file, onSuccess, onError }) => {
 }
 
 /** 下载安装包 */
-const handleDownload = (row) => {
-  const url = api.getPackageDownloadUrl(row.id)
+const handleDownload = async (row) => {
   const token = localStorage.getItem('token')
+  const fileName = `${row.app_name}_${row.version_name}.${packageExtension(row)}`
+  const bridge = typeof window === 'undefined' ? null : window.desktop
+  // 客户端模式：走壳内断点续传下载（经隧道的大文件被截断可续传 + 大小校验），
+  // 落地系统「下载」目录并自动定位文件；Web 模式保持浏览器下载。
+  if (isClientApp.value && typeof bridge?.downloadPackage === 'function') {
+    const relative = api.getPackageDownloadUrl(row.id)
+    let absolute = relative
+    try {
+      absolute = new URL(relative, location.origin).toString()
+    } catch (e) {
+      absolute = relative
+    }
+    const query = token ? `?token=${encodeURIComponent(token)}` : ''
+    const notice = ElNotification({
+      id: 'autodroid-package-download',
+      title: '下载安装包',
+      message: `正在下载 ${fileName}：0%`,
+      type: 'info',
+      duration: 0,
+    })
+    let unsubscribe = () => {}
+    try {
+      unsubscribe = bridge.onDownloadProgress?.((evt) => {
+        if (evt?.phase === 'downloading') {
+          notice.message = `正在下载 ${fileName}：${evt.percent}%`
+        }
+      }) || (() => {})
+      await bridge.downloadPackage({ url: `${absolute}${query}`, fileName })
+      ElMessage.success('下载完成，已在文件管理器中定位')
+    } catch (e) {
+      ElMessage.error('下载失败：' + (e?.message || '未知错误'))
+    } finally {
+      unsubscribe()
+      notice.close?.()
+    }
+    return
+  }
   // 通过动态 a 标签触发浏览器下载
   const link = document.createElement('a')
-  link.href = `${url}?token=${token}`
-  link.download = `${row.app_name}_${row.version_name}.${packageExtension(row)}`
+  link.href = `${api.getPackageDownloadUrl(row.id)}?token=${token}`
+  link.download = fileName
   link.target = '_blank'
   document.body.appendChild(link)
   link.click()
