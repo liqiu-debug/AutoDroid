@@ -15,6 +15,20 @@ test('upload whitelist accepts the desktop installers and keeps the platform err
 test('desktop rows download with the real installer extension and hide the device install entry', () => {
   assert.match(source, /const isDesktopPackage = \(row\) => \['windows', 'macos'\]/)
   assert.match(source, /v-else-if="!isDesktopPackage\(row\)"/, '桌面包无对应设备，不显示安装入口')
-  assert.match(source, /link\.download = `\$\{row\.app_name\}_\$\{row\.version_name\}\.\$\{packageExtension\(row\)\}`/)
+  assert.match(
+    source,
+    /const fileName = `\$\{row\.app_name\}_\$\{row\.version_name\}\.\$\{packageExtension\(row\)\}`/,
+    '下载文件名沿用真实安装包扩展',
+  )
+  assert.match(source, /link\.download = fileName/)
   assert.match(source, /\{ ios: 'ipa', windows: 'exe', macos: 'dmg' \}/)
+})
+
+test('client mode downloads through the shell with resume download and live progress', () => {
+  // 客户端模式：经隧道的大文件浏览器下载会被截断；改走壳内断点续传 + 大小校验，
+  // 并用固定 id 通知原地刷新下载进度（下载安装包也能看到百分比）
+  assert.match(source, /isClientApp\.value && typeof bridge\?\.downloadPackage === 'function'/)
+  assert.match(source, /bridge\.onDownloadProgress\?\.\(/)
+  assert.match(source, /正在下载 \$\{fileName\}：\$\{evt\.percent\}%/)
+  assert.match(source, /await bridge\.downloadPackage\(\{ url: `\$\{absolute\}\$\{query\}`, fileName \}\)/)
 })

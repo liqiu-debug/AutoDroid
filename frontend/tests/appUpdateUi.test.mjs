@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { computed, ref } from 'vue'
 
-import { checkForUpdate, runUpdateInstall } from '../src/utils/appUpdate.js'
+import { applyUpdate, checkForUpdate, getStagedUpdate, runUpdateInstall } from '../src/utils/appUpdate.js'
+import { compareVersions } from '../src/utils/semver.js'
 
 // 桌面端「检查更新」前端流程：Navbar 账号下拉入口（clientMode 门控）+ 确认框
 // 「发现新版本 x.y.z（当前 a.b.c）」→「下载安装」+ 下载进度/完成/失败提示 +
@@ -28,8 +29,8 @@ const PKG = {
 }
 
 /** 假壳桥（window.desktop）：installUpdate 期间回放 events，再按 settle 收尾。 */
-function fakeDesktop({ events = [], settle = { type: 'resolve' }, clientInfo = { platform: 'darwin', version: '1.0.0' }, withTray = false } = {}) {
-  const state = { installCalls: [], unsubscribed: false, subscriber: null, trayCallback: null, trayUnsubscribed: false }
+function fakeDesktop({ events = [], settle = { type: 'resolve' }, clientInfo = { platform: 'darwin', version: '1.0.0' }, withTray = false, release = null, staged = null, installHandler = null } = {}) {
+  const state = { installCalls: [], unsubscribed: false, subscriber: null, trayCallback: null, trayUnsubscribed: false, applyCalls: 0, releaseQueries: 0 }
   return {
     state,
     getClientInfo: async () => clientInfo,
@@ -39,9 +40,22 @@ function fakeDesktop({ events = [], settle = { type: 'resolve' }, clientInfo = {
     },
     installUpdate: async payload => {
       state.installCalls.push(payload)
+      if (typeof installHandler === 'function') {
+        return installHandler(payload, state)
+      }
       for (const evt of events) state.subscriber?.(evt)
       if (settle.type === 'reject') throw new Error(settle.message || '下载失败')
       return settle.value || { launched: true }
+    },
+    checkRelease: async () => {
+      state.releaseQueries += 1
+      if (!release) return { ok: false, message: '更新源不可达' }
+      return { ok: true, release }
+    },
+    getUpdateStatus: async () => ({ staged }),
+    applyUpdate: async () => {
+      state.applyCalls += 1
+      return { ok: true }
     },
     ...(withTray ? {
       onCheckUpdateRequest: cb => {
@@ -94,6 +108,9 @@ function updateSetup({ clientMode = true, desktop = null, listItems = [], confir
     useClientApp,
     checkForUpdate,
     runUpdateInstall,
+    getStagedUpdate,
+    applyUpdate,
+    compareVersions,
     window: desktop ? { desktop } : {},
     localStorage: { getItem: key => (key === 'token' ? 'tok-1' : null) },
     location: { origin: 'http://127.0.0.1:5800' },
@@ -322,4 +339,80 @@ test('navbar dispatches the update entry and the silent startup check without to
   await state.handleCommand('logout')
   assert.ok(calls.some(([name]) => name === 'logout'), 'logout flow unchanged')
   assert.ok(calls.some(([name, path]) => name === 'push' && path === '/login'))
+})
+
+// ==================== 内置更新：待重启复用 / 双源回退提示 ====================
+
+test('a staged update offers restart directly without re-downloading', async () => {
+  const desktop = fakeDesktop({
+    clientInfo: { platform: 'darwin', version: '1.0.0' },
+    staged: { version: '1.3.0', fileName: 'AutoDroid-1.3.0-arm64.dmg', size: 251433097 },
+  })
+  const { useAppUpdate, apiCalls, confirms } = updateSetup({ clientMode: true, desktop, listItems: [] })
+  const app = useAppUpdate()
+  await app.startUpdateCheck()
+
+  assert.deepEqual(apiCalls, [], '已暂存待重启时不再查询版本源')
+  assert.equal(confirms.length, 1)
+  assert.equal(confirms[0][1], '重启完成更新')
+  assert.match(confirms[0][0], /1\.3\.0/)
+  assert.equal(desktop.state.applyCalls, 1, '确认后直接换包重启')
+})
+
+test('a staged update surfaces as a silent notification on startup', async () => {
+  const desktop = fakeDesktop({
+    clientInfo: { platform: 'darwin', version: '1.0.0' },
+    staged: { version: '1.3.0', fileName: 'AutoDroid-1.3.0-arm64.dmg', size: 10 },
+  })
+  const { useAppUpdate, notifications, notices } = updateSetup({ clientMode: true, desktop, listItems: [] })
+  const app = useAppUpdate()
+  await app.initSilentUpdateCheck()
+
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].title, '待重启完成更新')
+  assert.deepEqual(notices, [], '静默检查不弹 message')
+  assert.equal(desktop.state.applyCalls, 0, '未点击前不重启')
+})
+
+test('an older staged artifact falls back to the normal version check', async () => {
+  const desktop = fakeDesktop({
+    clientInfo: { platform: 'darwin', version: '2.0.0' },
+    staged: { version: '1.3.0', fileName: 'AutoDroid-1.3.0-arm64.dmg', size: 10 },
+  })
+  const { useAppUpdate, apiCalls, notices } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
+  const app = useAppUpdate()
+  await app.startUpdateCheck()
+
+  assert.deepEqual(apiCalls, [['getPackages', { package_name: 'autodroid-desktop', latest_only: true }]], '退回常规检查')
+  assert.deepEqual(notices.map(item => item[1]), ['已是最新版本（2.0.0）'])
+  assert.equal(desktop.state.applyCalls, 0)
+})
+
+test('a failing primary source surfaces the fallback notice and finishes on the backup source', async () => {
+  const release = {
+    version: '1.2.3',
+    fileName: 'AutoDroid-1.2.3-arm64.dmg',
+    url: 'https://github.com/liqiu-debug/AutoDroid-Desktop/releases/download/v1.2.3/AutoDroid-1.2.3-arm64.dmg',
+    size: 251433097,
+    pageUrl: 'https://github.com/liqiu-debug/AutoDroid-Desktop/releases/tag/v1.2.3',
+  }
+  const desktop = fakeDesktop({
+    release,
+    clientInfo: { platform: 'darwin', version: '1.0.0' },
+    installHandler: (payload, state) => {
+      if (state.installCalls.length === 1) throw new Error('下载不完整（1024/2048 字节）')
+      state.subscriber?.({ phase: 'done', path: '/updates/AutoDroid-1.2.3-arm64.dmg' })
+      return { launched: true, path: '/updates/AutoDroid-1.2.3-arm64.dmg' }
+    },
+  })
+  const { useAppUpdate, notifications, confirms } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
+  const app = useAppUpdate()
+  await app.startUpdateCheck()
+
+  assert.equal(confirms[0][1], '检查更新')
+  assert.equal(desktop.state.installCalls.length, 2, '主源失败自动切备用源')
+  assert.equal(desktop.state.installCalls[1].url, release.url)
+  const warning = notifications.find(item => item.type === 'warning')
+  assert.ok(warning, '回退时提示主源不可用')
+  assert.match(warning.message, /正在改用备用源/)
 })

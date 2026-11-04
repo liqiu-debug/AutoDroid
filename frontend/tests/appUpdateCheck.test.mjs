@@ -3,9 +3,11 @@ import test from 'node:test'
 
 import {
   UPDATE_PACKAGE_NAME,
+  applyUpdate,
   buildDownloadUrl,
   buildInstallerFileName,
   checkForUpdate,
+  getStagedUpdate,
   mapDesktopPlatform,
   pickDesktopPackage,
   runUpdateInstall,
@@ -31,8 +33,8 @@ const desktopPackage = (overrides = {}) => ({
 })
 
 /** 假壳桥：installUpdate 期间回放 events，再按 settle 结果收尾。 */
-function fakeBridge({ events = [], settle = { type: 'resolve' }, clientInfo = { platform: 'darwin', version: '1.0.0' } } = {}) {
-  const state = { installCalls: [], unsubscribed: false, subscriber: null }
+function fakeBridge({ events = [], settle = { type: 'resolve' }, clientInfo = { platform: 'darwin', version: '1.0.0' }, release = null, installHandler = null } = {}) {
+  const state = { installCalls: [], unsubscribed: false, subscriber: null, releaseQueries: 0 }
   return {
     state,
     getClientInfo: async () => clientInfo,
@@ -40,14 +42,32 @@ function fakeBridge({ events = [], settle = { type: 'resolve' }, clientInfo = { 
       state.subscriber = cb
       return () => { state.unsubscribed = true }
     },
+    checkRelease: async () => {
+      state.releaseQueries += 1
+      if (!release) return { ok: false, message: '更新源不可达' }
+      return { ok: true, release }
+    },
     installUpdate: async payload => {
       state.installCalls.push(payload)
+      if (typeof installHandler === 'function') {
+        return installHandler(payload, state)
+      }
       for (const evt of events) state.subscriber?.(evt)
       if (settle.type === 'reject') throw new Error(settle.message || '下载失败')
       return settle.value || { launched: true }
     },
   }
 }
+
+/** Release 源信息（壳内 GitHub 查询结果）。 */
+const releaseInfo = (overrides = {}) => ({
+  version: '1.2.3',
+  fileName: 'AutoDroid-1.2.3-arm64.dmg',
+  url: 'https://github.com/liqiu-debug/AutoDroid-Desktop/releases/download/v1.2.3/AutoDroid-1.2.3-arm64.dmg',
+  size: 251433097,
+  pageUrl: 'https://github.com/liqiu-debug/AutoDroid-Desktop/releases/tag/v1.2.3',
+  ...overrides,
+})
 
 test('mapDesktopPlatform maps Electron platforms and rejects the rest', () => {
   assert.equal(mapDesktopPlatform('darwin'), 'macos')
@@ -249,4 +269,146 @@ test('runUpdateInstall rejects non-http URLs and a missing installUpdate bridge'
     /当前环境不支持安装更新/,
   )
   assert.deepEqual(phases.map(e => e.phase), ['error', 'error'], 'both refusals surface as error phases')
+})
+
+// ==================== 双源（GitHub Release + 平台包管理）契约 ====================
+
+test('checkForUpdate takes the higher version across release and package sources', async () => {
+  // Release 更新 → 以 Release 为准
+  const releaseWins = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ version_name: '1.5.0' })],
+    getBridge: () => fakeBridge({ release: releaseInfo({ version: '2.0.0' }) }),
+  })
+  assert.equal(releaseWins.hasUpdate, true)
+  assert.equal(releaseWins.remoteVersion, '2.0.0')
+  assert.equal(releaseWins.source, 'release')
+  assert.equal(releaseWins.release?.url, releaseInfo({ version: '2.0.0' }).url)
+  assert.equal(releaseWins.pkg, null, '版本不一致的包条目不得作为回退源')
+
+  // 平台包更新（忘记发 Release）→ 以包管理为准
+  const packageWins = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ version_name: '1.5.0' })],
+    getBridge: () => fakeBridge({ release: releaseInfo({ version: '1.0.1' }) }),
+  })
+  assert.equal(packageWins.remoteVersion, '1.5.0')
+  assert.equal(packageWins.source, 'package')
+  assert.equal(packageWins.pkg?.version_name, '1.5.0')
+  assert.equal(packageWins.release, null)
+})
+
+test('checkForUpdate carries both download sources when versions agree', async () => {
+  const info = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ version_name: '1.2.3' })],
+    getBridge: () => fakeBridge({ release: releaseInfo() }),
+  })
+  assert.equal(info.hasUpdate, true)
+  assert.equal(info.remoteVersion, '1.2.3')
+  assert.equal(info.source, 'release')
+  assert.equal(info.release?.size, 251433097)
+  assert.equal(info.pkg?.id, 7, '同版本时包管理条目保留为回退下载源')
+})
+
+test('checkForUpdate still works when the release source is unreachable', async () => {
+  const info = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ version_name: '2.0.0' })],
+    getBridge: () => fakeBridge({ release: null }),  // checkRelease 返回 ok:false
+  })
+  assert.equal(info.hasUpdate, true)
+  assert.equal(info.source, 'package')
+  assert.equal(info.release, null)
+})
+
+test('runUpdateInstall prefers the package mirror and falls back to the release asset', async () => {
+  // 主源（平台包管理/云端隧道）失败 → 自动切 GitHub 资产，事件串里出现一次 fallback
+  const bridge = fakeBridge({
+    installHandler: (payload, state) => {
+      if (state.installCalls.length === 1) throw new Error('下载不完整（1024/2048 字节）')
+      state.subscriber?.({ phase: 'done', path: '/updates/AutoDroid-1.2.3-arm64.dmg' })
+      return { launched: true, path: '/updates/AutoDroid-1.2.3-arm64.dmg' }
+    },
+  })
+  const phases = []
+  const result = await runUpdateInstall({
+    pkg: desktopPackage({ version_name: '1.2.3' }),
+    release: releaseInfo(),
+    token: 'tok-1',
+    origin: ORIGIN,
+    bridge,
+    onPhase: evt => phases.push(evt),
+  })
+
+  assert.deepEqual(result, { launched: true })
+  assert.equal(bridge.state.installCalls.length, 2)
+  assert.deepEqual(bridge.state.installCalls[0], {
+    url: `${ORIGIN}/api/packages/7/download?token=tok-1`,
+    fileName: 'AutoDroid-1.2.3.dmg',
+    version: '1.2.3',
+  })
+  assert.deepEqual(bridge.state.installCalls[1], {
+    url: releaseInfo().url,
+    fileName: 'AutoDroid-1.2.3-arm64.dmg',
+    version: '1.2.3',
+    expectedSize: 251433097,
+  })
+  assert.deepEqual(phases.map(evt => evt.phase), ['fallback', 'done'])
+  assert.equal(phases[0].from, 'package')
+  assert.equal(phases[0].to, 'release')
+})
+
+test('runUpdateInstall uses the release asset directly when there is no package entry', async () => {
+  const bridge = fakeBridge({
+    installHandler: (payload, state) => {
+      state.subscriber?.({ phase: 'ready', version: '1.2.3', path: '/updates/x.dmg' })
+      return { launched: false, ready: true, version: '1.2.3' }
+    },
+  })
+  const phases = []
+  await runUpdateInstall({ release: releaseInfo(), bridge, onPhase: evt => phases.push(evt) })
+  assert.equal(bridge.state.installCalls.length, 1)
+  assert.equal(bridge.state.installCalls[0].url, releaseInfo().url)
+  assert.equal(bridge.state.installCalls[0].expectedSize, 251433097)
+  assert.deepEqual(phases.map(evt => evt.phase), ['ready'])
+})
+
+test('runUpdateInstall reports both failures with the release page hint', async () => {
+  const bridge = fakeBridge({
+    installHandler: (payload, state) => {
+      if (state.installCalls.length === 1) throw new Error('下载不完整（1/2 字节）')
+      throw new Error('查询/下载 GitHub 失败')
+    },
+  })
+  const phases = []
+  await assert.rejects(
+    () => runUpdateInstall({
+      pkg: desktopPackage({ version_name: '1.2.3' }),
+      release: releaseInfo(),
+      token: 'tok-1',
+      origin: ORIGIN,
+      bridge,
+      onPhase: evt => phases.push(evt),
+    }),
+    /手动下载/,
+  )
+  const error = phases.find(evt => evt.phase === 'error')
+  assert.ok(error, 'error phase present')
+  assert.match(error.message, /平台包管理源 下载不完整/, '主源错误保留在最终提示里')
+  assert.match(error.message, /GitHub源 查询\/下载 GitHub 失败/, '备用源错误保留在最终提示里')
+  assert.match(error.message, new RegExp(releaseInfo().pageUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+})
+
+test('getStagedUpdate / applyUpdate degrade without the bridge capability', async () => {
+  assert.equal(await getStagedUpdate(null), null)
+  assert.equal(await getStagedUpdate({}), null)
+  assert.deepEqual(
+    await getStagedUpdate({ getUpdateStatus: async () => ({ staged: { version: '1.2.3', fileName: 'x.dmg', size: 12 } }) }),
+    { version: '1.2.3', fileName: 'x.dmg', size: 12 },
+  )
+  assert.equal(await getStagedUpdate({ getUpdateStatus: async () => ({ staged: null }) }), null)
+
+  await assert.rejects(() => applyUpdate({ bridge: null }), /不支持自动重启更新/)
+  assert.equal(await applyUpdate({ bridge: { applyUpdate: async () => ({ ok: true }) } }), true)
+  await assert.rejects(
+    () => applyUpdate({ bridge: { applyUpdate: async () => ({ ok: false, message: '没有待安装的更新' }) } }),
+    /没有待安装的更新/,
+  )
 })
