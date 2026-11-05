@@ -26,6 +26,11 @@ const form = reactive({
     pct_majornav: 15,
 })
 
+const isIosDevice = (d) => String(d?.platform || '').toLowerCase() === 'ios'
+const selectedHasIos = computed(() =>
+    selectedDevices.value.some(serial => isIosDevice(devices.value.find(d => d.serial === serial)))
+)
+
 const pctSum = computed(() => form.pct_touch + form.pct_motion + form.pct_syskeys + form.pct_majornav)
 const pctRemaining = computed(() => Math.max(0, 100 - pctSum.value))
 
@@ -68,7 +73,7 @@ const fetchLatestTask = createGatedTask(async () => {
 const fetchDevices = async () => {
     devicesLoading.value = true
     try {
-        const res = await api.getFastbotDevices()
+        const res = await api.getFastbotDevices({ include_ios: true })
         devices.value = res.data || []
     } catch (err) {
         ElMessage.error('获取设备列表失败')
@@ -79,7 +84,7 @@ const fetchDevices = async () => {
 
 const handleRunClick = () => {
     if (!form.package_name) {
-        return ElMessage.warning('请输入目标包名')
+        return ElMessage.warning('请输入目标包名 / Bundle ID')
     }
     selectedDevices.value = []
     fetchDevices()
@@ -186,7 +191,7 @@ onUnmounted(() => {
                             <el-form-item label="目标包名">
                                 <el-input
                                     v-model="form.package_name"
-                                    placeholder="com.example.app"
+                                    placeholder="Android 包名 / iOS Bundle ID，如 com.example.app"
                                     clearable
                                     style="max-width: 360px"
                                 />
@@ -324,11 +329,18 @@ onUnmounted(() => {
                         :disabled="d.status !== 'IDLE'"
                     >
                         <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-                            <span>{{ d.custom_name || d.market_name || d.model || d.device_name || d.serial }}</span>
+                            <span>
+                                <el-tag v-if="isIosDevice(d)" size="small" type="info" effect="plain" class="platform-tag">iOS</el-tag>
+                                {{ d.custom_name || d.market_name || d.model || d.device_name || d.serial }}
+                            </span>
                             <el-tag :type="statusTagType(d.status)" size="small">{{ statusLabel(d.status) }}</el-tag>
                         </div>
                     </el-option>
                 </el-select>
+                <div v-if="selectedHasIos" class="ios-tip">
+                    iOS 设备由桌面客户端经 USB 驱动 WebDriverAgent 执行：需设备已解锁并信任本机、WDA 描述文件未过期；
+                    卡顿帧监控与 Perfetto 不适用，性能监控需本机安装 pymobiledevice3，崩溃堆栈来自设备崩溃报告（.ips）。
+                </div>
                 <div v-if="devices.length === 0 && !devicesLoading" class="no-device-tip">
                     暂无可用设备，请连接 USB 设备后重试
                 </div>
@@ -342,6 +354,8 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.platform-tag { margin-right: 6px; }
+.ios-tip { margin-top: 10px; font-size: 12px; line-height: 1.6; color: var(--ad-text-secondary, #909399); }
 .advanced-options { border-top: 1px solid var(--ad-border); margin-top: 12px; padding-top: 12px; }
 .advanced-options summary { cursor: pointer; color: var(--ad-text); font-size: 13px; font-weight: 600; padding-bottom: 12px; }
 

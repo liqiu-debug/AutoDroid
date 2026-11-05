@@ -531,8 +531,8 @@ export default {
     analyzeFastbotTrace(taskId, data) {
         return api.post(`/fastbot/reports/${taskId}/trace_ai_summary`, data, { timeout: 120000 })
     },
-    getFastbotDevices() {
-        return api.get('/fastbot/devices')
+    getFastbotDevices(params) {
+        return api.get('/fastbot/devices', params ? { params } : undefined)
     },
 
     // Compatibility (视觉兼容性)
