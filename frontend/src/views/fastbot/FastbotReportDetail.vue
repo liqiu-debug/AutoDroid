@@ -109,6 +109,15 @@ const verdict = computed(() => summary.value?.verdict || null)
 const performanceMonitorEnabled = computed(() => summary.value?.performance_monitor_enabled !== false)
 const jankFrameMonitorEnabled = computed(() => summary.value?.jank_frame_monitor_enabled === true)
 const localReplayEnabled = computed(() => summary.value?.local_replay_enabled === true)
+// 客户端本地执行时录制可能起不来（设备流未就绪等），后端会在 summary.degraded 标注：
+// 这种情况要说明原因，别让「表单开着 / 报告未开启」看起来像配置丢了。
+const localReplayDegraded = computed(() => (
+    Array.isArray(summary.value?.degraded) && summary.value.degraded.includes('local_replay')
+))
+const localReplayLabel = computed(() => {
+    if (localReplayEnabled.value) return '已开启'
+    return localReplayDegraded.value ? '未开启（客户端降级）' : '未开启'
+})
 const reportTitle = computed(() => {
     if (isStartupSession.value) return `冷热启动报告 — ${task.value?.package_name || ''}`
     return `${performanceMonitorEnabled.value ? '性能报告' : '智能探索报告'} — ${task.value?.package_name || ''}`
@@ -487,7 +496,16 @@ watch(
                     <el-descriptions-item label="忽略崩溃">{{ task.ignore_crashes ? '是' : '否' }}</el-descriptions-item>
                     <el-descriptions-item label="性能监控">{{ performanceMonitorEnabled ? '已开启' : '已关闭' }}</el-descriptions-item>
                     <el-descriptions-item label="卡顿帧监控">{{ jankFrameMonitorEnabled ? '已开启' : '已关闭' }}</el-descriptions-item>
-                    <el-descriptions-item label="异常回放">{{ localReplayEnabled ? '已开启' : '未开启' }}</el-descriptions-item>
+                    <el-descriptions-item label="异常回放">
+                        <el-tooltip
+                            v-if="localReplayDegraded && !localReplayEnabled"
+                            content="客户端未能启动本地回放录制（设备投屏流未就绪或不可用），本次运行无崩溃回放"
+                            placement="top"
+                        >
+                            <span>{{ localReplayLabel }}</span>
+                        </el-tooltip>
+                        <span v-else>{{ localReplayLabel }}</span>
+                    </el-descriptions-item>
                     <el-descriptions-item label="卡顿数据源">{{ jankMonitoringModeLabel }}</el-descriptions-item>
                     <el-descriptions-item label="开始时间">{{ formatTime(task.started_at) }}</el-descriptions-item>
                     <el-descriptions-item label="结束时间">{{ formatTime(task.finished_at) }}</el-descriptions-item>
