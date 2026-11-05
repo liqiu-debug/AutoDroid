@@ -86,8 +86,33 @@ _fluency_runtimes: Dict[int, _FluencyRuntime] = {}
 _startup_task_ids: set[int] = set()
 
 
+def _is_desktop_usb_ios_device(device: Device) -> bool:
+    """桌面客户端经 USB 登记的 iOS 真机（裸 UDID，非 App 形态 ios: 前缀）。
+
+    iOS 稳定性测试只在桌面客户端本机执行（主机驱动 WDA），云端不直接跑。
+    """
+    from backend.api.devices import is_client_managed_device
+
+    return (
+        str(device.platform or "").strip().lower() == "ios"
+        and not str(device.serial or "").startswith("ios:")
+        and is_client_managed_device(device)
+    )
+
+
+def _fastbot_device_visible(device: Device, include_ios: bool) -> bool:
+    if str(device.platform or "android").strip().lower() == "android":
+        return True
+    return include_ios and _is_desktop_usb_ios_device(device)
+
+
 def _ensure_fastbot_android_device(device: Device) -> None:
     platform = str(device.platform or "android").strip().lower()
+    if platform == "ios" and _is_desktop_usb_ios_device(device):
+        raise HTTPException(
+            status_code=400,
+            detail="P3001_FASTBOT_ANDROID_ONLY: iOS 稳定性测试需在桌面客户端中发起（设备需 USB 连接在客户端所在电脑）。",
+        )
     if platform != "android":
         raise HTTPException(
             status_code=400,
@@ -713,6 +738,7 @@ def get_fastbot_replay_file(task_id: int, filename: str):
 
 @router.get("/devices", response_model=List[DeviceRead])
 async def list_devices_with_status(
+    include_ios: bool = False,
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
@@ -729,9 +755,7 @@ async def list_devices_with_status(
 
     devices = sort_devices_for_display(session.exec(select(Device)).all())
     devices = filter_devices_for_user(devices, current_user)
-    devices = [
-        d for d in devices if str(d.platform or "android").strip().lower() == "android"
-    ]
+    devices = [d for d in devices if _fastbot_device_visible(d, include_ios)]
 
     # 实时检查哪些设备在线
     try:
@@ -763,9 +787,7 @@ async def list_devices_with_status(
             # 重新查询以获取最新状态（重新应用归属过滤）
             devices = sort_devices_for_display(session.exec(select(Device)).all())
             devices = filter_devices_for_user(devices, current_user)
-            devices = [
-                d for d in devices if str(d.platform or "android").strip().lower() == "android"
-            ]
+            devices = [d for d in devices if _fastbot_device_visible(d, include_ios)]
     except Exception as e:
         logger.warning(f"检查设备在线状态失败: {e}")
     

@@ -18,7 +18,7 @@ defineEmits(['view-log', 'view-replay'])
             <el-table-column label="时间" prop="time" width="120" align="center" />
             <el-table-column label="类型" width="100" align="center">
                 <template #default="{ row }">
-                    <el-tag :type="row.type === 'ANR' ? 'warning' : 'danger'" size="small">{{ row.type }}</el-tag>
+                    <el-tag :type="row.type === 'ANR' || row.type === 'OOM' ? 'warning' : 'danger'" size="small">{{ row.type }}</el-tag>
                 </template>
             </el-table-column>
             <el-table-column label="日志" width="120" align="center">
