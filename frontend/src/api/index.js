@@ -758,6 +758,10 @@ export default {
     deletePackage(id) {
         return api.delete(`/packages/${id}`)
     },
+    // 只改「更新提示」（changelog）：客户端检查更新弹窗展示的文案，改文案不必重传安装包
+    updatePackage(id, data) {
+        return api.patch(`/packages/${id}`, data)
+    },
     getPackageDownloadUrl(id) {
         return `/api/packages/${id}/download`
     },

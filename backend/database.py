@@ -107,6 +107,7 @@ def _migration_add_columns(cursor) -> None:
         ("testexecution", "env_id", "INTEGER"),
         ("fastbottask", "run_id", "VARCHAR"),
         ("testresult", "report_display", "JSON"),
+        ("apppackage", "changelog", "VARCHAR DEFAULT ''"),
         ("compatibilityrun", "compare_mode", "VARCHAR DEFAULT 'version'"),
         ("compatibilityrun", "baseline_device_serial", "VARCHAR"),
         ("compatibilitycell", "is_baseline", "BOOLEAN DEFAULT 0"),

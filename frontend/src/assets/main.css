@@ -87,6 +87,16 @@ h1, h2, h3 { color: var(--ad-text); }
 .el-message-box { width: var(--el-messagebox-width, 420px); max-width: calc(100vw - 32px); border-radius: 8px; padding: 16px; }
 .el-message-box__title { font-size: 16px; }
 .el-message-box__message { overflow-wrap: anywhere; }
+/* 客户端「发现新版本」弹窗：版本行 + 更新提示正文（提示可能很长，正文自己滚动，
+   弹窗整体不超出视口，移动端也不把按钮顶出屏幕）。内容用 span + display:block 撑块：
+   ElMessageBox 把这段 HTML 放进 <p>，块级标签会被浏览器提前闭合。 */
+.autodroid-update-box { --el-messagebox-width: 480px; }
+.autodroid-update-dialog { display: block; }
+.autodroid-update-version { display: block; font-size: 14px; color: var(--ad-text); margin-bottom: 10px; }
+.autodroid-update-version strong { font-size: 15px; color: var(--ad-primary); }
+.autodroid-update-current { color: var(--ad-muted); font-size: 12px; }
+.autodroid-update-notes-label { display: block; font-size: 12px; color: var(--ad-muted); margin-bottom: 4px; }
+.autodroid-update-notes { display: block; max-height: min(45vh, 320px); overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; color: var(--ad-text); background: var(--ad-bg); border: 1px solid var(--ad-border); border-radius: 6px; padding: 8px 10px; text-align: left; }
 .el-dropdown-menu__item, .el-select-dropdown__item { font-size: 13px; }
 .el-tooltip__popper, .el-popper { max-width: min(560px, calc(100vw - 24px)); overflow-wrap: anywhere; }
 .el-empty { padding: 24px 12px; }

@@ -2,14 +2,21 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  EMPTY_UPDATE_NOTES,
+  SKIPPED_UPDATE_KEY,
   UPDATE_PACKAGE_NAME,
   applyUpdate,
   buildDownloadUrl,
   buildInstallerFileName,
+  buildUpdateDialogHtml,
   checkForUpdate,
   getStagedUpdate,
+  isUpdateSkipped,
   mapDesktopPlatform,
+  normalizeUpdateNotes,
   pickDesktopPackage,
+  readSkippedUpdateVersion,
+  rememberSkippedUpdateVersion,
   runUpdateInstall,
 } from '../src/utils/appUpdate.js'
 
@@ -411,4 +418,107 @@ test('getStagedUpdate / applyUpdate degrade without the bridge capability', asyn
     () => applyUpdate({ bridge: { applyUpdate: async () => ({ ok: false, message: '没有待安装的更新' }) } }),
     /没有待安装的更新/,
   )
+})
+
+// ==================== 更新提示（changelog）与「不再提示」 ====================
+
+test('the update notes come from the winning source: package changelog or release body', async () => {
+  // 包管理源胜出 → 用上传时手写的 changelog
+  const fromPackage = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ changelog: '修复录制断连' })],
+    getBridge: () => fakeBridge(),
+  })
+  assert.equal(fromPackage.remoteVersion, '1.2.3')
+  assert.equal(fromPackage.changelog, '修复录制断连')
+
+  // Release 版本更高而胜出 → 用该 Release 的正文（notes）
+  const fromRelease = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ changelog: '旧包的文案' })],
+    getBridge: () => fakeBridge({ release: releaseInfo({ version: '1.3.0', notes: '新增 iOS 稳定性测试' }) }),
+  })
+  assert.equal(fromRelease.remoteVersion, '1.3.0')
+  assert.equal(fromRelease.source, 'release')
+  assert.equal(fromRelease.changelog, '新增 iOS 稳定性测试')
+
+  // 同版本时（发版惯例：Release 与平台包各传一份）优先用发版人手写在平台的那份
+  const sameVersionBothSources = await checkForUpdate({
+    listPackages: async () => [desktopPackage({ changelog: '平台写的更新提示' })],
+    getBridge: () => fakeBridge({ release: releaseInfo({ notes: 'GitHub 正文' }) }),
+  })
+  assert.equal(sameVersionBothSources.source, 'release', '同版本仍优先 Release 的下载元数据')
+  assert.equal(sameVersionBothSources.changelog, '平台写的更新提示')
+  assert.equal(sameVersionBothSources.pkg?.id, 7, '同版本的平台包仍作为下载候选')
+
+  // 两源都没有文案 → 空串，由展示层给兜底文案
+  const noNotes = await checkForUpdate({
+    listPackages: async () => [desktopPackage()],
+    getBridge: () => fakeBridge(),
+  })
+  assert.equal(noNotes.changelog, '')
+})
+
+test('normalizeUpdateNotes keeps intentional line breaks and fills the empty case', () => {
+  assert.equal(normalizeUpdateNotes('  修复 A\r\n新增 B  '), '修复 A\n新增 B')
+  assert.equal(normalizeUpdateNotes('修复 A\n\n\n\n新增 B'), '修复 A\n\n新增 B')
+  assert.equal(normalizeUpdateNotes(''), EMPTY_UPDATE_NOTES)
+  assert.equal(normalizeUpdateNotes(null), EMPTY_UPDATE_NOTES)
+  assert.equal(normalizeUpdateNotes('   '), EMPTY_UPDATE_NOTES)
+})
+
+test('the dialog html carries the version pair and an escaped notes block', () => {
+  const html = buildUpdateDialogHtml({
+    remoteVersion: '1.2.3',
+    localVersion: '1.0.0',
+    notes: '修复 A\n新增 B',
+  })
+  assert.match(html, /新版本 <strong>1\.2\.3<\/strong>/)
+  assert.match(html, /（当前 1\.0\.0）/)
+  assert.match(html, /<span class="autodroid-update-notes">修复 A\n新增 B<\/span>/)
+  // ElMessageBox 把这段 HTML 塞进 <p>：不能出现块级标签，否则会被浏览器提前闭合
+  assert.doesNotMatch(html, /<(div|p|section|ul|li)\b/)
+
+  const escaped = buildUpdateDialogHtml({ remoteVersion: '<b>1.2.3</b>', notes: '<script>x</script>' })
+  assert.doesNotMatch(escaped, /<script>/)
+  assert.match(escaped, /&lt;b&gt;1\.2\.3&lt;\/b&gt;/)
+  assert.match(escaped, /&lt;script&gt;x&lt;\/script&gt;/)
+
+  const blank = buildUpdateDialogHtml({ remoteVersion: '1.2.3', notes: '' })
+  assert.match(blank, new RegExp(EMPTY_UPDATE_NOTES))
+})
+
+test('the ignored version is remembered one at a time and only mutes that version', () => {
+  const store = new Map()
+  const storage = {
+    getItem: key => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(key, String(value)),
+  }
+  assert.equal(readSkippedUpdateVersion(storage), '')
+  assert.equal(isUpdateSkipped('1.2.3', readSkippedUpdateVersion(storage)), false)
+
+  assert.equal(rememberSkippedUpdateVersion(storage, '1.2.3'), true)
+  assert.equal(store.get(SKIPPED_UPDATE_KEY), '1.2.3')
+  assert.equal(readSkippedUpdateVersion(storage), '1.2.3')
+  assert.equal(isUpdateSkipped('1.2.3', '1.2.3'), true)
+  assert.equal(isUpdateSkipped('v1.2.3', '1.2.3'), true, 'v 前缀等价')
+  assert.equal(isUpdateSkipped('1.2.2', '1.2.3'), true, '比忽略版本更旧也不该弹')
+  assert.equal(isUpdateSkipped('1.2.4', '1.2.3'), false, '出现更高版本照常提示')
+  assert.equal(isUpdateSkipped('', '1.2.3'), false)
+
+  // 再忽略新版本：只留最近一次，旧记录被覆盖
+  rememberSkippedUpdateVersion(storage, '1.3.0')
+  assert.equal(readSkippedUpdateVersion(storage), '1.3.0')
+  assert.equal(isUpdateSkipped('1.2.3', readSkippedUpdateVersion(storage)), true)
+
+  assert.equal(rememberSkippedUpdateVersion(storage, ''), false, '空版本不写记录')
+})
+
+test('missing or throwing storage degrades to "nothing ignored"', () => {
+  assert.equal(readSkippedUpdateVersion(null), '')
+  assert.equal(rememberSkippedUpdateVersion(null, '1.2.3'), false)
+  const throwing = {
+    getItem: () => { throw new Error('storage disabled') },
+    setItem: () => { throw new Error('storage disabled') },
+  }
+  assert.equal(readSkippedUpdateVersion(throwing), '')
+  assert.equal(rememberSkippedUpdateVersion(throwing, '1.2.3'), false)
 })
