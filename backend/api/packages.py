@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select, col, func
@@ -64,6 +64,8 @@ DESKTOP_PACKAGE_NAME = "autodroid-desktop"
 DESKTOP_APP_NAME = "AutoDroid"
 DESKTOP_VERSION_PATTERN = re.compile(r"\d+(?:\.\d+)+")
 IOS_INSTALL_TIMEOUT_SECONDS = 300
+# 更新说明长度上限（桌面客户端检查更新的对话框内展示，超长文案没有意义）
+MAX_CHANGELOG_LENGTH = 20000
 
 
 class PackageUploadSessionCreate(BaseModel):
@@ -71,6 +73,7 @@ class PackageUploadSessionCreate(BaseModel):
     file_size: int
     chunk_size: int
     total_chunks: int
+    changelog: str = ""
 
 
 class PackageUploadSessionRead(BaseModel):
@@ -86,6 +89,20 @@ class PackageChunkUploadRead(BaseModel):
     received_bytes: int
     uploaded_chunks_count: int
     total_chunks: int
+
+
+class PackageChangelogUpdate(BaseModel):
+    changelog: str = ""
+
+
+def _validate_changelog(value: str) -> str:
+    text = str(value or "")
+    if len(text) > MAX_CHANGELOG_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"更新说明过长（最多 {MAX_CHANGELOG_LENGTH} 字符）",
+        )
+    return text
 
 
 def _resolve_package_file_path(stored_path: str) -> Path:
@@ -239,6 +256,7 @@ def _record_uploaded_package(
     session: Session,
     current_user: User,
     original_filename: Optional[str] = None,
+    changelog: str = "",
 ) -> AppPackage:
     extension = _package_extension(saved_path.name)
     package_platform = SUPPORTED_PACKAGE_EXTENSIONS[extension]
@@ -272,6 +290,7 @@ def _record_uploaded_package(
         package_name=package_info.get("package_name", ""),
         version_name=package_info.get("version_name", ""),
         version_code=package_info.get("version_code", ""),
+        changelog=_validate_changelog(changelog),
         file_path=project_relative_path(saved_path, anchors=("uploads/apps",)),
         file_size=round(file_size_bytes / (1024 * 1024), 2),
         is_latest=True,
@@ -739,16 +758,18 @@ async def install_managed_package_to_device(
 @router.post("/upload", response_model=AppPackageRead, summary="上传 APK/IPA 文件")
 async def upload_package(
     file: UploadFile = File(...),
+    changelog: str = Form(""),
     session: Session = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     """
     接收 APK/IPA 文件，保存到本地并自动解析包标识、版本号等元数据。
-    同平台、同标识的旧版本会自动标记为非最新。
+    同平台、同标识的旧版本会自动标记为非最新；changelog 为可选的更新说明。
     """
     # 1. 校验文件类型
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
+    _validate_changelog(changelog)
     ext = _package_extension(file.filename)
 
     # 2. 保存文件 (UUID 重命名防冲突)
@@ -763,6 +784,7 @@ async def upload_package(
             session=session,
             current_user=current_user,
             original_filename=file.filename,
+            changelog=changelog,
         )
     except Exception:
         _remove_path(saved_path)
@@ -791,6 +813,7 @@ def create_package_upload_session(
         "file_size": payload.file_size,
         "chunk_size": payload.chunk_size,
         "total_chunks": payload.total_chunks,
+        "changelog": _validate_changelog(payload.changelog),
         "user_id": current_user.id,
         "created_at": time.time(),
     }
@@ -921,6 +944,7 @@ def complete_package_upload(
             session=session,
             current_user=current_user,
             original_filename=str(meta.get("filename") or ""),
+            changelog=str(meta.get("changelog") or ""),
         )
     except HTTPException:
         _remove_path(saved_path)
@@ -1032,6 +1056,25 @@ def download_package(
         filename=download_name,
         media_type=media_type,
     )
+
+
+@router.patch("/{package_id}", response_model=AppPackageRead, summary="更新安装包信息（更新说明）")
+def update_package(
+    package_id: int,
+    payload: PackageChangelogUpdate,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """只改更新说明，不动安装包文件与版本元数据（改文案不用重传包）。"""
+    pkg = session.get(AppPackage, package_id)
+    if not pkg:
+        raise HTTPException(status_code=404, detail="安装包不存在")
+
+    pkg.changelog = _validate_changelog(payload.changelog)
+    session.add(pkg)
+    session.commit()
+    session.refresh(pkg)
+    return pkg
 
 
 @router.delete("/{package_id}", summary="删除安装包")

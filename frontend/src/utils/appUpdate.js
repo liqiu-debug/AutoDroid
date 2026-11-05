@@ -20,6 +20,10 @@
  * - onPhase 回调收到 0..N 次 downloading、且恰好一次终态（ready/downloaded/done/error）；
  * - 返回的 Promise 与终态一致（ready → {ready:true}，其余成功 → {launched:true}，
  *   error → reject Error(message)）。
+ *
+ * 另含「更新弹窗」所需的两块纯逻辑：
+ * - 更新提示文案：包管理源的 changelog / Release 源的正文（notes）→ 归一 + HTML 转义；
+ * - 「不再提示」：被忽略的版本号落 localStorage，判定为「远端 ≤ 已忽略版本」。
  */
 import { compareVersions } from './semver.js'
 
@@ -100,6 +104,8 @@ async function queryShellRelease(bridge) {
       size: Number(result.release.size) || 0,
       pageUrl: String(result.release.pageUrl ?? '').trim(),
       fileName: fileName || buildInstallerFileName({ platform: 'macos', version_name: version }),
+      // Release 正文即更新提示（发版时手写）；与包管理 changelog 同一展示位
+      changelog: String(result.release.notes ?? '').trim(),
     }
   } catch (error) {
     return null
@@ -188,7 +194,13 @@ export async function checkForUpdate({ listPackages, getBridge, compare = compar
 
   const pkg = pickDesktopPackage(items, platform)
   const packageCandidate = pkg
-    ? { source: 'package', version: String(pkg.version_name ?? '').trim(), pkg }
+    ? {
+        source: 'package',
+        version: String(pkg.version_name ?? '').trim(),
+        // 平台「App 包管理」上传时手写的更新提示，随条目一起回传
+        changelog: String(pkg.changelog ?? '').trim(),
+        pkg,
+      }
     : null
   const candidates = [release, packageCandidate].filter(candidate => candidate && candidate.version)
   if (!candidates.length) {
@@ -200,12 +212,18 @@ export async function checkForUpdate({ listPackages, getBridge, compare = compar
   const hasUpdate = compare(best.version, localVersion) > 0
   // 两个下载源都带回去：只有与目标版本一致的源才能作为下载/回退候选
   const sameVersion = candidate => candidate && compare(candidate.version, best.version) === 0
+  const packageChangelog = sameVersion(packageCandidate)
+    ? String(packageCandidate.changelog ?? '').trim()
+    : ''
   return {
     supported: true,
     hasUpdate,
     localVersion,
     remoteVersion: best.version,
     source: best.source,
+    // 更新提示：同版本时优先用平台上传时手写的 changelog（那是发版人写给用户看的），
+    // 平台侧没有该版本（Release 更高）时用 Release 正文
+    changelog: packageChangelog || String(best.changelog ?? '').trim(),
     release: sameVersion(release) ? release : null,
     pkg: sameVersion(packageCandidate) ? packageCandidate.pkg : null,
   }
@@ -344,3 +362,81 @@ async function installFromSource({ source, version, bridge, emit }) {
     unsubscribe()
   }
 }
+
+// ---- 「不再提示」与更新弹窗文案（纯逻辑，便于单测）----
+
+/** 「不再提示」落盘的 localStorage key，值为被忽略的版本号。 */
+export const SKIPPED_UPDATE_KEY = 'autodroid.skipped_update_version'
+
+/** 上传包时没写更新提示时的兜底文案（弹窗里不留空白）。 */
+export const EMPTY_UPDATE_NOTES = '本次更新未提供说明'
+
+/** 读取「不再提示」的版本号；storage 缺失或读写异常一律返回 ''（按未忽略处理）。 */
+export function readSkippedUpdateVersion(storage) {
+  try {
+    if (typeof storage?.getItem !== 'function') return ''
+    return String(storage.getItem(SKIPPED_UPDATE_KEY) ?? '').trim()
+  } catch (error) {
+    return ''
+  }
+}
+
+/** 记下「不再提示」的版本号（只保留最近一次忽略，旧记录被覆盖）。返回是否写入成功。 */
+export function rememberSkippedUpdateVersion(storage, version) {
+  const text = String(version ?? '').trim()
+  if (!text) return false
+  try {
+    if (typeof storage?.setItem !== 'function') return false
+    storage.setItem(SKIPPED_UPDATE_KEY, text)
+    return true
+  } catch (error) {
+    return false
+  }
+}
+
+/**
+ * 该版本是否已被「不再提示」忽略：远端 ≤ 已忽略版本都算忽略
+ * （用户忽略 1.2.3 后，再检查到的还是 1.2.3 或更旧，就不该再弹）。
+ */
+export function isUpdateSkipped(remoteVersion, skippedVersion, compare = compareVersions) {
+  const remote = String(remoteVersion ?? '').trim()
+  const skipped = String(skippedVersion ?? '').trim()
+  if (!remote || !skipped) return false
+  return compare(remote, skipped) <= 0
+}
+
+/** 更新提示文案归一：统一换行、折叠 3 行以上空行、空文案给兜底提示。 */
+export function normalizeUpdateNotes(notes) {
+  const text = String(notes ?? '').replace(/\r\n?/g, '\n').trim()
+  if (!text) return EMPTY_UPDATE_NOTES
+  return text.replace(/\n{3,}/g, '\n\n')
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+/**
+ * 更新弹窗 HTML（ElMessageBox dangerouslyUseHTMLString 用）：
+ * 「新版本 x.y.z（当前 a.b.c）」+「更新提示」正文（上传包时手写 / Release 正文）。
+ * 版本与提示都做 HTML 转义：提示来自平台上传内容，不能当标记渲染。
+ * 只用 span + CSS 撑块：ElMessageBox 把这段 HTML 塞进 <p> 里，块级标签会被浏览器提前闭合。
+ */
+export function buildUpdateDialogHtml({ remoteVersion, localVersion, notes } = {}) {
+  const remote = escapeHtml(String(remoteVersion ?? '').trim())
+  const local = escapeHtml(String(localVersion ?? '').trim())
+  const current = local ? `（当前 ${local}）` : ''
+  return [
+    '<span class="autodroid-update-dialog">',
+    `<span class="autodroid-update-version">新版本 <strong>${remote}</strong><span class="autodroid-update-current">${current}</span></span>`,
+    '<span class="autodroid-update-notes-label">更新提示</span>',
+    `<span class="autodroid-update-notes">${escapeHtml(normalizeUpdateNotes(notes))}</span>`,
+    '</span>',
+  ].join('')
+}
+

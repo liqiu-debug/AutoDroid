@@ -635,6 +635,7 @@ class AppPackageRead(BaseModel):
     package_name: str = ""
     version_name: str = ""
     version_code: str = ""
+    changelog: str = ""
     file_path: str = ""
     file_size: float = 0.0
     is_latest: bool = False

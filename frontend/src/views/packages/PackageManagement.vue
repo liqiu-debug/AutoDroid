@@ -42,6 +42,12 @@ const uploadCurrentChunkLoaded = ref(0)
 const uploadCurrentChunk = ref(0)
 const uploadTotalChunks = ref(0)
 const activeUploadId = ref('')
+// 「更新提示」：桌面客户端检查更新弹窗展示的文案；上传时手写，随本次上传写进包记录
+const uploadChangelog = ref('')
+const changelogDialogVisible = ref(false)
+const changelogTarget = ref(null)
+const changelogDraft = ref('')
+const changelogSaving = ref(false)
 
 let uploadCancelRequested = false
 let activeUploadController = null
@@ -206,7 +212,9 @@ const uploadPackageInChunks = async ({ file, onSuccess, onError }) => {
       filename: file.name,
       file_size: file.size,
       chunk_size: CHUNK_SIZE,
-      total_chunks: uploadTotalChunks.value
+      total_chunks: uploadTotalChunks.value,
+      // 更新提示随会话落盘，complete 时写进包记录（桌面客户端检查更新弹窗展示）
+      changelog: uploadChangelog.value.trim()
     })
     activeUploadId.value = session.upload_id
 
@@ -235,6 +243,8 @@ const uploadPackageInChunks = async ({ file, onSuccess, onError }) => {
     uploadStatusText.value = '上传完成'
     ElMessage.success(`上传成功：${result.app_name} v${result.version_name}`)
     onSuccess?.(result)
+    // 本次更新提示已随包落库，清空输入框免得下一版误带上一次的文案
+    uploadChangelog.value = ''
     await fetchPackages()
     uploadDialogVisible.value = false
   } catch (error) {
@@ -321,6 +331,38 @@ const handleDelete = async (row) => {
     if (e !== 'cancel') {
       ElMessage.error('删除失败：' + (e.response?.data?.detail || e.message))
     }
+  }
+}
+
+/** 行操作分发：下载 / 编辑更新提示 / 删除（下拉菜单 command 三选一）。 */
+const handleRowCommand = (command, row) => {
+  if (command === 'download') return handleDownload(row)
+  if (command === 'changelog') return openChangelogDialog(row)
+  return handleDelete(row)
+}
+
+/** 打开「更新提示」弹窗（老包补写文案，不必重传安装包）。 */
+const openChangelogDialog = (row) => {
+  changelogTarget.value = row
+  changelogDraft.value = row?.changelog || ''
+  changelogDialogVisible.value = true
+}
+
+/** 保存「更新提示」：PATCH /api/packages/{id}，成功后就地回填该行，不整页刷新。 */
+const saveChangelog = async () => {
+  const target = changelogTarget.value
+  if (!target || changelogSaving.value) return
+  changelogSaving.value = true
+  try {
+    const { data } = await api.updatePackage(target.id, { changelog: changelogDraft.value })
+    const index = packages.value.findIndex(item => item.id === target.id)
+    if (index >= 0) packages.value[index] = { ...packages.value[index], ...data }
+    ElMessage.success('更新提示已保存')
+    changelogDialogVisible.value = false
+  } catch (error) {
+    ElMessage.error('保存失败：' + getErrorMessage(error, '未知错误'))
+  } finally {
+    changelogSaving.value = false
   }
 }
 
@@ -431,6 +473,22 @@ onMounted(() => {
 
     <!-- 拖拽上传区 -->
     <el-card class="upload-card" shadow="never">
+      <!-- 更新提示先填后传：桌面客户端启动自动检查更新时，弹窗展示的正文就是这条 -->
+      <div class="changelog-field">
+        <div class="changelog-field-head">
+          <span class="changelog-field-label">更新提示</span>
+          <span class="changelog-field-hint">桌面客户端「检查更新」弹窗展示的文案，可留空；上传后也能在下方列表里补写</span>
+        </div>
+        <el-input
+          v-model="uploadChangelog"
+          type="textarea"
+          :rows="3"
+          maxlength="20000"
+          show-word-limit
+          :disabled="uploadInProgress"
+          placeholder="例：修复录制过程中偶发断连；新增 iOS 稳定性测试；优化安装包下载速度"
+        />
+      </div>
       <el-upload
         action="/api/packages/upload-sessions"
         :http-request="uploadPackageInChunks"
@@ -550,6 +608,14 @@ onMounted(() => {
         <!-- 上传者 -->
         <el-table-column label="上传者" prop="uploader_name" width="100" align="center" />
 
+        <!-- 更新提示（桌面客户端检查更新弹窗的正文，长文案截断悬停看全） -->
+        <el-table-column label="更新提示" min-width="200">
+          <template #default="{ row }">
+            <span v-if="row.changelog" class="changelog-cell" :title="row.changelog">{{ row.changelog }}</span>
+            <span v-else class="changelog-empty">—</span>
+          </template>
+        </el-table-column>
+
         <!-- 操作 -->
         <el-table-column label="操作" width="120" align="center" fixed="right">
           <template #default="{ row }">
@@ -566,7 +632,7 @@ onMounted(() => {
             <el-button v-else-if="!isDesktopPackage(row)" type="primary" link :icon="Cellphone" @click="openInstallDialog(row)">
               安装
             </el-button>
-            <el-dropdown trigger="click" @command="$event==='download' ? handleDownload(row) : handleDelete(row)"><el-button link :aria-label="row.app_name+'的更多操作'">更多</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="download">下载</el-dropdown-item><el-dropdown-item command="delete" divided>删除</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
+            <el-dropdown trigger="click" @command="handleRowCommand($event, row)"><el-button link :aria-label="row.app_name+'的更多操作'">更多</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="download">下载</el-dropdown-item><el-dropdown-item command="changelog">编辑更新提示</el-dropdown-item><el-dropdown-item command="delete" divided>删除</el-dropdown-item></el-dropdown-menu></template></el-dropdown>
           </template>
         </el-table-column>
       </el-table>
@@ -633,6 +699,31 @@ onMounted(() => {
       </template>
     </el-dialog>
 
+    <!-- 更新提示弹窗：补写 / 修改已上传包的文案（客户端检查更新弹窗展示） -->
+    <el-dialog class="ad-dialog"
+      v-model="changelogDialogVisible"
+      title="编辑更新提示"
+      width="min(520px, calc(100vw - 32px))"
+      align-center
+      destroy-on-close
+    >
+      <div v-if="changelogTarget" class="changelog-dialog-subject">
+        {{ changelogTarget.app_name }} v{{ changelogTarget.version_name }}
+      </div>
+      <el-input
+        v-model="changelogDraft"
+        type="textarea"
+        :rows="6"
+        maxlength="20000"
+        show-word-limit
+        placeholder="桌面客户端「检查更新」弹窗展示的文案，留空表示本次更新不写提示"
+      />
+      <template #footer>
+        <el-button @click="changelogDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="changelogSaving" @click="saveChangelog">保存</el-button>
+      </template>
+    </el-dialog>
+
   </div>
 </template>
 
@@ -678,6 +769,50 @@ onMounted(() => {
 
 .upload-card :deep(.el-upload) {
   width: 100%;
+}
+
+/* 更新提示：上传前填写，客户端检查更新弹窗展示 */
+.changelog-field {
+  margin-bottom: 12px;
+}
+
+.changelog-field-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.changelog-field-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ad-text);
+}
+
+.changelog-field-hint {
+  font-size: 12px;
+  color: var(--ad-muted);
+}
+
+.changelog-cell {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--ad-text);
+}
+
+.changelog-empty {
+  color: var(--ad-muted);
+}
+
+.changelog-dialog-subject {
+  margin-bottom: 12px;
+  font-size: 14px;
+  color: var(--ad-text);
 }
 
 .upload-card :deep(.el-upload-dragger) {
