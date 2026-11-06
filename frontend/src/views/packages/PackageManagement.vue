@@ -1,9 +1,10 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { h, ref, onMounted, computed } from 'vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { UploadFilled, Download, Delete, Box, Cellphone } from '@element-plus/icons-vue'
 import api from '@/api'
 import { useClientApp } from '@/composables/useClientApp'
+import { createProgressNotice } from '@/utils/progressNotice'
 
 const CHUNK_SIZE = 20 * 1024 * 1024
 const MAX_CHUNK_RETRIES = 2
@@ -282,18 +283,18 @@ const handleDownload = async (row) => {
       absolute = relative
     }
     const query = token ? `?token=${encodeURIComponent(token)}` : ''
-    const notice = ElNotification({
-      id: 'autodroid-package-download',
+    const notice = createProgressNotice({
+      notify: ElNotification,
+      h,
+      ref,
       title: '下载安装包',
       message: `正在下载 ${fileName}：0%`,
-      type: 'info',
-      duration: 0,
     })
     let unsubscribe = () => {}
     try {
       unsubscribe = bridge.onDownloadProgress?.((evt) => {
         if (evt?.phase === 'downloading') {
-          notice.message = `正在下载 ${fileName}：${evt.percent}%`
+          notice.update(`正在下载 ${fileName}：${evt.percent}%`)
         }
       }) || (() => {})
       await bridge.downloadPackage({ url: `${absolute}${query}`, fileName })
@@ -302,7 +303,7 @@ const handleDownload = async (row) => {
       ElMessage.error('下载失败：' + (e?.message || '未知错误'))
     } finally {
       unsubscribe()
-      notice.close?.()
+      notice.close()
     }
     return
   }

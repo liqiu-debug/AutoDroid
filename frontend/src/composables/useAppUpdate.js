@@ -1,8 +1,9 @@
-import { ref } from 'vue'
+import { h, ref } from 'vue'
 import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import api from '@/api'
 import { useClientApp } from '@/composables/useClientApp'
 import { compareVersions } from '@/utils/semver'
+import { createProgressNotice } from '@/utils/progressNotice'
 import {
   applyUpdate,
   buildUpdateDialogHtml,
@@ -26,8 +27,9 @@ import {
  * macOS 下载完成即已暂存，确认后换包重启（applyUpdate）；win32 拉起安装向导。
  */
 
-// 下载进度通知固定 id：同 id 通知原地替换，避免进度事件刷屏
-const PROGRESS_NOTIFICATION_ID = 'autodroid-update-progress'
+// 下载进度：整个下载只开一个通知、原地改文字（ElNotification 同 id 并不会替换，
+// 每个进度事件都调用会叠出一屏「正在下载」）
+const PROGRESS_TITLE = '下载更新'
 
 // 启动自动检查每会话至多一次（间隔 ≥ 该会话）
 let silentCheckStarted = false
@@ -146,26 +148,23 @@ export function useAppUpdate() {
         origin: getOrigin(),
         bridge: getBridge(),
         onPhase: (evt) => {
-          if (evt.phase === 'downloading') {
-            downloadPercent.value = evt.percent
-            progressNotice = ElNotification({
-              id: PROGRESS_NOTIFICATION_ID,
-              title: '下载更新',
-              message: `正在下载 ${info.remoteVersion}：${evt.percent}%`,
-              type: 'info',
-              duration: 0,
-            })
-            return
-          }
-          if (evt.phase === 'fallback') {
-            // 主源（平台包管理）失败切备用源（GitHub）；进度通知原地更新，不新开提示
-            progressNotice = ElNotification({
-              id: PROGRESS_NOTIFICATION_ID,
-              title: '下载更新',
-              message: `主下载源不可用（${evt.message || '连接失败'}），正在改用备用源…`,
-              type: 'warning',
-              duration: 0,
-            })
+          if (evt.phase === 'downloading' || evt.phase === 'fallback') {
+            const text = evt.phase === 'downloading'
+              ? `正在下载 ${info.remoteVersion}：${evt.percent}%`
+              : `主下载源不可用（${evt.message || '连接失败'}），正在改用备用源…`
+            if (evt.phase === 'downloading') downloadPercent.value = evt.percent
+            if (!progressNotice) {
+              progressNotice = createProgressNotice({
+                notify: ElNotification,
+                h,
+                ref,
+                title: PROGRESS_TITLE,
+                message: text,
+                type: evt.phase === 'fallback' ? 'warning' : 'info',
+              })
+            } else {
+              progressNotice.update(text)
+            }
             return
           }
           terminalHandled = true

@@ -15,6 +15,7 @@ import {
   runUpdateInstall,
 } from '../src/utils/appUpdate.js'
 import { compareVersions } from '../src/utils/semver.js'
+import { createProgressNotice } from '../src/utils/progressNotice.js'
 
 // 桌面端「检查更新」前端流程：Navbar 账号下拉入口（clientMode 门控）+ 更新弹窗
 // （新版本 + 更新提示 + 「立即更新 / 不再提示」）+ 下载进度/完成/失败提示 +
@@ -112,9 +113,25 @@ function updateSetup({ clientMode = true, desktop = null, listItems = [], confir
       return 'confirm'
     },
   }
+  // 与 element-plus 真实行为一致：每次调用都新开一个通知（同 id 不会替换旧的）。
+  // message 为渲染函数时，text() 取它当前渲染出的文本。
   const ElNotification = options => {
-    notifications.push(options)
-    return { close: () => { options.closed = true } }
+    const entry = {
+      ...options,
+      text: () => (typeof options.message === 'function' ? options.message() : options.message),
+    }
+    notifications.push(entry)
+    return { close: () => { entry.closed = true } }
+  }
+  const h = (_tag, children) => children
+  // 记录进度通知的文本变化序列（初始文本 + 每次 update）
+  const progressTexts = []
+  const trackedProgressNotice = options => {
+    const notice = createProgressNotice(options)
+    progressTexts.push(options.message)
+    const update = notice.update
+    notice.update = text => { progressTexts.push(text); update(text) }
+    return notice
   }
   const store = {}
   if (skippedVersion) store[SKIPPED_UPDATE_KEY] = skippedVersion
@@ -130,6 +147,8 @@ function updateSetup({ clientMode = true, desktop = null, listItems = [], confir
     ElMessage,
     ElMessageBox,
     ElNotification,
+    h,
+    createProgressNotice: trackedProgressNotice,
     api,
     useClientApp,
     checkForUpdate,
@@ -147,7 +166,7 @@ function updateSetup({ clientMode = true, desktop = null, listItems = [], confir
   }
   const source = stripImports(read('composables/useAppUpdate.js')).replace('export function useAppUpdate', 'function useAppUpdate')
   const useAppUpdate = new Function(...Object.keys(deps), source + '\nreturn useAppUpdate')(...Object.values(deps))
-  return { useAppUpdate, apiCalls, notices, confirms, notifications, detectCalls, isClientApp, localStorage }
+  return { useAppUpdate, apiCalls, notices, confirms, notifications, progressTexts, detectCalls, isClientApp, localStorage }
 }
 
 test('web mode has no entry and never queries the update source', async () => {
@@ -240,7 +259,7 @@ test('download install streams percents and finishes with the restart notice', a
     ],
     clientInfo: { platform: 'darwin', version: '1.0.0' },
   })
-  const { useAppUpdate, confirms, notices, notifications } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
+  const { useAppUpdate, confirms, notices, notifications, progressTexts } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
   await useAppUpdate().startUpdateCheck()
 
   assert.deepEqual(confirms[0], [
@@ -263,10 +282,14 @@ test('download install streams percents and finishes with the restart notice', a
     version: '1.2.3',
   })
 
-  const progress = notifications.filter(item => item.id === 'autodroid-update-progress')
-  assert.deepEqual(progress.map(item => item.message), ['正在下载 1.2.3：37%', '正在下载 1.2.3：80%'])
-  assert.equal(progress[0].duration, 0, 'progress notice stays until the terminal phase')
-  assert.equal(progress[1].closed, true, 'progress notice is closed on completion')
+  // 回归：1.0.2 每个进度事件都新开一个通知，叠出一屏「正在下载」
+  assert.equal(notifications.length, 1, '整个下载只开一个进度通知')
+  const [progress] = notifications
+  assert.equal(progress.title, '下载更新')
+  assert.equal(progress.text(), '正在下载 1.2.3：80%', '进度原地更新到最新百分比')
+  assert.deepEqual(progressTexts, ['正在下载 1.2.3：37%', '正在下载 1.2.3：80%'])
+  assert.equal(progress.duration, 0, 'progress notice stays until the terminal phase')
+  assert.equal(progress.closed, true, 'progress notice is closed on completion')
   assert.deepEqual(notices.filter(([kind]) => kind === 'success').map(([, text]) => text), ['安装完成后请重启应用'])
   assert.equal(desktop.state.unsubscribed, true)
 })
@@ -335,8 +358,8 @@ test('a failed download shows one retryable error despite event and rejection bo
 
   const errors = notices.filter(([kind]) => kind === 'error')
   assert.deepEqual(errors.map(([, text]) => text), ['更新失败：网络中断（可重试）'])
-  const progress = notifications.filter(item => item.id === 'autodroid-update-progress')
-  assert.equal(progress[progress.length - 1].closed, true, 'progress notice closes on failure')
+  assert.equal(notifications.length, 1, '失败路径同样只有一个进度通知')
+  assert.equal(notifications[0].closed, true, 'progress notice closes on failure')
 })
 
 test('a rejection without an error event still surfaces the retryable error', async () => {
@@ -550,14 +573,13 @@ test('a failing primary source surfaces the fallback notice and finishes on the 
       return { launched: true, path: '/updates/AutoDroid-1.2.3-arm64.dmg' }
     },
   })
-  const { useAppUpdate, notifications, confirms } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
+  const { useAppUpdate, notifications, confirms, progressTexts } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
   const app = useAppUpdate()
   await app.startUpdateCheck()
 
   assert.equal(confirms[0][1], '发现新版本')
   assert.equal(desktop.state.installCalls.length, 2, '主源失败自动切备用源')
   assert.equal(desktop.state.installCalls[1].url, release.url)
-  const warning = notifications.find(item => item.type === 'warning')
-  assert.ok(warning, '回退时提示主源不可用')
-  assert.match(warning.message, /正在改用备用源/)
+  assert.equal(notifications.length, 1, '切换备用源也复用同一个进度通知')
+  assert.ok(progressTexts.some(text => /正在改用备用源/.test(text)), '回退时提示主源不可用')
 })
