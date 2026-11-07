@@ -215,7 +215,9 @@ function handleClose(event) {
   // WDA / MJPEG 上游不可用：需要用户到设备中心处理，不做自动重连
   if (code === 4005 || reason.includes('P1005_WDA_UNAVAILABLE')) {
     status.value = 'wda-down'
-    statusDetail.value = 'WDA 不可用，请到「设备中心」检测/启动 WDA 后重试'
+    // 关闭原因带具体原因时直接展示（如设备未连接 / 描述文件过期），否则给通用指引
+    const cause = reason.replace(/^P1005_WDA_UNAVAILABLE[:：]?\s*/, '').trim()
+    statusDetail.value = cause ? `WDA 不可用：${cause}` : 'WDA 不可用，请到「设备中心」检测/启动 WDA 后重试'
     emit('wda-unavailable', reason)
     emit('error', reason || 'WDA 不可用')
     return

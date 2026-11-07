@@ -371,6 +371,7 @@ const deviceUnavailableReason = (device) => {
   if (!device) return ''
   if (device.status === 'WDA_DOWN') return 'WDA 未就绪'
   if (device.status === 'BUSY') return '设备正忙'
+  if (device.status === 'FASTBOT_RUNNING') return '正在跑稳定性测试'
   return ''
 }
 

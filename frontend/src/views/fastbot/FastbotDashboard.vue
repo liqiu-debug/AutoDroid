@@ -329,10 +329,7 @@ onUnmounted(() => {
                         :disabled="d.status !== 'IDLE'"
                     >
                         <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-                            <span>
-                                <el-tag v-if="isIosDevice(d)" size="small" type="info" effect="plain" class="platform-tag">iOS</el-tag>
-                                {{ d.custom_name || d.market_name || d.model || d.device_name || d.serial }}
-                            </span>
+                            <span>{{ d.custom_name || d.market_name || d.model || d.device_name || d.serial }}</span>
                             <el-tag :type="statusTagType(d.status)" size="small">{{ statusLabel(d.status) }}</el-tag>
                         </div>
                     </el-option>
@@ -354,7 +351,6 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.platform-tag { margin-right: 6px; }
 .ios-tip { margin-top: 10px; font-size: 12px; line-height: 1.6; color: var(--ad-text-secondary, #909399); }
 .advanced-options { border-top: 1px solid var(--ad-border); margin-top: 12px; padding-top: 12px; }
 .advanced-options summary { cursor: pointer; color: var(--ad-text); font-size: 13px; font-weight: 600; padding-bottom: 12px; }

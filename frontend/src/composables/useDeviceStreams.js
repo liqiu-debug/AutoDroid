@@ -27,8 +27,9 @@ export function useDeviceStreams({ liveMode, isStageActive }) {
   const selectedRecordingPlatform = computed(() =>
     String(selectedRecordingDevice.value?.platform || 'android').toLowerCase()
   )
+  // 执行中 / 跑稳定性测试中：只读观察实时画面，不能录制（iOS 录制还会顶掉测试的 WDA 会话）
   const isSelectedDeviceBusy = computed(() =>
-    String(selectedRecordingDevice.value?.status || '').toUpperCase() === 'BUSY'
+    ['BUSY', 'FASTBOT_RUNNING'].includes(String(selectedRecordingDevice.value?.status || '').toUpperCase())
   )
   const isIosLivePreview = computed(() =>
     Boolean(liveMode.value && selectedSerial.value && selectedRecordingPlatform.value === 'ios')
