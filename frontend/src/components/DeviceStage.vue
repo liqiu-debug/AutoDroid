@@ -218,7 +218,7 @@ function ensureInteractionReady(actionLabel = '录制') {
     return false
   }
 
-  if (String(device.status || '').toUpperCase() === 'BUSY') {
+  if (isSelectedDeviceBusy.value) {
     ElMessage.warning(`当前设备正在执行任务，暂不支持${actionLabel}，可继续观察实时投屏`)
     return false
   }
@@ -590,13 +590,13 @@ onUnmounted(() => {
 
 /** 状态标签类型映射 */
 const statusTagType = (status) => {
-  const map = { IDLE: 'success', BUSY: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
+  const map = { IDLE: 'success', BUSY: 'danger', FASTBOT_RUNNING: 'danger', OFFLINE: 'info', WDA_DOWN: 'warning' }
   return map[status] || 'info'
 }
 
 /** 状态中文映射 */
 const statusLabel = (status) => {
-  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
+  const map = { IDLE: '🟢 空闲', BUSY: '🔴 执行中', FASTBOT_RUNNING: '🔴 跑测中', OFFLINE: '⚫ 离线', WDA_DOWN: '🟠 WDA异常' }
   return map[status] || status
 }
 
