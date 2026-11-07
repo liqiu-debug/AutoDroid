@@ -1729,6 +1729,10 @@ def _run_migrations_with_conn(conn) -> None:
             ("20261026_038_steps_version", _migrate_steps_version_columns),
             # 补 compatibilityrun.client_executed（桌面本地回放执行标记）
             ("20261026_039_compatibility_client_executed", _migrate_compatibility_client_executed),
+            # 复用 _migration_add_columns（幂等按列检查），补 apppackage.changelog（更新提示）。
+            # 此前只把列加进 _migration_add_columns 的清单、没有新版本号：已跑过 001 的生产库
+            # 不会再执行它，缺列导致包管理列表 / 客户端检查更新全部 500。
+            ("20261107_040_apppackage_changelog", _migration_add_columns),
         ]
 
         for version, migration_func in migration_plan:

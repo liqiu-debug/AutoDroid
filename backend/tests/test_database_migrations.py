@@ -234,7 +234,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 38)
+        self.assertEqual(len(rows), 39)
         self.assertIn(("20260930_028_api_testing",), rows)
         self.assertIn(("20260930_029_api_testing_owners",), rows)
         self.assertIn(("20261026_034_device_owner_id",), rows)
@@ -245,6 +245,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("run_id", {c[1] for c in self._table_columns("fastbottask")})
         self.assertIn(("20261026_038_steps_version",), rows)
         self.assertIn(("20261026_039_compatibility_client_executed",), rows)
+        self.assertIn(("20261107_040_apppackage_changelog",), rows)
         self.assertIn(
             "client_executed",
             {c[1] for c in self._table_columns("compatibilityrun")},
@@ -821,6 +822,27 @@ class DatabaseMigrationsTests(unittest.TestCase):
             for row in self.conn.execute("SELECT version FROM schema_migration").fetchall()
         }
         self.assertIn("20260711_010_testcasestep_retry_count", versions)
+
+    def test_apppackage_changelog_added_for_db_upgraded_through_039(self):
+        """生产库已跑完 001~039（changelog 加进 001 清单之前）：由 040 补 apppackage.changelog。
+
+        缺列时包管理列表与客户端检查更新查询全部 500（no such column: apppackage.changelog）。
+        """
+        _run_migrations_with_conn(self.conn)
+        self.conn.execute("ALTER TABLE apppackage DROP COLUMN changelog")
+        self.conn.execute("DELETE FROM schema_migration WHERE version = '20261107_040_apppackage_changelog'")
+        self.conn.commit()
+        self.assertNotIn("changelog", {c[1] for c in self._table_columns("apppackage")})
+
+        _run_migrations_with_conn(self.conn)
+
+        self.assertIn("changelog", {c[1] for c in self._table_columns("apppackage")})
+        self.assertEqual(
+            self.conn.execute("SELECT changelog FROM apppackage WHERE id = 1").fetchone(), ("",),
+            "已有安装包的更新提示默认为空串（AppPackageRead.changelog 为 str）",
+        )
+        versions = {row[0] for row in self.conn.execute("SELECT version FROM schema_migration").fetchall()}
+        self.assertIn("20261107_040_apppackage_changelog", versions)
 
     def test_compatibility_compare_mode_added_for_existing_compat_tables(self):
         """已应用过 001~010 的旧库：由 011 版本迁移补机型对比列。"""
