@@ -234,7 +234,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn("folder_id", testscenario_cols)
 
         rows = self.conn.execute("SELECT version FROM schema_migration ORDER BY version").fetchall()
-        self.assertEqual(len(rows), 39)
+        self.assertEqual(len(rows), 40)
         self.assertIn(("20260930_028_api_testing",), rows)
         self.assertIn(("20260930_029_api_testing_owners",), rows)
         self.assertIn(("20261026_034_device_owner_id",), rows)
@@ -246,6 +246,7 @@ class DatabaseMigrationsTests(unittest.TestCase):
         self.assertIn(("20261026_038_steps_version",), rows)
         self.assertIn(("20261026_039_compatibility_client_executed",), rows)
         self.assertIn(("20261107_040_apppackage_changelog",), rows)
+        self.assertIn(("20261108_041_device_display_names",), rows)
         self.assertIn(
             "client_executed",
             {c[1] for c in self._table_columns("compatibilityrun")},

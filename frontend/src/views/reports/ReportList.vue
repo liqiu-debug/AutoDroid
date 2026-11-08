@@ -4,6 +4,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { Search, Refresh, Timer, Download, Delete, View, CircleClose, TrendCharts, MoreFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
 import { runStatusTagType, runSourceLabel } from '@/utils/statusMeta'
@@ -76,7 +77,8 @@ const reportErrors = ref({})
 
 const fetchDevices = async () => {
     try {
-        const { data } = await api.getFastbotDevices()
+        // 全量设备列表：/fastbot/devices 默认不返回 iOS 设备，iOS 报告行会退回显示设备编号
+        const { data } = await api.getDeviceList({ timeout: 30000 })
         const map = {}
         data.forEach(d => {
             map[d.serial] = d
@@ -88,27 +90,8 @@ const fetchDevices = async () => {
 }
 
 const formatDeviceName = (deviceSerial, fallbackInfo) => {
-    const dev = deviceSerial ? devicesMap.value[deviceSerial] : null
-    if (dev) {
-        const namePart = dev.custom_name || dev.market_name || dev.model
-        if (namePart) return namePart
-    }
-
-    const serial = String(deviceSerial || '').trim()
-    const info = String(fallbackInfo || '').trim()
-
-    // Handle historical data format "Model (serial)" -> "Model"
-    if (info) {
-        const cleanedInfo = info.replace(/\s*\([^)]+\)$/, '').trim()
-        if (cleanedInfo) return cleanedInfo
-    }
-
-    // iOS UDID / serial-like fallback should not be shown in report center.
-    const serialLike = /^[0-9A-Za-z-]{8,}$/.test(serial)
-    if (serialLike) return '未知设备'
-    return serial || '未知设备'
+    return deviceNameFromRecord(deviceSerial, devicesMap.value[deviceSerial], fallbackInfo, '未知设备')
 }
-
 const fetchData = async () => {
     loading.value = true
     reportErrors.value.ui = ''
@@ -429,14 +412,7 @@ const handleInspectionCommand = (command, row) => {
     if (command === 'delete' && !isInspectionRunActive(row)) handleInspectionDelete(row)
 }
 
-const resolveDeviceForRow = (item) => {
-    const dev = devicesMap.value[item.device_serial]
-    if (dev) {
-        const p = dev.custom_name || dev.market_name || dev.model
-        if (p) return p
-    }
-    return item.device_serial
-}
+const resolveDeviceForRow = (item) => formatDeviceName(item.device_serial, item.device_info)
 
 const fbTasksWithDevice = computed(() => (
     fbTasks.value.map(item => ({ ...item, _resolved_device: resolveDeviceForRow(item) }))

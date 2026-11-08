@@ -33,6 +33,7 @@ from backend.autojs_export.precheck import precheck_case_script
 from backend.database import get_session
 from backend.device_presence import is_app_device
 from backend.execution_errors import suggestion_for
+from backend.ios_models import ios_marketing_name
 from backend.models import (
     CaseFolder,
     Device,
@@ -79,6 +80,9 @@ class DeviceRunTaskCreate(BaseModel):
     device_serial: Optional[str] = None
     name: Optional[str] = None
     platform: Optional[str] = None
+
+
+LEGACY_IOS_APP_DEFAULT_NAMES = frozenset({"AutoDroid · iPhone", "AutoDroid · iPad", "AutoDroid · iPod touch"})
 
 
 class DeviceRegisterPayload(BaseModel):
@@ -314,7 +318,8 @@ def register_device(
     device.app_executor_status = payload.executor_status if payload.executor_status in {"READY", "NOT_READY", "RUNNING"} else "UNKNOWN"
     device.status = "BUSY" if device.app_executor_status == "RUNNING" else "IDLE"
     if payload.model:
-        device.model = str(payload.model)
+        # iOS App 上报机型标识（iPhone15,2）→ 市场名；Android 原样
+        device.model = ios_marketing_name(payload.model) if platform == "ios" else str(payload.model)
     if payload.brand:
         device.brand = str(payload.brand)
     os_version = str(payload.os_version or payload.android_version or "").strip()
@@ -326,6 +331,10 @@ def register_device(
         device.resolution = str(payload.resolution)
     if payload.name:
         device.custom_name = str(payload.name)
+    elif device.custom_name in LEGACY_IOS_APP_DEFAULT_NAMES:
+        # 旧版 iOS App 每次心跳上报「AutoDroid · iPhone」（UIDevice.model 只有 iPhone/iPad），
+        # 盖住了型号；新版不再上报 name，清掉旧默认名让型号显示出来
+        device.custom_name = None
     if device.status == "OFFLINE":
         device.status = "IDLE"
     device.updated_at = now

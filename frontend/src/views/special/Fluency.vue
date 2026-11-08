@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { VideoPlay, VideoPause, Position, Timer } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import { useClientApp } from '@/composables/useClientApp'
 import { createPollingLoop } from '@/utils/polling'
 
@@ -60,7 +61,8 @@ const recentSessions = computed(() => sessions.value)
 const fetchDevices = async () => {
     devicesLoading.value = true
     try {
-        const res = await api.getFastbotDevices()
+        // include_ios：历史行可能记着 iOS 设备，缺了会退回显示设备编号（可选设备仍只列 Android）
+        const res = await api.getFastbotDevices({ include_ios: true })
         devices.value = res.data || []
         if (!form.device_serial && availableDevices.value.length > 0) {
             form.device_serial = availableDevices.value[0].serial
@@ -202,11 +204,8 @@ const statusTagType = (status) => {
     return 'info'
 }
 const formatDeviceName = (serial) => {
-    const device = devices.value.find(item => item.serial === serial)
-    if (!device) return serial || '未知设备'
-    return device.custom_name || device.market_name || device.model || device.serial
+    return deviceNameFromRecord(serial, devices.value.find(item => item.serial === serial), undefined, '未知设备')
 }
-
 // 录制会话 8s 轮询：在途不重叠 + 页面隐藏即暂停（utils/polling.js 统一门闩）
 const SESSION_POLL_INTERVAL_MS = 8000
 const sessionPollLoop = createPollingLoop({

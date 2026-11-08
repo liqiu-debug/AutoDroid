@@ -3,6 +3,7 @@ import { ref, watch, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import {
     runStatusTagType,
     runStatusLabel,
@@ -83,8 +84,7 @@ const formatDelta = (value, formatter) => {
 
 const deviceLabel = (meta) => {
     if (!meta) return '-'
-    const info = String(meta.device_info || '').replace(/\s*\([^)]+\)$/, '').trim()
-    return info || meta.device_serial || '-'
+    return deviceNameFromRecord(meta.device_serial, null, meta.device_info, '-')
 }
 
 const stepDisplayName = (row) => {

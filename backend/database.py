@@ -1733,6 +1733,9 @@ def _run_migrations_with_conn(conn) -> None:
             # 此前只把列加进 _migration_add_columns 的清单、没有新版本号：已跑过 001 的生产库
             # 不会再执行它，缺列导致包管理列表 / 客户端检查更新全部 500。
             ("20261107_040_apppackage_changelog", _migration_add_columns),
+            # iOS 设备展示名纠正：model 里的机型标识（iPhone18,2）译成市场名；market_name 里
+            # 服务端同步曾写入的手机名（DeviceName，如「刘鸿的iPhone」）清掉，让型号显示出来
+            ("20261108_041_device_display_names", _migrate_device_display_names),
         ]
 
         for version, migration_func in migration_plan:
@@ -1750,6 +1753,45 @@ def _run_migrations_with_conn(conn) -> None:
     finally:
         if restore_foreign_keys:
             cursor.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_device_display_names(cursor) -> None:
+    """设备展示名数据纠正（2026-11-08 排查「报告里显示设备编号」）。
+
+    - iOS device.model 里的机型标识（iPhone18,2）译成市场名（iPhone 17 Pro Max）；
+    - iOS device.market_name 曾被服务端同步写成手机名（DeviceName，如「刘鸿的iPhone」），
+      清空让型号显示出来；
+    - 桌面客户端执行记录的旧占位「桌面客户端 · <序列号>」换成展示名快照（设备不存在则保留）。
+    """
+    from backend.ios_models import ios_marketing_name, is_product_type
+
+    if _table_has_columns(cursor, "device", ("id", "serial", "platform", "model", "market_name")):
+        rows = cursor.execute(
+            "SELECT id, model, market_name FROM device WHERE lower(coalesce(platform, '')) = 'ios'"
+        ).fetchall()
+        for device_id, model, market_name in rows:
+            new_model = ios_marketing_name(model) if is_product_type(model) else model
+            if new_model != model or market_name is not None:
+                cursor.execute(
+                    "UPDATE device SET model = ?, market_name = NULL WHERE id = ?",
+                    (new_model, device_id),
+                )
+
+    if not _table_has_columns(cursor, "testexecution", ("id", "device_serial", "device_info")):
+        return
+    legacy_rows = cursor.execute(
+        "SELECT id, device_serial, device_info FROM testexecution WHERE device_info LIKE '桌面客户端 · %'"
+    ).fetchall()
+    for execution_id, serial, info in legacy_rows:
+        row = cursor.execute(
+            "SELECT custom_name, market_name, model FROM device WHERE serial = ?", (serial,)
+        ).fetchone()
+        display = None
+        if row:
+            custom_name, market_name, model = row
+            display = custom_name or market_name or model or None
+        if display and display != info:
+            cursor.execute("UPDATE testexecution SET device_info = ? WHERE id = ?", (display, execution_id))
 
 
 def _run_migrations():

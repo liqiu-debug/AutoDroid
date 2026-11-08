@@ -28,6 +28,7 @@ from sqlmodel import Session, col, select
 from backend.api.deps import get_current_user
 from backend.api.devices import _build_device_reads
 from backend.database import get_session
+from backend.ios_models import ios_marketing_name
 from backend.models import Device, User
 from backend.schemas import DeviceRead
 
@@ -44,6 +45,8 @@ class ClientDeviceRegisterRequest(BaseModel):
     os_version: str
     resolution: str
     custom_name: Optional[str] = None
+    # Android 厂商市场型号（ro.product.marketname 等，如「OPPO Reno14 Pro」；model 是 PKZ110）
+    market_name: Optional[str] = None
     connection_type: Optional[str] = None
     client_instance_id: Optional[str] = None
 
@@ -103,7 +106,13 @@ def register_client_device(
         # 归属 + 元数据刷新：必填字段直接覆盖，可选字段仅在显式提供时写入
         device.owner_id = current_user.id
         device.platform = platform
-        device.model = str(payload.model or "Unknown")
+        model = str(payload.model or "Unknown")
+        device.model = ios_marketing_name(model) if platform == "ios" else model
+        market_name = str(payload.market_name or "").strip()
+        if market_name and market_name != device.model:
+            device.market_name = market_name
+        elif platform == "ios":
+            device.market_name = None  # 历史上服务端同步写进来的手机名（见 devices.py iOS 同步）
         device.brand = str(payload.brand or "")
         device.android_version = str(payload.android_version or "")
         device.os_version = str(payload.os_version or "")

@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { VideoPlay, Refresh, View } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import api from '@/api'
+import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import { runStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useClientApp } from '@/composables/useClientApp'
 import { createPollingLoop } from '@/utils/polling'
@@ -73,7 +74,8 @@ const startupModes = computed(() => {
 const fetchDevices = async () => {
     devicesLoading.value = true
     try {
-        const res = await api.getFastbotDevices()
+        // include_ios：历史行可能记着 iOS 设备，缺了会退回显示设备编号（可选设备仍只列 Android）
+        const res = await api.getFastbotDevices({ include_ios: true })
         devices.value = res.data || []
         if (selectedDevices.value.length === 0 && availableDevices.value.length > 0) {
             selectedDevices.value = [availableDevices.value[0].serial]
@@ -179,8 +181,7 @@ const formatMs = (value) => {
     return Number.isFinite(num) ? `${num} ms` : '-'
 }
 const formatDeviceName = (serial) => {
-    const device = devices.value.find(item => item.serial === serial)
-    return device?.custom_name || device?.market_name || device?.model || serial || '未知设备'
+    return deviceNameFromRecord(serial, devices.value.find(item => item.serial === serial), undefined, '未知设备')
 }
 const formatModes = (task) => {
     const modes = task.summary?.startup_config?.startup_modes || []
