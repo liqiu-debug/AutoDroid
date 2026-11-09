@@ -46,6 +46,7 @@ from backend.api.autojs import (
 )
 from backend.database import get_session
 from backend.models import (
+    Device,
     TestCase,
     TestExecution,
     TestScenario,
@@ -131,6 +132,21 @@ class ClientRunFinishPayload(BaseModel):
 # --------------------------------------------------------------------------- #
 #  执行记录状态（用例报告条目暂存）
 # --------------------------------------------------------------------------- #
+def _client_device_display(session: Session, device_serial: Optional[str]) -> str:
+    """执行记录的设备展示名快照（同 scenario_execution._resolve_device_meta 口径）。
+
+    设备之后被删除 / 改名，历史报告仍显示执行时的型号，而不是一串序列号。
+    """
+    if not device_serial:
+        return "桌面客户端"
+    device = session.exec(select(Device).where(Device.serial == device_serial)).first()
+    if device is not None:
+        display = device.custom_name or device.market_name or device.model
+        if display:
+            return str(display)
+    return f"桌面客户端 · {device_serial}"
+
+
 def _run_state_path(execution_id: int) -> Path:
     return project_path("reports", "client_runs", f"exec_{execution_id}.json")
 
@@ -357,7 +373,7 @@ def _create_client_run_locked(
         executor_name=current_user.full_name or current_user.username,
         device_serial=device_serial,
         platform=normalize_platform(payload.platform),
-        device_info=f"桌面客户端 · {device_serial}" if device_serial else "桌面客户端",
+        device_info=_client_device_display(session, device_serial),
         batch_id=run_id,
         batch_name=display_name,
         run_source=run_source,

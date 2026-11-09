@@ -731,7 +731,7 @@ defineExpose({
       @mousedown="onCanvasMouseDown"
       @mouseup="onCanvasMouseUp"
       @click="onCanvasClick"
-      v-loading="loading"
+      v-loading="loading && (!isIosLivePreview || isAnyCropMode)"
       element-loading-text="正在执行操作..."
     >
       <img
@@ -748,11 +748,12 @@ defineExpose({
       <!--
         iOS 实时画面层（WDA MJPEG）：只读预览，鼠标事件穿透到底层静态画布。
         点击 / 悬停 / 框选仍基于"静态截图 + 层级"坐标系，保证录制正确性；
-        框选或快捷图像提示期间隐藏实时层，露出真实的截取源画面（静态截图）。
+        框选期间隐藏实时层，露出真实的截取源画面（静态截图）。
+        实时模式下操作不盖加载蒙层（与 Android 投屏一致），画面本身就是反馈。
       -->
       <IosMjpegPlayer
         v-if="isIosLivePreview"
-        v-show="!isAnyCropMode && !quickImagePrompt"
+        v-show="!isAnyCropMode"
         class="ios-live-layer"
         :serial="selectedSerial"
         @streaming="iosStreamHealthy = true"

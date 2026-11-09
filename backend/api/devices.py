@@ -1917,7 +1917,9 @@ async def sync_devices(
                 existing.model = ios_dev["model"]
                 existing.brand = "APPLE"
                 existing.os_version = ios_dev["os_version"]
-                existing.market_name = ios_dev["name"]
+                # market_name 在 Android 上是厂商市场型号；iOS 的 DeviceName 是用户给手机起的名字
+                # （如「刘鸿的iPhone」），写进来会盖住型号——型号已在 model 里
+                existing.market_name = None
                 existing.connection_type = ios_dev.get("connection_type")
                 existing.status = _resolve_ios_device_status(existing.status, wda_healthy)
                 existing.updated_at = datetime.now()
@@ -1929,7 +1931,7 @@ async def sync_devices(
                     model=ios_dev["model"],
                     brand="APPLE",
                     os_version=ios_dev["os_version"],
-                    market_name=ios_dev["name"],
+                    market_name=None,
                     connection_type=ios_dev.get("connection_type"),
                     owner_id=getattr(current_user, "id", None),
                     status=_resolve_ios_device_status(None, wda_healthy),

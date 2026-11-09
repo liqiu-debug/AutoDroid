@@ -460,6 +460,24 @@ export function useScreenCrop({
       return
     }
 
+    // iOS 实时模式：底层静态截图是低频兜底（可能落后几秒），截模板前换成当前画面
+    if (isIosLivePreview.value) {
+      loading.value = true
+      try {
+        const res = await api.getDeviceDump(selectedSerial.value, {
+          includeScreenshot: true,
+          includeHierarchy: true,
+          includeDeviceInfo: shouldRequestDeviceInfo()
+        })
+        updateStateFromDump(res.data)
+      } catch (err) {
+        ElMessage.error('切换图像点击失败: ' + getErrorDetail(err, '获取设备截图失败'))
+        return
+      } finally {
+        loading.value = false
+      }
+    }
+
     activateQuickImageCaptureDraft(draft)
   }
 

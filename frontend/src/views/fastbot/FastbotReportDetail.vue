@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import { connect, disconnect } from 'echarts/core'
 import StatCard from './components/StatCard.vue'
 import StartupReportSection from './components/StartupReportSection.vue'
@@ -61,7 +62,8 @@ const fetchData = async () => {
         const [taskRes, reportRes, deviceRes] = await Promise.all([
             api.getFastbotTask(taskId),
             api.getFastbotReport(taskId),
-            api.getDeviceList().catch(() => ({ data: [] }))
+            // 8s 轮询超时在慢链路上会被吞掉（map 为空 → 设备栏显示设备编号），给足超时
+            api.getDeviceList({ timeout: 30000 }).catch(() => ({ data: [] }))
         ])
         task.value = taskRes.data
         report.value = reportRes.data
@@ -82,19 +84,8 @@ const fetchData = async () => {
 }
 
 const formatDeviceName = (identifier) => {
-    if (!identifier) return '未知设备'
-    const dev = devicesMap.value[identifier]
-    if (dev) {
-        const namePart = dev.custom_name || dev.market_name || dev.model
-        if (namePart) return namePart
-    }
-    // Strip trailing parenthesized serial from DB historical strings
-    if (typeof identifier === 'string') {
-        return identifier.replace(/\s*\([^)]+\)$/, '')
-    }
-    return identifier
+    return deviceNameFromRecord(identifier, devicesMap.value[identifier], identifier, '未知设备')
 }
-
 const perfData = computed(() => report.value?.performance_data || [])
 const jankData = computed(() => report.value?.jank_data || [])
 const jankEvents = computed(() => report.value?.jank_events || [])

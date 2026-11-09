@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft, Monitor, Timer, User, Picture, View, Switch } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
 import { runStatusTagType as getStatusTagType, runSourceLabel } from '@/utils/statusMeta'
@@ -100,24 +101,8 @@ const fetchDevices = async () => {
 
 const formatDeviceName = (deviceSerial, fallbackInfo) => {
     const dev = deviceSerial ? devices.value.find(d => d.serial === deviceSerial) : null
-    if (dev) {
-        const name = dev.custom_name || dev.market_name || dev.model
-        if (name) return name
-    }
-
-    const serial = String(deviceSerial || '').trim()
-    const info = String(fallbackInfo || '').trim()
-
-    if (info) {
-        const cleanedInfo = info.replace(/\s*\([^)]+\)$/, '').trim()
-        if (cleanedInfo) return cleanedInfo
-    }
-
-    const serialLike = /^[0-9A-Za-z-]{8,}$/.test(serial)
-    if (serialLike) return 'Unknown Device'
-    return serial || 'Unknown Device'
+    return deviceNameFromRecord(deviceSerial, dev, fallbackInfo, 'Unknown Device')
 }
-
 const normalizeStatus = (status) => String(status || '').toUpperCase()
 
 const translateStepDesc = (desc) => {

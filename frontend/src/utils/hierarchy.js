@@ -83,12 +83,21 @@ export const parseHierarchy = (xml, deviceInfoPayload = null) => {
   const doc = parser.parseFromString(xml, 'text/xml')
   const result = []
   const coordinateScale = resolveHierarchyScale(deviceInfoPayload)
+  // iOS 滚动内容可远超屏幕（相册容器是屏幕的 3.5 倍）：面积只算屏幕内部分，否则「占屏比」全部失真
+  const iosScreen = String(doc.documentElement?.getAttribute?.('type') || '').includes('XCUIElementTypeApplication')
+    ? parseNodeBounds(doc.documentElement, coordinateScale)
+    : null
+  const screenArea = iosScreen ? (iosScreen.x2 - iosScreen.x1) * (iosScreen.y2 - iosScreen.y1) : undefined
 
   const traverse = (node, depth = 0) => {
     if (node.nodeType === 1) {
       const bounds = parseNodeBounds(node, coordinateScale)
       if (bounds) {
         const { x1, y1, x2, y2 } = bounds
+        const area = iosScreen
+          ? Math.max(0, Math.min(x2, iosScreen.x2) - Math.max(x1, iosScreen.x1))
+            * Math.max(0, Math.min(y2, iosScreen.y2) - Math.max(y1, iosScreen.y1))
+          : Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
         const hasElementChildren = Array.from(node.childNodes || []).some(child => child.nodeType === 1)
         const className = node.getAttribute('class') || node.getAttribute('type') || node.nodeName || ''
         if (!shouldSkipCanvasNode(className, depth)) {
@@ -104,7 +113,8 @@ export const parseHierarchy = (xml, deviceInfoPayload = null) => {
             depth,
             childCount: Array.from(node.childNodes || []).filter(child => child.nodeType === 1).length,
             isLeaf: !hasElementChildren,
-            area: Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+            area,
+            ...(screenArea ? { screenArea } : {})
           })
         }
       }

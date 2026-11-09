@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection, Link, Download, CopyDocument } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import api from '@/api'
+import { deviceDisplayName } from '@/utils/deviceName'
 import { hasSessionToken } from '@/utils/sessionExpiry'
 import { createPollingLoop } from '@/utils/polling'
 import ScrcpyPlayer from '@/components/ScrcpyPlayer.vue'
@@ -53,6 +54,9 @@ const agentProbeLoadingId = ref(null)
 
 // 快照弹窗：Android 默认嵌实时投屏（避免整图截图挤占远程链路带宽），
 // iOS 或投屏不可用时回落到静态截图
+// 展示名（用户改名 > 市场型号 > model > 序列号）；弹窗文案不再直接用 model
+const deviceTitle = (device) => deviceDisplayName(device, device?.serial || '')
+
 const screenshotVisible = ref(false)
 const screenshotLoading = ref(false)
 const screenshotData = ref('')
@@ -197,7 +201,7 @@ const refreshScreenshot = async (serial) => {
 const handleUnlock = async (device) => {
   try {
     await api.unlockDevice(device.serial)
-    ElMessage.success(`设备 ${device.model} 已释放`)
+    ElMessage.success(`设备 ${deviceTitle(device)} 已释放`)
     await fetchDevices()
   } catch (e) {
     ElMessage.error('释放失败：' + (e.response?.data?.detail || e.message))
@@ -220,7 +224,7 @@ const handleMaintenance = (command, device) => {
 const handleStopExecution = async (device) => {
   try {
     await ElMessageBox.confirm(
-      `确定要停止 ${device.custom_name || device.market_name || device.model || device.serial} 当前执行吗？`,
+      `确定要停止 ${deviceTitle(device)} 当前执行吗？`,
       '停止当前设备执行',
       { type: 'warning', confirmButtonText: '停止执行', cancelButtonText: '取消' }
     )
@@ -242,12 +246,12 @@ const handleStopExecution = async (device) => {
 const handleReboot = async (device) => {
   try {
     await ElMessageBox.confirm(
-      `确定要重启设备 ${device.model} (${device.serial}) 吗？设备将暂时离线。`,
+      `确定要重启设备 ${deviceTitle(device)} (${device.serial}) 吗？设备将暂时离线。`,
       '确认重启',
       { type: 'warning', confirmButtonText: '确定重启', cancelButtonText: '取消' }
     )
     await api.rebootDevice(device.serial)
-    ElMessage.success(`设备 ${device.model} 正在重启`)
+    ElMessage.success(`设备 ${deviceTitle(device)} 正在重启`)
     await fetchDevices()
   } catch (e) {
     if (e !== 'cancel') {
@@ -326,7 +330,7 @@ const handleDeleteDevice = async (device) => {
   if (!isDeviceOffline(device)) return
   try {
     await ElMessageBox.confirm(
-      `确定要删除设备 ${device.model} (${device.serial}) 的信息吗？删除后可通过同步物理设备重新发现。`,
+      `确定要删除设备 ${deviceTitle(device)} (${device.serial}) 的信息吗？删除后可通过同步物理设备重新发现。`,
       '确认删除设备',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
     )
@@ -352,11 +356,11 @@ const handleCheckWda = async (device) => {
     device.status = data.status || device.status
     if (data.wda_healthy) {
       if (data.attempted_start) {
-        ElMessage.success(`设备 ${device.model} WDA 启动成功`)
+        ElMessage.success(`设备 ${deviceTitle(device)} WDA 启动成功`)
       } else if (data.recovered_by_cleanup) {
-        ElMessage.success(`设备 ${device.model} WDA 已修复`)
+        ElMessage.success(`设备 ${deviceTitle(device)} WDA 已修复`)
       } else {
-        ElMessage.success(`设备 ${device.model} WDA 正常`)
+        ElMessage.success(`设备 ${deviceTitle(device)} WDA 正常`)
       }
     } else {
       ElMessage.warning(data.error || 'WDA 启动失败，请检查 WebDriverAgent 与 tidevice 环境')
@@ -403,7 +407,7 @@ const handleDisableWireless = async (device) => {
 /** 进入就地编辑模式 */
 const startEditing = (device) => {
   editingSerial.value = device.serial
-  editingName.value = device.custom_name || device.market_name || device.model
+  editingName.value = deviceDisplayName(device, device.serial)
   nextTick(() => {
     // 自动聚焦：通过 ref 或 DOM 查询
     const input = document.querySelector('.inline-edit-input input')
@@ -600,7 +604,7 @@ onBeforeUnmount(() => {
 
     <el-dialog
       v-model="screenshotVisible"
-      :title="`实时屏幕快照 — ${screenshotDevice?.model || ''}`"
+      :title="`实时屏幕快照 — ${deviceDisplayName(screenshotDevice, '')}`"
       width="92%"
       align-center
       destroy-on-close
@@ -756,11 +760,12 @@ onBeforeUnmount(() => {
                 </div>
                 <!-- 展示模式 -->
                 <button v-else type="button" class="device-name-display" aria-label="修改设备名称" @click="startEditing(device)">
-                  <span class="device-title">{{ device.custom_name || device.market_name || device.model }}</span>
+                  <span class="device-title">{{ deviceDisplayName(device, '') }}</span>
                   <el-icon class="edit-icon" :size="13"><Edit /></el-icon>
                 </button>
                 <!-- 用户修改了名称时，显示 market_name；否则显示 model（如果不同于 market_name） -->
                 <span v-if="device.custom_name && device.market_name && device.market_name !== device.custom_name" class="device-model-sub">{{ device.market_name }}</span>
+                <span v-else-if="device.custom_name && !device.market_name && device.model && device.model !== device.custom_name" class="device-model-sub">{{ device.model }}</span>
                 <span v-else-if="!device.custom_name && device.market_name && device.market_name !== device.model" class="device-model-sub">{{ device.model }}</span>
               </div>
               <div class="card-header-tags">
@@ -829,7 +834,7 @@ onBeforeUnmount(() => {
     <!-- 快照弹窗 -->
     <el-dialog
       v-model="screenshotVisible"
-      :title="`实时屏幕快照 — ${screenshotDevice?.model || ''}`"
+      :title="`实时屏幕快照 — ${deviceDisplayName(screenshotDevice, '')}`"
       width="420px"
       align-center
       destroy-on-close
@@ -925,7 +930,7 @@ onBeforeUnmount(() => {
     <el-select v-model="bindingSerial" placeholder="选择同平台设备" clearable style="width: 100%">
       <el-option label="不绑定（分别显示）" value="" />
       <el-option v-for="item in bindingOptions" :key="item.serial" :value="item.serial"
-        :label="`${item.custom_name || item.market_name || item.model} · ${item.serial}`" />
+        :label="`${deviceDisplayName(item, '')} · ${item.serial}`" />
     </el-select>
     <template #footer>
       <el-button @click="bindingDevice = null">取消</el-button>
