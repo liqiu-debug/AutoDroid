@@ -1,6 +1,6 @@
 # CI 集成指南（API Token）
 
-本指南介绍如何让外部 CI 系统（Jenkins、GitLab CI、GitHub Actions 等）通过 **API Token** 调用 AutoDroid 接口，打通「App 代码合并 -> 上传新包 -> 自动触发场景/巡检/兼容性任务 -> 轮询结果 -> 判定流水线成败」的完整链路。
+本指南介绍如何让外部 CI 系统（Jenkins、GitLab CI、GitHub Actions 等）通过 **API Token** 调用 AutoDroid 接口，打通「App 代码合并 -> 上传新包 -> 自动触发场景/兼容性任务 -> 轮询结果 -> 判定流水线成败」的完整链路。
 
 ## 1. API Token 是什么
 
@@ -18,8 +18,7 @@
 | 中止执行（`POST /api/runs/cancel`） | ✅ | |
 | 查询报告 / 批次结果（`GET /api/reports/executions`） | ✅ | |
 | 查询设备（`GET /api/devices/`）、执行预检（`GET /api/scenarios/{id}/precheck`） | ✅ | |
-| 巡检配置 / 触发 / 查询 / 取消（`/api/inspections/*`） | ✅ | 继承属主业务权限；需启用 `model_inspection` |
-| 用巡检稳定路径创建兼容性任务（`POST /api/compatibility/runs`） | ✅ | `source_type=inspection` |
+| 创建/查询/取消兼容性对比任务（`/api/compatibility/runs*`） | ✅ | 来源为手动维护的页面合集 |
 | 查询/下载内容寻址资产（`GET /api/assets/*`） | ✅ | 必须带 Authorization，不提供匿名路径 |
 | 用例 / 场景 / 任务等其他业务读写 | ✅ | 与属主账号权限一致 |
 | 管理接口（`/api/admin/*`） | ❌ 403 | 机器凭证禁止管理面 |
@@ -119,160 +118,18 @@ echo "== 回归通过 =="
 - **预检**（可选）：触发前可用 `GET /api/scenarios/{id}/precheck?device_serial=xxx` 与 `GET /api/devices/`（看 `status` 是否 `IDLE`）先挑选可用设备。
 - **中止**：`POST /api/runs/cancel`，body `{"kind": "scenario", "target_id": <场景ID>, "batch_id": "<批次>"}`，用于超时兜底。
 
-## 4. 模型化智能巡检（Android）
+## 4. 兼容性对比任务（Android）
 
-巡检接口同样接受 API Token。它只支持显式指定一台 Android 设备，且服务器必须先开启
-`model_inspection` Feature Flag。Profile 中保存未登录、已登录两条业务线，用例和环境 ID
-由平台配置管理，CI 不应硬编码这些内部依赖。
+兼容性对比任务同样接受 API Token。链路是「手动维护页面合集 -> 新建对比任务 -> 轮询结果」：
 
-```bash
-PROFILE_ID="${INSPECTION_PROFILE_ID:?缺少巡检 Profile ID}"
-DEVICE_SERIAL="${INSPECTION_DEVICE_SERIAL:?缺少巡检设备}"
-PACKAGE_ID="${AUTODROID_PACKAGE_ID:-null}" # 可使用上传接口响应中的 .id
+- 页面合集（`GET/POST /api/compatibility/page-sets`）保存页面名称、进入页面用例、稳定等待时间和必需文本，是任务的唯一来源。
+- 创建任务：`POST /api/compatibility/runs`，指定对比维度（`compare_mode`：`version` 版本对比 / `device` 机型对比）、执行模式（升级兼容 / 干净安装）、旧版与新版 APK（旧版可选「当前版本」）、Android 设备列表与判定阈值（像素差异、SSIM、XML 差异）。
+- 轮询结果：`GET /api/compatibility/runs/{id}`；逐页差异图通过 `GET /api/compatibility/runs/{id}/pages/{page_result_id}/diff` 获取，资产同样必须携带 Authorization，不能当作匿名静态链接。
+- 超时兜底：`POST /api/compatibility/runs/{id}/cancel`，不要调用仅支持 case/scenario 的通用取消接口。
 
-run=$(curl -sf "${auth[@]}" -H "Content-Type: application/json" \
-  -d "{
-    \"profile_id\": $PROFILE_ID,
-    \"name\": \"CI 模型巡检 ${GIT_COMMIT:-manual}\",
-    \"device_serial\": \"$DEVICE_SERIAL\",
-    \"package_id\": $PACKAGE_ID,
-    \"branches\": [\"guest\", \"authenticated\"]
-  }" \
-  "$AUTODROID_URL/api/inspections/runs")
-inspection_run_id=$(echo "$run" | jq -r .id)
+发起任务时会把页面合集名称和页面列表复制进任务快照，后续编辑或删除页面合集不会影响历史报告判定。
 
-deadline=$(( $(date +%s) + 2400 ))
-while true; do
-  result=$(curl -sf "${auth[@]}" \
-    "$AUTODROID_URL/api/inspections/runs/$inspection_run_id")
-  status=$(echo "$result" | jq -r .status)
-  case "$status" in
-    PASS|WARNING|FAIL|ERROR|ABORTED) break ;;
-  esac
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    curl -sf -X POST "${auth[@]}" \
-      "$AUTODROID_URL/api/inspections/runs/$inspection_run_id/cancel" >/dev/null
-    echo "巡检超时并已请求取消"
-    exit 1
-  fi
-  sleep 15
-done
-
-echo "$result" | jq '{
-  id, status, total_states, total_transitions, blocked_count, stable_count, fault_count
-}'
-# CI 默认将 WARNING（预算停止/覆盖盲区）视为通过；可按项目门禁改为仅 PASS。
-[ "$status" = PASS ] || [ "$status" = WARNING ]
-```
-
-巡检报告可通过 `GET /api/inspections/runs/{id}/graph` 查询拓扑。报告资产接口要求同一
-Authorization 头，不能把资产 URL 当作匿名静态链接。取消使用巡检自己的
-`POST /api/inspections/runs/{id}/cancel`，不要调用仅支持 case/scenario 的通用取消接口。
-
-新巡检任务会在不可变的 `profile_snapshot` 中记录 `graph_hierarchy_version=2`，graph
-顶层通过 `hierarchy_version` 返回该协议版本。v2 graph link 会返回 `relation_type`
-（`SELF`、`VIEWPORT`、`PEER`、`CHILD`）和 `relation_confidence`；node 的
-`hierarchy_role` 为 `BRANCH_ROOT`、`PEER`、`PAGE`、`VIEWPORT` 或 `ORPHAN`。
-`depth` / `parent_state_id` 表示业务展示层级，真实设备回放仍以 `first_path` 为准。
-历史任务缺少版本标记时按 v1 返回，`hierarchy_role` 固定为空并继续使用旧构树逻辑，
-不会根据新关系字段重新解释历史报告。
-
-当前 Graph schema v8 在层级 v2 基础上增加页面子类型、Frontier 优先级、Observation、
-页面族代表覆盖率、Coverage Contract 和冻结回放摘要。客户端应读取响应的 `schema_version`，
-不要把固定版本写死。灰度环境可分别开启 `inspection_coverage_scheduler_v2` 与
-`inspection_visual_home_actions`；后者依赖前者。覆盖调度器按页面族代表和动作组采样，
-滚动只新增 `VIEWPORT` Observation，不创建新的业务 State。历史任务不会重算。
-
-上线真机前可用历史资产做只读离线验收：
-
-```bash
-.venv/bin/python scripts/maintenance/replay_inspection_coverage.py 22 --strict
-```
-
-严格模式会检查商品动作不超过 5、滚动动作不超过 25、viewport State 为 0，以及附近
-门店不重复执行全局导航。
-
-若要把已勾选的稳定状态作为兼容性基线，创建兼容性任务时传：
-
-```json
-{
-  "name": "CI 巡检快照回归",
-  "source_type": "inspection",
-  "inspection_run_id": 123,
-  "inspection_state_ids": [],
-  "compare_mode": "snapshot",
-  "old_package_id": null,
-  "new_package_id": 456,
-  "page_set_id": null,
-  "device_serials": ["emulator-5554"],
-  "mode": "upgrade",
-  "thresholds": {}
-}
-```
-
-空的 `inspection_state_ids` 表示使用该巡检任务中人工勾选的全部稳定状态。创建任务时，
-路径、规则及脱敏基线文件会复制进兼容性报告目录，因此后续巡检报告清理不会改变历史判定。
-
-### 4.1 当前安装版本冻结路径回放
-
-该模式不上传或安装 APK。CI 先预检设备当前安装包和冻结路径，再把返回的两个摘要原样带入
-创建请求。预检与创建之间若包版本、签名或路径计划变化，创建会失败，CI 必须重新预检。
-
-```bash
-BRANCH_KEY="${INSPECTION_BRANCH_KEY:-guest}"
-
-preflight=$(curl -sf "${auth[@]}" -H "Content-Type: application/json" \
-  -d "{
-    \"inspection_run_id\": $inspection_run_id,
-    \"branch_key\": \"$BRANCH_KEY\",
-    \"device_serial\": \"$DEVICE_SERIAL\",
-    \"max_chains\": 20
-  }" \
-  "$AUTODROID_URL/api/compatibility/replay-preflight")
-
-blockers=$(echo "$preflight" | jq '.blockers | length')
-[ "$blockers" -eq 0 ] || {
-  echo "$preflight" | jq '.blockers'
-  exit 1
-}
-
-chain_ids=$(echo "$preflight" | jq '[.chains[] | select(.replay_eligibility != "NONE") | .chain_id]')
-[ "$(echo "$chain_ids" | jq 'length')" -gt 0 ] || {
-  echo "没有可执行的冻结路径"
-  exit 1
-}
-
-payload=$(jq -n \
-  --arg name "CI 当前版本回放 ${GIT_COMMIT:-manual}" \
-  --argjson run_id "$inspection_run_id" \
-  --arg branch "$BRANCH_KEY" \
-  --arg serial "$DEVICE_SERIAL" \
-  --arg plan "$(echo "$preflight" | jq -r .plan_digest)" \
-  --arg device "$(echo "$preflight" | jq -r .device_snapshot_digest)" \
-  --argjson chains "$chain_ids" \
-  '{
-    name: $name,
-    execution_mode: "installed_replay",
-    inspection_run_id: $run_id,
-    replay_branch_key: $branch,
-    selected_chain_ids: $chains,
-    plan_digest: $plan,
-    device_snapshot_digest: $device,
-    manual_install_confirmed: true,
-    duration_seconds: 3600,
-    device_serials: [$serial]
-  }')
-
-replay=$(curl -sf "${auth[@]}" -H "Content-Type: application/json" \
-  -d "$payload" "$AUTODROID_URL/api/compatibility/runs")
-replay_run_id=$(echo "$replay" | jq -r .id)
-```
-
-`manual_install_confirmed=true` 表示调用方已确认当前设备上的版本就是待测版本，不代表平台绕过
-包身份校验。结果继续通过 `GET /api/compatibility/runs/{id}` 轮询。路径可能是完整链路，也可能
-只允许执行到安全边界前缀；CI 应根据最终 `status` 和每条链路的 terminal outcome 判定。
-
-巡检或兼容性任务在所在文件系统达到内置 `95%` 硬容量阈值时会返回 HTTP `507`。流水线应查询
+兼容性任务在所在文件系统达到内置 `95%` 硬容量阈值时会返回 HTTP `507`。流水线应查询
 `GET /api/assets/status` 并通知平台运维处理，不能把 507 当成产品回归失败。资产内容通过
 `GET /api/assets/{asset_id}` 下载，同样必须携带 API Token。
 
@@ -408,5 +265,3 @@ stages {
 - **关注最近使用**：列表页的「最近使用」时间（约 1 分钟粒度）可用于发现僵尸 Token（长期未用应吊销）与异常调用（非构建时段的使用）。
 - **网络层面**：生产部署建议 HTTPS 反向代理，避免 Token 在链路上明文传输。
 - **证据下载**：不要把带 Token 的资产请求 URL 输出到公开日志；资产端点支持 Range 和 ETag，重试时可复用缓存而无需复制凭证到临时静态目录。
-
-巡检、回放、Graph 版本和资产保留的完整运维说明见 [巡检、回放与证据资产指南](INSPECTION_REPLAY_ASSETS.md)。

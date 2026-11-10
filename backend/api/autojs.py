@@ -1,10 +1,12 @@
-"""AutoDroid 脚本导出 + 设备端执行 API。
+"""AutoDroid 设备端执行 API（设备注册 / 心跳 / 执行结果回传）。
 
-两组路由：
-- router（浏览器侧，JWT）：用例/场景 -> AutoDroid 脚本包导出与预检
-- device_router（设备侧，API Token 或 JWT）：设备注册、任务领取、
-  脚本包下载、执行结果回传（落库 TestExecution/TestResult -> HTML 报告
-  -> 复用飞书通知）
+旧的「导出 zip 脚本包 → 设备任务队列 → 设备端 Agent 领取执行」链路已下线，
+导出、预检、任务队列与脚本包下载端点均已删除；设备端执行改由 App 直跑链路
+（/app-runs/*/script 下发 + /device-runs/report 回传）承担。
+
+当前路由：
+- device_router（设备侧，API Token 或 JWT）：设备注册 / 心跳 / 退出登录、
+  执行结果回传（落库 TestExecution/TestResult -> HTML 报告 -> 复用飞书通知）
 
 结果回传链路复用平台既有设施：
 - 持久化: backend/scenario_results._persist_case_result_and_build_case_report
@@ -15,29 +17,20 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
-from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlmodel import Session, or_, select
+from sqlmodel import Session, select
 
 from backend.api import deps
-from backend.autojs_export import packager
 from backend.autojs_export.generator import load_case_steps
-from backend.autojs_export.packager import PROJECT_ROOT
-from backend.autojs_export.precheck import precheck_case_script
 from backend.database import get_session
 from backend.device_presence import is_app_device
 from backend.execution_errors import suggestion_for
 from backend.ios_models import ios_marketing_name
 from backend.models import (
-    CaseFolder,
     Device,
-    DeviceRunTask,
     ScenarioStep,
     TestCase,
     TestExecution,
@@ -51,11 +44,8 @@ from backend.step_contract import normalize_platform, standard_step_to_legacy
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
 device_router = APIRouter()
 
-PACKAGE_DIR = PROJECT_ROOT / "uploads" / "autojs6_packages"
-CLAIM_TIMEOUT = timedelta(minutes=15)
 DEVICE_SERIAL_PREFIX = "autojs6:"
 # iOS 端（AutoDroid-WDA 设备端执行器）设备 serial 前缀
 DEVICE_SERIAL_PREFIX_IOS = "ios:"
@@ -64,24 +54,6 @@ DEVICE_SERIAL_PREFIX_IOS = "ios:"
 # --------------------------------------------------------------------------- #
 #  Schemas
 # --------------------------------------------------------------------------- #
-class BatchExportRequest(BaseModel):
-    case_ids: List[int] = Field(default_factory=list)
-    folder_id: Optional[int] = None
-    name: Optional[str] = None
-    env_id: Optional[int] = None
-    platform: Optional[str] = None
-
-
-class DeviceRunTaskCreate(BaseModel):
-    kind: str  # case | scenario
-    case_id: Optional[int] = None
-    scenario_id: Optional[int] = None
-    env_id: Optional[int] = None
-    device_serial: Optional[str] = None
-    name: Optional[str] = None
-    platform: Optional[str] = None
-
-
 LEGACY_IOS_APP_DEFAULT_NAMES = frozenset({"AutoDroid · iPhone", "AutoDroid · iPad", "AutoDroid · iPod touch"})
 
 
@@ -123,10 +95,12 @@ class DeviceReportCase(BaseModel):
 
 
 class DeviceReportPayload(BaseModel):
+    # 旧任务链路（Agent 领取任务）的任务标识，已随任务队列下线：
+    # 保留字段只为给残留的旧客户端返回明确报错，不再查任务表。
     task_id: Optional[str] = None
     # 上报来源平台：android（默认，兼容既有 AutoDroid App）| ios（WDA fork 设备端执行器）
     platform: Optional[str] = None
-    # App 直跑模式：无任务时用客户端生成的 run_id 做幂等标识
+    # App 直跑：客户端生成的 run_id 做幂等标识（必填）
     run_id: Optional[str] = None
     # 是否发送飞书通知（默认发送；App 可逐次关闭）
     notify: bool = False  # 默认不发（与 Web 一致）：仅显式开启/定时任务勾选才发飞书
@@ -144,143 +118,7 @@ class DeviceReportPayload(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-#  导出（浏览器侧）
-# --------------------------------------------------------------------------- #
-def _file_response(content: bytes, filename: str, media_type: str) -> Response:
-    return Response(
-        content=content,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
-        },
-    )
-
-
-def _load_case(session: Session, case_id: int) -> TestCase:
-    case = session.get(TestCase, case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="用例不存在")
-    return case
-
-
-@router.get("/cases/{case_id}/precheck")
-def precheck_case(
-    case_id: int,
-    env_id: Optional[int] = None,
-    platform: str = Query(default="android"),
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    """可导出性预检（不生成文件）。"""
-    from backend.autojs_export.generator import build_case_script
-
-    case = _load_case(session, case_id)
-    platform = normalize_platform(platform)
-    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
-    return precheck_case_script(case_script, project_root=PROJECT_ROOT, platform=platform)
-
-
-@router.post("/cases/{case_id}/export")
-def export_case(
-    case_id: int,
-    format: str = Query(default="zip", pattern="^(zip|file)$"),
-    env_id: Optional[int] = None,
-    platform: str = Query(default="android"),
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    """导出单用例脚本包（zip 目录包或单文件 .js）。"""
-    case = _load_case(session, case_id)
-    platform = normalize_platform(platform)
-    if format == "file":
-        result = packager.build_single_file(session, case, env_id=env_id, platform=platform)
-        return _file_response(result["content"], result["filename"], "application/javascript")
-    result = packager.build_case_package(session, case, env_id=env_id, platform=platform)
-    return _file_response(result["content"], result["filename"], "application/zip")
-
-
-def _collect_folder_case_ids(session: Session, folder_id: int) -> List[int]:
-    """递归收集目录及其子目录下的用例。"""
-    folder_ids = [folder_id]
-    frontier = [folder_id]
-    while frontier:
-        current = frontier.pop()
-        children = session.exec(
-            select(CaseFolder).where(CaseFolder.parent_id == current)
-        ).all()
-        for child in children:
-            if child.id not in folder_ids:
-                folder_ids.append(child.id)
-                frontier.append(child.id)
-    cases = session.exec(select(TestCase).where(TestCase.folder_id.in_(folder_ids))).all()
-    return [case.id for case in cases if case.id is not None]
-
-
-@router.post("/cases/export-batch")
-def export_cases_batch(
-    request: BatchExportRequest,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    """批量导出：多选用例或按目录（递归）打包为一个 zip。"""
-    case_ids: List[int] = []
-    for case_id in request.case_ids or []:
-        if case_id not in case_ids:
-            case_ids.append(case_id)
-    if request.folder_id:
-        for case_id in _collect_folder_case_ids(session, request.folder_id):
-            if case_id not in case_ids:
-                case_ids.append(case_id)
-    if not case_ids:
-        raise HTTPException(status_code=400, detail="请选择要导出的用例或目录")
-
-    cases: List[TestCase] = []
-    for case_id in case_ids:
-        case = session.get(TestCase, case_id)
-        if case:
-            cases.append(case)
-    if not cases:
-        raise HTTPException(status_code=404, detail="未找到可导出的用例")
-
-    batch_name = request.name or (f"folder_{request.folder_id}" if request.folder_id else "batch")
-    result = packager.build_batch_package(
-        session, cases, env_id=request.env_id, batch_name=batch_name, platform=normalize_platform(request.platform)
-    )
-    return _file_response(result["content"], result["filename"], "application/zip")
-
-
-@router.get("/scenarios/{scenario_id}/precheck")
-def precheck_scenario(
-    scenario_id: int,
-    env_id: Optional[int] = None,
-    platform: str = Query(default="android"),
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    scenario = session.get(TestScenario, scenario_id)
-    if not scenario:
-        raise HTTPException(status_code=404, detail="场景不存在")
-    result = packager.build_scenario_package(session, scenario, env_id=env_id, platform=normalize_platform(platform))
-    return result["precheck"]
-
-
-@router.post("/scenarios/{scenario_id}/export")
-def export_scenario(
-    scenario_id: int,
-    env_id: Optional[int] = None,
-    platform: str = Query(default="android"),
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    scenario = session.get(TestScenario, scenario_id)
-    if not scenario:
-        raise HTTPException(status_code=404, detail="场景不存在")
-    result = packager.build_scenario_package(session, scenario, env_id=env_id, platform=normalize_platform(platform))
-    return _file_response(result["content"], result["filename"], "application/zip")
-
-
-# --------------------------------------------------------------------------- #
-#  设备侧：注册 / 任务领取 / 包下载
+#  设备侧：注册 / 心跳 / 退出登录
 # --------------------------------------------------------------------------- #
 def _device_serial_for(payload: DeviceRegisterPayload) -> str:
     platform = normalize_platform(payload.platform)
@@ -359,94 +197,6 @@ def logout_device(payload: DeviceRegisterPayload, session: Session = Depends(get
         session.add(device)
         session.commit()
     return {"ok": True}
-
-
-@device_router.get("/pending")
-def claim_pending_task(
-    serial: str = Query(..., description="设备 serial（register 返回值）"),
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    """领取一个待执行任务。
-
-    领取使用条件更新保证原子性（UPDATE ... WHERE status='PENDING'），
-    同一任务即使被多个 Agent 实例并发轮询也只会被领取一次；
-    超时未上报的 CLAIMED 任务自动回收。
-    """
-    from sqlalchemy import update as sa_update
-
-    now = datetime.now()
-    stale = session.exec(
-        select(DeviceRunTask).where(
-            DeviceRunTask.status == "CLAIMED",
-            DeviceRunTask.claimed_at < now - CLAIM_TIMEOUT,
-        )
-    ).all()
-    for task in stale:
-        task.status = "PENDING"
-        task.claimed_at = None
-        session.add(task)
-    if stale:
-        session.commit()
-
-    candidates = session.exec(
-        select(DeviceRunTask)
-        .where(
-            DeviceRunTask.status == "PENDING",
-            or_(
-                DeviceRunTask.device_serial.is_(None),
-                DeviceRunTask.device_serial == serial,
-            ),
-        )
-        .order_by(DeviceRunTask.created_at)
-        .limit(3)
-    ).all()
-
-    for candidate in candidates:
-        result = session.execute(
-            sa_update(DeviceRunTask)
-            .where(
-                DeviceRunTask.id == candidate.id,
-                DeviceRunTask.status == "PENDING",  # 条件更新：并发下只有一个赢家
-            )
-            .values(
-                status="CLAIMED",
-                claimed_at=now,
-                device_serial=candidate.device_serial or serial,
-            )
-        )
-        session.commit()
-        if result.rowcount == 1:
-            session.refresh(candidate)
-            return {
-                "task": {
-                    "task_id": candidate.task_id,
-                    "kind": candidate.kind,
-                    "name": candidate.package_name,
-                    "case_id": candidate.case_id,
-                    "scenario_id": candidate.scenario_id,
-                    "package_url": f"/api/device-runs/packages/{candidate.task_id}",
-                }
-            }
-    return {"task": None}
-
-
-@device_router.get("/packages/{task_id}")
-def download_package(
-    task_id: str,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    task = session.exec(select(DeviceRunTask).where(DeviceRunTask.task_id == task_id)).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if not task.package_path or not Path(task.package_path).is_file():
-        raise HTTPException(status_code=404, detail="脚本包不存在或已被清理")
-    return FileResponse(
-        task.package_path,
-        media_type="application/zip",
-        filename=task.package_name or f"{task_id}.zip",
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -593,43 +343,31 @@ def _persist_device_report(
     payload: DeviceReportPayload,
     current_user: User,
 ) -> Dict[str, Any]:
-    # 两种上报来源：
-    # 1) Agent 领取的任务（task_id）：任务状态收尾 + 报告 + 通知；
-    # 2) App 直跑（run_id，无任务）：按 run_id 幂等落库，不涉及任务表。
-    task: Optional[DeviceRunTask] = None
+    # 上报来源：App 直跑（run_id）按 run_id 幂等落库。
+    # 旧的 Agent 任务链路（task_id）已下线，残留的旧客户端收到明确报错。
     if payload.task_id:
-        task = session.exec(
-            select(DeviceRunTask).where(DeviceRunTask.task_id == payload.task_id)
-        ).first()
-        if not task:
-            raise HTTPException(status_code=404, detail="任务不存在（task_id 未注册）")
-        kind = task.kind
-        ref_case_id = task.case_id
-        ref_scenario_id = task.scenario_id
+        raise HTTPException(
+            status_code=400,
+            detail="旧任务链路已下线（task_id 无效），请改用 App 直跑上报：带 run_id",
+        )
+    if not payload.run_id:
+        raise HTTPException(status_code=400, detail="上报需要 run_id（App 直跑）")
+    if payload.case_id:
+        kind = "case"
+    elif payload.scenario_id:
+        kind = "scenario"
     else:
-        if not payload.run_id:
-            raise HTTPException(status_code=400, detail="上报需要 task_id（Agent 任务）或 run_id（App 直跑）")
-        if payload.case_id:
-            kind = "case"
-        elif payload.scenario_id:
-            kind = "scenario"
-        else:
-            raise HTTPException(status_code=400, detail="App 直跑上报需要 case_id 或 scenario_id")
-        ref_case_id = payload.case_id
-        ref_scenario_id = payload.scenario_id
+        raise HTTPException(status_code=400, detail="App 直跑上报需要 case_id 或 scenario_id")
+    ref_case_id = payload.case_id
+    ref_scenario_id = payload.scenario_id
 
     # A lost HTTP response can make either app upload the same completed run
     # again. Return the original record without generating a second notification.
-    previous = []
-    if task is not None and task.execution_id:
-        existing = session.get(TestExecution, task.execution_id)
-        previous = [existing] if existing else []
-    elif task is None:
-        previous = session.exec(
-            select(TestExecution).where(TestExecution.batch_id == payload.run_id)
-        ).all()
-        if any(item.executor_id != current_user.id for item in previous):
-            raise HTTPException(status_code=409, detail="运行编号已被其他账号使用")
+    previous = session.exec(
+        select(TestExecution).where(TestExecution.batch_id == payload.run_id)
+    ).all()
+    if any(item.executor_id != current_user.id for item in previous):
+        raise HTTPException(status_code=409, detail="运行编号已被其他账号使用")
     completed = next((item for item in previous if item.status != "RUNNING"), None)
     if completed is not None:
         return {"execution_id": completed.id, "status": completed.status, "report_id": completed.report_id}
@@ -712,20 +450,13 @@ def _persist_device_report(
     if previous:
         session.flush()
 
-    if task is not None:
-        device_serial = task.device_serial
-        batch_id = None
-        executor_id = task.created_by or current_user.id
-    else:
-        device_serial = _serial_from_device(payload)
-        batch_id = payload.run_id
-        executor_id = current_user.id
+    device_serial = _serial_from_device(payload)
+    batch_id = payload.run_id
+    executor_id = current_user.id
     # 报告中心标题展示用例/场景名；执行方式（App/平台）由 run_source 表达。
     batch_name = display_name
 
     report_platform = normalize_platform(payload.platform)
-    if not payload.platform and task is not None and str(task.device_serial or "").startswith(DEVICE_SERIAL_PREFIX_IOS):
-        report_platform = "ios"
 
     execution = TestExecution(
         scenario_id=scenario.id if scenario else 0,
@@ -787,7 +518,7 @@ def _persist_device_report(
                 ] if case_entries else None,
             )
     except Exception as exc:
-        logger.warning("AutoDroid 报告生成失败: task=%s run=%s error=%s", payload.task_id, payload.run_id, exc)
+        logger.warning("AutoDroid 报告生成失败: run=%s error=%s", payload.run_id, exc)
 
     execution.status = overall_status
     execution.end_time = end_time
@@ -818,21 +549,6 @@ def _persist_device_report(
         if step.get("status") == "success"
     )
 
-    # 任务收尾（仅 Agent 任务）
-    if task is not None:
-        task.status = "DONE"
-        task.execution_id = execution.id
-        task.finished_at = end_time
-        task.error = None
-        task.result_summary = {
-            "status": overall_status,
-            "execution_id": execution.id,
-            "total_steps": total_steps,
-            "passed_steps": passed_steps,
-            "failed_steps": total_steps - passed_steps,
-            "duration": round(duration, 2),
-        }
-        session.add(task)
     session.commit()
 
     # 飞书通知（复用平台卡片；失败不影响上报结果；App 可通过 notify=false 关闭）
@@ -859,9 +575,9 @@ def _persist_device_report(
                 failed_devices=[] if overall_status == "PASS" else [device_display],
             )
         except Exception as exc:
-            logger.error("AutoDroid 飞书通知发送失败: task=%s run=%s error=%s", payload.task_id, payload.run_id, exc)
+            logger.error("AutoDroid 飞书通知发送失败: run=%s error=%s", payload.run_id, exc)
     else:
-        logger.info("上报 notify=false，跳过飞书通知: task=%s run=%s", payload.task_id, payload.run_id)
+        logger.info("上报 notify=false，跳过飞书通知: run=%s", payload.run_id)
 
     return {
         "execution_id": execution.id,
@@ -879,128 +595,9 @@ def submit_device_report(
     """设备端执行结果回传：落库 -> 生成报告 -> 飞书通知。"""
     result = _process_device_report(session, payload, current_user)
     logger.info(
-        "AutoDroid 结果回传完成: task=%s execution=%s status=%s",
-        payload.task_id,
+        "AutoDroid 结果回传完成: run=%s execution=%s status=%s",
+        payload.run_id,
         result.get("execution_id"),
         result.get("status"),
     )
     return result
-
-
-# --------------------------------------------------------------------------- #
-#  任务管理（浏览器侧）
-# --------------------------------------------------------------------------- #
-def _task_to_dict(task: DeviceRunTask) -> Dict[str, Any]:
-    return {
-        "id": task.id,
-        "task_id": task.task_id,
-        "kind": task.kind,
-        "case_id": task.case_id,
-        "scenario_id": task.scenario_id,
-        "device_serial": task.device_serial,
-        "status": task.status,
-        "package_name": task.package_name,
-        "execution_id": task.execution_id,
-        "error": task.error,
-        "result_summary": task.result_summary,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "claimed_at": task.claimed_at.isoformat() if task.claimed_at else None,
-        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
-    }
-
-
-@router.post("/tasks")
-def create_device_run_task(
-    request: DeviceRunTaskCreate,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    """创建 AutoDroid 设备端任务（生成脚本包等待设备领取）。"""
-    kind = str(request.kind or "").strip().lower()
-    platform = normalize_platform(request.platform)
-    if request.device_serial:
-        device = session.exec(select(Device).where(Device.serial == request.device_serial)).first()
-        if device is not None:
-            platform = normalize_platform(device.platform)
-    if kind == "case":
-        case = session.get(TestCase, request.case_id) if request.case_id else None
-        if not case:
-            raise HTTPException(status_code=404, detail="用例不存在")
-        package = packager.build_case_package(session, case, env_id=request.env_id, platform=platform)
-        display_name = request.name or f"用例: {case.name}"
-    elif kind == "scenario":
-        scenario = session.get(TestScenario, request.scenario_id) if request.scenario_id else None
-        if not scenario:
-            raise HTTPException(status_code=404, detail="场景不存在")
-        package = packager.build_scenario_package(session, scenario, env_id=request.env_id, platform=platform)
-        display_name = request.name or f"场景: {scenario.name}"
-    else:
-        raise HTTPException(status_code=400, detail="kind 仅支持 case/scenario")
-
-    if not package["precheck"].get("ok"):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "脚本包预检未通过，请先修复导出问题",
-                "issues": package["precheck"].get("issues") or [],
-            },
-        )
-
-    task_id = str(uuid4())
-    PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
-    package_path = PACKAGE_DIR / f"{task_id}.zip"
-    package_path.write_bytes(package["content"])
-
-    task = DeviceRunTask(
-        task_id=task_id,
-        kind=kind,
-        case_id=request.case_id if kind == "case" else None,
-        scenario_id=request.scenario_id if kind == "scenario" else None,
-        env_id=request.env_id,
-        device_serial=request.device_serial,
-        status="PENDING",
-        package_name=display_name,
-        package_path=str(package_path),
-        created_by=current_user.id,
-    )
-    session.add(task)
-    session.commit()
-    session.refresh(task)
-    return _task_to_dict(task)
-
-
-@router.get("/tasks")
-def list_device_run_tasks(
-    status: Optional[str] = None,
-    limit: int = Query(default=50, le=200),
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    query = select(DeviceRunTask).order_by(DeviceRunTask.created_at.desc()).limit(limit)
-    if status:
-        query = (
-            select(DeviceRunTask)
-            .where(DeviceRunTask.status == status)
-            .order_by(DeviceRunTask.created_at.desc())
-            .limit(limit)
-        )
-    tasks = session.exec(query).all()
-    return {"items": [_task_to_dict(task) for task in tasks]}
-
-
-@router.post("/tasks/{task_id}/cancel")
-def cancel_device_run_task(
-    task_id: str,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    task = session.exec(select(DeviceRunTask).where(DeviceRunTask.task_id == task_id)).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.status in ("DONE", "FAILED", "CANCELED"):
-        raise HTTPException(status_code=400, detail=f"任务已结束（{task.status}），无法取消")
-    task.status = "CANCELED"
-    task.finished_at = datetime.now()
-    session.add(task)
-    session.commit()
-    return _task_to_dict(task)

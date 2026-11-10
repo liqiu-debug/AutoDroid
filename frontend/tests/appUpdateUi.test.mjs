@@ -15,7 +15,7 @@ import {
   runUpdateInstall,
 } from '../src/utils/appUpdate.js'
 import { compareVersions } from '../src/utils/semver.js'
-import { createProgressNotice } from '../src/utils/progressNotice.js'
+import { createProgressNotice, formatDownloadProgress } from '../src/utils/progressNotice.js'
 
 // 桌面端「检查更新」前端流程：Navbar 账号下拉入口（clientMode 门控）+ 更新弹窗
 // （新版本 + 更新提示 + 「立即更新 / 不再提示」）+ 下载进度/完成/失败提示 +
@@ -149,6 +149,7 @@ function updateSetup({ clientMode = true, desktop = null, listItems = [], confir
     ElNotification,
     h,
     createProgressNotice: trackedProgressNotice,
+    formatDownloadProgress,
     api,
     useClientApp,
     checkForUpdate,
@@ -280,6 +281,7 @@ test('download install streams percents and finishes with the restart notice', a
     url: 'http://127.0.0.1:5800/api/packages/7/download?token=tok-1',
     fileName: 'AutoDroid-1.2.3.dmg',
     version: '1.2.3',
+    sizeHint: 54945382,
   })
 
   // 回归：1.0.2 每个进度事件都新开一个通知，叠出一屏「正在下载」
@@ -292,6 +294,25 @@ test('download install streams percents and finishes with the restart notice', a
   assert.equal(progress.closed, true, 'progress notice is closed on completion')
   assert.deepEqual(notices.filter(([kind]) => kind === 'success').map(([, text]) => text), ['安装完成后请重启应用'])
   assert.equal(desktop.state.unsubscribed, true)
+})
+
+test('a download without a known size shows bytes received instead of a stuck 0%', async () => {
+  // 回归：引擎反代把响应转成 chunked 时壳拿不到总长，旧逻辑把「不知道」显示成一直 0%
+  const desktop = fakeDesktop({
+    events: [
+      { phase: 'downloading', percent: null, received: 3 * 1024 * 1024, total: 0 },
+      { phase: 'downloading', percent: null, received: 12.5 * 1024 * 1024, total: 0 },
+      { phase: 'downloading', percent: 100, received: 52 * 1024 * 1024, total: 52 * 1024 * 1024 },
+      { phase: 'done', path: '/updates/AutoDroid-1.2.3.dmg' },
+    ],
+  })
+  const { useAppUpdate, progressTexts } = updateSetup({ clientMode: true, desktop, listItems: [PKG] })
+  await useAppUpdate().startUpdateCheck()
+  assert.deepEqual(progressTexts, [
+    '正在下载 1.2.3：已下载 3.0 MB',
+    '正在下载 1.2.3：已下载 12.5 MB',
+    '正在下载 1.2.3：100%',
+  ])
 })
 
 test('「不再提示」records the version and leaves the shell untouched', async () => {

@@ -378,7 +378,7 @@ test('fetchUserInfo 成功仍回填 userInfo 与 featureFlags', async () => {
   await store.fetchUserInfo()
   assert.equal(store.userInfo.value.id, 7)
   assert.equal(store.isLoggedIn.value, true)
-  assert.equal(store.featureFlags.value.model_inspection, false)
+  assert.equal(store.featureFlags.value.content_addressed_assets, false)
 })
 
 // ==================== 路由守卫 / DeviceCenter 契约 ====================
@@ -442,7 +442,7 @@ const netDownError = () => Object.assign(new Error('network down'), { authFailur
 test('G5：非鉴权错误（网络抖动）时 requiresAdmin / featureFlag 路由不放行，收口首页', async () => {
   const throwNet = async () => { throw netDownError() }
   const adminTo = { path: '/settings/users', matched: [{ meta: { requiresAdmin: true } }] }
-  const featureTo = { path: '/special/inspection', matched: [{ meta: { featureFlag: 'model_inspection' } }] }
+  const featureTo = { path: '/settings/storage', matched: [{ meta: { featureFlag: 'content_addressed_assets' } }] }
 
   assert.deepEqual(
     await runGuard({ to: adminTo, fetchUserInfo: throwNet }),
@@ -527,5 +527,4 @@ test('DeviceCenter：autoRefresh 由 onActivated/onDeactivated 管理，onBefore
     /if \(!hasSessionToken\(\)\) \{\s*stopAutoRefresh\(\)\s*return\s*\}/,
     '轮询 tick 发现 token 已清即自动停表',
   )
-  assert.match(source, /const fetchRemoteAgents = async \(\) => \{\s*if \(!hasSessionToken\(\)\) return/)
 })

@@ -12,14 +12,8 @@ from sqlmodel import Session, col, func, select
 from datetime import datetime
 
 from backend.database import get_session
-from backend.feature_flags import (
-    FLAG_MODEL_INSPECTION,
-    is_flag_enabled,
-)
 from backend.models import (
-    AppPackage,
     Device,
-    InspectionProfile,
     ScheduledTask,
     TestExecution,
     TestScenario,
@@ -42,7 +36,7 @@ router = APIRouter()
 
 def _task_type(config: dict) -> str:
     value = str((config or {}).get("_task_type") or "ui").strip().lower()
-    if value not in {"ui", "fastbot", "inspection", "api"}:
+    if value not in {"ui", "fastbot", "api"}:
         raise HTTPException(status_code=400, detail=f"不支持的定时任务类型: {value}")
     return value
 
@@ -56,9 +50,7 @@ def _validate_scheduled_target(
 ) -> Optional[TestScenario]:
     """Validate the target-specific part of a scheduled task.
 
-    Inspection schedules deliberately require one explicit Android device.  The
-    device is not reserved at schedule creation time; the execution-time atomic
-    lease remains the source of truth.
+    执行时的原子设备租约仍是唯一权威：创建定时任务时不预占设备。
     """
     task_type = _task_type(config)
     if task_type == "api":
@@ -83,62 +75,6 @@ def _validate_scheduled_target(
         if scenario is None:
             raise HTTPException(status_code=404, detail="场景不存在")
         return scenario
-
-    if task_type == "inspection":
-        if not is_flag_enabled(session, FLAG_MODEL_INSPECTION):
-            raise HTTPException(
-                status_code=404,
-                detail="模型化智能巡检尚未启用（Feature Flag: model_inspection）",
-            )
-        if len(device_serials) != 1:
-            raise HTTPException(status_code=400, detail="巡检定时任务必须显式选择 1 台设备")
-        device = session.exec(
-            select(Device).where(Device.serial == device_serials[0])
-        ).first()
-        if device is None:
-            raise HTTPException(status_code=404, detail="巡检设备不存在")
-        if str(device.platform or "android").lower() != "android":
-            raise HTTPException(status_code=400, detail="智能巡检首期仅支持 Android")
-
-        try:
-            profile_id = int(config.get("inspection_profile_id") or 0)
-        except (TypeError, ValueError):
-            profile_id = 0
-        profile = session.get(InspectionProfile, profile_id) if profile_id else None
-        if profile is None:
-            raise HTTPException(status_code=404, detail="巡检配置不存在")
-
-        branches = list(config.get("inspection_branches") or ["guest", "authenticated"])
-        normalized = []
-        for item in branches:
-            key = str(item or "").strip().lower()
-            if key not in {"guest", "authenticated"}:
-                raise HTTPException(status_code=400, detail=f"不支持的巡检业务线: {key}")
-            if key not in normalized:
-                normalized.append(key)
-        if not normalized:
-            raise HTTPException(status_code=400, detail="巡检定时任务至少选择一条业务线")
-        missing = [key for key in normalized if key not in (profile.branches or {})]
-        if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"巡检配置缺少业务线: {', '.join(missing)}",
-            )
-        config["inspection_branches"] = normalized
-
-        package_id = config.get("inspection_package_id")
-        if package_id not in (None, ""):
-            try:
-                package = session.get(AppPackage, int(package_id))
-            except (TypeError, ValueError):
-                package = None
-            if package is None:
-                raise HTTPException(status_code=404, detail="巡检安装包不存在")
-            if str(package.platform or "android").lower() != "android":
-                raise HTTPException(status_code=400, detail="巡检安装包必须为 Android")
-            if package.package_name and package.package_name != profile.package_name:
-                raise HTTPException(status_code=400, detail="安装包包名与巡检配置不一致")
-        return None
 
     # Fastbot validation stays backward compatible, while new UI always supplies
     # an explicit device.
@@ -165,7 +101,7 @@ def client_scheduled_serials(session: Session, task: ScheduledTask) -> List[str]
     云端触发过滤（_run_scheduled_scenario）与 GET /api/client-tasks 下发过滤共用
     同一实现，消除两侧口径漂移：
     - 仅 ui 类型 + scenario_id（桌面 LOCAL_TASK_TYPES={"ui"} 且 execute_task 需要
-      场景）；fastbot/inspection/api 桌面不接管；
+      场景）；fastbot/api 桌面不接管；
     - serial 命中「认领/心跳」客户端设备（client_instance_id / last_seen_at，见
       devices.is_client_managed_device）；
     - 空列表 = 该任务没有任何 serial 归客户端调度（桌面不调度，云端执行）。
@@ -192,7 +128,7 @@ def is_client_scheduled_task(session: Session, task: ScheduledTask) -> bool:
 
     判定与 GET /api/client-tasks ∩ 桌面 should_schedule_locally 口径一致（统一
     谓词 client_scheduled_serials 同源）：
-    - 仅 ui 类型 + scenario_id（桌面 LOCAL_TASK_TYPES={"ui"}；fastbot/inspection/api
+    - 仅 ui 类型 + scenario_id（桌面 LOCAL_TASK_TYPES={"ui"}；fastbot/api
       桌面不接管，云端必须保留注册）；
     - device_serials 非空且全部命中「认领/心跳」客户端设备（client_instance_id /
       last_seen_at，见 devices.is_client_managed_device）。混合绑定时云端保留 job，
@@ -291,7 +227,7 @@ def _observe_client_scheduled_serials(
 
 
 def _run_scheduled_scenario(task_id: int):
-    """调度器回调：根据任务类型执行 UI 场景、Fastbot 或模型化巡检。"""
+    """调度器回调：根据任务类型执行 UI 场景、Fastbot 或接口自动化。"""
     from backend.database import engine
     # Dispatch before importing device execution code: HTTP runs need no driver.
     with Session(engine) as api_session:
@@ -397,19 +333,6 @@ def _run_scheduled_scenario(task_id: int):
     if task_type == "fastbot":
         fb_device_serial = device_serials[0] if device_serials else None
         _run_scheduled_fastbot(config, task_name, fb_device_serial, enable_notification)
-    elif task_type == "inspection":
-        if len(device_serials) != 1:
-            logger.error(
-                "[定时任务] 巡检任务 #%s 必须显式配置且只能配置 1 台设备",
-                task_id,
-            )
-            return
-        _run_scheduled_inspection(
-            config=config,
-            task_name=task_name,
-            device_serial=device_serials[0],
-            executor_id=task.user_id,
-        )
     else:
         if scenario_id is None:
             logger.error(f"[定时任务] UI 任务 #{task_id} 缺少 scenario_id")
@@ -497,122 +420,6 @@ def _run_scheduled_scenario(task_id: int):
                         )
             except Exception as e:
                 logger.error(f"[定时任务] 发送通知失败: {e}")
-
-
-def _run_scheduled_inspection(
-    *,
-    config: dict,
-    task_name: str,
-    device_serial: str,
-    executor_id: Optional[int],
-) -> Optional[int]:
-    """Create an immutable inspection run snapshot and execute it synchronously."""
-    from backend.database import engine
-    from backend.inspection.engine import execute_inspection_run
-    from backend.inspection.runtime import abort_event_for_run
-    from backend.models import InspectionBranchRun, InspectionRun
-    from sqlmodel import Session as SQLSession
-
-    with SQLSession(engine) as session:
-        if not is_flag_enabled(session, FLAG_MODEL_INSPECTION):
-            logger.error("[定时任务] 模型化智能巡检 Feature Flag 未开启")
-            return None
-        try:
-            profile_id = int(config.get("inspection_profile_id") or 0)
-        except (TypeError, ValueError):
-            profile_id = 0
-        profile = session.get(InspectionProfile, profile_id) if profile_id else None
-        device = session.exec(select(Device).where(Device.serial == device_serial)).first()
-        if profile is None or device is None:
-            logger.error(
-                "[定时任务] 巡检目标无效: profile=%s device=%s",
-                profile_id,
-                device_serial,
-            )
-            return None
-        if str(device.platform or "android").lower() != "android":
-            logger.error("[定时任务] 巡检设备不是 Android: %s", device_serial)
-            return None
-
-        selected_branches = []
-        for item in list(
-            config.get("inspection_branches") or ["guest", "authenticated"]
-        ):
-            key = str(item or "").strip().lower()
-            if key in {"guest", "authenticated"} and key not in selected_branches:
-                selected_branches.append(key)
-        selected_branches = [
-            key for key in selected_branches if key in (profile.branches or {})
-        ]
-        if not selected_branches:
-            logger.error("[定时任务] 巡检任务没有可执行业务线: profile=%s", profile_id)
-            return None
-
-        package_id = config.get("inspection_package_id")
-        try:
-            package_id = int(package_id) if package_id not in (None, "") else None
-        except (TypeError, ValueError):
-            logger.error("[定时任务] 巡检安装包 ID 非法: %r", package_id)
-            return None
-        if package_id is not None:
-            package = session.get(AppPackage, package_id)
-            if (
-                package is None
-                or str(package.platform or "android").lower() != "android"
-                or (
-                    package.package_name
-                    and package.package_name != profile.package_name
-                )
-            ):
-                logger.error("[定时任务] 巡检安装包与配置不匹配: %s", package_id)
-                return None
-
-        snapshot = {
-            "name": profile.name,
-            "package_name": profile.package_name,
-            "branches": profile.branches or {},
-            "input_rules": profile.input_rules or [],
-            "safety_rules": profile.safety_rules or [],
-            "sanitizer_rules": profile.sanitizer_rules or [],
-            "dynamic_text_patterns": profile.dynamic_text_patterns or [],
-            "budgets": profile.budgets or {},
-            "monitor_options": profile.monitor_options or {},
-            "selected_branches": selected_branches,
-            "graph_hierarchy_version": 2,
-        }
-        run = InspectionRun(
-            name=f"定时任务: {task_name}",
-            profile_id=profile.id,
-            package_name=profile.package_name,
-            package_id=package_id,
-            package_source="package" if package_id is not None else "installed",
-            profile_snapshot=snapshot,
-            device_serial=device_serial,
-            selected_branches=selected_branches,
-            status="PENDING",
-            current_stage="等待设备租约",
-            total_branches=len(selected_branches),
-            executor_id=executor_id,
-            executor_name=f"定时任务: {task_name}",
-        )
-        session.add(run)
-        session.flush()
-        for branch_key in selected_branches:
-            branch = dict((profile.branches or {}).get(branch_key) or {})
-            session.add(
-                InspectionBranchRun(
-                    run_id=run.id,
-                    branch_key=branch_key,
-                    branch_name=str(branch.get("name") or branch_key),
-                )
-            )
-        session.commit()
-        session.refresh(run)
-        run_id = int(run.id)
-
-    logger.info("[定时任务] 开始模型化巡检: task=%s run=%s", task_name, run_id)
-    execute_inspection_run(run_id, abort_event_for_run(run_id))
-    return run_id
 
 
 def _run_scheduled_fastbot(config: dict, task_name: str, device_serial: str, enable_notification: bool):
@@ -763,13 +570,6 @@ def _scheduled_target_name(
         api_id = (config or {}).get("api_scenario_id")
         target = session.get(ApiScenario, api_id) if api_id else None
         return target.name if target else "接口场景（已删除）"
-    if task_type == "inspection":
-        profile_id = (config or {}).get("inspection_profile_id")
-        try:
-            profile = session.get(InspectionProfile, int(profile_id))
-        except (TypeError, ValueError):
-            profile = None
-        return f"模型化巡检 · {profile.name}" if profile else "模型化巡检"
     if task_type == "fastbot":
         return "智能探索"
     if task.scenario_id is None:
@@ -1024,7 +824,7 @@ def list_client_tasks(
     统一谓词（P4 终验必修缺陷 2，与云端 is_client_scheduled_task / 触发过滤
     同源 client_scheduled_serials）：仅下发 ui + scenario_id + 绑定中存在
     认领/心跳客户端设备的任务——「本人创建 + 未认领 serial」不下发（云端执行），
-    否则两端都调度（真双跑窗口）；无绑定设备 / fastbot/inspection/api 不下发
+    否则两端都调度（真双跑窗口）；无绑定设备 / fastbot/api 不下发
     （桌面 LOCAL_TASK_TYPES={'ui'} 且 execute_task 需要绑定设备）。
 
     可见性过滤：创建者=本人 或 device_serials 命中本人设备（owner_id /

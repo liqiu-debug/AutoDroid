@@ -7,7 +7,7 @@ P4 终验必修缺陷 2 后统一谓词 = client_scheduled_serials 同源）：
   缺席 = 静默漏跑无记录）：触发时只做心跳观测不执行——桌面心跳在线 → 静默
   交本地引擎；无客户端心跳 → warning 日志 + 落 SKIPPED 执行记录。物理任务照
   旧注册执行 job；
-- 非 ui 任务（fastbot/inspection/api）桌面不接管（LOCAL_TASK_TYPES={'ui'}），
+- 非 ui 任务（fastbot/api）桌面不接管（LOCAL_TASK_TYPES={'ui'}），
   即使绑定客户端设备也保留云端注册；
 - 无绑定设备任务桌面 execute_task 不触发，保留云端注册；
 - 混合绑定（客户端设备 + 物理设备）保留云端 job，但触发时只跑非客户端设备
@@ -145,7 +145,7 @@ class DualTriggerTests(unittest.TestCase):
         self.assertTrue(self.scheduler.has_job(read["id"]))
 
     def test_non_ui_task_on_client_device_stays_cloud_scheduled(self):
-        """fastbot/inspection/api 桌面不接管（LOCAL_TASK_TYPES={'ui'}），云端照旧注册。"""
+        """fastbot/api 桌面不接管（LOCAL_TASK_TYPES={'ui'}），云端照旧注册。"""
         self._add_device("d-client", client_instance_id="desktop-1")
         read = self._create(
             "智能探索任务",

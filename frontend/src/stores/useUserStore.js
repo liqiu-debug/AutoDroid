@@ -6,10 +6,6 @@ export const useUserStore = defineStore('user', () => {
     const token = ref(localStorage.getItem('token') || '')
     const userInfo = ref(null)
     const defaultFeatureFlags = {
-        model_inspection: false,
-        inspection_identity_v2: false,
-        inspection_similarity_convergence: false,
-        inspection_exploration_family_convergence: false,
         content_addressed_assets: false,
         tiered_asset_retention: false,
     }

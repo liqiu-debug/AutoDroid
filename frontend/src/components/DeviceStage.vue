@@ -831,7 +831,7 @@ defineExpose({
         <el-table-column prop="totalBytes" label="累计流量" width="90" align="right" />
       </el-table>
       <template #footer>
-        <span class="link-diag-hint">判读：P95 耗时高且体积大 → 带宽瓶颈；体积小但耗时高 → RTT/设备侧耗时。接入点卡片可测 B→A 带宽。</span>
+        <span class="link-diag-hint">判读：P95 耗时高且体积大 → 带宽瓶颈；体积小但耗时高 → RTT/设备侧耗时。</span>
         <el-button :icon="Refresh" @click="openLinkDiagnostics" :loading="linkDiagLoading">刷新</el-button>
       </template>
     </el-dialog>

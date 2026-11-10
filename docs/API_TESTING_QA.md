@@ -201,6 +201,8 @@ npm run build
 
 ## 首期验证记录（优化前）
 
+> （历史记录：保留原文；其中提到的巡检页面/巡检文案契约测试已随模型化智能巡检于 2026-11 下线。）
+
 | 检查 | 结果 |
 |---|---|
 | 新增后端测试 | 30 项通过 |
@@ -227,6 +229,8 @@ npm run build
 飞书卡片通过模拟发送验证了报告链接、摘要内容、成功、未配置和发送失败状态。真实飞书联调尚未执行；需要在部署环境配置 Webhook 和系统访问地址后验证投递与链接可达性。
 
 ## 先前记录的旧测试问题
+
+> （历史记录：保留原文；第 3 项涉及的巡检页面与 `inspectionReportUiContracts.test.mjs` 已于 2026-11 随模型化智能巡检下线。）
 
 1. `test_flaky_analysis.FlakyScoringTests.test_endpoint_returns_pydantic_model`：样本日期固定为 2026-07-10 附近，端点使用当前日期的 30 天窗口，9 月运行时样本已过期。
 2. `test_retention_service.RetentionCleanupTests.test_run_retention_cleanup_respects_setting`：测试“近期”记录固定在 2026-07-09，实际清理按当前日期运行，因此清理数量由 1 变为 2。

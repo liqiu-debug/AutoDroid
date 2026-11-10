@@ -552,9 +552,6 @@ class ClientDeviceStatusRefreshTests(unittest.TestCase):
 
         with patch("backend.api.devices._run_adb_command", new=_adb_one), patch(
             "backend.api.devices._get_device_props_batch", new=_props
-        ), patch(
-            "backend.api.devices._remote_usb_fields",
-            return_value={"connection_type": None, "agent_name": None, "source_serial": None},
         ):
             resp = self.client.post("/api/devices/sync")
 

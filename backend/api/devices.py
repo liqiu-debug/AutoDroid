@@ -1075,7 +1075,7 @@ async def _get_coalesced_android_screenshot_preview(serial: str) -> Tuple[str, s
 
 
 # 批量属性查询的分隔标记：一次 shell 往返取回全部属性，
-# 远程隧道/无线设备下把最多 8 次 adb 往返压缩为 1 次。
+# 把最多 8 次 adb 往返压缩为 1 次。
 _PROP_BATCH_SEPARATOR = "___AUTODROID_SEP___"
 
 # market_name 候选属性（按优先级）：通用 → OPPO/OnePlus → vivo
@@ -1128,28 +1128,6 @@ async def _run_blocking_call(func, *args):
     """兼容 Python 3.8：在线程池执行阻塞调用。"""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args))
-
-
-def _remote_usb_fields(serial: str) -> Dict[str, Optional[str]]:
-    """serial 为远程接入隧道形态（127.0.0.1:<端口>）时补充来源元数据。
-
-    普通本机 USB / 无线设备返回全 None（Android 设备该三列本就为空）。
-    """
-    try:
-        from backend.device_agents import tunnel_hub
-        from backend.device_agents.protocol import REMOTE_USB_CONNECTION_TYPE
-
-        meta = tunnel_hub.get_remote_device_meta(serial)
-    except Exception as exc:
-        logger.warning("查询远程设备元数据失败: serial=%s error=%s", serial, exc)
-        meta = None
-    if not meta:
-        return {"connection_type": None, "agent_name": None, "source_serial": None}
-    return {
-        "connection_type": REMOTE_USB_CONNECTION_TYPE,
-        "agent_name": meta.get("agent_name"),
-        "source_serial": meta.get("usb_serial"),
-    }
 
 
 def _capture_ios_screenshot_bytes(serial: str, wda_url: str) -> bytes:
@@ -1376,7 +1354,6 @@ async def _discover_new_adb_devices(
         if not market_name or market_name == model:
             market_name = None
 
-        remote_fields = _remote_usb_fields(serial)
         device = Device(
             serial=serial,
             platform="android",
@@ -1387,9 +1364,6 @@ async def _discover_new_adb_devices(
             resolution=props["resolution"],
             market_name=market_name,
             status="IDLE",
-            connection_type=remote_fields.get("connection_type"),
-            agent_name=remote_fields.get("agent_name"),
-            source_serial=remote_fields.get("source_serial"),
             owner_id=getattr(current_user, "id", None),
             updated_at=now,
         )
@@ -1820,7 +1794,7 @@ async def sync_devices(
 
     # Step 2: 并发获取设备属性
     async def _fetch_device_info(serial: str) -> dict:
-        # 一次 shell 往返取回全部属性（远程隧道设备下多次往返代价高）
+        # 一次 shell 往返取回全部属性，减少 adb 往返次数
         props = await _get_device_props_batch(serial)
         model = props["ro.product.model"]
         version = props["ro.build.version.release"]
@@ -1847,8 +1821,6 @@ async def sync_devices(
             "resolution": props["resolution"],
             "market_name": market_name,
         }
-        # 远程接入设备（127.0.0.1:<隧道端口>）补充来源信息
-        info.update(_remote_usb_fields(serial))
         return info
 
     device_infos = await asyncio.gather(
@@ -1873,9 +1845,6 @@ async def sync_devices(
             existing.os_version = info.get("os_version", info["android_version"])
             existing.resolution = info["resolution"]
             existing.market_name = info["market_name"]
-            existing.connection_type = info.get("connection_type")
-            existing.agent_name = info.get("agent_name")
-            existing.source_serial = info.get("source_serial")
             existing.status = "IDLE" if existing.status == "OFFLINE" else existing.status
             existing.updated_at = datetime.now()
             session.add(existing)
@@ -1889,9 +1858,6 @@ async def sync_devices(
                 os_version=info.get("os_version", info["android_version"]),
                 resolution=info["resolution"],
                 market_name=info["market_name"],
-                connection_type=info.get("connection_type"),
-                agent_name=info.get("agent_name"),
-                source_serial=info.get("source_serial"),
                 owner_id=getattr(current_user, "id", None),
                 status="IDLE",
             )

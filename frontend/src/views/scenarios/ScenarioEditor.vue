@@ -7,10 +7,9 @@ import { describeRunSubmission } from '@/utils/uiRunPresentation'
 import { ElMessage } from 'element-plus'
 import {
   VideoPlay, Delete, Rank, Document,
-  Search, Upload, ArrowLeft, FolderOpened, CircleClose, Download
+  Search, Upload, ArrowLeft, FolderOpened, CircleClose
 } from '@element-plus/icons-vue'
 import LogConsole from '@/components/LogConsole.vue'
-import ExportAutoJsDialog from '@/components/ExportAutoJsDialog.vue'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
@@ -51,21 +50,6 @@ const logConsoleRef = ref(null)
 
 const envId = ref(null)
 const environments = ref([])
-
-// AutoDroid 脚本导出
-const exportDialogVisible = ref(false)
-const exportTarget = ref(null)
-const openExportDialog = async () => {
-  if (!scenarioId.value || isDirty.value) {
-    if (!await saveSteps()) return
-  }
-  if (!scenarioSteps.value.length) {
-    ElMessage.warning('场景没有用例，无法导出')
-    return
-  }
-  exportTarget.value = { type: 'scenario', scenarioId: scenarioId.value, name: currentScenario.value.name }
-  exportDialogVisible.value = true
-}
 
 // Unsaved changes tracking
 const savedSnapshot = ref(null)
@@ -686,7 +670,6 @@ const getStepTitle = (step) => {
       <div class="editor-actions">
         <el-select v-model="envId" placeholder="运行环境" :disabled="runBusy" class="environment-select" aria-label="运行环境"><el-option v-for="env in environments" :key="env.id" :label="env.name" :value="env.id" /></el-select>
         <el-button :icon="Upload" @click="saveSteps" :loading="isSaving" :disabled="runBusy && !isSaving">保存</el-button>
-        <el-button :icon="Download" @click="openExportDialog" :disabled="runBusy">导出脚本</el-button>
         <el-button :type="running ? 'danger' : 'primary'" :icon="running ? CircleClose : VideoPlay" @click="openRunDialog" :disabled="runBusy || terminatingRun">{{ runLabel }}</el-button>
       </div>
     </header>
@@ -934,9 +917,6 @@ const getStepTitle = (step) => {
         </span>
       </template>
     </el-dialog>
-
-    <!-- AutoDroid 脚本导出弹窗 -->
-    <ExportAutoJsDialog v-model="exportDialogVisible" :target="exportTarget" :env-id="envId" />
   </el-container>
   </el-container>
 </template>

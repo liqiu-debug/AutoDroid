@@ -103,7 +103,7 @@ class DeviceExecutionLease:
                         raise DeviceLeaseUnavailable(f"设备不存在: {serial}")
                     if str(device.platform or "").lower() != "android":
                         raise DeviceLeaseUnavailable(
-                            f"智能巡检仅支持 Android 设备: {serial}"
+                            f"设备 {serial} 非 Android 设备，暂不支持执行租用"
                         )
                     raise DeviceLeaseUnavailable(
                         f"设备 {serial} 非空闲或已被其他任务租用 "

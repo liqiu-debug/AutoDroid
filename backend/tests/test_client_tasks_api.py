@@ -6,7 +6,7 @@
   client_scheduled_serials）：仅下发「ui + scenario_id + 绑定中存在认领/心跳
   客户端设备」的任务——「本人创建 + 未认领 serial」不下发（云端执行），否则
   两端都调度（真双跑窗口）；无绑定设备任务不下发（桌面 execute_task 本就
-  不触发）；fastbot/inspection/api 不下发（桌面 LOCAL_TASK_TYPES={'ui'}）；
+  不触发）；fastbot/api 不下发（桌面 LOCAL_TASK_TYPES={'ui'}）；
 - 可见性过滤：创建者=本人 或 device_serials 命中本人设备（owner_id /
   app_owner_id == 本人，与 filter_devices_for_user 归属口径一致）；
 - 仅返回 is_active 任务（暂停任务不进本地调度，对齐 _restore_scheduled_tasks）；
@@ -244,7 +244,7 @@ class ClientTasksVisibilityTests(unittest.TestCase):
         self.assertEqual(items, [])
 
     def test_non_ui_task_not_delivered(self):
-        """fastbot/inspection/api 桌面不接管（LOCAL_TASK_TYPES={'ui'}），不下发。"""
+        """fastbot/api 桌面不接管（LOCAL_TASK_TYPES={'ui'}），不下发。"""
         self._add_client_device("d-alice", owner_id=self.alice.id)
         task = _make_task(
             self.session,

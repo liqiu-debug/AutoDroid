@@ -13,22 +13,17 @@ test('settings keeps one low-height scroll container and a reachable save bar', 
   assert.match(source, /\.global-actions\s*\{[\s\S]*?position:\s*sticky;[\s\S]*?bottom:\s*0;/)
 })
 
-test('settings opens only core experiments and closes retention with CAS', () => {
-  assert.match(source, /activeFeatureGroups\s*=\s*ref\(\['core'\]\)/)
+test('settings keeps retention tied to CAS and drops the retired inspection switches', () => {
+  assert.match(source, /activeFeatureGroups\s*=\s*ref\(\[\]\)/)
   assert.match(
     source,
     /watch\(\(\)\s*=>\s*form\.value\.content_addressed_assets,[\s\S]*?form\.value\.tiered_asset_retention\s*=\s*false/,
   )
   assert.match(source, /:disabled="!form\.content_addressed_assets"/)
   assert.match(source, /需先启用报告资产去重/)
-})
-
-test('settings exposes Haier business coverage as an independent shadow flag', () => {
-  assert.match(source, /form\.value\.inspection_business_coverage_v2 = flagRes\.data\?\.inspection_business_coverage_v2 === true/)
-  assert.match(source, /key: 'inspection_business_coverage_v2'/)
-  assert.match(source, /v-model="form\.inspection_business_coverage_v2" :disabled="!form\.model_inspection"/)
-  assert.match(source, /核心旅程覆盖/)
-  assert.doesNotMatch(source, /v-model="form\.inspection_business_coverage_v2" :disabled="!form\.inspection_coverage_scheduler_v2"/)
+  // 智能巡检试验开关已随功能废弃整体移除
+  assert.doesNotMatch(source, /model_inspection|inspection_/)
+  assert.doesNotMatch(source, /巡检/)
 })
 
 test('settings blocks saving partial defaults and lazily loads capacity details', () => {

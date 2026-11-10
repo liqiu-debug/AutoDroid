@@ -48,16 +48,16 @@ class DeviceExecutionLeaseTests(unittest.TestCase):
         lease = DeviceExecutionLease.acquire(
             user_id=1,
             serial="android-lease-1",
-            task_id="inspection:7",
-            kind="inspection",
+            task_id="compatibility:7",
+            kind="compatibility",
             timeout=0.1,
             check_legacy_fastbot=False,
             db_engine=self.engine,
         )
         busy = self._device()
         self.assertEqual(busy.status, "BUSY")
-        self.assertEqual(busy.lease_task_id, "inspection:7")
-        self.assertEqual(busy.lease_kind, "inspection")
+        self.assertEqual(busy.lease_task_id, "compatibility:7")
+        self.assertEqual(busy.lease_kind, "compatibility")
         self.assertIsNotNone(busy.lease_acquired_at)
 
         self.assertTrue(lease.release())
@@ -82,8 +82,8 @@ class DeviceExecutionLeaseTests(unittest.TestCase):
             DeviceExecutionLease.acquire(
                 user_id=2,
                 serial="android-lease-1",
-                task_id="inspection:8",
-                kind="inspection",
+                task_id="compatibility:8",
+                kind="compatibility",
                 timeout=0.1,
                 check_legacy_fastbot=False,
                 db_engine=self.engine,
@@ -102,8 +102,8 @@ class DeviceExecutionLeaseTests(unittest.TestCase):
             DeviceExecutionLease.acquire(
                 user_id=5,
                 serial="android-lease-1",
-                task_id="inspection:legacy-race",
-                kind="inspection",
+                task_id="compatibility:legacy-race",
+                kind="compatibility",
                 timeout=0.1,
                 db_engine=self.engine,
             )
@@ -114,8 +114,8 @@ class DeviceExecutionLeaseTests(unittest.TestCase):
         lease = DeviceExecutionLease.acquire(
             user_id=3,
             serial="android-lease-1",
-            task_id="inspection:9",
-            kind="inspection",
+            task_id="compatibility:9",
+            kind="compatibility",
             timeout=0.1,
             check_legacy_fastbot=False,
             db_engine=self.engine,
@@ -140,8 +140,8 @@ class DeviceExecutionLeaseTests(unittest.TestCase):
         lease = DeviceExecutionLease.acquire(
             user_id=4,
             serial="android-lease-1",
-            task_id="inspection:disconnect",
-            kind="inspection",
+            task_id="compatibility:disconnect",
+            kind="compatibility",
             timeout=0.1,
             check_legacy_fastbot=False,
             db_engine=self.engine,

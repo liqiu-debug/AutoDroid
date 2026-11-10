@@ -44,7 +44,6 @@ from backend.device_stream.manager import (
     get_scrcpy_stream_params,
     get_stream_profile_state,
     is_remote_serial,
-    is_tunnel_serial,
     set_stream_profile_override,
 )
 
@@ -183,20 +182,14 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         self.assertIn("max_fps=25 ", command)
         self.assertTrue(command.endswith("i_frame_interval=5"))
 
-    def test_is_remote_serial_detects_tunnel_and_wireless_forms(self):
+    def test_is_remote_serial_detects_wireless_forms(self):
         self.assertTrue(is_remote_serial("127.0.0.1:28100"))
         self.assertTrue(is_remote_serial("192.168.1.5:5555"))
         self.assertFalse(is_remote_serial("emulator-5554"))
         self.assertFalse(is_remote_serial("ABCD1234"))
         self.assertFalse(is_remote_serial(""))
-
-    def test_is_tunnel_serial_only_matches_tunnel_port_range(self):
-        self.assertTrue(is_tunnel_serial("127.0.0.1:28100"))
-        self.assertTrue(is_tunnel_serial("127.0.0.1:28199"))
-        self.assertFalse(is_tunnel_serial("127.0.0.1:28200"))
-        self.assertFalse(is_tunnel_serial("192.168.1.5:5555"))
-        self.assertFalse(is_tunnel_serial("ABCD1234"))
-        self.assertFalse(is_tunnel_serial(""))
+        self.assertEqual(default_stream_profile("192.168.1.5:5555"), STREAM_PROFILE_SMOOTH)
+        self.assertEqual(default_stream_profile("ABCD1234"), STREAM_PROFILE_HD)
 
     def test_wireless_serial_uses_smooth_profile_defaults(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -212,16 +205,6 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
                 "i_frame_interval": DEFAULT_SCRCPY_REMOTE_GOP,
             },
         )
-
-    def test_tunnel_serial_defaults_to_smooth_profile(self):
-        with patch.dict(os.environ, {}, clear=False):
-            self._clear_scrcpy_env()
-            params = get_scrcpy_stream_params("127.0.0.1:28100")
-
-        self.assertEqual(params, STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
-        self.assertEqual(default_stream_profile("127.0.0.1:28100"), STREAM_PROFILE_SMOOTH)
-        self.assertEqual(default_stream_profile("192.168.1.5:5555"), STREAM_PROFILE_SMOOTH)
-        self.assertEqual(default_stream_profile("ABCD1234"), STREAM_PROFILE_HD)
 
     def test_usb_serial_keeps_standard_profile(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -255,16 +238,6 @@ class ScrcpyStreamParamsTests(unittest.TestCase):
         )
         self.assertEqual(usb["max_size"], DEFAULT_SCRCPY_MAX_SIZE)
         self.assertEqual(usb["video_bit_rate"], DEFAULT_SCRCPY_BITRATE)
-
-    def test_build_scrcpy_server_command_applies_smooth_profile_for_tunnel_serial(self):
-        with patch.dict(os.environ, {}, clear=False):
-            self._clear_scrcpy_env()
-            command = _build_scrcpy_server_command("127.0.0.1:28100")
-
-        smooth = STREAM_PROFILES[STREAM_PROFILE_SMOOTH]
-        self.assertIn(f"max_size={smooth['max_size']} ", command)
-        self.assertIn(f"video_bit_rate={smooth['video_bit_rate']} ", command)
-        self.assertIn(f"max_fps={smooth['max_fps']} ", command)
 
 
 class StreamProfileOverrideTests(unittest.TestCase):

@@ -1,6 +1,9 @@
-"""脚本包（zip / 单文件）组装。
+"""脚本包组装（App 直跑 JSON 包）。
 
-脚本包结构：
+旧的 zip 脚本包（导出下载 / 设备任务队列下发）已随旧链路下线删除，
+现在只负责组装 App 直跑用的 JSON 脚本包（build_case_bundle / build_scenario_bundle），
+其内容与运行目录结构为：
+
     manifest.json   —— 元信息（用例清单/变量/预检结果/生成器版本）
     main.js         —— 入口（自动生成）
     runtime.js      —— 设备端运行时库（随包分发）
@@ -10,11 +13,8 @@
 from __future__ import annotations
 
 import base64
-import io
 import json
 import logging
-import os
-import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -118,21 +118,6 @@ __RUNNER__
 global.__AUTODROID_RESULT__ = AUTODROID_RUNTIME.finish(ctx);
 '''
 
-_PACKAGE_README = """AutoDroid 脚本包使用说明
-======================
-
-1. 本目录是一个完整的 AutoDroid 脚本项目（含 project.json）：
-   - 方式一：把整个目录拷贝到手机 AutoDroid 的脚本目录下；
-   - 方式二：在 AutoDroid 中以项目方式导入本目录（或包含本目录的 zip）。
-2. 运行入口是 main.js（项目模式下运行项目即执行 main.js）。
-3. 请勿单独运行 cases/*.js 或 runtime.js —— 它们由 main.js 加载。
-4. 结果回传：
-   - 由 autodroid_agent.js 领取执行时，结果自动回传平台；
-   - 手动运行时若未配置平台地址/Token，结果写入同目录 report.json。
-5. 图像/OCR 步骤需要开启无障碍服务；建议 Android 11+（无障碍截图无弹窗）。
-"""
-
-
 def _main_js_source(manifest: Dict[str, Any]) -> str:
     require_lines = "\n".join(
         f'    __loadModule__("{entry["file"]}")' + ("," if index < len(manifest["cases"]) - 1 else "")
@@ -147,24 +132,6 @@ def _main_js_source(manifest: Dict[str, Any]) -> str:
         .replace("__REQUIRE_LINES__", require_lines)
         .replace("__RUNNER__", runner)
     )
-
-
-def _project_json(manifest: Dict[str, Any]) -> str:
-    kind = str(manifest.get("kind") or "case")
-    identity = kind
-    for entry in manifest.get("cases") or []:
-        identity = f"{kind}{entry.get('id') or ''}"
-        break
-    package_name = "com.autodroid.export." + "".join(
-        ch for ch in identity.lower() if ch.isalnum()
-    )
-    return json.dumps({
-        "name": manifest.get("name") or "AutoDroid 脚本包",
-        "versionName": "1.0.0",
-        "versionCode": 1,
-        "packageName": package_name,
-        "main": "main.js",
-    }, ensure_ascii=False, indent=2)
 
 
 def _build_manifest(
@@ -210,81 +177,6 @@ def _build_manifest(
     }
 
 
-def _write_zip(
-    manifest: Dict[str, Any],
-    case_scripts: List[Tuple[Dict[str, Any], str]],  # (case_script, module_file)
-    template_refs: List[Tuple[str, str]],
-    *,
-    embedded_assets: bool = False,
-) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("project.json", _project_json(manifest))
-        zf.writestr("README.txt", _PACKAGE_README)
-        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        zf.writestr("main.js", _main_js_source(manifest))
-        # iOS 包需要把适配层一起放进 zip（JSON 下发路径放在 adapter_js 字段）
-        adapter_source = _load_adapter_source(manifest.get("platform") or "android")
-        if adapter_source:
-            zf.writestr("adapter.js", adapter_source)
-        zf.writestr("runtime.js", _load_runtime_source())
-        for case_script, module_file in case_scripts:
-            zf.writestr(module_file, _case_module_source(case_script))
-        if not embedded_assets:
-            for asset_name, rel_path in template_refs:
-                abs_path = PROJECT_ROOT / rel_path
-                if abs_path.is_file():
-                    zf.write(abs_path, f"assets/{asset_name}")
-                else:
-                    logger.warning("模板图缺失，跳过打包: %s", rel_path)
-    return buffer.getvalue()
-
-
-def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def _safe_name(name: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(name or "").strip())
-    return cleaned[:48] or "package"
-
-
-def build_case_package(
-    session: Session,
-    case: TestCase,
-    *,
-    env_id: Optional[int] = None,
-    platform: str = "android",
-) -> Dict[str, Any]:
-    """单用例脚本包（zip）。"""
-    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
-    precheck = precheck_case_package(
-        [case_script], project_root=PROJECT_ROOT, platform=platform
-    )
-    module_file = f"cases/case_{case.id}.js"
-    manifest = _build_manifest(
-        kind="case",
-        name=case.name,
-        case_entries=[{
-            "id": case.id,
-            "name": case.name,
-            "alias": None,
-            "file": module_file,
-        }],
-        variables=case_script.get("variables") or {},
-        scenario_id=None,
-        precheck=precheck,
-        platform=platform,
-    )
-    content = _write_zip(manifest, [(case_script, module_file)], case_script.get("template_refs") or [])
-    return {
-        "filename": f"autodroid_case_{case.id}_{_timestamp()}.zip",
-        "content": content,
-        "manifest": manifest,
-        "precheck": precheck,
-    }
-
-
 def collect_scenario_parts(
     session: Session,
     scenario: TestScenario,
@@ -292,7 +184,7 @@ def collect_scenario_parts(
     env_id: Optional[int] = None,
     platform: str = "android",
 ) -> Dict[str, Any]:
-    """收集场景脚本包的组成部件（zip 打包与 App JSON 下发共用）。"""
+    """收集场景脚本包的组成部件（App 直跑 JSON 下发使用）。"""
     scenario_steps = session.exec(
         select(ScenarioStep)
         .where(ScenarioStep.scenario_id == scenario.id)
@@ -354,33 +246,6 @@ def collect_scenario_parts(
     }
 
 
-def build_scenario_package(
-    session: Session,
-    scenario: TestScenario,
-    *,
-    env_id: Optional[int] = None,
-    platform: str = "android",
-) -> Dict[str, Any]:
-    """场景脚本包：全部子用例 + 场景串联入口。"""
-    parts = collect_scenario_parts(session, scenario, env_id=env_id, platform=platform)
-    manifest = _build_manifest(
-        kind="scenario",
-        name=scenario.name,
-        case_entries=parts["case_entries"],
-        variables=parts["variables"],
-        scenario_id=scenario.id,
-        precheck=parts["precheck"],
-        platform=platform,
-    )
-    content = _write_zip(manifest, parts["case_scripts"], parts["template_refs"])
-    return {
-        "filename": f"autodroid_scenario_{scenario.id}_{_timestamp()}.zip",
-        "content": content,
-        "manifest": manifest,
-        "precheck": parts["precheck"],
-    }
-
-
 def _bundle_payload(
     *,
     kind: str,
@@ -389,7 +254,7 @@ def _bundle_payload(
     template_refs: List[Tuple[str, str]],
     precheck: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """组装 JSON 形式的脚本包（App 直跑下发用，与 zip 打包同源同内容）。"""
+    """组装 JSON 形式的脚本包（App 直跑下发用）。"""
     case_files = [
         {"path": module_file, "content": _case_module_source(case_script)}
         for case_script, module_file in case_scripts
@@ -479,116 +344,3 @@ def build_scenario_bundle(
         template_refs=parts["template_refs"],
         precheck=parts["precheck"],
     )
-
-
-def build_batch_package(
-    session: Session,
-    cases: List[TestCase],
-    *,
-    env_id: Optional[int] = None,
-    batch_name: str = "batch",
-    platform: str = "android",
-) -> Dict[str, Any]:
-    """批量导出：多个独立用例打进一个包（入口按顺序执行，失败不中断）。"""
-    case_scripts: List[Tuple[Dict[str, Any], str]] = []
-    case_entries: List[Dict[str, Any]] = []
-    template_refs: List[Tuple[str, str]] = []
-    variables: Dict[str, str] = {}
-
-    for order, case in enumerate(cases, start=1):
-        case_script = build_case_script(session, case, env_id=env_id, platform=platform)
-        module_file = f"cases/case_{case.id}.js"
-        case_scripts.append((case_script, module_file))
-        case_entries.append({
-            "id": case.id,
-            "name": case.name,
-            "alias": None,
-            "order": order,
-            "file": module_file,
-        })
-        for ref in case_script.get("template_refs") or []:
-            if ref not in template_refs:
-                template_refs.append(ref)
-        for key, value in (case_script.get("variables") or {}).items():
-            variables.setdefault(key, value)
-
-    precheck = precheck_case_package(
-        [script for script, _ in case_scripts],
-        project_root=PROJECT_ROOT,
-        platform=platform,
-    )
-    manifest = _build_manifest(
-        kind="batch",
-        name=batch_name,
-        case_entries=case_entries,
-        variables=variables,
-        scenario_id=None,
-        precheck=precheck,
-        platform=platform,
-    )
-    content = _write_zip(manifest, case_scripts, template_refs)
-    return {
-        "filename": f"autodroid_batch_{_safe_name(batch_name)}_{_timestamp()}.zip",
-        "content": content,
-        "manifest": manifest,
-        "precheck": precheck,
-    }
-
-
-def build_single_file(
-    session: Session,
-    case: TestCase,
-    *,
-    env_id: Optional[int] = None,
-    platform: str = "android",
-) -> Dict[str, Any]:
-    """单文件模式：runtime + 用例清单 + 模板图 base64 内嵌为一个 .js。
-
-    适合无图像步骤或图像极少的用例快速分享；图像多时请用 zip 脚本包。
-    """
-    case_script = build_case_script(session, case, env_id=env_id, platform=platform)
-    precheck = precheck_case_package(
-        [case_script], project_root=PROJECT_ROOT, platform=platform
-    )
-
-    embedded: Dict[str, str] = {}
-    for asset_name, rel_path in case_script.get("template_refs") or []:
-        abs_path = PROJECT_ROOT / rel_path
-        if abs_path.is_file():
-            embedded[asset_name] = base64.b64encode(abs_path.read_bytes()).decode("ascii")
-
-    manifest = _build_manifest(
-        kind="case",
-        name=case.name,
-        case_entries=[{
-            "id": case.id,
-            "name": case.name,
-            "alias": None,
-            "file": None,
-        }],
-        variables=case_script.get("variables") or {},
-        scenario_id=None,
-        precheck=precheck,
-        platform=platform,
-    )
-
-    runtime_source = _load_runtime_source()
-    source = (
-        '"use strict";\n'
-        "// AutoDroid 单文件脚本（平台生成，请勿手改）\n"
-        f"// case: {case.name}\n"
-        f"{runtime_source}\n"
-        "var AUTODROID_RUNTIME = RUNTIME_API;\n"
-        f"var manifest = {json.dumps(manifest, ensure_ascii=False, indent=2)};\n"
-        f"var caseScript = {json.dumps(case_script, ensure_ascii=False, indent=2)};\n"
-        f"var EMBEDDED_ASSETS = {json.dumps(embedded, ensure_ascii=False)};\n"
-        "var ctx = AUTODROID_RUNTIME.createContext(manifest, files.cwd(), EMBEDDED_ASSETS);\n"
-        "AUTODROID_RUNTIME.runCase(ctx, caseScript, manifest.cases[0]);\n"
-        "global.__AUTODROID_RESULT__ = AUTODROID_RUNTIME.finish(ctx);\n"
-    )
-    return {
-        "filename": f"autodroid_case_{case.id}_{_timestamp()}.js",
-        "content": source.encode("utf-8"),
-        "manifest": manifest,
-        "precheck": precheck,
-    }

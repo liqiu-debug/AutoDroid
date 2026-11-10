@@ -3,14 +3,9 @@ import unittest
 from fastapi import HTTPException
 from sqlmodel import SQLModel, Session, create_engine, select
 
-from backend.api.settings import SettingItem, get_feature_flags, save_settings
+from backend.api.settings import SettingItem, save_settings
 from backend.feature_flags import (
     FLAG_CONTENT_ADDRESSED_ASSETS,
-    FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
-    FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
-    FLAG_INSPECTION_IDENTITY_V2,
-    FLAG_INSPECTION_VISUAL_HOME_ACTIONS,
-    FLAG_MODEL_INSPECTION,
     FLAG_TIERED_ASSET_RETENTION,
 )
 from backend.models import SystemSetting, User
@@ -70,53 +65,6 @@ class SettingsDependencyTests(unittest.TestCase):
             )
 
         self.assertEqual(context.exception.status_code, 422)
-
-    def test_effective_flags_close_inspection_children_with_master(self):
-        flags = get_feature_flags(session=self.session, current_user=self.user)
-
-        self.assertFalse(flags[FLAG_MODEL_INSPECTION])
-        self.assertFalse(flags[FLAG_INSPECTION_IDENTITY_V2])
-        self.assertFalse(flags[FLAG_INSPECTION_BUSINESS_COVERAGE_V2])
-        self.assertFalse(flags[FLAG_INSPECTION_COVERAGE_SCHEDULER_V2])
-        self.assertFalse(flags[FLAG_INSPECTION_VISUAL_HOME_ACTIONS])
-
-    def test_explicit_parent_disable_overrides_child_true_in_same_request(self):
-        response = save_settings(
-            [
-                SettingItem(key=FLAG_MODEL_INSPECTION, value="false"),
-                SettingItem(key=FLAG_INSPECTION_IDENTITY_V2, value="true"),
-                SettingItem(
-                    key=FLAG_INSPECTION_BUSINESS_COVERAGE_V2,
-                    value="true",
-                ),
-                SettingItem(
-                    key=FLAG_INSPECTION_COVERAGE_SCHEDULER_V2,
-                    value="true",
-                ),
-                SettingItem(
-                    key=FLAG_INSPECTION_VISUAL_HOME_ACTIONS,
-                    value="true",
-                ),
-            ],
-            session=self.session,
-            current_user=self.user,
-        )
-
-        self.assertGreaterEqual(response["count"], 4)
-        self.assertEqual(self._value(FLAG_MODEL_INSPECTION), "false")
-        self.assertEqual(self._value(FLAG_INSPECTION_IDENTITY_V2), "false")
-        self.assertEqual(
-            self._value(FLAG_INSPECTION_BUSINESS_COVERAGE_V2),
-            "false",
-        )
-        self.assertEqual(
-            self._value(FLAG_INSPECTION_COVERAGE_SCHEDULER_V2),
-            "false",
-        )
-        self.assertEqual(
-            self._value(FLAG_INSPECTION_VISUAL_HOME_ACTIONS),
-            "false",
-        )
 
 
 if __name__ == "__main__":

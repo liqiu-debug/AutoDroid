@@ -1,8 +1,5 @@
-"""AutoDroid 导出器 + 设备端回传链路测试。"""
-import io
-import json
+"""AutoDroid 脚本生成器 + App 直跑下发 / 设备端回传链路测试。"""
 import unittest
-import zipfile
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -21,7 +18,6 @@ from backend.database import get_session
 from backend.models import (
     ApiToken,
     Device,
-    DeviceRunTask,
     TestCase,
     TestCaseStep,
     TestExecution,
@@ -268,74 +264,9 @@ class PrecheckTests(_Base):
         self.assertIn("EXPORT_UNRESOLVED_VARIABLE", [i["code"] for i in result["issues"]])
 
 
-class PackagerTests(_Base):
-    def test_case_package_zip_structure(self):
-        case = self._create_case(name="打包用例")
-        self._add_step(case.id, 1, "sleep", args={"seconds": 0})
-        package = packager.build_case_package(self.session, case)
-        self.assertTrue(package["filename"].endswith(".zip"))
-        with zipfile.ZipFile(io.BytesIO(package["content"])) as zf:
-            names = set(zf.namelist())
-            self.assertIn("manifest.json", names)
-            self.assertIn("main.js", names)
-            self.assertIn("runtime.js", names)
-            self.assertIn("project.json", names)
-            self.assertIn("README.txt", names)
-            self.assertIn(f"cases/case_{case.id}.js", names)
-            manifest = json.loads(zf.read("manifest.json"))
-            self.assertEqual(manifest["kind"], "case")
-            self.assertEqual(manifest["cases"][0]["id"], case.id)
-            project = json.loads(zf.read("project.json"))
-            self.assertEqual(project["main"], "main.js")
-            main_js = zf.read("main.js").decode("utf-8")
-            self.assertIn("__loadModule__", main_js)
-            case_module = zf.read(f"cases/case_{case.id}.js").decode("utf-8")
-            self.assertIn("module.exports", case_module)
-            # 直接运行时（顶层无 module）不应因 module 未定义而崩溃
-            self.assertIn('typeof module !== "undefined"', case_module)
-
-    def test_scenario_package_contains_all_cases(self):
-        case_a = self._create_case(name="用例A")
-        case_b = self._create_case(name="用例B")
-        self._add_step(case_a.id, 1, "sleep", args={"seconds": 0})
-        self._add_step(case_b.id, 1, "sleep", args={"seconds": 0})
-        scenario = TestScenario(name="场景1")
-        self.session.add(scenario)
-        self.session.commit()
-        self.session.refresh(scenario)
-        self.session.add(ScenarioStep(scenario_id=scenario.id, case_id=case_a.id, order=1, alias="A"))
-        self.session.add(ScenarioStep(scenario_id=scenario.id, case_id=case_b.id, order=2, alias="B"))
-        self.session.commit()
-
-        package = packager.build_scenario_package(self.session, scenario)
-        with zipfile.ZipFile(io.BytesIO(package["content"])) as zf:
-            manifest = json.loads(zf.read("manifest.json"))
-            self.assertEqual(manifest["kind"], "scenario")
-            self.assertEqual([entry["id"] for entry in manifest["cases"]], [case_a.id, case_b.id])
-            self.assertIn(f"cases/case_{case_a.id}.js", zf.namelist())
-            self.assertIn(f"cases/case_{case_b.id}.js", zf.namelist())
-
-    def test_single_file_embeds_case(self):
-        case = self._create_case(name="单文件")
-        self._add_step(case.id, 1, "sleep", args={"seconds": 0})
-        result = packager.build_single_file(self.session, case)
-        source = result["content"].decode("utf-8")
-        self.assertIn("createContext", source)
-        self.assertIn('"case_id": %d' % case.id, source)
-        self.assertTrue(result["filename"].endswith(".js"))
-
-
 class DeviceFlowTests(_Base):
     def setUp(self) -> None:
         super().setUp()
-        import tempfile
-        from pathlib import Path
-
-        # 脚本包写入临时目录，避免污染仓库 uploads/
-        self._package_dir = Path(tempfile.mkdtemp(prefix="autodroid_test_packages_"))
-        self._package_dir_patch = patch.object(autojs_api, "PACKAGE_DIR", self._package_dir)
-        self._package_dir_patch.start()
-        self.addCleanup(self._package_dir_patch.stop)
         self.user = User(username="tester", hashed_password="x", role="user", is_active=True)
         self.session.add(self.user)
         self.session.commit()
@@ -351,7 +282,6 @@ class DeviceFlowTests(_Base):
         self.session.commit()
 
         app = FastAPI()
-        app.include_router(autojs_api.router, prefix="/api/autojs")
         app.include_router(autojs_api.device_router, prefix="/api/device-runs")
         app.include_router(app_runs_api.router, prefix="/api/app-runs")
         app.dependency_overrides[get_session] = lambda: self.session
@@ -378,133 +308,6 @@ class DeviceFlowTests(_Base):
         device = self.session.exec(select(Device).where(Device.serial == "autojs6:abc123")).first()
         self.assertIsNotNone(device)
         self.assertEqual(device.connection_type, "autojs6")
-
-    def test_full_flow_create_claim_report(self):
-        case = self._make_case_with_steps()
-
-        # 1. 创建任务（生成脚本包）
-        resp = self.client.post(
-            "/api/autojs/tasks",
-            json={"kind": "case", "case_id": case.id},
-            headers=self.headers,
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        task_id = resp.json()["task_id"]
-        self.assertEqual(resp.json()["status"], "PENDING")
-
-        # 2. 设备领取任务
-        resp = self.client.get(
-            "/api/device-runs/pending",
-            params={"serial": "autojs6:abc123"},
-            headers=self.headers,
-        )
-        self.assertEqual(resp.status_code, 200)
-        claimed = resp.json()["task"]
-        self.assertEqual(claimed["task_id"], task_id)
-
-        # 3. 下载脚本包
-        resp = self.client.get(
-            f"/api/device-runs/packages/{task_id}", headers=self.headers
-        )
-        self.assertEqual(resp.status_code, 200)
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            self.assertIn("main.js", zf.namelist())
-
-        # 4. 上报结果 -> 落库 + 报告 + 通知
-        report_payload = {
-            "task_id": task_id,
-            "kind": "case",
-            "case_id": case.id,
-            "device": {"model": "Pixel 8", "android_id": "abc123"},
-            "started_at": 1000.0,
-            "finished_at": 6000.0,
-            "success": False,
-            "cases": [{
-                "case_id": case.id,
-                "name": case.name,
-                "success": False,
-                "steps": [
-                    {"order": 1, "action": "click", "status": "PASS", "duration": 1.2},
-                    {"order": 2, "action": "assert_text", "status": "FAIL", "duration": 0.8,
-                     "error": "断言失败: 期望页面包含 \"欢迎\"，未找到",
-                     "error_code": "E2003_ASSERT_TEXT_FAILED", "attempts": 2},
-                ],
-            }],
-            "logs": ["step1 ok"],
-            "notify": True,
-        }
-        with patch.object(autojs_api.report_generator, "generate_report", return_value="report-test.html") as report_mock, \
-             patch.object(autojs_api.NotificationService, "send_report_card") as notify_mock:
-            resp = self.client.post(
-                "/api/device-runs/report", json=report_payload, headers=self.headers
-            )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        body = resp.json()
-        self.assertEqual(body["status"], "FAIL")
-        self.assertEqual(body["report_id"], "report-test.html")
-        report_mock.assert_called_once()
-        notify_mock.assert_called_once()
-
-        # 执行记录与步骤结果
-        execution = self.session.get(TestExecution, body["execution_id"])
-        self.assertIsNotNone(execution)
-        self.assertEqual(execution.device_serial, "autojs6:abc123")
-        self.assertEqual(execution.platform, "android")
-        self.assertEqual(execution.batch_name, execution.scenario_name)
-        self.assertEqual(execution.run_source, "app")
-        results = self.session.exec(
-            select(TestResult).where(TestResult.execution_id == execution.id).order_by(TestResult.step_order)
-        ).all()
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0].status, "PASS")
-        self.assertEqual(results[1].status, "FAIL")
-
-        # 任务收尾
-        task = self.session.exec(select(DeviceRunTask).where(DeviceRunTask.task_id == task_id)).first()
-        self.assertEqual(task.status, "DONE")
-        self.assertEqual(task.execution_id, execution.id)
-        self.assertEqual(task.result_summary["failed_steps"], 1)
-
-        # 5. 幂等重报：不产生重复执行记录
-        with patch.object(autojs_api.report_generator, "generate_report", return_value="report-test-2.html"), \
-             patch.object(autojs_api.NotificationService, "send_report_card"):
-            resp = self.client.post(
-                "/api/device-runs/report", json=report_payload, headers=self.headers
-            )
-        self.assertEqual(resp.status_code, 200)
-        executions = self.session.exec(select(TestExecution)).all()
-        self.assertEqual(len(executions), 1)
-
-    def test_claim_returns_none_when_empty(self):
-        resp = self.client.get(
-            "/api/device-runs/pending",
-            params={"serial": "autojs6:none"},
-            headers=self.headers,
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertIsNone(resp.json()["task"])
-
-    def test_concurrent_claim_only_one_wins(self):
-        """两个 Agent 实例轮询同一任务时，只有一个能领到（原子领取）。"""
-        case = self._make_case_with_steps()
-        resp = self.client.post(
-            "/api/autojs/tasks",
-            json={"kind": "case", "case_id": case.id},
-            headers=self.headers,
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        task_id = resp.json()["task_id"]
-
-        first = self.client.get(
-            "/api/device-runs/pending", params={"serial": "autojs6:agent-a"}, headers=self.headers
-        ).json()["task"]
-        second = self.client.get(
-            "/api/device-runs/pending", params={"serial": "autojs6:agent-b"}, headers=self.headers
-        ).json()["task"]
-
-        self.assertIsNotNone(first)
-        self.assertEqual(first["task_id"], task_id)
-        self.assertIsNone(second)
 
     # ------------------------------------------------------------------ #
     #  App 直跑（无任务）：脚本下发 + 上报
@@ -665,10 +468,6 @@ class DeviceFlowTests(_Base):
         codes = [issue["code"] for issue in detail.get("issues") or []]
         self.assertIn("EXPORT_UNSUPPORTED_LOCATOR", codes)
 
-    def test_export_requires_auth(self):
-        case = self._make_case_with_steps()
-        resp = self.client.post(f"/api/autojs/cases/{case.id}/export")
-        self.assertEqual(resp.status_code, 401)
 
 
 if __name__ == "__main__":
@@ -757,26 +556,17 @@ class IOSPlatformTests(DeviceFlowTests):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertIn("com.demo.mall.ios", resp.json()["case_files"][0]["content"])
 
-    def test_ios_unmapped_app_is_blocked_before_download_or_dispatch(self):
+    def test_ios_unmapped_app_is_blocked_before_download(self):
         case = self._create_case(name="缺少应用映射")
         self._add_step(case.id, 1, "start_app", args={"app_key": "adwad"})
-        responses = [
-            self.client.get(
-                f"/api/app-runs/cases/{case.id}/script?platform=ios", headers=self.headers
-            ),
-            self.client.post(
-                "/api/autojs/tasks",
-                json={"kind": "case", "case_id": case.id, "platform": "ios"},
-                headers=self.headers,
-            ),
-        ]
-        for response in responses:
-            self.assertEqual(response.status_code, 400, response.text)
-            issues = response.json()["detail"]["issues"]
-            self.assertEqual(issues[0]["code"], "P1004_APP_MAPPING_MISSING")
-            self.assertIn("adwad", issues[0]["message"])
-            self.assertIn("ios", issues[0]["message"])
-        self.assertEqual(self.session.exec(select(DeviceRunTask)).all(), [])
+        response = self.client.get(
+            f"/api/app-runs/cases/{case.id}/script?platform=ios", headers=self.headers
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        issues = response.json()["detail"]["issues"]
+        self.assertEqual(issues[0]["code"], "P1004_APP_MAPPING_MISSING")
+        self.assertIn("adwad", issues[0]["message"])
+        self.assertIn("ios", issues[0]["message"])
 
     def test_register_ios_device_uses_ios_serial_prefix(self):
         resp = self.client.post(

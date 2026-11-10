@@ -37,10 +37,6 @@ from backend.models import (
     AssetReference,
     CompatibilityPageResult,
     CompatibilityRun,
-    InspectionFault,
-    InspectionObservation,
-    InspectionRun,
-    InspectionState,
     StoredAsset,
 )
 from backend.paths import project_path
@@ -120,116 +116,6 @@ def _upsert_owner_assets(
             pinned_reason=(pinned_reason if retention_class == RETENTION_PINNED else None),
             commit=False,
         )
-
-
-def _backfill_state(session: Session, state: InspectionState) -> bool:
-    observation = None
-    if state.representative_observation_id:
-        observation = session.get(
-            InspectionObservation,
-            state.representative_observation_id,
-        )
-    if observation is None:
-        observation = session.exec(
-            select(InspectionObservation)
-            .where(InspectionObservation.state_id == state.id)
-            .order_by(
-                col(InspectionObservation.is_representative).desc(),
-                col(InspectionObservation.id).asc(),
-            )
-        ).first()
-
-    run = session.get(InspectionRun, state.run_id)
-    if observation is None:
-        observation = InspectionObservation(
-            run_id=state.run_id,
-            branch_run_id=state.branch_run_id,
-            state_id=state.id,
-            template_id=state.template_id,
-            sequence=int(state.id or 0),
-            capture_kind="LEGACY",
-            package_name=(run.package_name if run else state.foreground_package),
-            activity=state.activity,
-            exact_cluster_key=state.cluster_key or "",
-            exact_replay_key=state.state_key or "",
-            exact_state_key=state.state_key or "",
-            screenshot_sha=state.screenshot_sha,
-            screenshot_phash=state.perceptual_hash,
-            perceptual_hash=state.perceptual_hash,
-            is_representative=True,
-            captured_at=state.created_at,
-            created_at=datetime.now(),
-        )
-        session.add(observation)
-        session.flush()
-
-    action_path = None
-    if state.screenshot_path:
-        action_path = str(Path(state.screenshot_path).with_name("actions.json"))
-    screenshot = _asset_for_path(
-        session,
-        asset_id=observation.screenshot_asset_id,
-        legacy_path=state.screenshot_path,
-    )
-    xml = _asset_for_path(
-        session,
-        asset_id=observation.xml_asset_id,
-        legacy_path=state.xml_path,
-    )
-    thumbnail = _asset_for_path(
-        session,
-        asset_id=observation.thumbnail_asset_id,
-        legacy_path=state.thumbnail_path,
-    )
-    action_map = _asset_for_path(
-        session,
-        asset_id=observation.action_map_asset_id,
-        legacy_path=action_path,
-    )
-
-    observation.screenshot_asset_id = screenshot.id if screenshot else None
-    observation.xml_asset_id = xml.id if xml else None
-    observation.thumbnail_asset_id = thumbnail.id if thumbnail else None
-    observation.action_map_asset_id = action_map.id if action_map else None
-    observation.original_width = screenshot.original_width if screenshot else None
-    observation.original_height = screenshot.original_height if screenshot else None
-    observation.is_representative = True
-    observation.retention_class = (
-        RETENTION_PINNED if state.selected_for_regression else RETENTION_HOT
-    )
-    observation.retained_until = retention_expiry(observation.retention_class)
-    present = sum(
-        bool(item)
-        for item in (
-            observation.screenshot_asset_id,
-            observation.xml_asset_id,
-            observation.thumbnail_asset_id,
-            observation.action_map_asset_id,
-        )
-    )
-    observation.asset_status = "AVAILABLE" if present == 4 else ("PARTIAL" if present else "UNAVAILABLE")
-    observation.metadata_only = present == 0
-    session.add(observation)
-    session.flush()
-
-    retention = observation.retention_class
-    _upsert_owner_assets(
-        session,
-        owner_type="inspection_observation",
-        owner_id=int(observation.id),
-        assets=(
-            ("screenshot", observation.screenshot_asset_id, retention),
-            ("xml", observation.xml_asset_id, retention),
-            ("thumbnail", observation.thumbnail_asset_id, retention),
-            ("action_map", observation.action_map_asset_id, retention),
-        ),
-        pinned_reason=f"selected inspection regression state {state.id}",
-    )
-    state.representative_observation_id = observation.id
-    state.observation_count = max(1, int(state.observation_count or 0))
-    state.last_observed_at = state.last_observed_at or observation.captured_at
-    session.add(state)
-    return present > 0
 
 
 def _backfill_page_result(session: Session, row: CompatibilityPageResult) -> bool:
@@ -324,37 +210,13 @@ def _backfill_run_snapshot(session: Session, run: CompatibilityRun) -> bool:
                 owner_id=int(run.id),
                 role=f"baseline:{key}:{kind}",
                 retention_class=RETENTION_PINNED,
-                pinned_reason=f"inspection baseline for compatibility run {run.id}",
+                pinned_reason=f"compatibility baseline for run {run.id}",
                 commit=False,
             )
     if changed:
         run.page_set_snapshot = pages
         session.add(run)
     return changed
-
-
-def _backfill_fault(session: Session, fault: InspectionFault) -> bool:
-    assets = []
-    for role, path_value in (
-        ("full_log", fault.full_log_path),
-        ("screenshot", fault.screenshot_path),
-        ("xml", fault.xml_path),
-        ("replay", fault.replay_path),
-        ("trace", fault.trace_path),
-    ):
-        source = _report_file(path_value)
-        if source is None:
-            continue
-        asset = store_file(session, source, commit=False)
-        assets.append((role, asset.id, RETENTION_PINNED))
-    _upsert_owner_assets(
-        session,
-        owner_type="inspection_fault",
-        owner_id=int(fault.id),
-        assets=assets,
-        pinned_reason=f"inspection fault evidence {fault.id}",
-    )
-    return bool(assets)
 
 
 def _run_rows(
@@ -387,26 +249,14 @@ def backfill(
     *,
     after_id: int = 0,
     limit: Optional[int] = None,
-    include_faults: bool = True,
 ) -> Dict[str, int]:
     summary = {
-        "inspection_states": 0,
         "compatibility_page_results": 0,
         "compatibility_runs": 0,
-        "inspection_faults": 0,
         "owners_with_assets": 0,
         "failed": 0,
     }
     with Session(engine) as session:
-        _run_rows(
-            session,
-            InspectionState,
-            _backfill_state,
-            "inspection_states",
-            summary,
-            after_id=after_id,
-            limit=limit,
-        )
         _run_rows(
             session,
             CompatibilityPageResult,
@@ -425,16 +275,6 @@ def backfill(
             after_id=after_id,
             limit=limit,
         )
-        if include_faults:
-            _run_rows(
-                session,
-                InspectionFault,
-                _backfill_fault,
-                "inspection_faults",
-                summary,
-                after_id=after_id,
-                limit=limit,
-            )
     return summary
 
 
@@ -515,24 +355,6 @@ def materialize_legacy_paths(*, force: bool = False) -> Dict[str, int]:
                     file=sys.stderr,
                 )
 
-        for state in session.exec(select(InspectionState)).all():
-            observation = (
-                session.get(InspectionObservation, state.representative_observation_id)
-                if state.representative_observation_id is not None
-                else None
-            )
-            if observation is None:
-                continue
-            materialize(observation.screenshot_asset_id, state.screenshot_path)
-            materialize(observation.xml_asset_id, state.xml_path)
-            materialize(observation.thumbnail_asset_id, state.thumbnail_path)
-            action_path = (
-                str(Path(state.screenshot_path).with_name("actions.json"))
-                if state.screenshot_path
-                else None
-            )
-            materialize(observation.action_map_asset_id, action_path)
-
         for row in session.exec(select(CompatibilityPageResult)).all():
             for asset_id, path_value in (
                 (row.baseline_screenshot_asset_id, row.baseline_screenshot_path),
@@ -556,23 +378,6 @@ def materialize_legacy_paths(*, force: bool = False) -> Dict[str, int]:
                     page.get("baseline_xml_path"),
                 )
 
-        for fault in session.exec(select(InspectionFault)).all():
-            for role, path_value in (
-                ("full_log", fault.full_log_path),
-                ("screenshot", fault.screenshot_path),
-                ("xml", fault.xml_path),
-                ("replay", fault.replay_path),
-                ("trace", fault.trace_path),
-            ):
-                reference = session.exec(
-                    select(AssetReference).where(
-                        AssetReference.owner_type == "inspection_fault",
-                        AssetReference.owner_id == fault.id,
-                        AssetReference.role == role,
-                        AssetReference.released_at == None,  # noqa: E711
-                    )
-                ).first()
-                materialize(reference.asset_id if reference else None, path_value)
     return summary
 
 
@@ -582,7 +387,6 @@ def main() -> None:
     )
     parser.add_argument("--after-id", type=int, default=0)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--skip-faults", action="store_true")
     parser.add_argument(
         "--materialize-legacy",
         action="store_true",
@@ -600,7 +404,6 @@ def main() -> None:
         result = backfill(
             after_id=max(0, args.after_id),
             limit=(max(1, args.limit) if args.limit is not None else None),
-            include_faults=not args.skip_faults,
         )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 

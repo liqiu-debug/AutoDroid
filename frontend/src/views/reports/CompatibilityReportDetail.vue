@@ -8,19 +8,7 @@ import dayjs from 'dayjs'
 import api from '@/api'
 import { runStatusTagType } from '@/utils/statusMeta'
 import { createPollingLoop, pollRequestConfig } from '@/utils/polling'
-import {
-  compatibilityStatusLabel,
-  compatibilityExecutionMode,
-  normalizeReplayResults,
-  normalizeReplayTrace,
-  packageSnapshotLabel,
-  replayBoundaryEvidenceLabel,
-  replayFailureLabel,
-  replayPathLabel,
-  replayScopeLabel,
-  sourceBoundaryEvidenceLabel,
-  terminalOutcomeLabel,
-} from '@/utils/compatibilityReplay'
+import { compatibilityStatusLabel } from '@/utils/compatibilityReplay'
 
 const route = useRoute()
 const router = useRouter()
@@ -43,36 +31,7 @@ let pageActive = false
 let assetLifecycleVersion = 0
 
 const matrixPages = computed(() => run.value?.page_set?.pages || [])
-const isInstalledReplay = computed(() => compatibilityExecutionMode(run.value) === 'installed_replay')
 const isDeviceCompare = computed(() => run.value?.compare_mode === 'device')
-const replayResults = computed(() => normalizeReplayResults(run.value))
-const replaySourcePackage = computed(() => run.value?.source_package_snapshot || {})
-const replayTargetPackage = computed(() => (
-  run.value?.target_package_snapshot
-  || run.value?.cells?.[0]?.installed_package_snapshot
-  || {}
-))
-const sourceVersionUnknown = computed(() => (
-  run.value && isInstalledReplay.value && replaySourcePackage.value.known === false
-))
-const isUnknownSourceWarning = item => {
-  const code = String(item?.code || item?.type || '').trim().toUpperCase()
-  const message = String(item?.message || item || '')
-  return ['SOURCE_VERSION_UNKNOWN', 'SOURCE_PACKAGE_UNKNOWN'].includes(code)
-    || (message.includes('历史巡检') && message.includes('来源版本'))
-}
-const replayPackageWarnings = computed(() => (
-  (replayTargetPackage.value?.preflight_warnings || []).filter(item => (
-    !(sourceVersionUnknown.value && isUnknownSourceWarning(item))
-  ))
-))
-const replayDeviceSerial = computed(() => (
-  run.value?.cells?.[0]?.device_serial || replayResults.value[0]?.device_serial || '-'
-))
-const selectedReplayTrace = computed(() => {
-  const trace = selectedResult.value?.replay_trace
-  return Array.isArray(trace) ? trace : normalizeReplayTrace(trace)
-})
 const hasRunningRun = computed(() => {
   const status = String(run.value?.status || '').toUpperCase()
   return ['PENDING', 'RUNNING'].includes(status)
@@ -128,75 +87,12 @@ const hiddenMetricKeys = new Set([
   'ocr_diff_ratio',
   'ocr_error_baseline',
   'ocr_error_candidate',
-  'duration_ms',
-  'checkpoint_count',
-  'completed_checkpoints',
-  'warning_codes',
-  'reachability_evidence',
-  'replay_eligibility',
-  'replay_scope',
-  'terminal_outcome',
-  'boundary_evidence',
-  'source_boundary_evidence',
-  'replay_boundary_evidence',
-  'execution_boundary_evidence',
-  'prefix_path_key',
-  'terminal_boundaries',
-  'asset_error',
 ])
 const formatMode = (mode) => mode === 'clean' ? '干净对比' : '升级兼容'
 const formatCompareMode = (mode) => ({
-  snapshot: '快照回归',
   version: '版本对比',
   device: '机型对比',
 }[mode] || '兼容性对比')
-const formatSourceType = (sourceType) => (
-  sourceType === 'inspection' ? '智能巡检状态' : '人工页面合集'
-)
-const evidenceLabel = value => ({
-  VERIFIED_TWICE: '已验证两次',
-  OBSERVED_ONCE: '已观测一次',
-  UNSTABLE: '历史链路不稳定',
-  UNKNOWN: '证据待确认',
-}[String(value || '').toUpperCase()] || '证据待确认')
-const replayStepType = status => ({
-  PASS: 'success',
-  WARNING: 'warning',
-  BLOCKED: 'warning',
-  FAIL: 'danger',
-  ERROR: 'danger',
-}[String(status || '').toUpperCase()] || 'info')
-const formatDuration = value => {
-  if (value === null || value === undefined || value === '') return '-'
-  const number = Number(value)
-  if (!Number.isFinite(number)) return '-'
-  if (number < 1000) return `${number} ms`
-  return `${(number / 1000).toFixed(1)} s`
-}
-const branchLabel = value => ({
-  guest: '未登录',
-  authenticated: '已登录',
-}[String(value || '').toLowerCase()] || '默认业务线')
-const stageLabel = value => ({
-  PENDING: '等待执行',
-  PREFLIGHT: '检查设备',
-  REPLAYING: '回放链路',
-  CAPTURING: '保存证据',
-  CANCELLING: '正在取消',
-  CANCELLED: '已取消',
-  FINISHED: '已完成',
-  COMPLETED: '已完成',
-}[String(value || '').trim().toUpperCase()] || (hasRunningRun.value ? '执行中' : '已完成'))
-const replayFailureText = result => {
-  const terminalOutcome = String(result?.terminal_outcome || '').toUpperCase()
-  const failureCode = result?.failure_type || (terminalOutcome !== 'NONE' ? terminalOutcome : '')
-  return replayFailureLabel(failureCode)
-    || (statusText(result?.status) === 'PASS' ? '链路可正常到达' : statusLabel(result?.status))
-}
-const hasSafetyBoundary = result => (
-  String(result?.terminal_outcome || '').toUpperCase() === 'SAFETY_BLOCKED'
-  || String(result?.replay_scope || '').toUpperCase() === 'PREFIX_TO_SAFETY_BOUNDARY'
-)
 const formatMetricLabel = (key) => metricLabels[key] || key
 const formatMetricValue = (value) => {
   if (typeof value === 'boolean') return value ? '是' : '否'
@@ -366,15 +262,6 @@ const openResult = (cell, page) => {
   hydrateResultAssets(selectedResult.value)
   void hydrateOnDemandDiff(selectedResult.value)
 }
-const openReplayResult = result => {
-  if (!result) return
-  selectedResult.value = result
-  resultDrawerVisible.value = true
-  void hydrateAsset(
-    assetIdFor(result, 'candidate_screenshot'),
-    assetPathFor(result, 'candidate_screenshot'),
-  )
-}
 
 const openXmlAsset = async (assetId, path) => {
   try {
@@ -474,44 +361,12 @@ onUnmounted(() => {
       </div>
 
         <el-alert v-if="loadError" :title="loadError" type="error" :closable="false"><el-button link @click="fetchRun()">重新加载</el-button></el-alert>
-      <el-alert
-        v-if="sourceVersionUnknown"
-        title="巡检来源版本未知，本次结果仅证明当前已安装版本的历史链路可达性"
-        type="warning"
-        :closable="false"
-        show-icon
-      />
-      <el-alert
-        v-for="item in replayPackageWarnings"
-        :key="`replay-warning-${item.code || item.message}`"
-        :title="item.message || item.code || item"
-        type="warning"
-        :closable="false"
-        show-icon
-      />
 
-      <div v-if="run && isInstalledReplay" class="kpi-row">
+      <div v-if="run" class="kpi-row">
         <div class="kpi-item">
           <span class="kpi-label">状态</span>
           <el-tag :type="statusType(run.status)" effect="plain">{{ statusLabel(run.status) }}</el-tag>
         </div>
-        <div class="kpi-item version-kpi">
-          <span class="kpi-label">版本</span>
-          <strong>{{ packageSnapshotLabel(replaySourcePackage) }} → {{ packageSnapshotLabel(replayTargetPackage) }}</strong>
-        </div>
-        <div class="kpi-item"><span class="kpi-label">执行环境</span><strong>{{ formatDevice(replayDeviceSerial) }} · {{ branchLabel(run.replay_branch_key) }}</strong></div>
-        <div class="kpi-item">
-          <span class="kpi-label">链路结果</span>
-          <strong><span class="pass">{{ run.pass_count || 0 }} 通过</span> · <span class="warn">{{ run.warning_count || 0 }} 需关注</span> · <span class="fail">{{ run.fail_count || 0 }} 失败</span></strong>
-        </div>
-      </div>
-
-      <div v-else-if="run" class="kpi-row">
-        <div class="kpi-item">
-          <span class="kpi-label">状态</span>
-          <el-tag :type="statusType(run.status)" effect="plain">{{ statusLabel(run.status) }}</el-tag>
-        </div>
-        <div class="kpi-item"><span class="kpi-label">页面来源</span><strong>{{ formatSourceType(run.source_type) }}</strong></div>
         <div class="kpi-item"><span class="kpi-label">对比维度</span><strong>{{ formatCompareMode(run.compare_mode) }}</strong></div>
         <div class="kpi-item"><span class="kpi-label">模式</span><strong>{{ formatMode(run.mode) }}</strong></div>
         <div v-if="isDeviceCompare" class="kpi-item"><span class="kpi-label">基准设备</span><strong>{{ formatDevice(run.baseline_device_serial) }}</strong></div>
@@ -523,56 +378,7 @@ onUnmounted(() => {
         <div class="kpi-item"><span class="kpi-label">开始</span><span>{{ formatTime(run.started_at || run.created_at) }}</span></div>
       </div>
 
-      <section v-if="run && isInstalledReplay" class="replay-panel">
-        <div class="replay-stage">
-          <div>
-            <strong>链路回放结果</strong>
-            <span class="muted-text">每条链路独立回根执行；失败不会阻断后续链路</span>
-          </div>
-          <div v-if="run.cells?.[0]" class="stage-text">
-              {{ stageLabel(run.cells[0].current_stage) }}
-              <el-tag :type="statusType(run.cells[0].status)" size="small" effect="plain">{{ statusLabel(run.cells[0].status) }}</el-tag>
-            </div>
-          </div>
-          <el-table :data="replayResults" border height="100%" empty-text="等待生成链路结果">
-          <el-table-column label="链路" min-width="310">
-            <template #default="{ row }">
-              <div class="run-name">{{ row.name }}</div>
-              <div class="muted-text replay-path-label">{{ replayPathLabel(row) }}</div>
-            </template>
-          </el-table-column>
-          <el-table-column label="来源页面" min-width="190">
-            <template #default="{ row }">
-              <div>{{ row.source_reference }}</div>
-              <div class="muted-text">{{ row.source_capture_label }} · {{ evidenceLabel(row.evidence_level) }}</div>
-            </template>
-          </el-table-column>
-          <el-table-column label="回放范围" min-width="190">
-            <template #default="{ row }">
-              <div>{{ replayScopeLabel(row.replay_scope) }}</div>
-              <div class="muted-text">{{ terminalOutcomeLabel(row.terminal_outcome) }}</div>
-              <div v-if="hasSafetyBoundary(row)" class="boundary-inline muted-text">
-                <span>{{ sourceBoundaryEvidenceLabel(row.source_boundary_evidence) }}</span>
-                <span>{{ replayBoundaryEvidenceLabel(row.replay_boundary_evidence) }}</span>
-              </div>
-            </template>
-          </el-table-column>
-          <el-table-column label="本次结果" min-width="170">
-            <template #default="{ row }">
-              <el-tag :type="statusType(row.status)" size="small" effect="plain">{{ statusLabel(row.status) }}</el-tag>
-              <div class="muted-text result-summary">{{ replayFailureText(row) }}<span v-if="row.failed_step_index !== null"> · 第 {{ Number(row.failed_step_index) + 1 }} 步</span></div>
-            </template>
-          </el-table-column>
-          <el-table-column label="耗时" width="100" align="center">
-            <template #default="{ row }">{{ formatDuration(row.duration_ms) }}</template>
-          </el-table-column>
-          <el-table-column label="详情" width="80" align="center" fixed="right">
-            <template #default="{ row }"><el-button link type="primary" @click="openReplayResult(row)">查看</el-button></template>
-          </el-table-column>
-        </el-table>
-      </section>
-
-      <section v-else-if="run" class="matrix-panel">
+      <section v-if="run" class="matrix-panel">
         <el-table :data="run.cells || []" border class="matrix-table" height="100%">
           <el-table-column label="设备" fixed min-width="180">
             <template #default="{ row }">
@@ -611,7 +417,7 @@ onUnmounted(() => {
         </el-table>
       </section>
 
-      <section v-if="run && !isInstalledReplay && galleryCards.length" class="gallery-panel">
+      <section v-if="run && galleryCards.length" class="gallery-panel">
         <div class="gallery-header">
           <span class="card-title">页面画廊</span>
           <el-select v-model="galleryPageKey" filterable class="gallery-page-select" size="small">
@@ -656,84 +462,8 @@ onUnmounted(() => {
       <div v-else-if="!run" class="empty-state">暂无兼容性报告详情</div>
     </div>
 
-    <el-drawer v-model="resultDrawerVisible" size="min(960px, 100vw)" :title="isInstalledReplay ? '链路回放详情' : '页面对比详情'">
-      <div v-if="selectedResult && isInstalledReplay" class="result-detail replay-result-detail">
-        <div class="result-header">
-          <div>
-            <h3>{{ selectedResult.name || '链路回放' }}</h3>
-            <p class="muted-text">{{ selectedResult.source_reference }} · {{ selectedResult.source_capture_label }} · {{ formatDevice(selectedResult.device_serial) }}</p>
-          </div>
-          <el-tag :type="statusType(selectedResult.status)" effect="plain">{{ statusLabel(selectedResult.status) }}</el-tag>
-        </div>
-        <el-alert v-if="selectedResult.failure_type" :title="replayFailureText(selectedResult)" type="warning" show-icon :closable="false" />
-        <div class="metric-grid">
-          <div class="metric-item"><span class="kpi-label">来源页面</span><strong>{{ selectedResult.source_reference }} · {{ selectedResult.source_capture_label }}</strong></div>
-          <div class="metric-item"><span class="kpi-label">历史证据</span><strong>{{ evidenceLabel(selectedResult.evidence_level) }}</strong></div>
-          <div class="metric-item"><span class="kpi-label">回放范围</span><strong>{{ replayScopeLabel(selectedResult.replay_scope) }}</strong></div>
-          <div class="metric-item"><span class="kpi-label">终点</span><strong>{{ terminalOutcomeLabel(selectedResult.terminal_outcome) }}</strong></div>
-          <div class="metric-item"><span class="kpi-label">耗时</span><strong>{{ formatDuration(selectedResult.duration_ms) }}</strong></div>
-        </div>
-        <div v-if="hasSafetyBoundary(selectedResult)" class="boundary-evidence-grid">
-          <div>
-            <span>源巡检报告</span>
-            <strong>{{ sourceBoundaryEvidenceLabel(selectedResult.source_boundary_evidence) }}</strong>
-          </div>
-          <div>
-            <span>升级后执行</span>
-            <strong>{{ replayBoundaryEvidenceLabel(selectedResult.replay_boundary_evidence) }}</strong>
-          </div>
-        </div>
-        <div class="replay-evidence-grid">
-          <div>
-            <div class="image-title">当前页面截图</div>
-            <img v-if="resultAssetUrl(selectedResult, 'candidate_screenshot')" :src="resultAssetUrl(selectedResult, 'candidate_screenshot')" alt="replay screenshot" />
-            <div v-else-if="hasResultAsset(selectedResult, 'candidate_screenshot')" class="image-placeholder muted-text">{{ resultAssetNotice(selectedResult, 'candidate_screenshot') || '加载中' }}</div>
-            <div v-else class="image-placeholder muted-text">暂无截图</div>
-          </div>
-          <div class="replay-xml-box">
-            <div class="image-title">当前 XML</div>
-            <el-button
-              v-if="selectedResult.candidate_xml_asset_id || selectedResult.candidate_xml_path"
-              link
-              type="primary"
-              @click="openXmlAsset(selectedResult.candidate_xml_asset_id, selectedResult.candidate_xml_path)"
-            >查看 XML</el-button>
-            <span v-else class="muted-text">暂无 XML</span>
-          </div>
-        </div>
-        <div class="trace-section">
-          <div class="detail-section-title">步骤 Trace</div>
-          <el-empty v-if="!selectedReplayTrace.length" description="暂无步骤 Trace" :image-size="56" />
-          <el-timeline v-else>
-            <el-timeline-item
-              v-for="step in selectedReplayTrace"
-              :key="`${selectedResult.id}-${step.index}`"
-              :type="replayStepType(step.status)"
-              :timestamp="formatDuration(step.duration_ms)"
-            >
-              <div class="trace-title">{{ step.index + 1 }}. {{ step.name }} <el-tag size="small" effect="plain">{{ step.status_label }}</el-tag></div>
-              <div v-if="step.expected_role || step.actual_role" class="trace-line">页面：{{ step.expected_role_label }} → {{ step.actual_role_label }}</div>
-              <div v-if="step.reason" class="trace-line muted-text">{{ step.reason }}</div>
-            </el-timeline-item>
-          </el-timeline>
-        </div>
-        <el-collapse class="technical-collapse">
-          <el-collapse-item title="技术信息" name="technical">
-            <div class="technical-grid">
-              <div><span>链路 ID</span><code>{{ selectedResult.chain_id || '-' }}</code></div>
-              <div><span>Path key</span><code>{{ selectedResult.path_key || '-' }}</code></div>
-              <div><span>State ID</span><code>{{ selectedResult.source_state_id || '-' }}</code></div>
-              <div><span>Observation ID</span><code>{{ selectedResult.source_observation_id || '-' }}</code></div>
-              <div><span>原始状态</span><code>{{ statusText(selectedResult.status) }}</code></div>
-              <div><span>失败类型</span><code>{{ selectedResult.failure_type || '-' }}</code></div>
-              <div><span>源边界证据</span><code>{{ selectedResult.source_boundary_evidence || '-' }}</code></div>
-              <div><span>升级执行边界</span><code>{{ selectedResult.replay_boundary_evidence || '-' }}</code></div>
-            </div>
-            <div v-if="selectedResult.reason" class="technical-reason"><span>执行说明</span><code>{{ selectedResult.reason }}</code></div>
-          </el-collapse-item>
-        </el-collapse>
-      </div>
-      <div v-else-if="selectedResult" class="result-detail">
+    <el-drawer v-model="resultDrawerVisible" size="min(960px, 100vw)" title="页面对比详情">
+      <div v-if="selectedResult" class="result-detail">
         <div class="result-header">
           <div>
             <h3>{{ selectedResult.page_name }}</h3>
@@ -894,44 +624,6 @@ onUnmounted(() => {
   min-height: 0;
 }
 
-.replay-panel {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.replay-stage {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.replay-stage > div {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.version-kpi {
-  max-width: 520px;
-}
-
-.replay-path-label,
-.result-summary {
-  margin-top: 3px;
-  line-height: 1.45;
-}
-
-.boundary-inline {
-  margin-top: 4px;
-  display: flex;
-  flex-direction: column;
-  line-height: 1.4;
-}
-
 .matrix-table {
   height: 100%;
 }
@@ -1062,118 +754,6 @@ onUnmounted(() => {
   background: var(--ad-bg);
 }
 
-.replay-evidence-grid {
-  display: grid;
-  grid-template-columns: minmax(280px, 1fr) minmax(180px, 0.5fr);
-  gap: 12px;
-}
-
-.boundary-evidence-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
-  border: 1px solid var(--ad-primary-soft);
-  background: var(--ad-primary-soft);
-}
-
-.boundary-evidence-grid > div {
-  min-height: 60px;
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 5px;
-  background: var(--ad-primary-soft);
-}
-
-.boundary-evidence-grid span,
-.technical-grid span,
-.technical-reason span {
-  color: var(--ad-muted);
-  font-size: 12px;
-}
-
-.boundary-evidence-grid strong {
-  color: var(--ad-text);
-  font-size: 13px;
-}
-
-.replay-evidence-grid img {
-  width: 100%;
-  max-height: 520px;
-  object-fit: contain;
-  border: 1px solid var(--ad-border);
-  border-radius: var(--ad-radius);
-  background: #111;
-}
-
-.replay-xml-box {
-  min-height: 120px;
-  padding: 12px;
-  border: 1px solid var(--ad-border);
-  border-radius: var(--ad-radius);
-  background: var(--ad-bg);
-}
-
-.trace-section {
-  padding-top: 12px;
-  border-top: 1px solid var(--ad-border);
-}
-
-.technical-collapse {
-  border-top: 1px solid var(--ad-border);
-}
-
-.technical-collapse :deep(.el-collapse-item__header) {
-  color: var(--ad-muted);
-  font-size: 13px;
-}
-
-.technical-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.technical-grid > div,
-.technical-reason {
-  min-width: 0;
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  border: 1px solid var(--ad-border);
-  background: var(--ad-bg);
-}
-
-.technical-grid code,
-.technical-reason code {
-  overflow-wrap: anywhere;
-  color: var(--ad-muted);
-  font-size: 12px;
-}
-
-.technical-reason {
-  margin-top: 8px;
-}
-
-.detail-section-title,
-.trace-title {
-  color: var(--ad-text);
-  font-weight: 600;
-}
-
-.detail-section-title {
-  margin-bottom: 12px;
-}
-
-.trace-line {
-  margin-top: 5px;
-  color: var(--ad-muted);
-  font-size: 12px;
-  word-break: break-all;
-}
-
 .xml-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1200,23 +780,20 @@ onUnmounted(() => {
 @media (max-width: 800px) {
   .compat-report-detail { overflow: auto; }
   .content-wrapper { height: auto; min-height: calc(100% - 32px); overflow: visible; }
-  .replay-panel { min-height: 520px; }
-  .replay-stage { align-items: flex-start; flex-direction: column; }
-  .replay-evidence-grid, .image-grid, .xml-summary, .boundary-evidence-grid, .technical-grid { grid-template-columns: 1fr; }
+  .image-grid, .xml-summary { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 767px) {
-  :deep(.el-button), :deep(.el-radio-button__inner), :deep(.el-select__wrapper), :deep(.el-collapse-item__header) { min-height: 44px; }
+  :deep(.el-button), :deep(.el-radio-button__inner), :deep(.el-select__wrapper) { min-height: 44px; }
   :deep(.el-input__inner), :deep(.el-textarea__inner) { font-size: 16px; }
-  :deep(.el-form-item__label), :deep(.el-table), :deep(.el-descriptions), :deep(.el-tabs__item), :deep(.el-collapse-item__content) { font-size: 14px; }
+  :deep(.el-form-item__label), :deep(.el-table), :deep(.el-descriptions), :deep(.el-tabs__item) { font-size: 14px; }
   :deep(.el-table__cell) { font-size: 14px; }
 }
 @media (max-width: 767px) {
   .content-wrapper { margin: 8px; padding: 12px; height: calc(100% - 16px); }
-  .detail-header, .header-actions, .result-header, .replay-stage { flex-wrap: wrap; }
+  .detail-header, .header-actions, .result-header { flex-wrap: wrap; }
   .title-block { min-width: 0; }
   .title-block h2, .title-block p { overflow-wrap: anywhere; }
   .kpi-item, .metric-item { min-width: 0; max-width: 100%; font-size: 14px; }
-  .version-kpi { max-width: 100%; }
 }
 </style>

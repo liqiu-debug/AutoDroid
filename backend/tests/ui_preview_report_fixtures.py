@@ -1,7 +1,7 @@
 """Rich report fixtures for the isolated UI preview. No routers, database or I/O clients.
 
 Integrate with ui_preview_app: create reports = make_report_fixtures(NOW, DEVICES),
-replace FASTBOT/COMPAT/INSPECTIONS from it, then call report_fixture_response(path,
+replace FASTBOT/COMPAT from it, then call report_fixture_response(path,
 request.method, request.query_params, reports, SVG) before generic report branches.
 A None result means this module does not handle the request.
 """
@@ -70,13 +70,7 @@ def make_report_fixtures(now, devices):
     graph=dict(schema_version=6,hierarchy_version=1,nodes=nodes,links=links,tree={},
                stats=dict(states=3,stable_count=3,transitions=2,actual_device_actions=2),
                summary=dict(replay={'total':2,'verified':1,'observed':1}),coverage_assessment={})
-    inspections=[dict(id=i,name=f'商城智能巡检 · {i}',profile_id=1,profile_name='商城巡检',package_name='com.demo.shop',
-                      device_serial=android,status='PASS',started_at=now,finished_at=now,created_at=now,elapsed_seconds=480,
-                      duration_seconds=1800,selected_branches=['guest'],state_count=3,transition_count=2,
-                      stop_reason='覆盖完成',terminal_outcome='completed',replay_evidence_available=True,replay_source_eligible=True,
-                      coverage_assessment={},summary={'replay':{'total':2,'verified':1,'observed':1},'coverage':{'covered':3,'total':3}},
-                      graph_schema_version=6,source_package_snapshot={'known':True,'package_name':'com.demo.shop','version_name':'2.8.0'}) for i in range(1,5)]
-    return dict(fastbot=fastbot,fastbot_reports=fastbot_reports,compat=compat,inspections=inspections,graph=graph,now=now)
+    return dict(fastbot=fastbot,fastbot_reports=fastbot_reports,compat=compat,graph=graph,now=now)
 
 
 def report_fixture_response(path, method, query, fixtures, svg):
@@ -94,19 +88,4 @@ def report_fixture_response(path, method, query, fixtures, svg):
     if path.startswith('fastbot/reports/'):
         if parts[-1]=='trace_ai_summary': return {'success':True,'analysis_result':'### 诊断结论\n隔离示例：建议减少主线程初始化任务。','cached':True,'token_usage':0}
         return deepcopy(fixtures['fastbot_reports'].get(parts[2],fixtures['fastbot_reports']['1']))
-    if path.startswith('inspections/runs/'):
-        tail=parts[-1];nodes=fixtures['graph']['nodes']
-        if tail=='graph': return deepcopy(fixtures['graph'])
-        if tail=='families': return []
-        if tail=='assets':
-            if str(query.get('path','')).endswith('.xml'): return Response('<hierarchy><node text="登录" class="android.widget.Button" bounds="[24,586][336,634]"/></hierarchy>',media_type='application/xml')
-            return Response(svg,media_type='image/svg+xml')
-        if tail=='observations':
-            state_id=int(parts[-2]);return [dict(id=state_id,state_id=state_id,screenshot_path='preview.svg',xml_path='preview.xml',capture_kind='REPRESENTATIVE',captured_at=fixtures['now'])]
-        if tail=='action-map': return dict(screen_size={'width':360,'height':780},actions=[dict(id=1,sequence=1,label='登录',action_type='click',status='SUCCESS',bounds=[24,586,336,634],target_label='登录')])
-        if tail in {'live','live-session'}:
-            snapshot=dict(run_id=int(parts[2]),revision=1,run_status='PASS',terminal=True,current_stage='巡检完成',
-                          current_page={'state_id':3,'label':'会员中心','screenshot_path':'preview.svg'},
-                          frontier={'pending':0,'completed':3},recent_events=[dict(type='completed',message='示例巡检已完成',timestamp=fixtures['now'])])
-            return dict(snapshot=snapshot,video_available=False) if tail=='live-session' else snapshot
     return None

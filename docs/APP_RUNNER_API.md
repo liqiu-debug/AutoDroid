@@ -75,7 +75,7 @@ App 侧处理：把 `manifest.json / runtime.js / main.js / case_files / assets`
 ```
 POST /device-runs/report
 {
-  "run_id": "<与 task_config 相同>",     // App 直跑必填（无 task_id 时）
+  "run_id": "<与 task_config 相同>",     // App 直跑必填（幂等标识）
   "notify": true,                        // false 时不发飞书卡片
   "kind": "case" | "scenario",
   "case_id": 3,                          // 或 scenario_id
@@ -96,7 +96,7 @@ POST /device-runs/report
 - 幂等：同一 `run_id` 的已完成结果重复上报时返回原 `execution_id / status / report_id`，不重新落库或再次发送飞书通知；当前 SQLite 实现对并发回传也串行处理。其他账号复用该 `run_id` 返回 409；
 - 场景中重复引用同一个用例时，每次引用分别消费一条结果；缺失的引用记为执行中断，不复用前一次成功结果；
 - 步骤状态：`PASS / FAIL / WARNING / SKIP`；`error_code` 使用 E2xxx 语义；
-- 该接口即 App 与 Agent 共用的回传入口（Agent 任务带 `task_id`，App 直跑带 `run_id`）。
+- 上报必带 `run_id`；旧任务链路的 `task_id` 已随任务队列下线，残留字段会返回 400。
 
 ## 6. 报告中心
 
@@ -111,7 +111,7 @@ App 渲染建议：带鉴权下载 HTML → `WebView.loadDataWithBaseURL(serverU
 
 ## 7. 兼容说明
 
-- 官方 AutoJs6 + `scripts/autojs6/autodroid_agent.js` 的旧链路继续可用（任务接口 `/autojs/tasks`、`/device-runs/pending|packages` 不变）；
+- 官方 AutoJs6 + `scripts/autojs6/autodroid_agent.js` 的旧任务链路已下线（`/autojs/tasks`、`/device-runs/pending|packages` 与任务表已删除），设备端执行以本文的 App 契约为准；
 - App 专用端点统一走 `/app-runs/*` 前缀，后续变更视为契约变更。
 
 ## 8. iOS：设备端执行器（AutoDroid-WDA）

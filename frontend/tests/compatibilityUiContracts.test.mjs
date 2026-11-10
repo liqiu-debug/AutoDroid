@@ -11,27 +11,22 @@ const reportSource = await readFile(
   'utf8',
 )
 
-test('compatibility deep links fetch the requested inspection report and gate the default selection', () => {
-  assert.match(creationSource, /api\.getInspectionRun\(numericRunId\)/)
-  assert.match(creationSource, /const hasExplicitRouteSource = await loadRouteInspectionRun\(\)/)
-  assert.match(creationSource, /if \(!hasExplicitRouteSource && !replayForm\.inspection_run_id/)
-  assert.match(creationSource, /v-if="routeSourceError"/)
+// 兼容性测试只保留「手动配置页面合集」一条路：创建表单常驻可见，
+// 来源固定为 page_set，对比维度只剩版本 / 机型。
+test('compatibility creation keeps the manual page-set flow only', () => {
+  assert.match(creationSource, /新建兼容性测试/)
+  assert.match(creationSource, /source_type: 'page_set'/)
+  assert.match(creationSource, /label: '版本对比', value: 'version'/)
+  assert.match(creationSource, /label: '机型对比', value: 'device'/)
+  assert.match(creationSource, /页面合集/)
+  // 巡检来源 / 升级后链路回放已下线
+  assert.doesNotMatch(creationSource, /inspection_run_id|replayForm|installed_replay|巡检来源|升级后链路回放/)
+  // 创建入口不再受灰度开关隐藏
+  assert.doesNotMatch(creationSource, /legacyCreationEnabled|compatibility_legacy_compare_creation/)
 })
 
-test('compatibility report keeps ids in technical details and separates boundary evidence', () => {
-  const template = reportSource.slice(reportSource.indexOf('<template>'))
-  const technicalIndex = template.indexOf('<el-collapse class="technical-collapse">')
-  assert.ok(technicalIndex > 0)
-  const ordinaryTemplate = template.slice(0, technicalIndex)
-  assert.doesNotMatch(ordinaryTemplate, /selectedResult\.(?:path_key|chain_id|source_state_id|source_observation_id)/)
-  assert.match(template, /sourceBoundaryEvidenceLabel\(selectedResult\.source_boundary_evidence\)/)
-  assert.match(template, /replayBoundaryEvidenceLabel\(selectedResult\.replay_boundary_evidence\)/)
-  assert.match(template, /<span>State ID<\/span>/)
-  assert.match(template, /<span>Observation ID<\/span>/)
-})
-
-test('compatibility report deduplicates the unknown source-version warning', () => {
-  assert.match(reportSource, /sourceVersionUnknown/)
-  assert.match(reportSource, /isUnknownSourceWarning/)
-  assert.match(reportSource, /!\(sourceVersionUnknown\.value && isUnknownSourceWarning\(item\)\)/)
+test('compatibility report renders page-set results without inspection or replay fields', () => {
+  assert.match(reportSource, /page_set/)
+  assert.doesNotMatch(reportSource, /source_state_id|source_observation_id|State ID|Observation ID/)
+  assert.doesNotMatch(reportSource, /replay_boundary_evidence|source_boundary_evidence|chain_id|path_key/)
 })

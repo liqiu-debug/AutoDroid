@@ -9,9 +9,9 @@
  *      按自身平台选条目（darwin→macos、win32→windows）。
  * - 下载：Release 源直接下载资产 URL（无需 token）；包管理源现拼
  *   /api/packages/{id}/download?token=<localStorage token> 绝对地址。
- * - 安装：window.desktop.installUpdate({ url, fileName, version, expectedSize? })，
+ * - 安装：window.desktop.installUpdate({ url, fileName, version, expectedSize?, sizeHint? })，
  *   过程事件经 window.desktop.onUpdateProgress(cb)（订阅式，返回退订函数）：
- *   {phase:'downloading', percent} | {phase:'ready', version, path}
+ *   {phase:'downloading', percent, received, total}（总长未知时 percent 为 null）| {phase:'ready', version, path}
  *   | {phase:'downloaded', path, message} | {phase:'done', path} | {phase:'error', message}。
  *   macOS 内置安装完成下载后进入 ready（已暂存），由 applyUpdate() 换包并重启；
  *   win32 为 done（已拉起安装向导）。downloaded = 自动安装不可用，已打开安装包手动安装。
@@ -63,6 +63,17 @@ export function buildDownloadUrl(pkgId, token, origin) {
   const id = encodeURIComponent(String(pkgId ?? ''))
   const query = encodeURIComponent(String(token ?? ''))
   return `${base}/api/packages/${id}/download?token=${query}`
+}
+
+/**
+ * 包管理条目的近似字节数（file_size 以 MB 记录、保留两位小数）。
+ * 只给壳做进度估算（sizeHint）：响应没声明总长时也能算出百分比；
+ * 不能当 expectedSize——近似值做硬校验会把完整的包判成「下载不完整」。
+ */
+export function packageSizeHint(pkg) {
+  const megabytes = Number(pkg?.file_size)
+  if (!Number.isFinite(megabytes) || megabytes <= 0) return 0
+  return Math.round(megabytes * 1024 * 1024)
 }
 
 /**
@@ -266,6 +277,7 @@ export async function runUpdateInstall({ pkg, release, token, origin, bridge, on
         url: packageUrl,
         fileName: buildInstallerFileName(pkg),
         expectedSize: 0,
+        sizeHint: packageSizeHint(pkg),
       })
     }
   }
@@ -320,6 +332,23 @@ export async function runUpdateInstall({ pkg, release, token, origin, bridge, on
   throw new Error(message)
 }
 
+/**
+ * 壳的 downloading 事件归一：percent 取整并限定 0..100；壳报 null/缺省（总长未知）时保持
+ * null，由界面改显示已下载字节——不能折算成 0%，否则又是「在下载但进度一直为 0」。
+ */
+function normalizeDownloadingEvent(evt) {
+  const raw = evt.percent
+  const value = raw === null || raw === undefined || raw === '' ? NaN : Number(raw)
+  const received = Number(evt.received)
+  const total = Number(evt.total)
+  return {
+    phase: 'downloading',
+    percent: Number.isFinite(value) ? Math.min(100, Math.max(0, Math.round(value))) : null,
+    received: Number.isFinite(received) && received > 0 ? received : 0,
+    total: Number.isFinite(total) && total > 0 ? total : 0,
+  }
+}
+
 /** 单源安装：订阅壳事件 → installUpdate → 归一为 {ready|manual|done} 或抛错。 */
 async function installFromSource({ source, version, bridge, emit }) {
   let terminal = null
@@ -329,11 +358,7 @@ async function installFromSource({ source, version, bridge, emit }) {
       const maybeUnsubscribe = bridge.onUpdateProgress(evt => {
         if (!evt || typeof evt !== 'object') return
         if (evt.phase === 'downloading') {
-          const percent = Number(evt.percent)
-          emit({
-            phase: 'downloading',
-            percent: Number.isFinite(percent) ? Math.min(100, Math.max(0, Math.round(percent))) : 0,
-          })
+          emit(normalizeDownloadingEvent(evt))
         } else if (evt.phase === 'ready') {
           terminal = { phase: 'ready', version: String(evt.version ?? version), path: String(evt.path ?? '') }
         } else if (evt.phase === 'downloaded') {
@@ -349,6 +374,7 @@ async function installFromSource({ source, version, bridge, emit }) {
 
     const payload = { url: source.url, fileName: source.fileName, version }
     if (source.expectedSize > 0) payload.expectedSize = source.expectedSize
+    if (source.sizeHint > 0) payload.sizeHint = source.sizeHint
     const result = await bridge.installUpdate(payload)
     if (terminal?.phase === 'error') throw new Error(terminal.message)
     if (result?.ready === true || terminal?.phase === 'ready') {

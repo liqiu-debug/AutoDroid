@@ -8,11 +8,10 @@ import re
 import shutil
 import shlex
 import threading
-import time
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import or_
@@ -49,18 +48,6 @@ from backend.device_execution_lease import (
     DeviceExecutionLease,
     legacy_fastbot_device_locked,
 )
-from backend.compatibility_replay import (
-    build_replay_plan,
-    branch_config_for_run,
-    entry_case_safety_issues,
-    package_snapshot_digest,
-    plan_digest_matches,
-    read_installed_package,
-    read_installed_package_sync,
-    select_and_freeze_chains,
-    source_branch_exists,
-    source_package_snapshot,
-)
 from backend.models import (
     AppPackage,
     AssetReference,
@@ -69,34 +56,11 @@ from backend.models import (
     CompatibilityPageResult,
     CompatibilityRun,
     Device,
-    InspectionRun,
-    InspectionObservation,
-    InspectionState,
     StoredAsset,
     TestCase,
     User,
 )
-from backend.inspection.device import (
-    InspectionAborted,
-    connect_android,
-    ready_assertion_exists,
-)
-from backend.inspection.engine import (
-    _deserialize_action,
-    _environment_secret_values,
-    _prepare_branch,
-    _replay_path,
-    _resolve_input_value,
-    resolve_inspection_asset,
-)
-from backend.inspection.sanitizer import InspectionArtifactSanitizer
-from backend.inspection.replay import execute_replay_chain
 from backend.paths import project_path
-from backend.feature_flags import (
-    FLAG_COMPATIBILITY_INSTALLED_REPLAY,
-    FLAG_MODEL_INSPECTION,
-    is_flag_enabled,
-)
 from backend.schemas import (
     CompatPageDefinition,
     CompatPageSetCreate,
@@ -104,9 +68,6 @@ from backend.schemas import (
     CompatPageSetUpdate,
     CompatibilityCellRead,
     CompatibilityPageResultRead,
-    CompatibilityReplayIssue,
-    CompatibilityReplayPreflightRead,
-    CompatibilityReplayPreflightRequest,
     CompatibilityRunCreate,
     CompatibilityRunRead,
     PaginatedCompatibilityRunRead,
@@ -119,42 +80,6 @@ router = APIRouter()
 
 TERMINAL_STATUSES = {"PASS", "WARNING", "FAIL", "ERROR", "ABORTED"}
 
-
-def _compat_replay_scope(chain: Dict[str, Any]) -> str:
-    value = str(
-        chain.get("replay_scope") or chain.get("replay_eligibility") or "FULL"
-    ).strip().upper()
-    return {
-        "FULL": "FULL_PATH",
-        "FULL_PATH": "FULL_PATH",
-        "SAFE_PREFIX": "PREFIX_TO_SAFETY_BOUNDARY",
-        "PREFIX_TO_SAFETY_BOUNDARY": "PREFIX_TO_SAFETY_BOUNDARY",
-        "DIAGNOSTIC_ONLY": "DIAGNOSTIC_ONLY",
-    }.get(value, "NONE")
-
-
-def _compat_terminal_outcome(chain: Dict[str, Any]) -> str:
-    explicit = str(chain.get("terminal_outcome") or "").strip().upper()
-    if explicit:
-        return explicit
-    outcomes = {
-        str(item.get("terminal_outcome") or "NONE").strip().upper()
-        for item in chain.get("terminal_boundaries") or []
-        if isinstance(item, dict)
-    }
-    for outcome in (
-        "APP_FAULT",
-        "INFRA_FAULT",
-        "AUTOMATION_FAILED",
-        "EXTERNAL_NAVIGATION",
-        "LOCATOR_FAILED",
-        "SAFETY_BLOCKED",
-        "BUDGET_STOP",
-        "CANCELLED",
-    ):
-        if outcome in outcomes:
-            return outcome
-    return "NONE"
 _CRASH_PATTERN = re.compile(r"FATAL EXCEPTION|ANR in|Application Not Responding", re.I)
 _RUN_ABORT_EVENTS: Dict[int, threading.Event] = {}
 _RUN_ABORT_LOCK = threading.Lock()
@@ -205,12 +130,30 @@ def _normalize_pages(raw_pages: List[Any]) -> List[Dict[str, Any]]:
     return pages
 
 
+def _page_definitions(raw_pages: List[Any]) -> List[CompatPageDefinition]:
+    """把历史 page_set_snapshot 归一成页面定义。
+
+    历史行可能来自已下线的巡检快照/链路回放来源，字段形态不完全一致；
+    只读展示允许信息变少，但绝不能因为个别脏数据让整份报告读取报错。
+    """
+    definitions: List[CompatPageDefinition] = []
+    for index, page in enumerate(_normalize_pages(raw_pages or []), start=1):
+        candidate = dict(page)
+        if not str(candidate.get("name") or "").strip():
+            candidate["name"] = str(candidate.get("key") or f"页面 {index}")
+        try:
+            definitions.append(CompatPageDefinition(**candidate))
+        except Exception:
+            logger.warning("skip unreadable compatibility page snapshot: %s", candidate.get("key"))
+    return definitions
+
+
 def _page_set_read(row: CompatPageSet) -> CompatPageSetRead:
     return CompatPageSetRead(
         id=row.id,
         name=row.name,
         description=row.description,
-        pages=[CompatPageDefinition(**page) for page in _normalize_pages(row.pages or [])],
+        pages=_page_definitions(row.pages or []),
         user_id=row.user_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -218,14 +161,14 @@ def _page_set_read(row: CompatPageSet) -> CompatPageSetRead:
 
 
 def _page_set_snapshot_read(row: CompatibilityRun) -> Optional[CompatPageSetRead]:
-    pages = _normalize_pages(row.page_set_snapshot or [])
+    pages = _page_definitions(row.page_set_snapshot or [])
     if not pages and not row.page_set_name:
         return None
     return CompatPageSetRead(
         id=row.page_set_id or 0,
         name=row.page_set_name or "已删除页面合集",
         description=None,
-        pages=[CompatPageDefinition(**page) for page in pages],
+        pages=pages,
         user_id=row.user_id,
         created_at=row.created_at,
         updated_at=None,
@@ -239,13 +182,6 @@ def _page_result_read(row: CompatibilityPageResult) -> CompatibilityPageResultRe
         cell_id=row.cell_id,
         page_key=row.page_key,
         page_name=row.page_name,
-        path_key=row.path_key,
-        source_state_id=row.source_state_id,
-        source_observation_id=row.source_observation_id,
-        evidence_level=row.evidence_level,
-        failure_type=row.failure_type,
-        failed_step_index=row.failed_step_index,
-        replay_trace=row.replay_trace or [],
         case_id=row.case_id,
         status=row.status,
         reason=row.reason,
@@ -347,51 +283,24 @@ def _run_read(
             for item in cell_rows
         ]
 
-    replay_snapshot = [
+    snapshot_pages = [
         dict(item)
         for item in (row.page_set_snapshot or [])
         if isinstance(item, dict)
     ]
-    if str(row.execution_mode or "").upper() == "INSTALLED_REPLAY":
-        snapshot_pages = replay_snapshot
-    else:
-        snapshot_pages = [
-            CompatPageDefinition(**page)
-            for page in _normalize_pages(replay_snapshot)
-        ]
     return CompatibilityRunRead(
         id=row.id,
         name=row.name,
         page_set_id=row.page_set_id,
         page_set_name=row.page_set_name,
-        page_set_snapshot=snapshot_pages,
+        page_set_snapshot=_page_definitions(snapshot_pages),
         source_type=row.source_type or "page_set",
-        inspection_run_id=row.inspection_run_id,
-        inspection_state_ids=row.inspection_state_ids or [],
-        inspection_observation_ids=row.inspection_observation_ids or [],
-        source_coverage_snapshot=row.source_coverage_snapshot or {},
         old_package_id=row.old_package_id,
         new_package_id=row.new_package_id,
         package_name=row.package_name,
-        execution_mode=str(row.execution_mode or "COMPARISON").lower(),
-        replay_branch_key=row.replay_branch_key,
-        replay_plan_version=row.replay_plan_version,
-        replay_plan_digest=row.replay_plan_digest,
-        duration_seconds=int(row.replay_duration_seconds or 3600),
-        source_package_snapshot=row.source_package_snapshot or {},
-        target_package_snapshot=row.target_package_snapshot or {},
-        manual_install_confirmed_at=row.manual_install_confirmed_at,
-        compare_mode=(
-            row.compare_mode
-            if str(row.execution_mode or "").upper() == "INSTALLED_REPLAY"
-            else row.compare_mode or "version"
-        ),
+        compare_mode=row.compare_mode or "version",
         baseline_device_serial=row.baseline_device_serial,
-        mode=(
-            row.mode
-            if str(row.execution_mode or "").upper() == "INSTALLED_REPLAY"
-            else row.mode or "upgrade"
-        ),
+        mode=row.mode or "upgrade",
         env_id=row.env_id,
         device_serials=row.device_serials or [],
         thresholds=row.thresholds or {},
@@ -421,352 +330,6 @@ def _validate_page_set(session: Session, page_set: CompatPageSet) -> List[Dict[s
         if not case_id or not session.get(TestCase, case_id):
             raise HTTPException(status_code=400, detail=f"页面用例不存在: {case_id}")
     return pages
-
-
-def _validate_inspection_source(
-    session: Session,
-    *,
-    inspection_run_id: int,
-    inspection_state_ids: List[int],
-    inspection_observation_ids: List[int],
-    package_name: str,
-) -> Tuple[InspectionRun, List[InspectionState], List[Dict[str, Any]]]:
-    source_run = session.get(InspectionRun, inspection_run_id)
-    if not source_run:
-        raise HTTPException(status_code=404, detail="巡检来源任务不存在")
-    if source_run.package_name != package_name:
-        raise HTTPException(status_code=400, detail="巡检来源与测试包的 package_name 不一致")
-    if str(source_run.status or "").upper() not in {"PASS", "WARNING", "FAIL"}:
-        raise HTTPException(status_code=400, detail="巡检来源任务尚未完成")
-    assessment = (
-        dict(source_run.coverage_assessment or {})
-        if isinstance(source_run.coverage_assessment, dict)
-        else {}
-    )
-    default_eligible = bool(
-        str(source_run.status or "").upper() == "PASS"
-        and str(assessment.get("selected_scope_verdict") or "") == "COMPLETE"
-    )
-    if (
-        not inspection_state_ids
-        and not inspection_observation_ids
-        and not default_eligible
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "该巡检报告不允许空选择自动采用路径；"
-                "请人工明确选择稳定 State 或 Observation"
-            ),
-        )
-
-    explicit_observations: Dict[int, InspectionObservation] = {}
-    requested_observation_ids = list(inspection_observation_ids or [])
-    if requested_observation_ids:
-        observation_rows = session.exec(
-            select(InspectionObservation).where(
-                col(InspectionObservation.id).in_(requested_observation_ids)
-            )
-        ).all()
-        observations_by_id = {int(item.id): item for item in observation_rows}
-        missing_observations = set(requested_observation_ids) - set(observations_by_id)
-        if missing_observations:
-            raise HTTPException(
-                status_code=400,
-                detail=f"巡检 Observation 不存在: {sorted(missing_observations)}",
-            )
-        ordered_observations = [
-            observations_by_id[item_id] for item_id in requested_observation_ids
-        ]
-        invalid_run = [
-            item.id for item in ordered_observations if item.run_id != inspection_run_id
-        ]
-        if invalid_run:
-            raise HTTPException(
-                status_code=400,
-                detail=f"巡检 Observation 不属于来源任务: {invalid_run}",
-            )
-        for observation in ordered_observations:
-            if observation.state_id in explicit_observations:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"每个状态只能选择一个 Observation: state={observation.state_id}",
-                )
-            explicit_observations[observation.state_id] = observation
-        observed_state_ids = list(explicit_observations)
-        if inspection_state_ids and set(inspection_state_ids) != set(observed_state_ids):
-            raise HTTPException(
-                status_code=400,
-                detail="inspection_state_ids 必须与显式 Observation 的状态一一对应",
-            )
-        state_rows = session.exec(
-            select(InspectionState).where(
-                InspectionState.run_id == inspection_run_id,
-                col(InspectionState.id).in_(observed_state_ids),
-            )
-        ).all()
-        states_by_id = {int(item.id): item for item in state_rows}
-        states = [states_by_id[item_id] for item_id in observed_state_ids if item_id in states_by_id]
-    else:
-        query = select(InspectionState).where(InspectionState.run_id == inspection_run_id)
-        if inspection_state_ids:
-            query = query.where(col(InspectionState.id).in_(inspection_state_ids))
-        else:
-            query = query.where(InspectionState.selected_for_regression == True)  # noqa: E712
-        states = session.exec(
-            query.order_by(InspectionState.depth, InspectionState.id)
-        ).all()
-    if not states:
-        raise HTTPException(status_code=400, detail="没有可用的巡检稳定状态")
-    requested = set(inspection_state_ids or explicit_observations)
-    found = {item.id for item in states}
-    if requested - found:
-        raise HTTPException(
-            status_code=400,
-            detail=f"部分巡检状态不存在或不属于来源任务: {sorted(requested - found)}",
-        )
-    selected_observations: Dict[int, Optional[InspectionObservation]] = {}
-    invalid_observations: List[int] = []
-    for state in states:
-        observation = explicit_observations.get(state.id)
-        if observation is None and not explicit_observations:
-            if state.representative_observation_id:
-                candidate = session.get(
-                    InspectionObservation,
-                    state.representative_observation_id,
-                )
-                if (
-                    candidate is not None
-                    and candidate.state_id == state.id
-                    and candidate.run_id == inspection_run_id
-                ):
-                    observation = candidate
-            if observation is None:
-                observation = session.exec(
-                    select(InspectionObservation)
-                    .where(
-                        InspectionObservation.state_id == state.id,
-                        InspectionObservation.run_id == inspection_run_id,
-                        InspectionObservation.is_representative == True,  # noqa: E712
-                    )
-                    .order_by(col(InspectionObservation.captured_at).desc())
-                ).first()
-        selected_observations[state.id] = observation
-        if explicit_observations and (
-            observation is None
-            or _active_compatibility_asset(session, observation.screenshot_asset_id) is None
-            or _active_compatibility_asset(session, observation.xml_asset_id) is None
-        ):
-            invalid_observations.append(int(observation.id) if observation else state.id)
-    if invalid_observations:
-        raise HTTPException(
-            status_code=400,
-            detail=f"显式 Observation 缺少可用截图/XML 资产: {invalid_observations}",
-        )
-
-    invalid = []
-    for item in states:
-        observation = selected_observations.get(item.id)
-        has_cas = bool(
-            observation
-            and _active_compatibility_asset(session, observation.screenshot_asset_id)
-            and _active_compatibility_asset(session, observation.xml_asset_id)
-        )
-        has_legacy = bool(item.screenshot_path and item.xml_path)
-        if (
-            str(item.stable_status or "").upper()
-            not in {"STABLE", "VERIFIED_TWICE"}
-            or (not has_cas and not has_legacy)
-            or item.locator_quality == "COORDINATE_ONLY"
-        ):
-            invalid.append(item.id)
-    if invalid:
-        raise HTTPException(
-            status_code=400,
-            detail=f"巡检状态不是稳定可回放资产: {invalid}",
-        )
-
-    snapshot = dict(source_run.profile_snapshot or {})
-    branch_configs = dict(snapshot.get("branches") or {})
-    input_rules = [
-        dict(item) for item in snapshot.get("input_rules") or [] if isinstance(item, dict)
-    ]
-    sanitizer_rules = [
-        dict(item)
-        for item in snapshot.get("sanitizer_rules") or []
-        if isinstance(item, dict)
-    ]
-    dynamic_patterns = [
-        str(item)
-        for item in snapshot.get("dynamic_text_patterns") or []
-        if str(item or "").strip()
-    ]
-    stable_wait = float((snapshot.get("budgets") or {}).get("stable_wait_seconds") or 5.0)
-    pages: List[Dict[str, Any]] = []
-    for state in states:
-        branch_config = branch_configs.get(state.branch_key)
-        if not isinstance(branch_config, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=f"巡检状态缺少业务线快照: {state.id}",
-            )
-        observation = selected_observations.get(state.id)
-        page = {
-                "key": f"inspection_state_{state.id}",
-                "name": f"{state.branch_key} · {state.activity or state.cluster_key[:8]}",
-                "case_id": None,
-                "settle_seconds": 0,
-                "required_text": None,
-                "inspection_state_id": state.id,
-                "inspection_path": list(state.first_path or []),
-                "branch_key": state.branch_key,
-                "branch_config": dict(branch_config),
-                "input_rules": input_rules,
-                "sanitizer_rules": sanitizer_rules,
-                "dynamic_text_patterns": dynamic_patterns,
-                "stable_wait_seconds": stable_wait,
-                "baseline_screenshot_path": state.screenshot_path,
-                "baseline_xml_path": state.xml_path,
-                "baseline_activity": state.activity,
-            }
-        if observation is not None:
-            page.update(
-                {
-                    "inspection_observation_id": observation.id,
-                    "baseline_screenshot_asset_id": observation.screenshot_asset_id,
-                    "baseline_xml_asset_id": observation.xml_asset_id,
-                }
-            )
-        pages.append(page)
-    return source_run, states, pages
-
-
-def _copy_inspection_baselines(
-    *,
-    session: Session,
-    compatibility_run_id: int,
-    inspection_run_id: int,
-    pages: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    copied: List[Dict[str, Any]] = []
-    reports_root = project_path("reports").resolve()
-    use_cas = content_addressed_assets_enabled(session)
-    for page in pages:
-        item = dict(page)
-        key = _page_key(len(copied) + 1, item)
-        for source_field, asset_field, filename, role in (
-            (
-                "baseline_screenshot_path",
-                "baseline_screenshot_asset_id",
-                "screenshot.png",
-                f"baseline:{key}:screenshot",
-            ),
-            (
-                "baseline_xml_path",
-                "baseline_xml_asset_id",
-                "hierarchy.xml",
-                f"baseline:{key}:xml",
-            ),
-        ):
-            source_value = str(item.get(source_field) or "")
-            existing_asset = None
-            existing_asset_id = str(item.get(asset_field) or "")
-            if use_cas and existing_asset_id:
-                candidate_asset = session.get(StoredAsset, existing_asset_id)
-                if candidate_asset is not None and candidate_asset.status == "ACTIVE":
-                    try:
-                        read_asset(session, candidate_asset.id, transparent=True)
-                        existing_asset = candidate_asset
-                    except (AssetGone, AssetNotFound):
-                        existing_asset = None
-            if use_cas:
-                if existing_asset is None:
-                    source = resolve_inspection_asset(
-                        source_value,
-                        run_id=inspection_run_id,
-                    )
-                    if not source.is_file():
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"巡检基线文件不存在: {source_value}",
-                        )
-                    asset = store_file(session, source, commit=False)
-                else:
-                    asset = existing_asset
-                item[asset_field] = asset.id
-                upsert_reference(
-                    session,
-                    asset_id=asset.id,
-                    owner_type="compatibility_run",
-                    owner_id=compatibility_run_id,
-                    role=role,
-                    retention_class=RETENTION_PINNED,
-                    pinned_reason=(
-                        f"inspection baseline for compatibility run {compatibility_run_id}"
-                    ),
-                    commit=False,
-                )
-                # The source path remains the rollout fallback.  The PIN keeps
-                # the CAS copy available after the source inspection is pruned.
-                item[source_field] = source_value
-                continue
-
-            source = resolve_inspection_asset(
-                source_value,
-                run_id=inspection_run_id,
-            )
-            if not source.is_file():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"巡检基线文件不存在: {source_value}",
-                )
-            target_dir = (
-                reports_root
-                / "compatibility"
-                / str(compatibility_run_id)
-                / "inspection_baseline"
-                / key
-            )
-            target_dir.mkdir(parents=True, exist_ok=True)
-            destination = (target_dir / filename).resolve()
-            destination.relative_to(reports_root)
-            shutil.copy2(source, destination)
-            item[source_field] = destination.relative_to(reports_root).as_posix()
-        copied.append(item)
-    if use_cas:
-        session.commit()
-    return copied
-
-
-def _inspection_page_groups(
-    pages: List[Dict[str, Any]],
-) -> List[Tuple[str, List[Dict[str, Any]]]]:
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    order: List[str] = []
-    for page in pages:
-        key = str(page.get("branch_key") or "").strip() or "default"
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(page)
-    return [(key, groups[key]) for key in order]
-
-
-def _prepare_inspection_page_group(
-    *,
-    serial: str,
-    page: Dict[str, Any],
-    abort_event: threading.Event,
-) -> None:
-    config = page.get("branch_config")
-    if not isinstance(config, dict):
-        raise RuntimeError("巡检路径缺少业务线配置快照")
-    _prepare_branch(
-        device=connect_android(serial),
-        branch_config=dict(config),
-        device_serial=serial,
-        abort_event=abort_event,
-    )
 
 
 def _validate_packages(session: Session, old_package_id: Optional[int], new_package_id: int) -> Tuple[Optional[AppPackage], AppPackage]:
@@ -819,163 +382,6 @@ def _validate_devices(session: Session, serials: List[str]) -> List[Device]:
             raise HTTPException(status_code=400, detail=f"设备非空闲，无法启动兼容性任务: {serial} ({status})")
         validated.append(device)
     return validated
-
-
-def _validate_replay_source(
-    session: Session,
-    *,
-    inspection_run_id: int,
-    branch_key: str,
-) -> InspectionRun:
-    source_run = session.get(InspectionRun, inspection_run_id)
-    if source_run is None:
-        raise HTTPException(status_code=404, detail="巡检来源任务不存在")
-    if str(source_run.status or "").upper() not in {"PASS", "WARNING", "FAIL"}:
-        raise HTTPException(status_code=400, detail="巡检来源任务尚未完成")
-    if not source_branch_exists(session, inspection_run_id, branch_key):
-        raise HTTPException(status_code=400, detail="巡检来源不包含所选业务线")
-    if not str(source_run.package_name or "").strip():
-        raise HTTPException(status_code=400, detail="巡检来源缺少 package_name")
-    return source_run
-
-
-def _replay_preflight_result(
-    session: Session,
-    *,
-    source_run: InspectionRun,
-    branch_key: str,
-    installed_package: Dict[str, Any],
-    max_chains: int,
-) -> Dict[str, Any]:
-    blockers: List[Dict[str, str]] = []
-    warnings: List[Dict[str, str]] = []
-    branch_config = branch_config_for_run(source_run, branch_key)
-    if not branch_config:
-        blockers.append(
-            {
-                "code": "BRANCH_SNAPSHOT_MISSING",
-                "message": "巡检报告缺少所选业务线的冻结配置",
-            }
-        )
-    else:
-        blockers.extend(
-            entry_case_safety_issues(
-                session,
-                branch_config,
-                package_name=source_run.package_name,
-            )
-        )
-
-    source_package = source_package_snapshot(session, source_run)
-    if not bool(installed_package.get("installed")):
-        blockers.append(
-            {
-                "code": "PACKAGE_NOT_INSTALLED",
-                "message": f"设备未安装 {source_run.package_name}",
-            }
-        )
-    elif str(installed_package.get("package_name") or "") != source_run.package_name:
-        blockers.append(
-            {
-                "code": "PACKAGE_NAME_MISMATCH",
-                "message": "设备包名与巡检来源不一致",
-            }
-        )
-    if installed_package.get("error"):
-        blockers.append(
-            {
-                "code": "PACKAGE_METADATA_UNAVAILABLE",
-                "message": str(installed_package.get("error")),
-            }
-        )
-
-    source_version = str(source_package.get("version_code") or "").strip()
-    installed_version = str(installed_package.get("version_code") or "").strip()
-    if not source_version:
-        warnings.append(
-            {
-                "code": "SOURCE_VERSION_UNKNOWN",
-                "message": "历史巡检未记录来源版本，人工确认后仍可回放",
-            }
-        )
-    elif not installed_version:
-        warnings.append(
-            {
-                "code": "TARGET_VERSION_UNKNOWN",
-                "message": "无法读取设备 versionCode，人工确认后仍可回放",
-            }
-        )
-    elif source_version == installed_version:
-        warnings.append(
-            {
-                "code": "SAME_VERSION_REPLAY",
-                "message": "设备版本与巡检来源相同，本次结果用于链路回放验收",
-            }
-        )
-
-    plan: Dict[str, Any]
-    try:
-        plan = build_replay_plan(
-            session,
-            inspection_run_id=int(source_run.id),
-            branch_key=branch_key,
-            max_chains=max_chains,
-        )
-    except Exception as exc:
-        plan = {
-            "plan_version": 3,
-            "digest": "",
-            "summary": {},
-            "chains": [],
-            "excluded": {},
-        }
-        blockers.append(
-            {
-                "code": str(getattr(exc, "code", "REPLAY_PLAN_UNAVAILABLE")),
-                "message": str(exc),
-            }
-        )
-    chains = [dict(item) for item in plan.get("chains") or [] if isinstance(item, dict)]
-    for chain in chains:
-        scope = _compat_replay_scope(chain)
-        chain["replay_scope"] = scope
-        chain["replay_eligibility"] = {
-            "FULL_PATH": "FULL",
-            "PREFIX_TO_SAFETY_BOUNDARY": "SAFE_PREFIX",
-        }.get(scope, "NONE")
-        chain["terminal_outcome"] = _compat_terminal_outcome(chain)
-        chain.setdefault("boundary_evidence", "NOT_APPLICABLE")
-    if not chains and not any(item["code"] == "REPLAY_PLAN_UNAVAILABLE" for item in blockers):
-        blockers.append(
-            {
-                "code": "NO_REPLAYABLE_CHAINS",
-                "message": "所选业务线没有安全、可定位的回放链路",
-            }
-        )
-    installed_package = dict(installed_package)
-    device_digest = package_snapshot_digest(installed_package)
-    installed_package["snapshot_digest"] = device_digest
-    return {
-        "execution_mode": "installed_replay",
-        "inspection_run_id": int(source_run.id),
-        "branch_key": branch_key,
-        "package_name": source_run.package_name,
-        "source_package": source_package,
-        "installed_package": installed_package,
-        "blockers": blockers,
-        "warnings": warnings,
-        "plan_digest": str(plan.get("digest") or plan.get("plan_digest") or ""),
-        "device_snapshot_digest": device_digest,
-        "plan_version": int(plan.get("plan_version") or 1),
-        "summary": dict(plan.get("summary") or {}),
-        "chains": chains,
-        "available_prefixes": [
-            str(item.get("chain_id") or item.get("path_key") or "")
-            for item in chains
-            if _compat_replay_scope(item) == "PREFIX_TO_SAFETY_BOUNDARY"
-        ],
-        "excluded": plan.get("excluded") or {},
-    }
 
 
 def _abort_event_for_run(run_id: int) -> threading.Event:
@@ -1640,87 +1046,6 @@ def compare_device_pages(
     }
 
 
-def _run_inspection_path_capture(
-    *,
-    serial: str,
-    package_name: str,
-    run_id: int,
-    cell_id: int,
-    phase: str,
-    page: Dict[str, Any],
-    abort_event: threading.Event,
-) -> Dict[str, Any]:
-    device = connect_android(serial)
-    branch_config = dict(page.get("branch_config") or {})
-    secret_values: List[str] = _environment_secret_values(
-        branch_config.get("env_id")
-    )
-    capture, unique = _replay_path(
-        device=device,
-        path=list(page.get("inspection_path") or []),
-        branch_config=branch_config,
-        device_serial=serial,
-        package_name=package_name,
-        abort_event=abort_event,
-        input_rules=[
-            dict(item)
-            for item in page.get("input_rules") or []
-            if isinstance(item, dict)
-        ],
-        dynamic_patterns=list(page.get("dynamic_text_patterns") or []),
-        stable_wait_seconds=float(page.get("stable_wait_seconds") or 5.0),
-        secret_values=secret_values,
-    )
-    try:
-        if not unique or capture is None:
-            raise RuntimeError("巡检稳定路径无法唯一回放")
-        if capture.package_name != package_name:
-            raise RuntimeError(f"巡检路径回放进入外部包: {capture.package_name or '-'}")
-        page_key = str(page.get("key") or "page")
-        base_dir = project_path(
-            "reports",
-            "compatibility",
-            str(run_id),
-            str(cell_id),
-            phase,
-            page_key,
-        )
-        reports_root = project_path("reports").resolve()
-        screenshot_path = (base_dir / "screenshot.png").resolve(strict=False)
-        xml_path = (base_dir / "hierarchy.xml").resolve(strict=False)
-        screenshot_path.relative_to(reports_root)
-        xml_path.relative_to(reports_root)
-        artifacts = InspectionArtifactSanitizer(
-            [
-                dict(item)
-                for item in page.get("sanitizer_rules") or []
-                if isinstance(item, dict)
-            ]
-        ).write(
-            xml=capture.xml,
-            screenshot_png=capture.screenshot_png,
-            xml_path=xml_path,
-            screenshot_path=screenshot_path,
-        )
-        resolved_screenshot = screenshot_path.resolve()
-        resolved_xml = xml_path.resolve()
-        resolved_screenshot.relative_to(reports_root)
-        resolved_xml.relative_to(reports_root)
-        return {
-            "screenshot_path": resolved_screenshot.relative_to(reports_root).as_posix(),
-            "screenshot_bytes": artifacts.screenshot_png,
-            "screenshot_asset_id": artifacts.screenshot_asset_id,
-            "xml_path": resolved_xml.relative_to(reports_root).as_posix(),
-            "xml_text": artifacts.xml,
-            "xml_asset_id": artifacts.xml_asset_id,
-            "activity": capture.activity,
-            "logcat_errors": "",
-        }
-    finally:
-        for index in range(len(secret_values)):
-            secret_values[index] = ""
-
-
 async def _run_page_capture(
     *,
     session: Session,
@@ -1730,24 +1055,6 @@ async def _run_page_capture(
     phase: str,
     abort_event: threading.Event,
 ) -> Dict[str, Any]:
-    if page.get("inspection_state_id"):
-        await _clear_logcat(cell.device_serial)
-        snapshot = await asyncio.to_thread(
-            _run_inspection_path_capture,
-            serial=cell.device_serial,
-            package_name=run.package_name,
-            run_id=run.id,
-            cell_id=cell.id,
-            phase=phase,
-            page=page,
-            abort_event=abort_event,
-        )
-        snapshot["logcat_errors"] = await _capture_logcat_errors(
-            cell.device_serial,
-            run.package_name,
-        )
-        return _persist_snapshot_assets(session, snapshot)
-
     case = session.get(TestCase, int(page.get("case_id") or 0))
     if not case:
         raise RuntimeError(f"页面用例不存在: {page.get('case_id')}")
@@ -1783,8 +1090,6 @@ def _run_case_for_capture(
     serial: str,
     env_id: Optional[int],
     abort_event: threading.Event,
-    before_device_step: Optional[Callable[[str], None]] = None,
-    before_step: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     from sqlmodel import Session as SQLSession
 
@@ -1798,674 +1103,7 @@ def _run_case_for_capture(
             device_serial=serial,
             env_id=env_id,
             abort_event=abort_event,
-            before_device_step=before_device_step,
-            before_step=before_step,
         )
-
-
-def _persist_replay_capture(
-    session: Session,
-    *,
-    run: CompatibilityRun,
-    cell: CompatibilityCell,
-    chain: Dict[str, Any],
-    capture,
-) -> Dict[str, Any]:
-    page_key = _page_key(
-        1,
-        {
-            "key": chain.get("chain_id") or chain.get("path_key"),
-            "name": chain.get("name") or "replay",
-        },
-    )
-    base_dir = project_path(
-        "reports",
-        "compatibility",
-        str(run.id),
-        str(cell.id),
-        "replay",
-        page_key,
-    )
-    reports_root = project_path("reports").resolve()
-    screenshot_path = (base_dir / "screenshot.png").resolve(strict=False)
-    xml_path = (base_dir / "hierarchy.xml").resolve(strict=False)
-    screenshot_path.relative_to(reports_root)
-    xml_path.relative_to(reports_root)
-    artifacts = InspectionArtifactSanitizer(
-        [
-            dict(item)
-            for item in chain.get("sanitizer_rules") or []
-            if isinstance(item, dict)
-        ]
-    ).write(
-        xml=capture.xml,
-        screenshot_png=capture.screenshot_png,
-        xml_path=xml_path,
-        screenshot_path=screenshot_path,
-    )
-    snapshot = {
-        "screenshot_path": screenshot_path.relative_to(reports_root).as_posix(),
-        "screenshot_bytes": artifacts.screenshot_png,
-        "xml_path": xml_path.relative_to(reports_root).as_posix(),
-        "xml_text": artifacts.xml,
-        "activity": capture.activity,
-    }
-    return _persist_snapshot_assets(session, snapshot)
-
-
-def _record_replay_result(
-    session: Session,
-    *,
-    run: CompatibilityRun,
-    cell: CompatibilityCell,
-    chain: Dict[str, Any],
-    result: Dict[str, Any],
-    snapshot: Optional[Dict[str, Any]] = None,
-) -> CompatibilityPageResult:
-    chain_id = str(chain.get("chain_id") or chain.get("path_key") or "")
-    row = session.exec(
-        select(CompatibilityPageResult).where(
-            CompatibilityPageResult.cell_id == cell.id,
-            CompatibilityPageResult.page_key == chain_id,
-        )
-    ).first()
-    if row is None:
-        row = CompatibilityPageResult(
-            run_id=int(run.id),
-            cell_id=int(cell.id),
-            page_key=chain_id,
-            created_at=_now(),
-        )
-    display_label = str(chain.get("display_label") or "").strip()
-    source_page_name = str(
-        chain.get("page_name") or chain.get("name") or chain_id
-    ).strip()
-    row.page_name = (
-        f"{display_label} · {source_page_name}"
-        if display_label and source_page_name
-        else display_label or source_page_name
-    )
-    row.path_key = str(chain.get("path_key") or chain_id)
-    row.source_state_id = (
-        int(chain.get("endpoint_state_id"))
-        if chain.get("endpoint_state_id")
-        else None
-    )
-    row.source_observation_id = (
-        int(chain.get("source_observation_id"))
-        if chain.get("source_observation_id")
-        else None
-    )
-    row.evidence_level = str(chain.get("evidence_level") or "OBSERVED_ONCE")
-    row.status = str(result.get("status") or "FAIL").upper()
-    row.reason = str(result.get("reason") or "") or None
-    row.failure_type = str(result.get("failure_type") or "") or None
-    row.failed_step_index = (
-        int(result.get("failed_step_index"))
-        if result.get("failed_step_index") is not None
-        else None
-    )
-    row.replay_trace = [
-        dict(item)
-        for item in result.get("trace") or []
-        if isinstance(item, dict)
-    ]
-    trace_duration_ms = sum(
-        float(item.get("duration_ms") or 0)
-        for item in row.replay_trace
-        if isinstance(item, dict)
-    )
-    source_boundary_evidence = str(
-        chain.get("boundary_evidence") or "NOT_APPLICABLE"
-    ).upper()
-    replay_boundary_evidence = str(
-        result.get("boundary_evidence") or source_boundary_evidence
-    ).upper()
-    boundary_results = [
-        {
-            "step_index": item.get("step_index"),
-            "status": item.get("status"),
-            "boundary_evidence": str(
-                item.get("boundary_evidence") or "NOT_VERIFIABLE"
-            ).upper(),
-            "failure_type": item.get("failure_type"),
-            "reason": item.get("reason"),
-            "action_role": item.get("action_role"),
-        }
-        for item in row.replay_trace
-        if isinstance(item, dict)
-        and str(item.get("status") or "").upper().startswith("BOUNDARY_")
-    ]
-    row.metrics = {
-        "completed_checkpoints": int(result.get("completed_checkpoints") or 0),
-        "checkpoint_count": len(chain.get("checkpoints") or []),
-        "duration_ms": round(
-            float(result.get("duration_ms") or trace_duration_ms),
-            2,
-        ),
-        "warning_codes": list(result.get("warning_codes") or []),
-        "display_index": chain.get("display_index"),
-        "display_label": display_label,
-        "page_name": source_page_name,
-        "source_observation_index": chain.get("source_observation_index"),
-        "reachability_evidence": str(
-            chain.get("reachability_evidence")
-            or chain.get("evidence_level")
-            or "OBSERVED_ONCE"
-        ),
-        "replay_eligibility": str(chain.get("replay_eligibility") or "FULL"),
-        "replay_scope": _compat_replay_scope(chain),
-        "terminal_outcome": _compat_terminal_outcome(chain),
-        "source_boundary_evidence": source_boundary_evidence,
-        "replay_boundary_evidence": replay_boundary_evidence,
-        # Compatibility readers before schema v4 used this scalar.  It now
-        # intentionally represents the target-version probe result.
-        "boundary_evidence": replay_boundary_evidence,
-        "boundary_results": boundary_results,
-        "prefix_path_key": chain.get("prefix_path_key") or chain.get("path_key"),
-        "terminal_boundaries": [
-            dict(item)
-            for item in chain.get("terminal_boundaries") or []
-            if isinstance(item, dict)
-        ],
-    }
-    if result.get("asset_error"):
-        row.metrics["asset_error"] = str(result.get("asset_error"))[:500]
-    row.updated_at = _now()
-    if snapshot:
-        row.candidate_screenshot_path = snapshot.get("screenshot_path")
-        row.candidate_screenshot_asset_id = snapshot.get("screenshot_asset_id")
-        row.candidate_xml_path = snapshot.get("xml_path")
-        row.candidate_xml_asset_id = snapshot.get("xml_asset_id")
-        row.candidate_activity = str(snapshot.get("activity") or "") or None
-    session.add(row)
-    session.flush()
-    _sync_page_asset_references(session, row)
-    session.commit()
-    return row
-
-
-def _budget_not_reached_result() -> Dict[str, Any]:
-    return {
-        "status": "WARNING",
-        "reason": "回放任务已达到时间预算",
-        "failure_type": "BUDGET_NOT_REACHED",
-        "failed_step_index": None,
-        "trace": [],
-        "completed_checkpoints": 0,
-        "warning_codes": ["BUDGET_NOT_REACHED"],
-    }
-
-
-async def _execute_cell_installed_replay_body(
-    session: Session,
-    run: CompatibilityRun,
-    cell: CompatibilityCell,
-    pages: List[Dict[str, Any]],
-    abort_event: threading.Event,
-    run_id: int,
-) -> None:
-    """Replay frozen chains on the already-installed package.
-
-    This path intentionally has no install/prepare/baseline/diff calls.  The
-    entry case is the only reset operation and is run once per chain; the
-    replay kernel performs current-XML rebinding and stores a safe trace.
-    """
-    del run_id
-    duration = max(300, min(3600, int(run.replay_duration_seconds or 3600)))
-    deadline = time.monotonic() + duration
-    cell.old_install_status = "SKIPPED"
-    cell.new_install_status = "SKIPPED"
-    cell.current_stage = "复核设备已安装版本"
-    session.add(cell)
-    session.commit()
-
-    installed = await read_installed_package(
-        cell.device_serial,
-        run.package_name,
-    )
-    expected_snapshot = dict(run.target_package_snapshot or {})
-    expected_digest = str(
-        expected_snapshot.get("snapshot_digest")
-        or package_snapshot_digest(expected_snapshot)
-    )
-    actual_digest = package_snapshot_digest(installed)
-    cell.installed_package_snapshot = dict(installed)
-    session.add(cell)
-    session.commit()
-    if (
-        not installed.get("installed")
-        or installed.get("package_name") != run.package_name
-        or actual_digest != expected_digest
-    ):
-        reason = (
-            "租约后设备安装包与预检快照不一致"
-            if installed.get("installed")
-            else "租约后设备未安装巡检包"
-        )
-        for chain in pages:
-            _record_replay_result(
-                session,
-                run=run,
-                cell=cell,
-                chain=chain,
-                result={
-                    "status": "FAIL",
-                    "reason": reason,
-                    "failure_type": "PACKAGE_SNAPSHOT_CHANGED",
-                    "trace": [],
-                    "completed_checkpoints": 0,
-                    "warning_codes": [],
-                },
-            )
-        cell.status = "FAIL"
-        cell.error_message = reason
-        cell.current_stage = "设备版本校验失败"
-        cell.finished_at = _now()
-        session.add(cell)
-        session.commit()
-        return
-
-    source_run = (
-        session.get(InspectionRun, run.inspection_run_id)
-        if run.inspection_run_id
-        else None
-    )
-    profile_snapshot = dict(source_run.profile_snapshot or {}) if source_run else {}
-    branch_config = dict(
-        pages[0].get("branch_config")
-        or (
-            branch_config_for_run(
-                session.get(InspectionRun, run.inspection_run_id),
-                str(run.replay_branch_key or ""),
-            )
-            if source_run
-            else {}
-        )
-    )
-    if source_run is None or not branch_config:
-        reason = "回放任务缺少业务线冻结配置"
-        for chain in pages:
-            _record_replay_result(
-                session,
-                run=run,
-                cell=cell,
-                chain=chain,
-                result={
-                    "status": "FAIL",
-                    "reason": reason,
-                    "failure_type": "INVALID_REPLAY_PLAN",
-                    "trace": [],
-                    "completed_checkpoints": 0,
-                    "warning_codes": [],
-                },
-            )
-        cell.status = "FAIL"
-        cell.error_message = reason
-        cell.finished_at = _now()
-        session.add(cell)
-        session.commit()
-        return
-
-    input_rules = [
-        dict(item)
-        for item in profile_snapshot.get("input_rules") or []
-        if isinstance(item, dict)
-    ]
-    safety_rules = [
-        dict(item)
-        for item in profile_snapshot.get("safety_rules") or []
-        if isinstance(item, dict)
-    ]
-    dynamic_patterns = [
-        str(item)
-        for item in profile_snapshot.get("dynamic_text_patterns") or []
-    ]
-    secret_values = _environment_secret_values(branch_config.get("env_id"))
-    entry_case_id = int(branch_config.get("entry_case_id") or 0)
-
-    def guard_device_step(_label: str) -> None:
-        if abort_event.is_set():
-            raise InspectionAborted("replay cancelled")
-        if time.monotonic() >= deadline:
-            raise InspectionAborted("replay time budget reached")
-
-    def resolve_input(step: Dict[str, Any]) -> Optional[str]:
-        action = _deserialize_action(dict(step))
-        value, _, _ = _resolve_input_value(
-            action=action,
-            input_rules=input_rules,
-            env_id=branch_config.get("env_id"),
-            secret_values=secret_values,
-        )
-        return value
-
-    async def mark_budget_for_remaining(start_index: int) -> None:
-        for remaining in pages[start_index:]:
-            _record_replay_result(
-                session,
-                run=run,
-                cell=cell,
-                chain=remaining,
-                result=_budget_not_reached_result(),
-            )
-
-    def record_chain_failure(
-        chain: Dict[str, Any],
-        *,
-        reason: str,
-        failure_type: str,
-        warning_codes: Optional[List[str]] = None,
-    ) -> None:
-        """Keep one result row for every chain even when entry/setup fails."""
-        _record_replay_result(
-            session,
-            run=run,
-            cell=cell,
-            chain=chain,
-            result={
-                "status": "FAIL",
-                "reason": reason,
-                "failure_type": failure_type,
-                "trace": [],
-                "completed_checkpoints": 0,
-                "warning_codes": list(warning_codes or []),
-            },
-        )
-
-    def record_cancelled_remaining(start_index: int) -> None:
-        for remaining in pages[start_index:]:
-            _record_replay_result(
-                session,
-                run=run,
-                cell=cell,
-                chain=remaining,
-                result={
-                    "status": "CANCELLED",
-                    "reason": "用户取消回放任务",
-                    "failure_type": "CANCELLED",
-                    "trace": [],
-                    "completed_checkpoints": 0,
-                    "warning_codes": [],
-                },
-            )
-
-    def persist_capture_best_effort(
-        chain: Dict[str, Any],
-        capture: Any,
-    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Keep replay outcomes durable when screenshot/XML persistence fails."""
-        if capture is None:
-            return None, None
-        try:
-            return (
-                _persist_replay_capture(
-                    session,
-                    run=run,
-                    cell=cell,
-                    chain=chain,
-                    capture=capture,
-                ),
-                None,
-            )
-        except Exception as exc:  # pragma: no cover - real filesystem faults
-            logger.exception(
-                "persist installed replay capture failed: run=%s cell=%s chain=%s",
-                run.id,
-                cell.id,
-                chain.get("chain_id") or chain.get("path_key"),
-            )
-            return None, f"{type(exc).__name__}: {exc}"
-
-    def annotate_asset_failure(
-        result: Dict[str, Any],
-        asset_error: Optional[str],
-    ) -> None:
-        if not asset_error:
-            return
-        warning_codes = list(result.get("warning_codes") or [])
-        if "ASSET_PERSIST_FAILED" not in warning_codes:
-            warning_codes.append("ASSET_PERSIST_FAILED")
-        result["warning_codes"] = warning_codes
-        result["asset_error"] = asset_error
-        # Do not mask a real replay failure. A successful chain without its
-        # evidence is a warning rather than a pass.
-        if str(result.get("status") or "").upper() == "PASS":
-            result["status"] = "WARNING"
-            result["reason"] = "链路已执行，但截图/XML 证据保存失败"
-            result["failure_type"] = "ASSET_PERSIST_FAILED"
-
-    chain_index = 0
-    cancelled_chain_recorded = False
-    try:
-        for chain_index, chain in enumerate(pages):
-            if abort_event.is_set():
-                raise asyncio.CancelledError()
-            if time.monotonic() >= deadline:
-                await mark_budget_for_remaining(chain_index)
-                break
-            cell.current_stage = f"回放链路 {chain_index + 1}/{len(pages)}"
-            session.add(cell)
-            session.commit()
-
-            # Attribute Crash/ANR evidence to this chain only.  Without a
-            # clear, errors emitted by an earlier chain (or before the run)
-            # would be observed again and incorrectly fail every later chain.
-            await _clear_logcat(cell.device_serial)
-
-            try:
-                entry_result = await asyncio.to_thread(
-                    _run_case_for_capture,
-                    entry_case_id,
-                    cell.device_serial,
-                    branch_config.get("env_id"),
-                    abort_event,
-                    guard_device_step,
-                    guard_device_step,
-                )
-            except InspectionAborted:
-                raise
-            except Exception:
-                record_chain_failure(
-                    chain,
-                    reason="entry 用例执行异常，无法建立业务根页面",
-                    failure_type="ENTRY_CASE_FAILED",
-                )
-                for remaining in pages[chain_index + 1 :]:
-                    record_chain_failure(
-                        remaining,
-                        reason="entry 用例执行异常，后续链路未开始",
-                        failure_type="ENTRY_CASE_FAILED",
-                    )
-                break
-            if time.monotonic() >= deadline:
-                await mark_budget_for_remaining(chain_index)
-                break
-
-            # A ready assertion alone is not proof that the entry case worked:
-            # a stale page from a failed reset can still contain the same text.
-            # Never replay actions after an unsuccessful entry case.
-            if not isinstance(entry_result, dict) or not entry_result.get("success"):
-                record_chain_failure(
-                    chain,
-                    reason="entry 用例未成功，无法建立业务根页面",
-                    failure_type="ENTRY_CASE_FAILED",
-                    warning_codes=["ENTRY_CASE_FAILED"],
-                )
-                for remaining in pages[chain_index + 1 :]:
-                    record_chain_failure(
-                        remaining,
-                        reason="entry 用例未成功，后续链路未开始",
-                        failure_type="ENTRY_CASE_FAILED",
-                        warning_codes=["ENTRY_CASE_FAILED"],
-                    )
-                break
-
-            remaining_before_ready = deadline - time.monotonic()
-            if remaining_before_ready <= 0:
-                await mark_budget_for_remaining(chain_index)
-                break
-            ready_assertion = dict(branch_config.get("ready_assertion") or {})
-            try:
-                device = await asyncio.to_thread(connect_android, cell.device_serial)
-                try:
-                    requested_ready_timeout = float(
-                        ready_assertion.get("timeout") or 5
-                    )
-                except (TypeError, ValueError):
-                    requested_ready_timeout = 5.0
-                ready_assertion["timeout"] = min(
-                    max(1.0, requested_ready_timeout),
-                    max(1.0, remaining_before_ready),
-                )
-                ready = await asyncio.to_thread(
-                    ready_assertion_exists,
-                    device,
-                    ready_assertion,
-                    abort_event=abort_event,
-                )
-            except InspectionAborted:
-                raise
-            except Exception:
-                record_chain_failure(
-                    chain,
-                    reason="设备连接或 ready assertion 执行失败",
-                    failure_type="DEVICE_ERROR",
-                )
-                for remaining in pages[chain_index + 1 :]:
-                    record_chain_failure(
-                        remaining,
-                        reason="设备连接或 ready assertion 失败，后续链路未开始",
-                        failure_type="DEVICE_ERROR",
-                    )
-                break
-            if not ready:
-                record_chain_failure(
-                    chain,
-                    reason="entry 用例后未保留业务根页面",
-                    failure_type="STATE_NOT_PRESERVED",
-                )
-                for remaining in pages[chain_index + 1 :]:
-                    record_chain_failure(
-                        remaining,
-                        reason="业务根页面未保留，后续链路未开始",
-                        failure_type="STATE_NOT_PRESERVED",
-                    )
-                break
-            if time.monotonic() >= deadline:
-                await mark_budget_for_remaining(chain_index)
-                break
-
-            def before_action(_label: str) -> None:
-                guard_device_step(_label)
-
-            result_obj = await asyncio.to_thread(
-                execute_replay_chain,
-                device,
-                chain,
-                package_name=run.package_name,
-                abort_event=abort_event,
-                dynamic_patterns=dynamic_patterns,
-                safety_rules=safety_rules,
-                input_rules=input_rules,
-                input_resolver=resolve_input,
-                stable_wait_seconds=float(chain.get("stable_wait_seconds") or 5.0),
-                before_device_action=before_action,
-            )
-            result = result_obj.to_dict()
-            if (
-                result.get("failure_type") == "CANCELLED"
-                and not abort_event.is_set()
-                and time.monotonic() >= deadline
-            ):
-                # Preserve the partial trace and last capture for the chain
-                # that reached the deadline. Untouched later chains receive
-                # the empty BUDGET_NOT_REACHED result below.
-                result["status"] = "WARNING"
-                result["reason"] = "当前链路执行触达时间预算，已停止"
-                result["failure_type"] = "BUDGET_LIMIT"
-                warning_codes = list(result.get("warning_codes") or [])
-                if "BUDGET_LIMIT" not in warning_codes:
-                    warning_codes.append("BUDGET_LIMIT")
-                result["warning_codes"] = warning_codes
-            if abort_event.is_set():
-                # Preserve a partial trace/capture returned by the replay
-                # kernel before handing control to the cell cancellation
-                # handler. Previously this branch discarded the evidence and
-                # rewrote the current chain as an empty CANCELLED row.
-                result["status"] = "CANCELLED"
-                result["reason"] = "用户取消回放任务"
-                result["failure_type"] = "CANCELLED"
-                capture_snapshot, asset_error = persist_capture_best_effort(
-                    chain,
-                    result_obj.last_capture,
-                )
-                annotate_asset_failure(result, asset_error)
-                _record_replay_result(
-                    session,
-                    run=run,
-                    cell=cell,
-                    chain=chain,
-                    result=result,
-                    snapshot=capture_snapshot,
-                )
-                cancelled_chain_recorded = True
-                raise asyncio.CancelledError()
-            capture_snapshot, asset_error = persist_capture_best_effort(
-                chain,
-                result_obj.last_capture,
-            )
-            annotate_asset_failure(result, asset_error)
-            logcat = await _capture_logcat_errors(
-                cell.device_serial,
-                run.package_name,
-            )
-            if _CRASH_PATTERN.search(logcat or ""):
-                result["status"] = "FAIL"
-                result["reason"] = "检测到 Crash/ANR 日志"
-                result["failure_type"] = "CRASH_OR_ANR"
-            _record_replay_result(
-                session,
-                run=run,
-                cell=cell,
-                chain=chain,
-                result=result,
-                snapshot=capture_snapshot,
-            )
-            if time.monotonic() >= deadline:
-                await mark_budget_for_remaining(chain_index + 1)
-                break
-    except InspectionAborted:
-        if abort_event.is_set():
-            record_cancelled_remaining(chain_index)
-            raise asyncio.CancelledError()
-        await mark_budget_for_remaining(chain_index)
-    except asyncio.CancelledError:
-        start_index = chain_index + 1 if cancelled_chain_recorded else chain_index
-        record_cancelled_remaining(start_index)
-        raise
-    finally:
-        for index in range(len(secret_values)):
-            secret_values[index] = ""
-
-    page_rows = session.exec(
-        select(CompatibilityPageResult).where(
-            CompatibilityPageResult.cell_id == cell.id
-        )
-    ).all()
-    statuses = {str(item.status or "").upper() for item in page_rows}
-    if any(item in statuses for item in {"FAIL", "ERROR"}):
-        cell.status = "FAIL"
-    elif "WARNING" in statuses or (run.target_package_snapshot or {}).get(
-        "preflight_warnings"
-    ):
-        cell.status = "WARNING"
-    else:
-        cell.status = "PASS"
-    cell.current_stage = "完成"
-    cell.finished_at = _now()
-    session.add(cell)
-    session.commit()
 
 
 async def _execute_cell(run_id: int, cell_id: int, pages: List[Dict[str, Any]], abort_event: threading.Event) -> None:
@@ -2516,25 +1154,7 @@ async def _execute_cell(run_id: int, cell_id: int, pages: List[Dict[str, Any]], 
             if _is_cancelled(session, run_id, abort_event):
                 raise asyncio.CancelledError()
 
-            if str(run.execution_mode or "").upper() == "INSTALLED_REPLAY":
-                await _execute_cell_installed_replay_body(
-                    session,
-                    run,
-                    cell,
-                    pages,
-                    abort_event,
-                    run_id,
-                )
-            elif run.compare_mode == "snapshot":
-                await _execute_cell_snapshot_body(
-                    session,
-                    run,
-                    cell,
-                    pages,
-                    abort_event,
-                    run_id,
-                )
-            elif run.compare_mode == "device":
+            if run.compare_mode == "device":
                 await _execute_cell_device_body(session, run, cell, pages, abort_event, run_id)
             else:
                 await _execute_cell_version_body(session, run, cell, pages, abort_event, run_id)
@@ -2570,126 +1190,6 @@ async def _execute_cell(run_id: int, cell_id: int, pages: List[Dict[str, Any]], 
             _update_run_summary(session, run_id, final=False)
 
 
-async def _execute_cell_snapshot_body(
-    session: Session,
-    run: CompatibilityRun,
-    cell: CompatibilityCell,
-    pages: List[Dict[str, Any]],
-    abort_event: threading.Event,
-    run_id: int,
-) -> None:
-    """Compare a new APK against copied, sanitized inspection baselines."""
-    cell.current_stage = "安装测试包"
-    cell.old_install_status = "SKIPPED"
-    cell.new_install_status = "RUNNING"
-    session.add(cell)
-    session.commit()
-    await install_app_package_to_device(
-        session=session,
-        package_id=run.new_package_id,
-        serial=cell.device_serial,
-        require_idle=False,
-        uninstall_first=(run.mode == "clean"),
-        allow_uninstall_retry=(run.mode == "clean"),
-        allow_downgrade=True,
-    )
-    cell.new_install_status = "PASS"
-    session.add(cell)
-    session.commit()
-
-    for branch_key, branch_pages in _inspection_page_groups(pages):
-        if _is_cancelled(session, run_id, abort_event):
-            raise asyncio.CancelledError()
-        cell.current_stage = f"准备巡检业务线: {branch_key}"
-        session.add(cell)
-        session.commit()
-        try:
-            await asyncio.to_thread(
-                _prepare_inspection_page_group,
-                serial=cell.device_serial,
-                page=branch_pages[0],
-                abort_event=abort_event,
-            )
-        except Exception as exc:
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-            for page in branch_pages:
-                baseline = {
-                    "screenshot_path": page.get("baseline_screenshot_path"),
-                    "screenshot_asset_id": page.get("baseline_screenshot_asset_id"),
-                    "xml_path": page.get("baseline_xml_path"),
-                    "xml_asset_id": page.get("baseline_xml_asset_id"),
-                    "activity": page.get("baseline_activity") or "",
-                }
-                _record_capture_failure(
-                    session,
-                    run,
-                    cell,
-                    page,
-                    "candidate",
-                    RuntimeError(f"业务线准备失败: {exc}"),
-                    baseline=baseline,
-                )
-            continue
-
-        for page in branch_pages:
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-            cell.current_stage = f"回放巡检路径: {page.get('name')}"
-            session.add(cell)
-            session.commit()
-            baseline = {
-                "screenshot_path": page.get("baseline_screenshot_path"),
-                "screenshot_asset_id": page.get("baseline_screenshot_asset_id"),
-                "xml_path": page.get("baseline_xml_path"),
-                "xml_asset_id": page.get("baseline_xml_asset_id"),
-                "xml_text": _load_report_text(
-                    page.get("baseline_xml_path"),
-                    asset_id=page.get("baseline_xml_asset_id"),
-                    session=session,
-                ),
-                "activity": page.get("baseline_activity") or "",
-                "logcat_errors": "",
-            }
-            try:
-                candidate = await _run_page_capture(
-                    session=session,
-                    run=run,
-                    cell=cell,
-                    page=page,
-                    phase="candidate",
-                    abort_event=abort_event,
-                )
-                _record_compare_result(session, run, cell, page, baseline, candidate)
-            except Exception as exc:
-                _record_capture_failure(
-                    session,
-                    run,
-                    cell,
-                    page,
-                    "candidate",
-                    exc,
-                    baseline=baseline,
-                )
-
-    page_rows = session.exec(
-        select(CompatibilityPageResult).where(
-            CompatibilityPageResult.cell_id == cell.id
-        )
-    ).all()
-    statuses = {str(item.status or "").upper() for item in page_rows}
-    if not page_rows or any(item in statuses for item in {"FAIL", "ERROR"}):
-        cell.status = "FAIL"
-    elif "WARNING" in statuses:
-        cell.status = "WARNING"
-    else:
-        cell.status = "PASS"
-    cell.current_stage = "完成"
-    cell.finished_at = _now()
-    session.add(cell)
-    session.commit()
-
-
 async def _execute_cell_version_body(
     session: Session,
     run: CompatibilityRun,
@@ -2699,17 +1199,6 @@ async def _execute_cell_version_body(
     run_id: int,
 ) -> None:
     """版本对比（纵向）：同设备安装旧版→采集基线→安装新版→采集并逐页对比。"""
-    if pages and pages[0].get("inspection_state_id"):
-        await _execute_cell_inspection_version_body(
-            session,
-            run,
-            cell,
-            pages,
-            abort_event,
-            run_id,
-        )
-        return
-
     if run.old_package_id is None:
         cell.current_stage = "检查当前版本"
         cell.old_install_status = "SKIPPED"
@@ -2817,175 +1306,6 @@ async def _execute_cell_version_body(
     session.commit()
 
 
-async def _execute_cell_inspection_version_body(
-    session: Session,
-    run: CompatibilityRun,
-    cell: CompatibilityCell,
-    pages: List[Dict[str, Any]],
-    abort_event: threading.Event,
-    run_id: int,
-) -> None:
-    """Replay each login-state branch across an in-place APK upgrade.
-
-    Each branch gets its own old-version installation so guest/authenticated
-    states cannot contaminate one another.  The prepare case runs only before
-    the old-version baseline.  After ``adb install -r`` the candidate path uses
-    entry + stable locators and never invokes login/logout preparation.
-    """
-    if run.old_package_id is None:
-        raise RuntimeError("巡检 Version 模式缺少显式旧版 APK")
-
-    cell.old_install_status = "RUNNING"
-    cell.new_install_status = "RUNNING"
-    session.add(cell)
-    session.commit()
-    installed_new = False
-
-    for branch_key, branch_pages in _inspection_page_groups(pages):
-        if _is_cancelled(session, run_id, abort_event):
-            raise asyncio.CancelledError()
-
-        cell.current_stage = f"安装旧版并准备业务线: {branch_key}"
-        session.add(cell)
-        session.commit()
-        await install_app_package_to_device(
-            session=session,
-            package_id=run.old_package_id,
-            serial=cell.device_serial,
-            require_idle=False,
-            uninstall_first=True,
-            allow_uninstall_retry=True,
-            allow_downgrade=True,
-        )
-        cell.old_install_status = "PASS"
-        session.add(cell)
-        session.commit()
-
-        try:
-            await asyncio.to_thread(
-                _prepare_inspection_page_group,
-                serial=cell.device_serial,
-                page=branch_pages[0],
-                abort_event=abort_event,
-            )
-        except Exception as exc:
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-            for page in branch_pages:
-                _record_capture_failure(
-                    session,
-                    run,
-                    cell,
-                    page,
-                    "baseline",
-                    RuntimeError(f"旧版业务线准备失败: {exc}"),
-                )
-            continue
-
-        baseline_by_key: Dict[str, Dict[str, Any]] = {}
-        for page in branch_pages:
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-            cell.current_stage = f"采集旧版: {page.get('name')}"
-            session.add(cell)
-            session.commit()
-            try:
-                baseline_by_key[str(page.get("key"))] = await _run_page_capture(
-                    session=session,
-                    run=run,
-                    cell=cell,
-                    page=page,
-                    phase="baseline",
-                    abort_event=abort_event,
-                )
-            except Exception as exc:
-                _record_capture_failure(
-                    session,
-                    run,
-                    cell,
-                    page,
-                    "baseline",
-                    exc,
-                )
-
-        if _is_cancelled(session, run_id, abort_event):
-            raise asyncio.CancelledError()
-        cell.current_stage = f"覆盖升级新版（保持 {branch_key} 登录态）"
-        session.add(cell)
-        session.commit()
-        await install_app_package_to_device(
-            session=session,
-            package_id=run.new_package_id,
-            serial=cell.device_serial,
-            require_idle=False,
-            uninstall_first=False,
-            allow_uninstall_retry=False,
-            allow_downgrade=False,
-        )
-        installed_new = True
-        cell.new_install_status = "PASS"
-        session.add(cell)
-        session.commit()
-
-        # Deliberately no prepare case here: upgrade compatibility must validate
-        # that the old login state survives the in-place installation.
-        for page in branch_pages:
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-            cell.current_stage = f"采集升级后新版: {page.get('name')}"
-            session.add(cell)
-            session.commit()
-            baseline = baseline_by_key.get(str(page.get("key")))
-            try:
-                candidate = await _run_page_capture(
-                    session=session,
-                    run=run,
-                    cell=cell,
-                    page=page,
-                    phase="candidate",
-                    abort_event=abort_event,
-                )
-                if not baseline:
-                    raise RuntimeError("旧版基线采集失败，无法对比")
-                _record_compare_result(
-                    session,
-                    run,
-                    cell,
-                    page,
-                    baseline,
-                    candidate,
-                )
-            except Exception as exc:
-                _record_capture_failure(
-                    session,
-                    run,
-                    cell,
-                    page,
-                    "candidate",
-                    exc,
-                    baseline=baseline,
-                )
-
-    if not installed_new:
-        cell.new_install_status = "SKIPPED"
-    page_rows = session.exec(
-        select(CompatibilityPageResult).where(
-            CompatibilityPageResult.cell_id == cell.id
-        )
-    ).all()
-    statuses = {str(item.status or "").upper() for item in page_rows}
-    if not page_rows or any(item in statuses for item in {"FAIL", "ERROR"}):
-        cell.status = "FAIL"
-    elif "WARNING" in statuses:
-        cell.status = "WARNING"
-    else:
-        cell.status = "PASS"
-    cell.current_stage = "完成"
-    cell.finished_at = _now()
-    session.add(cell)
-    session.commit()
-
-
 async def _execute_cell_device_body(
     session: Session,
     run: CompatibilityRun,
@@ -3013,56 +1333,24 @@ async def _execute_cell_device_body(
     session.add(cell)
     session.commit()
 
-    if pages and pages[0].get("inspection_state_id"):
-        groups = _inspection_page_groups(pages)
-    else:
-        groups = [("page_set", pages)]
-    for branch_key, branch_pages in groups:
+    for page in pages:
         if _is_cancelled(session, run_id, abort_event):
             raise asyncio.CancelledError()
-        if branch_key != "page_set":
-            cell.current_stage = f"准备巡检业务线: {branch_key}"
-            session.add(cell)
-            session.commit()
-            try:
-                await asyncio.to_thread(
-                    _prepare_inspection_page_group,
-                    serial=cell.device_serial,
-                    page=branch_pages[0],
-                    abort_event=abort_event,
-                )
-            except Exception as exc:
-                if _is_cancelled(session, run_id, abort_event):
-                    raise asyncio.CancelledError()
-                for page in branch_pages:
-                    _record_capture_failure(
-                        session,
-                        run,
-                        cell,
-                        page,
-                        "candidate",
-                        RuntimeError(f"业务线准备失败: {exc}"),
-                    )
-                continue
-
-        for page in branch_pages:
-            if _is_cancelled(session, run_id, abort_event):
-                raise asyncio.CancelledError()
-            cell.current_stage = f"采集页面: {page.get('name')}"
-            session.add(cell)
-            session.commit()
-            try:
-                snapshot = await _run_page_capture(
-                    session=session,
-                    run=run,
-                    cell=cell,
-                    page=page,
-                    phase="candidate",
-                    abort_event=abort_event,
-                )
-                _record_device_capture(session, run, cell, page, snapshot)
-            except Exception as exc:
-                _record_capture_failure(session, run, cell, page, "candidate", exc)
+        cell.current_stage = f"采集页面: {page.get('name')}"
+        session.add(cell)
+        session.commit()
+        try:
+            snapshot = await _run_page_capture(
+                session=session,
+                run=run,
+                cell=cell,
+                page=page,
+                phase="candidate",
+                abort_event=abort_event,
+            )
+            _record_device_capture(session, run, cell, page, snapshot)
+        except Exception as exc:
+            _record_capture_failure(session, run, cell, page, "candidate", exc)
 
     # 采集阶段结束：cell 状态暂留 RUNNING，终态由 join 后的横向对比统一收敛
     cell.current_stage = "采集完成，等待横向对比"
@@ -3686,42 +1974,6 @@ def list_runs(
     )
 
 
-@router.post(
-    "/replay-preflight",
-    response_model=CompatibilityReplayPreflightRead,
-)
-async def replay_preflight(
-    payload: CompatibilityReplayPreflightRequest,
-    session: Session = Depends(get_session),
-    current_user: User = Depends(deps.get_current_user),
-):
-    del current_user
-    if not is_flag_enabled(session, FLAG_COMPATIBILITY_INSTALLED_REPLAY):
-        raise HTTPException(
-            status_code=404,
-            detail="升级后链路回放尚未启用",
-        )
-    _validate_devices(session, [payload.device_serial])
-    source_run = _validate_replay_source(
-        session,
-        inspection_run_id=payload.inspection_run_id,
-        branch_key=payload.branch_key,
-    )
-    installed = await read_installed_package(
-        payload.device_serial,
-        source_run.package_name,
-    )
-    return CompatibilityReplayPreflightRead(
-        **_replay_preflight_result(
-            session,
-            source_run=source_run,
-            branch_key=payload.branch_key,
-            installed_package=installed,
-            max_chains=payload.max_chains,
-        )
-    )
-
-
 @router.post("/runs", response_model=CompatibilityRunRead)
 def create_run(
     payload: CompatibilityRunCreate,
@@ -3739,198 +1991,32 @@ def create_run(
                 "storage": exc.status,
             },
         ) from exc
-    replay_mode = payload.execution_mode == "installed_replay"
-    page_set = None
-    inspection_source = None
-    inspection_states: List[InspectionState] = []
-    replay_preflight_data: Optional[Dict[str, Any]] = None
-    old_pkg: Optional[AppPackage] = None
-    new_pkg: Optional[AppPackage] = None
-    if replay_mode:
-        if not is_flag_enabled(session, FLAG_COMPATIBILITY_INSTALLED_REPLAY):
-            raise HTTPException(status_code=404, detail="升级后链路回放尚未启用")
-        devices = _validate_devices(session, payload.device_serials)
-        inspection_source = _validate_replay_source(
-            session,
-            inspection_run_id=int(payload.inspection_run_id or 0),
-            branch_key=str(payload.replay_branch_key or ""),
+    if payload.source_type != "page_set":
+        raise HTTPException(
+            status_code=400,
+            detail="兼容性测试仅支持手动页面合集来源",
         )
-        installed = read_installed_package_sync(
-            payload.device_serials[0],
-            inspection_source.package_name,
-        )
-        replay_preflight_data = _replay_preflight_result(
-            session,
-            source_run=inspection_source,
-            branch_key=str(payload.replay_branch_key),
-            installed_package=installed,
-            max_chains=20,
-        )
-        blockers = list(replay_preflight_data.get("blockers") or [])
-        if blockers:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": "回放预检未通过",
-                    "blockers": blockers,
-                    "warnings": replay_preflight_data.get("warnings") or [],
-                },
-            )
-        if replay_preflight_data["device_snapshot_digest"] != payload.device_snapshot_digest:
-            raise HTTPException(
-                status_code=409,
-                detail="设备安装包在预检后发生变化，请重新预检",
-            )
-        if replay_preflight_data["plan_digest"] != payload.plan_digest:
-            raise HTTPException(
-                status_code=409,
-                detail="巡检报告的回放计划已变化，请重新预检",
-            )
-        plan = {
-            "plan_version": replay_preflight_data["plan_version"],
-            "digest": replay_preflight_data["plan_digest"],
-            "chains": replay_preflight_data["chains"],
-            "summary": replay_preflight_data["summary"],
-            "excluded": replay_preflight_data["excluded"],
-        }
-        try:
-            pages = select_and_freeze_chains(
-                plan,
-                payload.selected_path_ids or payload.selected_chain_ids,
-                source_run=inspection_source,
-                branch_key=str(payload.replay_branch_key),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        state_ids = {
-            int(page.get("endpoint_state_id"))
-            for page in pages
-            if page.get("endpoint_state_id")
-        }
-        if state_ids:
-            inspection_states = session.exec(
-                select(InspectionState).where(col(InspectionState.id).in_(state_ids))
-            ).all()
-        page_set_name = f"巡检 #{inspection_source.id} · {payload.replay_branch_key} 链路回放"
-    else:
-        old_pkg, new_pkg = _validate_packages(
-            session,
-            payload.old_package_id,
-            int(payload.new_package_id or 0),
-        )
-
-    if not replay_mode and payload.source_type == "inspection":
-        if not is_flag_enabled(session, FLAG_MODEL_INSPECTION):
-            raise HTTPException(
-                status_code=404,
-                detail="模型化智能巡检尚未启用（Feature Flag: model_inspection）",
-            )
-        inspection_source, inspection_states, pages = _validate_inspection_source(
-            session,
-            inspection_run_id=int(payload.inspection_run_id or 0),
-            inspection_state_ids=list(payload.inspection_state_ids),
-            inspection_observation_ids=list(payload.inspection_observation_ids),
-            package_name=new_pkg.package_name,
-        )
-        page_set_name = f"巡检 #{inspection_source.id}"
-    elif not replay_mode:
-        page_set = session.get(CompatPageSet, payload.page_set_id)
-        if not page_set:
-            raise HTTPException(status_code=404, detail="页面集合不存在")
-        pages = _validate_page_set(session, page_set)
-        page_set_name = page_set.name
-    if not replay_mode:
-        devices = _validate_devices(session, payload.device_serials)
-
+    page_set = session.get(CompatPageSet, payload.page_set_id)
+    if not page_set:
+        raise HTTPException(status_code=404, detail="页面集合不存在")
+    pages = _validate_page_set(session, page_set)
+    old_pkg, new_pkg = _validate_packages(
+        session,
+        payload.old_package_id,
+        int(payload.new_package_id or 0),
+    )
+    devices = _validate_devices(session, payload.device_serials)
     thresholds = dump_model(payload.thresholds) if payload.thresholds is not None else {}
-    observation_ids = list(payload.inspection_observation_ids or [])
-    for page in pages:
-        observation_id = page.get("inspection_observation_id") or page.get(
-            "source_observation_id"
-        )
-        if observation_id and int(observation_id) not in observation_ids:
-            observation_ids.append(int(observation_id))
 
     run = CompatibilityRun(
         name=payload.name,
-        page_set_id=page_set.id if page_set else None,
-        page_set_name=page_set_name,
-        page_set_snapshot=(
-            pages if replay_mode else [] if inspection_source else pages
-        ),
-        source_type=payload.source_type,
-        inspection_run_id=inspection_source.id if inspection_source else None,
-        inspection_state_ids=[item.id for item in inspection_states],
-        inspection_observation_ids=observation_ids,
-        source_coverage_snapshot=(
-            {
-                "inspection_run_id": int(inspection_source.id),
-                "manifest_id": inspection_source.coverage_manifest_id,
-                "manifest_version": inspection_source.coverage_manifest_version,
-                "manifest_hash": inspection_source.coverage_manifest_hash,
-                "coverage_verdict": inspection_source.coverage_verdict,
-                "selected_scope_verdict": (
-                    (inspection_source.coverage_assessment or {}).get(
-                        "selected_scope_verdict"
-                    )
-                    if isinstance(inspection_source.coverage_assessment, dict)
-                    else None
-                ),
-                "full_app_verdict": (
-                    (inspection_source.coverage_assessment or {}).get(
-                        "full_app_verdict"
-                    )
-                    if isinstance(inspection_source.coverage_assessment, dict)
-                    else None
-                ),
-                "assessment_origin": (
-                    (inspection_source.coverage_assessment or {}).get(
-                        "assessment_origin"
-                    )
-                    if isinstance(inspection_source.coverage_assessment, dict)
-                    else None
-                ),
-                "frozen_at": datetime.now().isoformat(),
-            }
-            if inspection_source
-            else {}
-        ),
+        page_set_id=page_set.id,
+        page_set_name=page_set.name,
+        page_set_snapshot=pages,
+        source_type="page_set",
         old_package_id=old_pkg.id if old_pkg else None,
-        new_package_id=new_pkg.id if new_pkg else None,
-        package_name=(
-            inspection_source.package_name
-            if replay_mode and inspection_source
-            else new_pkg.package_name
-        ),
-        execution_mode="INSTALLED_REPLAY" if replay_mode else "COMPARISON",
-        replay_branch_key=payload.replay_branch_key if replay_mode else None,
-        replay_plan_version=(
-            int(replay_preflight_data["plan_version"])
-            if replay_preflight_data
-            else None
-        ),
-        replay_plan_digest=(
-            str(replay_preflight_data["plan_digest"])
-            if replay_preflight_data
-            else None
-        ),
-        replay_duration_seconds=int(payload.duration_seconds or 3600),
-        source_package_snapshot=(
-            dict(replay_preflight_data["source_package"])
-            if replay_preflight_data
-            else {}
-        ),
-        target_package_snapshot=(
-            {
-                **dict(replay_preflight_data["installed_package"]),
-                "preflight_warnings": list(
-                    replay_preflight_data.get("warnings") or []
-                ),
-            }
-            if replay_preflight_data
-            else {}
-        ),
-        manual_install_confirmed_at=_now() if replay_mode else None,
+        new_package_id=new_pkg.id,
+        package_name=new_pkg.package_name,
         compare_mode=payload.compare_mode,
         baseline_device_serial=payload.baseline_device_serial,
         mode=payload.mode,
@@ -3948,33 +2034,6 @@ def create_run(
     session.commit()
     session.refresh(run)
 
-    if inspection_source and not replay_mode:
-        try:
-            pages = _copy_inspection_baselines(
-                session=session,
-                compatibility_run_id=run.id,
-                inspection_run_id=inspection_source.id,
-                pages=pages,
-            )
-        except Exception:
-            shutil.rmtree(
-                project_path("reports", "compatibility", str(run.id)),
-                ignore_errors=True,
-            )
-            release_owner_references(
-                session,
-                owner_type="compatibility_run",
-                owner_id=run.id,
-                commit=False,
-            )
-            session.delete(run)
-            session.commit()
-            raise
-        run.page_set_snapshot = pages
-        session.add(run)
-        session.commit()
-        session.refresh(run)
-
     for device in devices:
         display = device.custom_name or device.market_name or device.model or device.serial
         session.add(
@@ -3985,19 +2044,10 @@ def create_run(
                 os_version=device.os_version or device.android_version,
                 resolution=device.resolution,
                 is_baseline=(
-                    not replay_mode
-                    and payload.compare_mode == "device"
+                    payload.compare_mode == "device"
                     and device.serial == payload.baseline_device_serial
                 ),
                 status="PENDING",
-                preflight_at=_now() if replay_mode else None,
-                installed_package_snapshot=(
-                    dict(replay_preflight_data["installed_package"])
-                    if replay_preflight_data
-                    else {}
-                ),
-                old_install_status="SKIPPED" if replay_mode else None,
-                new_install_status="SKIPPED" if replay_mode else None,
             )
         )
     session.commit()
@@ -4030,11 +2080,6 @@ def get_or_create_page_diff(
     row = session.get(CompatibilityPageResult, page_result_id)
     if run is None or row is None or row.run_id != run_id:
         raise HTTPException(status_code=404, detail="兼容性页面结果不存在")
-    if str(run.execution_mode or "").upper() == "INSTALLED_REPLAY":
-        raise HTTPException(
-            status_code=409,
-            detail="已安装版本回放不生成视觉 diff",
-        )
     return _get_or_create_page_diff(session, row)
 
 
