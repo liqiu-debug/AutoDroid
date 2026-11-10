@@ -10,11 +10,9 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from backend.api.compatibility import (
-    _copy_inspection_baselines,
     _get_or_create_page_diff,
     _persist_snapshot_assets,
     _record_compare_result,
-    _validate_inspection_source,
     delete_run as delete_compatibility_run,
 )
 from backend.artifact_store import store_image_bytes, store_text
@@ -24,10 +22,6 @@ from backend.models import (
     CompatibilityCell,
     CompatibilityPageResult,
     CompatibilityRun,
-    InspectionBranchRun,
-    InspectionObservation,
-    InspectionRun,
-    InspectionState,
     SystemSetting,
     User,
 )
@@ -52,7 +46,6 @@ class CompatibilityAssetTests(unittest.TestCase):
         self.patches = [
             patch("backend.artifact_store.project_path", side_effect=fake_path),
             patch("backend.api.compatibility.project_path", side_effect=fake_path),
-            patch("backend.inspection.engine.project_path", side_effect=fake_path),
             patch(
                 "backend.artifact_store.shutil.disk_usage",
                 return_value=shutil._ntuple_diskusage(1_000_000, 100_000, 900_000),
@@ -92,44 +85,6 @@ class CompatibilityAssetTests(unittest.TestCase):
             "logcat_errors": "",
         }
         return _persist_snapshot_assets(self.session, snapshot)
-
-    def test_inspection_baseline_uses_pinned_cas_without_copy(self):
-        source = self.root / "reports" / "inspection" / "9" / "guest" / "4"
-        source.mkdir(parents=True)
-        (source / "screenshot.png").write_bytes(self._png())
-        (source / "hierarchy.xml").write_text("<hierarchy/>", encoding="utf-8")
-        run = CompatibilityRun(name="snapshot", new_package_id=1)
-        self.session.add(run)
-        self.session.commit()
-
-        pages = _copy_inspection_baselines(
-            session=self.session,
-            compatibility_run_id=run.id,
-            inspection_run_id=9,
-            pages=[
-                {
-                    "key": "home",
-                    "name": "Home",
-                    "baseline_screenshot_path": "inspection/9/guest/4/screenshot.png",
-                    "baseline_xml_path": "inspection/9/guest/4/hierarchy.xml",
-                }
-            ],
-        )
-
-        self.assertTrue(pages[0]["baseline_screenshot_asset_id"])
-        self.assertTrue(pages[0]["baseline_xml_asset_id"])
-        self.assertFalse(
-            (self.root / "reports" / "compatibility" / str(run.id) / "inspection_baseline").exists()
-        )
-        references = self.session.exec(
-            select(AssetReference).where(
-                AssetReference.owner_type == "compatibility_run",
-                AssetReference.owner_id == run.id,
-                AssetReference.released_at == None,  # noqa: E711
-            )
-        ).all()
-        self.assertEqual(len(references), 2)
-        self.assertEqual({item.retention_class for item in references}, {"PINNED"})
 
     def test_pass_has_no_permanent_diff_and_on_demand_diff_is_hot_cached(self):
         run = CompatibilityRun(name="compare", new_package_id=1, thresholds={})
@@ -245,69 +200,6 @@ class CompatibilityAssetTests(unittest.TestCase):
             )
         ).one()
         self.assertEqual(diff_reference.retention_class, "PINNED")
-
-    def test_explicit_observation_freezes_cas_only_baseline(self):
-        source_run = InspectionRun(
-            name="source",
-            package_name="com.demo",
-            device_serial="d1",
-            status="PASS",
-            profile_snapshot={
-                "branches": {"guest": {"name": "Guest"}},
-                "input_rules": [],
-                "sanitizer_rules": [],
-            },
-        )
-        self.session.add(source_run)
-        self.session.flush()
-        branch = InspectionBranchRun(
-            run_id=source_run.id,
-            branch_key="guest",
-            branch_name="Guest",
-            status="PASS",
-        )
-        self.session.add(branch)
-        self.session.flush()
-        state = InspectionState(
-            run_id=source_run.id,
-            branch_run_id=branch.id,
-            branch_key="guest",
-            cluster_key="home",
-            state_key="home-v1",
-            stable_status="STABLE",
-            locator_quality="RESOURCE_ID",
-            selected_for_regression=True,
-        )
-        self.session.add(state)
-        self.session.flush()
-        screenshot = store_image_bytes(self.session, self._png())
-        xml = store_text(self.session, "<hierarchy/>")
-        observation = InspectionObservation(
-            run_id=source_run.id,
-            branch_run_id=branch.id,
-            state_id=state.id,
-            exact_cluster_key="home",
-            exact_replay_key="home-v1",
-            exact_state_key="home-v1",
-            screenshot_asset_id=screenshot.id,
-            xml_asset_id=xml.id,
-            is_representative=True,
-        )
-        self.session.add(observation)
-        self.session.commit()
-
-        _, states, pages = _validate_inspection_source(
-            self.session,
-            inspection_run_id=source_run.id,
-            inspection_state_ids=[state.id],
-            inspection_observation_ids=[observation.id],
-            package_name="com.demo",
-        )
-        self.assertEqual([item.id for item in states], [state.id])
-        self.assertEqual(pages[0]["inspection_observation_id"], observation.id)
-        self.assertEqual(pages[0]["baseline_screenshot_asset_id"], screenshot.id)
-        self.assertEqual(pages[0]["baseline_xml_asset_id"], xml.id)
-        self.assertIsNone(pages[0]["baseline_screenshot_path"])
 
 
 if __name__ == "__main__":

@@ -29,6 +29,11 @@ test('client mode downloads through the shell with resume download and live prog
   // 并用固定 id 通知原地刷新下载进度（下载安装包也能看到百分比）
   assert.match(source, /isClientApp\.value && typeof bridge\?\.downloadPackage === 'function'/)
   assert.match(source, /bridge\.onDownloadProgress\?\.\(/)
-  assert.match(source, /正在下载 \$\{fileName\}：\$\{evt\.percent\}%/)
-  assert.match(source, /await bridge\.downloadPackage\(\{ url: `\$\{absolute\}\$\{query\}`, fileName \}\)/)
+  // 进度文案走 formatDownloadProgress：总长未知时显示已下载字节，而不是一直 0%
+  assert.match(source, /正在下载 \$\{fileName\}：\$\{formatDownloadProgress\(evt\)\}/)
+  assert.match(source, /const payload = \{ url: `\$\{absolute\}\$\{query\}`, fileName \}/)
+  // file_size 是 MB 近似值：只作进度估算 sizeHint，绝不当 expectedSize 硬校验
+  assert.match(source, /payload\.sizeHint = sizeHint/)
+  assert.doesNotMatch(source, /expectedSize: *packageSizeHint/)
+  assert.match(source, /await bridge\.downloadPackage\(payload\)/)
 })

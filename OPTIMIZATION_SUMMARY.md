@@ -37,7 +37,7 @@
 - `AUTODROID_LIMIT_GLOBAL` 和 `AUTODROID_LIMIT_PER_USER` 控制全局/用户上限，默认 20/5。
 - 超限的用例、场景和定时任务进入 FIFO 队列，不再把正常排队统一返回为 HTTP 429。
 - `AUTODROID_QUEUE_TIMEOUT` 控制最长排队时间，默认 1800 秒。
-- 巡检和兼容性等长任务使用 `backend/device_execution_lease.py`，同时持有内存限流租约与数据库 owner 租约。
+- 兼容性等长任务使用 `backend/device_execution_lease.py`，同时持有内存限流租约与数据库 owner 租约。
 - 设备释放会校验 `lease_task_id`，旧任务不能误把新任务占用的设备恢复为 `IDLE`。
 
 ## 2. 从首批优化到当前基线
@@ -49,7 +49,7 @@
 | 并发控制 | 固定上限、直接拒绝 | 环境变量配置、FIFO 排队、可取消、排队超时、owner-safe 设备租约 |
 | 执行器 | legacy 与跨端 Runner 并存 | 仅保留标准跨端 Runner，legacy `runner.py` 已删除 |
 | 步骤数据 | legacy JSON 为主 | `TestCaseStep` 标准表默认开启，legacy 数据幂等回填并保留兼容读取 |
-| 报告磁盘 | 手动清理 | 每日保留任务覆盖 UI/Fastbot/兼容性/巡检；默认按天清理关闭 |
+| 报告磁盘 | 手动清理 | 每日保留任务覆盖 UI/Fastbot/兼容性；默认按天清理关闭 |
 | 证据资产 | 报告目录文件 | 可灰度双写内容寻址资产，支持引用、鉴权读取、分层保留和容量水位 |
 | 工程验证 | 手工验证 | GitHub Actions 执行 Ruff、1087 个后端测试和前端构建；另有 72 个前端 Node 测试 |
 
@@ -69,7 +69,7 @@
 - `report_retention_days`：大于 0 时按天删除已结束的过期报告；0/缺失为关闭。
 - `content_addressed_assets`：证据双写到 `asset_store/`，默认关闭。
 - `tiered_asset_retention`：HOT/WARM/PINNED/COLD 分层保留，依赖内容寻址资产，默认关闭。
-- `asset_storage_low_watermark_percent`、`asset_storage_high_watermark_percent`、`asset_storage_critical_watermark_percent`：默认 80/90/95，用于状态与分层 GC；新巡检和兼容性任务的硬保护当前使用内置 95%。
+- `asset_storage_low_watermark_percent`、`asset_storage_high_watermark_percent`、`asset_storage_critical_watermark_percent`：默认 80/90/95，用于状态与分层 GC；兼容性任务的硬保护当前使用内置 95%。
 
 ## 4. 当前验证方式
 
@@ -106,7 +106,6 @@ curl -H "Authorization: Bearer <token>" \
 ## 6. 后续治理
 
 - 将 `frontend/tests/*.test.mjs` 接入 CI，并补充组件挂载级测试。
-- 拆分新的巡检巨型模块前先稳定 Graph v8、实时快照和回放契约。
 - 在默认开启内容寻址资产和分层保留前完成容量压测、24 小时恢复窗口与 legacy 物化演练。
 - 常用 OCR 的部署环境应固化 PaddleOCR 版本和模型缓存策略。
 
@@ -114,6 +113,5 @@ curl -H "Authorization: Bearer <token>" \
 
 - [项目深度说明](docs/PROJECT_OVERVIEW_CN.md)
 - [执行规范](docs/EXECUTION_SPEC.md)
-- [巡检、回放与证据资产指南](docs/INSPECTION_REPLAY_ASSETS.md)
 - [CI 集成指南](docs/CI_INTEGRATION.md)
 - [改进路线图](docs/IMPROVEMENT_ROADMAP.md)

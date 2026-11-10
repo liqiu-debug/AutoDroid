@@ -18,7 +18,6 @@ import queue
 from typing import Any, Dict, Optional, Generator, List, Set
 
 import adbutils
-from backend.device_agents.protocol import parse_tunnel_serial
 from backend.device_transport_metrics import device_transport_metrics
 from backend.paths import PROJECT_ROOT, project_path
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
@@ -167,11 +166,6 @@ def is_remote_serial(serial: str) -> bool:
     return bool(_NETWORK_SERIAL_RE.match(str(serial or "")) and ":" in str(serial or ""))
 
 
-def is_tunnel_serial(serial: str) -> bool:
-    """serial 是否为 Agent 反向隧道设备（127.0.0.1:28100-28199）。"""
-    return parse_tunnel_serial(str(serial or "")) is not None
-
-
 def default_stream_profile(serial: str) -> str:
     """按 serial 形态返回默认清晰度档位。"""
     key = str(serial or "").strip()
@@ -232,8 +226,6 @@ def get_scrcpy_stream_params(serial: str = "") -> Dict[str, int]:
         override = _stream_profile_overrides.get(key)
     if override in STREAM_PROFILES:
         return dict(STREAM_PROFILES[override])
-    if is_tunnel_serial(key):
-        return dict(STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
     if is_remote_serial(key):
         return {
             "max_size": _stream_param_from_env(SCRCPY_REMOTE_MAX_SIZE_ENV, DEFAULT_SCRCPY_REMOTE_MAX_SIZE),

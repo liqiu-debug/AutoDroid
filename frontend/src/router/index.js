@@ -152,16 +152,6 @@ const routes = [
             component: lazyRoute(() => import('@/views/special/Fastbot.vue'))
           },
           {
-            path: 'inspection',
-            name: 'ModelInspection',
-            meta: {
-              title: '模型化智能巡检',
-              keepAlive: true,
-              featureFlag: 'model_inspection'
-            },
-            component: lazyRoute(() => import('@/views/special/Inspection.vue'))
-          },
-          {
             path: 'fastbot/report/:id',
             name: 'fastbot-report',
             meta: { title: 'Fastbot 报告', hidden: true },
@@ -230,18 +220,6 @@ const routes = [
             path: 'reports/api/:id', name: 'api-report-detail',
             meta: { title: '接口测试报告', hidden: true },
             component: lazyRoute(() => import('../views/api-testing/RunDetail.vue')),
-          },
-          {
-            path: 'reports/inspection/:id',
-            name: 'inspection-report-detail',
-            meta: {
-              title: '智能巡检报告',
-              hidden: true,
-              mobileAvailable: true,
-              mobileTitle: '巡检报告',
-              featureFlag: 'model_inspection'
-            },
-            component: lazyRoute(() => import('../views/reports/InspectionReportDetail.vue'))
           },
           {
             path: 'reports/:id',

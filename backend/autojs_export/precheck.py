@@ -1,7 +1,7 @@
-"""导出可导出性预检。
+"""脚本可执行性预检。
 
-在生成脚本包之前对编译产物做静态检查，错误码沿用平台预检语义
-（P1002/P1003/P1004），另有 EXPORT_* 前缀的导出专属提示。
+在生成脚本包（App 直跑 JSON 包）之前对编译产物做静态检查，错误码沿用平台预检语义
+（P1002/P1003/P1004），另有 EXPORT_* 前缀的脚本专属提示。
 """
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def precheck_case_package(
     project_root: Optional[Path] = None,
     platform: str = "android",
 ) -> Dict[str, Any]:
-    """批量预检（场景/批量导出复用）。"""
+    """批量预检（场景包 / 单用例包共用）。"""
     all_issues: List[Dict[str, Any]] = []
     for case_script in case_scripts:
         result = precheck_case_script(

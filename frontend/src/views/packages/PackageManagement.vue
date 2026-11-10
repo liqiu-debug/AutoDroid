@@ -4,7 +4,8 @@ import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import { UploadFilled, Download, Delete, Box, Cellphone } from '@element-plus/icons-vue'
 import api from '@/api'
 import { useClientApp } from '@/composables/useClientApp'
-import { createProgressNotice } from '@/utils/progressNotice'
+import { createProgressNotice, formatDownloadProgress } from '@/utils/progressNotice'
+import { packageSizeHint } from '@/utils/appUpdate'
 
 const CHUNK_SIZE = 20 * 1024 * 1024
 const MAX_CHUNK_RETRIES = 2
@@ -288,16 +289,20 @@ const handleDownload = async (row) => {
       h,
       ref,
       title: '下载安装包',
-      message: `正在下载 ${fileName}：0%`,
+      message: `正在下载 ${fileName}：准备中…`,
     })
     let unsubscribe = () => {}
     try {
       unsubscribe = bridge.onDownloadProgress?.((evt) => {
         if (evt?.phase === 'downloading') {
-          notice.update(`正在下载 ${fileName}：${evt.percent}%`)
+          notice.update(`正在下载 ${fileName}：${formatDownloadProgress(evt)}`)
         }
       }) || (() => {})
-      await bridge.downloadPackage({ url: `${absolute}${query}`, fileName })
+      const payload = { url: `${absolute}${query}`, fileName }
+      // file_size 是 MB 近似值：只给壳估算进度（响应没声明总长时），不做完整性校验
+      const sizeHint = packageSizeHint(row)
+      if (sizeHint > 0) payload.sizeHint = sizeHint
+      await bridge.downloadPackage(payload)
       ElMessage.success('下载完成，已在文件管理器中定位')
     } catch (e) {
       ElMessage.error('下载失败：' + (e?.message || '未知错误'))

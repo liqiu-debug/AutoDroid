@@ -297,7 +297,6 @@ def flags():
 
 @app.get("/api/devices/")
 @app.get("/api/fastbot/devices")
-@app.get("/api/inspections/profiles")
 def empty_list():
     return []
 

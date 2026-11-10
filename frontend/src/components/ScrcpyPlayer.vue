@@ -8,7 +8,7 @@
  * - 降级路径：jmuxer + MSE 在 <video> 播放（浏览器不支持 WebCodecs、
  *   目标 codec 不受支持、连续解码失败，或通过 URL query / localStorage
  *   `scrcpyDecoder=jmuxer` 强制指定时启用）。
- * 支持点击触控事件转发、元素悬浮高亮、测试步骤录制，以及只读巡检覆盖层。
+ * 支持点击触控事件转发、元素悬浮高亮、测试步骤录制。
  */
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import JMuxer from 'jmuxer'
@@ -70,30 +70,10 @@ const props = defineProps({
   nodes: {
     type: Array,
     default: () => []
-  },
-  /** 智能巡检动作覆盖层 */
-  overlays: {
-    type: Array,
-    default: () => []
-  },
-  /** 覆盖层来源画布宽度，优先于 deviceWidth */
-  sourceWidth: {
-    type: Number,
-    default: 0
-  },
-  /** 覆盖层来源画布高度，优先于 deviceHeight */
-  sourceHeight: {
-    type: Number,
-    default: 0
-  },
-  /** 当前聚焦的动作覆盖层 ID */
-  selectedOverlayId: {
-    type: [String, Number],
-    default: ''
   }
 })
 
-const emit = defineEmits(['touch', 'error', 'connected', 'disconnected', 'overlay-select'])
+const emit = defineEmits(['touch', 'error', 'connected', 'disconnected'])
 
 // ==================== 响应式状态 ====================
 
@@ -333,8 +313,8 @@ function getVideoRenderArea() {
 }
 
 function getCoordinateSpace() {
-  const explicitWidth = Number(props.sourceWidth || props.deviceWidth) || 0
-  const explicitHeight = Number(props.sourceHeight || props.deviceHeight) || 0
+  const explicitWidth = Number(props.deviceWidth) || 0
+  const explicitHeight = Number(props.deviceHeight) || 0
   if (explicitWidth > 0 && explicitHeight > 0) {
     return { width: explicitWidth, height: explicitHeight }
   }
@@ -350,110 +330,6 @@ function getCoordinateSpace() {
   }
 
   return getSurfaceIntrinsicSize(getActiveSurface())
-}
-
-function sameOrientation(left, right) {
-  if (!left?.width || !left?.height || !right?.width || !right?.height) return false
-  const leftRatio = left.width / left.height
-  const rightRatio = right.width / right.height
-  // Near-square frames do not carry a meaningful rotation signal.
-  if (Math.abs(leftRatio - 1) < 0.04 || Math.abs(rightRatio - 1) < 0.04) return true
-  return (leftRatio > 1) === (rightRatio > 1)
-}
-
-function overlayId(item, index) {
-  return String(item?.id ?? item?.action_id ?? item?.action_key ?? item?.key ?? index)
-}
-
-function parseBounds(item) {
-  const value = item?.bounds
-  if (Array.isArray(value) && value.length >= 4) {
-    return value.slice(0, 4).map(Number)
-  }
-  if (value && typeof value === 'object') {
-    return [value.x1 ?? value.left, value.y1 ?? value.top, value.x2 ?? value.right, value.y2 ?? value.bottom].map(Number)
-  }
-  if (typeof value === 'string') {
-    const numbers = value.match(/-?\d+(?:\.\d+)?/g)?.slice(0, 4).map(Number)
-    if (numbers?.length === 4) return numbers
-  }
-  return [item?.x1 ?? item?.left, item?.y1 ?? item?.top, item?.x2 ?? item?.right, item?.y2 ?? item?.bottom].map(Number)
-}
-
-const normalizedOverlays = computed(() => {
-  const coordinateSpace = getCoordinateSpace()
-  if (!coordinateSpace) return []
-  return (props.overlays || []).map((item, index) => {
-    const [rawX1, rawY1, rawX2, rawY2] = parseBounds(item)
-    if (![rawX1, rawY1, rawX2, rawY2].every(Number.isFinite)) return null
-    const x1 = Math.max(0, Math.min(rawX1, rawX2, coordinateSpace.width))
-    const y1 = Math.max(0, Math.min(rawY1, rawY2, coordinateSpace.height))
-    const x2 = Math.max(0, Math.min(Math.max(rawX1, rawX2), coordinateSpace.width))
-    const y2 = Math.max(0, Math.min(Math.max(rawY1, rawY2), coordinateSpace.height))
-    if (x2 <= x1 || y2 <= y1) return null
-    const id = overlayId(item, index)
-    const statusValue = String(item?.failure_type || item?.final_status || item?.live_status || item?.invocation_status || item?.result || item?.status || 'PENDING').toUpperCase()
-    const actionType = String(item?.action_type || item?.type || 'click').toLowerCase()
-    const coordinateOnly = Boolean(item?.coordinate_only) || String(item?.locator_type || '').toLowerCase() === 'coordinate'
-    const canNumber = ['click', 'input', 'tap'].includes(actionType)
-      && !['BLOCKED', 'AMBIGUOUS', 'LOCATOR_AMBIGUOUS', 'LOCATOR_NOT_FOUND', 'LOCATOR_DRIFT', 'COORDINATE_ONLY', 'COORDINATE_UNSAFE', 'COORDINATE_STALE', 'PARENT_RECOVERY_FAILED', 'PARENT_RECOVERY_CASCADE', 'PATH_DIVERGED', 'SKIPPED', 'UNSTABLE_PARENT', 'NOT_REACHED', 'CANCELLED', 'BUDGET_NOT_REACHED', 'COVERED_BY_FAMILY', 'COVERAGE_EXHAUSTED', 'FILTERED_NON_ACTIONABLE', 'QUEUE_TRUNCATED', 'CYCLE_CONVERGED'].includes(statusValue)
-      && (!coordinateOnly || ['click', 'tap'].includes(actionType))
-    return {
-      ...item,
-      id,
-      x1,
-      y1,
-      width: x2 - x1,
-      height: y2 - y1,
-      statusValue,
-      actionType,
-      coordinateOnly,
-      displayOrder: canNumber ? (item?.display_order ?? item?.local_order ?? item?.order ?? index + 1) : null,
-      selected: id === String(props.selectedOverlayId ?? '')
-    }
-  }).filter(Boolean)
-})
-
-const svgOverlayStyle = computed(() => {
-  if (!normalizedOverlays.value.length) return { display: 'none' }
-  const area = getVideoRenderArea()
-  const coordinateSpace = getCoordinateSpace()
-  const intrinsic = getSurfaceIntrinsicSize(getActiveSurface())
-  const containerRect = playerContentRef.value?.getBoundingClientRect()
-  // Rotation changes can make the latest event snapshot briefly lag behind
-  // the video frame. Hide stale boxes instead of drawing them on the wrong
-  // orientation; PAGE_ACTIONS redraws once capture dimensions catch up.
-  if (!area || !containerRect || !sameOrientation(coordinateSpace, intrinsic)) {
-    return { display: 'none' }
-  }
-  return {
-    display: 'block',
-    left: `${area.rect.left - containerRect.left + area.offsetX}px`,
-    top: `${area.rect.top - containerRect.top + area.offsetY}px`,
-    width: `${area.renderWidth}px`,
-    height: `${area.renderHeight}px`
-  }
-})
-
-const overlayViewBox = computed(() => {
-  const size = getCoordinateSpace()
-  return size ? `0 0 ${size.width} ${size.height}` : '0 0 1 1'
-})
-
-function overlayClass(item) {
-  const classes = [`inspection-overlay--${item.statusValue.toLowerCase()}`]
-  if (item.coordinateOnly) classes.push('inspection-overlay--coordinate')
-  if (item.selected) classes.push('is-selected')
-  return classes
-}
-
-function scrollArrow(item) {
-  if (item.actionType !== 'scroll') return ''
-  const direction = String(item.direction || item.scroll_direction || item.label || '').toLowerCase()
-  if (direction.includes('down')) return '↓'
-  if (direction.includes('left')) return '←'
-  if (direction.includes('right')) return '→'
-  return '↑'
 }
 
 /**
@@ -551,7 +427,7 @@ function handleWebCodecsFallback(reason) {
   console.warn(`WebCodecs 解码不可用（${reason}），已降级为 jmuxer 兼容模式`)
   ElMessage.warning('硬件解码不可用，已切换至兼容播放模式')
   if (props.streamUrl) {
-    // 巡检视频票据为一次性票据，不能复用旧 URL 重连；交给调用方申请新会话。
+    // 一次性票据 URL 不能复用旧 URL 重连；交给调用方申请新会话。
     emit('error', 'decoder_fallback_requires_new_session')
     disconnect()
     return
@@ -561,7 +437,7 @@ function handleWebCodecsFallback(reason) {
 
 function resolveWebSocketUrl() {
   // 云端直连要求 WS 握手携带 token（浏览器无法带 Authorization 头，走 ?token= 查询通道）；
-  // 桌面引擎本地端点忽略 query，无害。巡检票据 URL 亦复用同套拼接（ticket 不受影响）。
+  // 桌面引擎本地端点忽略 query，无害；一次性票据 URL 亦复用同套拼接（ticket 不受影响）。
   const raw = String(props.streamUrl || '').trim()
   if (!raw) {
     if (!props.serial) return ''
@@ -693,7 +569,7 @@ function connect() {
     }
 
     // 非主动关闭（断流/网络抖动）：设备直连模式按 1s/2s/4s/8s 有限退避自动重连。
-    // 巡检视频票据是一次性票据，不能复用旧 URL 重建连接，交由调用方申请新会话。
+    // 一次性票据 URL 不能复用旧 URL 重建连接，交由调用方申请新会话。
     if (closedIntentionally || props.streamUrl) return
     if (autoReconnectAttempts < AUTO_RECONNECT_MAX_ATTEMPTS) {
       autoReconnectAttempts++
@@ -864,7 +740,7 @@ watch(() => [props.serial, props.streamUrl], ([newSerial, newStreamUrl], [oldSer
   }
 })
 
-watch(() => [props.sourceWidth, props.sourceHeight, props.deviceWidth, props.deviceHeight, props.overlays], () => {
+watch(() => [props.deviceWidth, props.deviceHeight], () => {
   layoutRevision.value++
 }, { deep: true })
 
@@ -957,45 +833,6 @@ defineExpose({ connect, disconnect, reconnect })
       <!-- 元素高亮框 -->
       <div class="hover-overlay" :style="overlayStyle"></div>
 
-      <!-- 智能巡检多动作覆盖层；只响应选中，不向设备发送任何输入。 -->
-      <svg
-        class="inspection-overlays"
-        :style="svgOverlayStyle"
-        :viewBox="overlayViewBox"
-        preserveAspectRatio="none"
-        aria-label="巡检识别控件"
-      >
-        <g
-          v-for="item in normalizedOverlays"
-          :key="item.id"
-          class="inspection-overlay"
-          :class="overlayClass(item)"
-          role="button"
-          :aria-label="item.label || item.name || `动作 ${item.displayOrder || item.id}`"
-          @click.stop="emit('overlay-select', item)"
-        >
-          <rect
-            :x="item.x1"
-            :y="item.y1"
-            :width="item.width"
-            :height="item.height"
-            rx="5"
-            ry="5"
-            vector-effect="non-scaling-stroke"
-          />
-          <template v-if="item.displayOrder != null">
-            <circle :cx="item.x1 + 18" :cy="item.y1 + 18" r="16" vector-effect="non-scaling-stroke" />
-            <text :x="item.x1 + 18" :y="item.y1 + 19" class="inspection-overlay__number">{{ item.displayOrder }}</text>
-          </template>
-          <text
-            v-if="scrollArrow(item)"
-            :x="item.x1 + item.width / 2"
-            :y="item.y1 + item.height / 2"
-            class="inspection-overlay__arrow"
-          >{{ scrollArrow(item) }}</text>
-        </g>
-      </svg>
-
       <!-- 元素信息提示 -->
       <div v-if="hoveredNode" class="element-tooltip">
         <div v-if="hoveredNode.text" class="tip-row"><b>Text:</b> {{ hoveredNode.text }}</div>
@@ -1019,7 +856,6 @@ defineExpose({ connect, disconnect, reconnect })
             <el-icon><VideoPlay /></el-icon>
             <span>开始投屏</span>
           </el-button>
-          <span v-else>等待巡检视频流</span>
         </div>
       </div>
     </div>
@@ -1084,122 +920,6 @@ defineExpose({ connect, disconnect, reconnect })
 
 .hover-overlay {
   transition: all 0.1s ease;
-}
-
-.inspection-overlays {
-  position: absolute;
-  z-index: 12;
-  overflow: visible;
-  pointer-events: none;
-}
-
-.inspection-overlay {
-  color: var(--ad-success);
-  pointer-events: auto;
-  cursor: pointer;
-}
-
-.inspection-overlay rect {
-  fill: color-mix(in srgb, currentColor 22%, transparent);
-  stroke: currentColor;
-  stroke-width: 2;
-}
-
-.inspection-overlay circle {
-  fill: currentColor;
-  stroke: var(--ad-surface);
-  stroke-width: 1.5;
-}
-
-.inspection-overlay text {
-  fill: var(--ad-surface);
-  font-weight: 700;
-  text-anchor: middle;
-  dominant-baseline: middle;
-  paint-order: stroke;
-  stroke: rgba(0, 0, 0, 0.46);
-  stroke-width: 2px;
-  pointer-events: none;
-  letter-spacing: 0;
-}
-
-.inspection-overlay__number {
-  font-size: 18px;
-}
-
-.inspection-overlay__arrow {
-  font-size: 42px;
-}
-
-.inspection-overlay--running,
-.inspection-overlay--started,
-.inspection-overlay--action_started,
-.inspection-overlay--invoking,
-.inspection-overlay--active {
-  color: var(--ad-warning);
-  animation: inspection-overlay-pulse 0.9s ease-in-out infinite alternate;
-}
-
-.inspection-overlay--invoked,
-.inspection-overlay--pass,
-.inspection-overlay--self_loop,
-.inspection-overlay--no_effect,
-.inspection-overlay--completed {
-  color: var(--ad-muted);
-}
-
-.inspection-overlay--blocked,
-.inspection-overlay--dangerous {
-  color: #f56c6c;
-}
-
-.inspection-overlay--blocked rect,
-.inspection-overlay--dangerous rect,
-.inspection-overlay--coordinate_only rect,
-.inspection-overlay--ambiguous rect,
-.inspection-overlay--locator_drift rect,
-.inspection-overlay--skipped rect,
-.inspection-overlay--unstable_parent rect,
-.inspection-overlay--not_reached rect,
-.inspection-overlay--coordinate rect {
-  stroke-dasharray: 8 5;
-}
-
-.inspection-overlay--ambiguous,
-.inspection-overlay--locator_drift,
-.inspection-overlay--coordinate_only {
-  color: var(--ad-warning);
-}
-
-.inspection-overlay--coordinate {
-  color: var(--ad-primary);
-}
-
-.inspection-overlay--no_effect.inspection-overlay--coordinate {
-  color: var(--ad-muted);
-}
-
-.inspection-overlay--action_error,
-.inspection-overlay--error,
-.inspection-overlay--failed {
-  color: #f56c6c;
-}
-
-.inspection-overlay--skipped,
-.inspection-overlay--unstable_parent,
-.inspection-overlay--not_reached {
-  color: #a8abb2;
-}
-
-.inspection-overlay.is-selected rect {
-  stroke: var(--ad-surface);
-  stroke-width: 4;
-  filter: drop-shadow(0 0 5px var(--ad-primary));
-}
-
-@keyframes inspection-overlay-pulse {
-  from { opacity: 0.62; }
-  to { opacity: 1; }
 }
 
 .element-tooltip {

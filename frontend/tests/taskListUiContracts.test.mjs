@@ -27,7 +27,6 @@ function taskListSetup({ items = [] } = {}) {
     getEnvironments: async () => ({ data: [{ id: 2, name: '预发布' }] }),
     getDeviceList: async () => ({ data: [] }),
     getPackages: async () => ({ data: { items: [], total: 0 } }),
-    getInspectionProfiles: async () => ({ data: [] }),
     getScenarios: async () => ({ data: { items: [] } }),
     getScenario: async () => ({ data: null }),
     apiTesting: { get: async () => ({ data: { items: [] } }) },
@@ -47,7 +46,6 @@ function taskListSetup({ items = [] } = {}) {
     api,
     dayjs,
     useRemoteSearch: () => ({ options: ref([]), loading: ref(false), search: () => {}, ensureOption: () => {} }),
-    useUserStore: () => ({ featureFlags: { model_inspection: false } }),
     scheduledTaskExecution,
   }
   const exports = 'tasks,taskRows,environments,form,buildPayload,fetchTasks,fetchEnvironments'

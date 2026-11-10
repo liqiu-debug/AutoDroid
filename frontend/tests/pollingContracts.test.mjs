@@ -9,25 +9,22 @@ import { pollRequestConfig } from '../src/utils/polling.js'
 // A1 全部轮询点走 utils/polling.js 的统一门闩（在途不重叠 + 可见性暂停 + 完成后续排）
 // A2 轮询类 GET 显式短超时（api 层默认 8s，可覆盖；全局 30s 保留）
 // A3 ScrcpyPlayer 非主动断流有限退避自动重连（封顶后「点击重连」）+ 遮罩不吞点击
-// A4 useDeviceDump / InspectionLivePanel 的条件门控 loading 复位改为无条件
+// A4 useDeviceDump 的条件门控 loading 复位改为无条件
 
 const read = path => readFile(new URL(`../src/${path}`, import.meta.url), 'utf8')
 
 const POLLING_SITES = [
   'composables/useDeviceStreams.js',
   'composables/useLivePreviewPolling.js',
-  'components/InspectionLivePanel.vue',
   'views/cases/CaseList.vue',
   'views/cases/CaseEditor.vue',
   'views/scenarios/ScenarioList.vue',
   'views/scenarios/ScenarioEditor.vue',
   'views/reports/ReportList.vue',
   'views/reports/CompatibilityReportDetail.vue',
-  'views/reports/InspectionReportDetail.vue',
   'views/fastbot/FastbotDashboard.vue',
   'views/special/Fluency.vue',
   'views/special/Startup.vue',
-  'views/special/Inspection.vue',
   'views/devices/DeviceCenter.vue',
   'views/dashboard/DashboardView.vue',
 ]
@@ -85,8 +82,6 @@ test('polling-class GETs carry an explicit short timeout while one-shot detail G
     'getActiveRuns(kind, targetId, config = {})',
     'getDevices(config = {})',
     'getDeviceList(options = {})',
-    'getInspectionLive(id, config = {})',
-    'getInspectionRuns(params, config = {})',
     'getFastbotTasks(params, config = {})',
     'getStartupTasks(params, config = {})',
     'getFluencySessions(params, config = {})',
@@ -101,11 +96,6 @@ test('polling-class GETs carry an explicit short timeout while one-shot detail G
   // F7：报告详情等一次性大载荷 getter 显式 30s，8s 只留给真轮询
   assert.match(
     apiSource,
-    /getInspectionRun\(id, config = \{\}\) \{[\s\S]*?api\.get\(`\/inspections\/runs\/\$\{id\}`, \{ timeout: DETAIL_GET_TIMEOUT_MS, \.\.\.config \}\)/,
-    'getInspectionRun 报告详情走全局 30s',
-  )
-  assert.match(
-    apiSource,
     /getCompatibilityRun\(id, config = \{\}\) \{[\s\S]*?api\.get\(`\/compatibility\/runs\/\$\{id\}`, \{ timeout: DETAIL_GET_TIMEOUT_MS, \.\.\.config \}\)/,
     'getCompatibilityRun 报告详情走全局 30s',
   )
@@ -116,11 +106,6 @@ test('polling-class GETs carry an explicit short timeout while one-shot detail G
     return src.slice(start, src.indexOf('\n    },', start))
   }
   assert.doesNotMatch(
-    methodBody(apiSource, 'getInspectionRun(id, config = {})'),
-    /POLL_GET_TIMEOUT_MS/,
-    'getInspectionRun 不得再套轮询短超时',
-  )
-  assert.doesNotMatch(
     methodBody(apiSource, 'getCompatibilityRun(id, config = {})'),
     /POLL_GET_TIMEOUT_MS/,
     'getCompatibilityRun 不得再套轮询短超时',
@@ -130,8 +115,8 @@ test('polling-class GETs carry an explicit short timeout while one-shot detail G
     /get: \(path, params, config\) => api\.get\(`\/api-testing\$\{path\}`, \{ timeout: DETAIL_GET_TIMEOUT_MS, params, \.\.\.config \}\)/,
     'api-testing 一次性 GET 默认全局 30s',
   )
-  // 短超时确实被用上（而不是只定义常量）
-  assert.ok((apiSource.match(/timeout: (?:options\.timeout \?\? )?POLL_GET_TIMEOUT_MS/g) || []).length >= 10)
+  // 短超时确实被用上（而不是只定义常量）；阈值按现存轮询 getter 计数（智能巡检接口退役后为 8）
+  assert.ok((apiSource.match(/timeout: (?:options\.timeout \?\? )?POLL_GET_TIMEOUT_MS/g) || []).length >= 8)
 })
 
 test('api-testing true polls opt into the 8s short timeout at the call site (F7)', async () => {
@@ -265,7 +250,7 @@ test('ScrcpyPlayer auto-reconnects unexpected closes with bounded backoff and a 
   assert.match(source, /'点击重连'/, 'gave-up state shows the 点击重连 button')
   assert.match(source, /function handleManualReconnect\(\)/, 'manual reconnect resets the retry budget')
   assert.match(source, /ws\.onopen[\s\S]*?autoReconnectAttempts = 0/, 'a successful open resets the budget')
-  // 一次性票据 URL（巡检视频）不套用自动重连，交由调用方重建会话
+  // 一次性票据 URL 不套用自动重连，交由调用方重建会话
   assert.match(source, /if \(closedIntentionally \|\| props\.streamUrl\) return/)
 })
 
@@ -294,15 +279,5 @@ test('conditional loading resets are unconditional (stuck-loading landmines remo
     dumpSource,
     /if \(isStageActive\.value\) \{\s*liveHierarchyLoading\.value = false/,
     'fetchLiveHierarchy must reset its loading flag unconditionally',
-  )
-  const panelSource = await read('components/InspectionLivePanel.vue')
-  assert.doesNotMatch(
-    panelSource,
-    /if \(generation === requestGeneration\) loading\.value = false/,
-    'session switching must not leave the live panel loading forever',
-  )
-  assert.match(
-    panelSource,
-    /finally \{\s*\/\/ 无条件复位 loading[\s\S]*?loading\.value = false/,
   )
 })

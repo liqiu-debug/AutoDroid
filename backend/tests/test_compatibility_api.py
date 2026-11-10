@@ -13,7 +13,6 @@ from sqlmodel import SQLModel, Session, create_engine, select
 
 from backend.api.compatibility import (
     _execute_cell,
-    _execute_cell_inspection_version_body,
     _execute_run_async,
     _abort_event_for_run,
     _discard_abort_event,
@@ -29,7 +28,6 @@ from backend.api.compatibility import (
 )
 from backend.api.packages import install_app_package_to_device
 from backend.artifact_store import AssetCapacityExceeded
-from backend.feature_flags import FLAG_MODEL_INSPECTION
 from backend.models import (
     AppPackage,
     CompatPageSet,
@@ -37,10 +35,6 @@ from backend.models import (
     CompatibilityPageResult,
     CompatibilityRun,
     Device,
-    InspectionBranchRun,
-    InspectionRun,
-    InspectionState,
-    SystemSetting,
     TestCase,
     User,
 )
@@ -309,262 +303,6 @@ class CompatibilityApiTests(unittest.IsolatedAsyncioTestCase):
         cells = self.session.exec(select(CompatibilityCell)).all()
         self.assertEqual(len(cells), 1)
         self.assertEqual(cells[0].device_serial, "android-1")
-
-    def test_snapshot_from_inspection_copies_sanitized_baseline_into_report(self):
-        user = self._user()
-        new_pkg = self._package("com.demo.app", "2.0")
-        self._device()
-        self.session.add(SystemSetting(key=FLAG_MODEL_INSPECTION, value="true"))
-        source_run = InspectionRun(
-            name="inspection source",
-            package_name="com.demo.app",
-            device_serial="android-1",
-            status="PASS",
-            coverage_manifest_id="haier-mall-v2",
-            coverage_manifest_version="2",
-            coverage_manifest_hash="manifest-sha256",
-            coverage_verdict="INCOMPLETE",
-            coverage_assessment={
-                "assessment_origin": "RUNTIME_V2",
-                "selected_scope_verdict": "COMPLETE",
-                "full_app_verdict": "INCOMPLETE",
-            },
-            profile_snapshot={
-                "branches": {
-                    "guest": {
-                        "name": "未登录",
-                        "prepare_case_id": 1,
-                        "entry_case_id": 1,
-                        "ready_assertion": {
-                            "selector": "首页",
-                            "by": "description",
-                        },
-                    }
-                },
-                "input_rules": [],
-                "sanitizer_rules": [],
-                "budgets": {"stable_wait_seconds": 5},
-            },
-        )
-        self.session.add(source_run)
-        self.session.flush()
-        branch = InspectionBranchRun(
-            run_id=source_run.id,
-            branch_key="guest",
-            branch_name="未登录",
-            status="PASS",
-        )
-        self.session.add(branch)
-        self.session.flush()
-        state = InspectionState(
-            run_id=source_run.id,
-            branch_run_id=branch.id,
-            branch_key="guest",
-            cluster_key="cluster-home",
-            state_key="state-home",
-            activity=".Home",
-            stable_status="STABLE",
-            locator_quality="DESCRIPTION",
-            selected_for_regression=True,
-            screenshot_path=(
-                f"inspection/{source_run.id}/guest/home/screenshot.png"
-            ),
-            xml_path=f"inspection/{source_run.id}/guest/home/hierarchy.xml",
-            first_path=[],
-        )
-        self.session.add(state)
-        self.session.commit()
-        self.session.refresh(state)
-
-        with tempfile.TemporaryDirectory() as temp_root:
-            reports = Path(temp_root) / "reports"
-            source_dir = (
-                reports
-                / "inspection"
-                / str(source_run.id)
-                / "guest"
-                / "home"
-            )
-            source_dir.mkdir(parents=True)
-            (source_dir / "screenshot.png").write_bytes(b"sanitized-png")
-            (source_dir / "hierarchy.xml").write_text(
-                "<hierarchy/>",
-                encoding="utf-8",
-            )
-
-            def fake_project_path(*parts):
-                return Path(temp_root).joinpath(*parts)
-
-            tasks = BackgroundTasks()
-            with patch(
-                "backend.api.compatibility.project_path",
-                side_effect=fake_project_path,
-            ), patch(
-                "backend.inspection.engine.project_path",
-                side_effect=fake_project_path,
-            ):
-                created = create_run(
-                    CompatibilityRunCreate(
-                        name="inspection snapshot",
-                        old_package_id=None,
-                        new_package_id=new_pkg.id,
-                        source_type="inspection",
-                        inspection_run_id=source_run.id,
-                        inspection_state_ids=[state.id],
-                        device_serials=["android-1"],
-                        compare_mode="snapshot",
-                    ),
-                    tasks,
-                    session=self.session,
-                    current_user=user,
-                )
-
-            self.assertEqual(created.source_type, "inspection")
-            self.assertEqual(created.compare_mode, "snapshot")
-            self.assertEqual(created.inspection_state_ids, [state.id])
-            self.assertEqual(
-                created.source_coverage_snapshot["manifest_hash"],
-                "manifest-sha256",
-            )
-            self.assertEqual(
-                created.source_coverage_snapshot["selected_scope_verdict"],
-                "COMPLETE",
-            )
-            self.assertEqual(
-                created.source_coverage_snapshot["full_app_verdict"],
-                "INCOMPLETE",
-            )
-            self.assertEqual(len(tasks.tasks), 1)
-            copied_page = created.page_set_snapshot[0]
-            copied_screenshot = reports / copied_page.baseline_screenshot_path
-            copied_xml = reports / copied_page.baseline_xml_path
-            self.assertEqual(copied_screenshot.read_bytes(), b"sanitized-png")
-            self.assertEqual(copied_xml.read_text(encoding="utf-8"), "<hierarchy/>")
-            self.assertIn(
-                f"compatibility/{created.id}/inspection_baseline",
-                copied_page.baseline_screenshot_path,
-            )
-
-    def test_incomplete_inspection_source_rejects_empty_replay_selection(self):
-        user = self._user()
-        new_pkg = self._package("com.demo.app", "2.0")
-        self._device()
-        self.session.add(SystemSetting(key=FLAG_MODEL_INSPECTION, value="true"))
-        source_run = InspectionRun(
-            name="partial inspection source",
-            package_name="com.demo.app",
-            device_serial="android-1",
-            status="WARNING",
-            coverage_verdict="INCOMPLETE",
-            coverage_assessment={
-                "selected_scope_verdict": "PARTIAL",
-                "full_app_verdict": "INCOMPLETE",
-            },
-        )
-        self.session.add(source_run)
-        self.session.commit()
-
-        with self.assertRaises(HTTPException) as context:
-            create_run(
-                CompatibilityRunCreate(
-                    name="must select evidence",
-                    new_package_id=new_pkg.id,
-                    source_type="inspection",
-                    inspection_run_id=source_run.id,
-                    device_serials=["android-1"],
-                    compare_mode="snapshot",
-                ),
-                BackgroundTasks(),
-                session=self.session,
-                current_user=user,
-            )
-
-        self.assertEqual(context.exception.status_code, 400)
-        self.assertIn("不允许空选择自动采用路径", str(context.exception.detail))
-
-    async def test_inspection_version_prepares_only_before_in_place_upgrade(self):
-        user = self._user()
-        old_pkg = self._package("com.demo.app", "1.0")
-        new_pkg = self._package("com.demo.app", "2.0")
-        device = self._device()
-        run = CompatibilityRun(
-            name="inspection version",
-            source_type="inspection",
-            inspection_run_id=11,
-            inspection_state_ids=[21],
-            old_package_id=old_pkg.id,
-            new_package_id=new_pkg.id,
-            package_name="com.demo.app",
-            compare_mode="version",
-            mode="upgrade",
-            device_serials=[device.serial],
-            status="RUNNING",
-            user_id=user.id,
-        )
-        self.session.add(run)
-        self.session.flush()
-        cell = CompatibilityCell(
-            run_id=run.id,
-            device_serial=device.serial,
-            status="RUNNING",
-        )
-        self.session.add(cell)
-        self.session.commit()
-        self.session.refresh(run)
-        self.session.refresh(cell)
-        page = {
-            "key": "guest-home",
-            "name": "未登录首页",
-            "inspection_state_id": 21,
-            "branch_key": "guest",
-            "branch_config": {
-                "prepare_case_id": 1,
-                "entry_case_id": 2,
-                "ready_assertion": {
-                    "selector": "首页",
-                    "by": "description",
-                },
-            },
-        }
-        install = AsyncMock()
-        prepare = Mock()
-        capture = AsyncMock(
-            side_effect=[
-                {"screenshot_path": "old.png", "xml_text": "<old/>"},
-                {"screenshot_path": "new.png", "xml_text": "<new/>"},
-            ]
-        )
-
-        with patch(
-            "backend.api.compatibility.install_app_package_to_device",
-            new=install,
-        ), patch(
-            "backend.api.compatibility._prepare_inspection_page_group",
-            new=prepare,
-        ), patch(
-            "backend.api.compatibility._run_page_capture",
-            new=capture,
-        ), patch(
-            "backend.api.compatibility._record_compare_result",
-        ):
-            await _execute_cell_inspection_version_body(
-                self.session,
-                run,
-                cell,
-                [page],
-                threading.Event(),
-                run.id,
-            )
-
-        self.assertEqual(prepare.call_count, 1)
-        self.assertEqual(capture.await_count, 2)
-        self.assertEqual(install.await_count, 2)
-        old_call, new_call = install.await_args_list
-        self.assertEqual(old_call.kwargs["package_id"], old_pkg.id)
-        self.assertTrue(old_call.kwargs["uninstall_first"])
-        self.assertEqual(new_call.kwargs["package_id"], new_pkg.id)
-        self.assertFalse(new_call.kwargs["uninstall_first"])
-        self.assertFalse(new_call.kwargs["allow_uninstall_retry"])
 
     def test_delete_referenced_page_set_detaches_runs_and_preserves_report_snapshot(self):
         user = self._user()
@@ -1049,40 +787,6 @@ class DeviceCompareSchemaTests(unittest.TestCase):
     def test_invalid_compare_mode_rejected(self):
         with self.assertRaises(ValidationError):
             CompatibilityRunCreate(**self._payload(compare_mode="matrix"))
-
-    def test_inspection_snapshot_rejects_old_package(self):
-        with self.assertRaises(ValidationError):
-            CompatibilityRunCreate(
-                name="巡检快照",
-                old_package_id=9,
-                new_package_id=1,
-                source_type="inspection",
-                inspection_run_id=8,
-                device_serials=["android-1"],
-                compare_mode="snapshot",
-            )
-
-    def test_inspection_version_requires_explicit_old_package_and_upgrade(self):
-        base = {
-            "name": "巡检版本",
-            "new_package_id": 2,
-            "source_type": "inspection",
-            "inspection_run_id": 8,
-            "device_serials": ["android-1"],
-            "compare_mode": "version",
-        }
-        with self.assertRaises(ValidationError):
-            CompatibilityRunCreate(**base)
-        with self.assertRaises(ValidationError):
-            CompatibilityRunCreate(**base, old_package_id=1, mode="clean")
-        payload = CompatibilityRunCreate(
-            **base,
-            old_package_id=1,
-            mode="upgrade",
-        )
-        self.assertEqual(payload.old_package_id, 1)
-        self.assertEqual(payload.mode, "upgrade")
-
 
 class NormalizeActivityTests(unittest.TestCase):
     def test_extracts_component_from_focus_line_with_hash(self):

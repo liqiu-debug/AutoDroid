@@ -2,7 +2,7 @@
 
 保留天数存于 SystemSetting（key: ``report_retention_days``）：
 - 未设置 / 0 / 非法值：不清理（默认关闭，避免升级后静默删除历史数据）
-- N > 0：每日定时清理 N 天前产生且已结束的 UI 执行、Fastbot、兼容性和巡检任务，
+- N > 0：每日定时清理 N 天前产生且已结束的 UI 执行、Fastbot 和兼容性任务，
   同时删除对应的 HTML 报告、失败截图与 reports/ 下的产物目录。
 
 复用各业务 API 中已有的产物删除逻辑，保证与手动删除行为一致。
@@ -23,12 +23,6 @@ from backend.models import (
     CompatibilityRun,
     FastbotReport,
     FastbotTask,
-    InspectionBranchRun,
-    InspectionFault,
-    InspectionObservation,
-    InspectionRun,
-    InspectionState,
-    InspectionTransition,
     TestExecution,
     TestResult,
 )
@@ -155,95 +149,6 @@ def _cleanup_expired_compatibility_runs(session: Session, cutoff: datetime) -> i
     return deleted
 
 
-def _cleanup_expired_inspection_runs(session: Session, cutoff: datetime) -> int:
-    from backend.api.inspections import _delete_inspection_run_artifacts
-    from backend.artifact_store import release_owner_references
-
-    expired = session.exec(
-        select(InspectionRun).where(InspectionRun.created_at < cutoff)
-    ).all()
-    deleted = 0
-    for run in expired:
-        if str(run.status or "").upper() in _ACTIVE_STATUSES:
-            continue
-        try:
-            _delete_inspection_run_artifacts(run.id)
-            # Compatibility reports own PINNED CAS baselines plus legacy path
-            # fallbacks and remain readable after their source run expires.
-            referencing_compatibility_runs = session.exec(
-                select(CompatibilityRun).where(
-                    CompatibilityRun.inspection_run_id == run.id
-                )
-            ).all()
-            for compatibility_run in referencing_compatibility_runs:
-                compatibility_run.inspection_run_id = None
-                session.add(compatibility_run)
-            faults = session.exec(
-                select(InspectionFault).where(InspectionFault.run_id == run.id)
-            ).all()
-            transitions = session.exec(
-                select(InspectionTransition).where(
-                    InspectionTransition.run_id == run.id
-                )
-            ).all()
-            states = session.exec(
-                select(InspectionState).where(InspectionState.run_id == run.id)
-            ).all()
-            branches = session.exec(
-                select(InspectionBranchRun).where(InspectionBranchRun.run_id == run.id)
-            ).all()
-            observations = session.exec(
-                select(InspectionObservation).where(
-                    InspectionObservation.run_id == run.id
-                )
-            ).all()
-            for item in faults:
-                release_owner_references(
-                    session,
-                    owner_type="inspection_fault",
-                    owner_id=item.id,
-                    commit=False,
-                )
-                session.delete(item)
-            for item in transitions:
-                session.delete(item)
-            for item in observations:
-                release_owner_references(
-                    session,
-                    owner_type="inspection_observation",
-                    owner_id=item.id,
-                    commit=False,
-                )
-                session.delete(item)
-            for item in states:
-                release_owner_references(
-                    session,
-                    owner_type="inspection_state",
-                    owner_id=item.id,
-                    commit=False,
-                )
-                release_owner_references(
-                    session,
-                    owner_type="inspection_regression",
-                    owner_id=item.id,
-                    commit=False,
-                )
-                session.delete(item)
-            for item in branches:
-                session.delete(item)
-            release_owner_references(
-                session,
-                owner_type="inspection_run",
-                owner_id=run.id,
-                commit=False,
-            )
-            session.delete(run)
-            deleted += 1
-        except Exception:
-            logger.exception("清理过期巡检任务失败: run_id=%s", run.id)
-    return deleted
-
-
 def _cleanup_expired_api_runs(session: Session, cutoff: datetime) -> int:
     from backend.models import ApiRun, ApiStepResult
     from sqlmodel import delete
@@ -266,7 +171,6 @@ def cleanup_expired_reports(days: int, now: Optional[datetime] = None) -> Dict[s
             "executions": 0,
             "fastbot_tasks": 0,
             "compatibility_runs": 0,
-            "inspection_runs": 0,
         }
 
     cutoff = (now or datetime.now()) - timedelta(days=days)
@@ -275,7 +179,6 @@ def cleanup_expired_reports(days: int, now: Optional[datetime] = None) -> Dict[s
         summary["executions"] = _cleanup_expired_executions(session, cutoff)
         summary["fastbot_tasks"] = _cleanup_expired_fastbot_tasks(session, cutoff)
         summary["compatibility_runs"] = _cleanup_expired_compatibility_runs(session, cutoff)
-        summary["inspection_runs"] = _cleanup_expired_inspection_runs(session, cutoff)
         summary["api_runs"] = _cleanup_expired_api_runs(session, cutoff)
         session.commit()
     return summary
@@ -304,9 +207,7 @@ def run_retention_cleanup() -> Dict[str, Any]:
         DEFAULT_LOW_WATERMARK_PERCENT,
         cleanup_verified_legacy_files,
         gc_assets,
-        materialize_warm_derivatives,
         tiered_asset_retention_enabled,
-        transition_warm_observations_to_cold,
     )
 
     with Session(engine) as session:
@@ -349,10 +250,6 @@ def run_retention_cleanup() -> Dict[str, Any]:
             summary["legacy_rollback_cleanup"] = cleanup_verified_legacy_files(
                 session
             )
-            summary["warm_derivatives"] = materialize_warm_derivatives(session)
-            summary["cold_transitions"] = transition_warm_observations_to_cold(
-                session
-            )
             summary["assets"] = gc_assets(
                 session,
                 low_watermark_percent=low,
@@ -365,7 +262,6 @@ def run_retention_cleanup() -> Dict[str, Any]:
             "executions",
             "fastbot_tasks",
             "compatibility_runs",
-            "inspection_runs",
         )
     ):
         logger.info("报告保留清理完成: %s", summary)

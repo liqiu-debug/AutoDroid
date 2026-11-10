@@ -28,14 +28,6 @@ class AssetRetentionServiceTests(unittest.TestCase):
         with (
             patch.object(retention_service, "engine", self.engine),
             patch(
-                "backend.artifact_store.materialize_warm_derivatives",
-                return_value={"derived": 1},
-            ) as warm,
-            patch(
-                "backend.artifact_store.transition_warm_observations_to_cold",
-                return_value={"transitioned": 1},
-            ) as cold,
-            patch(
                 "backend.artifact_store.gc_assets",
                 return_value={"deleted_assets": 2},
             ) as gc,
@@ -46,8 +38,6 @@ class AssetRetentionServiceTests(unittest.TestCase):
         self.assertFalse(summary["report_retention_enabled"])
         self.assertTrue(summary["asset_retention_enabled"])
         self.assertEqual(summary["assets"]["deleted_assets"], 2)
-        warm.assert_called_once()
-        cold.assert_called_once()
         gc.assert_called_once()
         self.assertEqual(gc.call_args.kwargs["low_watermark_percent"], 80.0)
         self.assertEqual(gc.call_args.kwargs["high_watermark_percent"], 90.0)

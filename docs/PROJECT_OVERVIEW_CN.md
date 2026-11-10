@@ -9,7 +9,7 @@ AutoDroid 是一个低代码 UI 自动化测试平台，核心模式是：
 - Android 实时投屏/静态截图录制，iOS WDA MJPEG 预览与静态层级录制
 - 统一步骤模型（标准步骤 + 兼容 legacy）
 - Android / iOS 双端执行
-- Android 模型化巡检、兼容性回放和可审计证据资产
+- 兼容性测试（页面合集版本/机型对比）与可审计证据资产
 - 多设备并发、定时调度、报告与通知闭环
 
 它解决的不是“单次脚本执行”，而是把 `录制 -> 编排 -> 预检 -> 执行 -> 报告 -> 运营` 全流程工程化。
@@ -20,8 +20,7 @@ AutoDroid 是一个低代码 UI 自动化测试平台，核心模式是：
 2. 一套用例覆盖双端：通过跨端步骤模型分发到 Android / iOS。  
 3. 执行前风险拦截：预检提前发现平台、定位器、变量、WDA、app 映射问题。  
 4. 运行稳定性提升：设备状态治理、WDA relay、执行后状态恢复、失败截图保留。  
-5. 可规模化运营：支持多设备并发、定时任务、飞书通知、运行大盘与告警。  
-6. 把探索转成回归资产：巡检生成页面拓扑和冻结路径，可继续用于版本、机型和当前安装版本验证。
+5. 可规模化运营：支持多设备并发、定时任务、飞书通知、运行大盘与告警。
 
 ## 3. 功能全景（产品能力）
 
@@ -33,14 +32,13 @@ AutoDroid 是一个低代码 UI 自动化测试平台，核心模式是：
 | 跨端执行 | 标准步骤下发 Android/iOS，容错策略控制流程 | `backend/drivers/cross_platform_runner.py`、`android_driver.py`、`ios_driver.py` |
 | 场景编排 | 多用例串联、别名、变量上下文跨用例传递 | `backend/api/scenarios.py` |
 | 并发运行 | 场景多设备并发批次执行，设备级预检过滤 | `backend/api/scenarios.py` `_schedule_concurrent_runs` |
-| 调度中心 | DAILY/WEEKLY/INTERVAL/ONCE 定时策略，支持 UI 场景、Fastbot 与巡检任务 | `backend/scheduler_service.py`、`backend/api/tasks.py` |
+| 调度中心 | DAILY/WEEKLY/INTERVAL/ONCE 定时策略，支持 UI 场景与 Fastbot 任务 | `backend/scheduler_service.py`、`backend/api/tasks.py` |
 | 设备中心 | ADB+tidevice 一键同步、解锁、重启、截图、WDA 检测、iOS 一键无线（WiFi 直连 WDA） | `backend/api/devices.py` |
 | 流媒体 | Scrcpy H.264 WebSocket 推流、触控转发、多客户端广播 | `backend/device_stream/manager.py` |
 | 报告中心 | 执行列表、详情、下载，DB 数据兜底生成 HTML 报告 | `backend/api/reports.py`、`backend/report_generator.py` |
 | 运行大盘 | KPI、趋势、状态分布、失败 Top、告警、即将执行任务 | `backend/api/reports.py` `/api/reports/dashboard/overview` |
 | 稳定性探索 | Fastbot 智能探索、性能曲线、Crash/ANR 统计 | `backend/api/fastbot.py`、`backend/fastbot_runner.py` |
-| 模型化智能巡检 | 页面身份/页面族、覆盖调度、安全边界、双业务线、实时拓扑与稳定路径 | `backend/api/inspections.py`、`backend/inspection/` |
-| 兼容性测试与回放 | 页面合集或巡检快照的版本/机型对比，当前安装版本冻结路径回放 | `backend/api/compatibility.py`、`backend/compatibility_replay.py` |
+| 兼容性测试 | 页面合集的版本对比/机型对比，升级兼容与干净安装两种执行模式 | `backend/api/compatibility.py` |
 | 证据资产 | 内容寻址、引用计数、鉴权读取、分层保留和容量水位 | `backend/artifact_store.py`、`backend/api/assets.py` |
 | 接口自动化 | 接口库与版本、cURL/文档导入、顺序场景与步骤引用、调试会话、断言与报告、无设备定时执行、影响面与批量同步、可选 AI 校验建议 | `backend/api/api_testing.py`、`backend/api_testing/` |
 | AI 能力 | 自然语言生成步骤（NL2Step）、日志 AI 根因分析、接口校验建议与失败解释 | `backend/api/ai.py`、`backend/api/log_analysis.py`、`backend/api_testing/ai_service.py` |
@@ -60,9 +58,8 @@ flowchart TD
     B --> G["流媒体<br/>Scrcpy H.264 / iOS MJPEG"]
     B --> H["调度与通知<br/>APScheduler + Feishu"]
     B --> I["报告与大盘<br/>SQLite + HTML Report + Dashboard API"]
-    B --> J["智能巡检<br/>Page Model + Coverage Scheduler"]
-    J --> K["兼容性快照 / 已安装版本回放"]
-    J --> L["内容寻址证据资产<br/>CAS + Reference + Retention"]
+    B --> K["兼容性测试<br/>页面合集 版本/机型对比"]
+    B --> L["内容寻址证据资产<br/>CAS + Reference + Retention"]
     K --> L
 ```
 
@@ -73,7 +70,7 @@ flowchart TD
 - Android 自动化：uiautomator2 + ADB  
 - iOS 自动化：facebook-wda + tidevice  
 - 图像/OCR：OpenCV + PaddleOCR（兼容封装）  
-- 实时通信：WebSocket（执行日志、Scrcpy H.264、WDA MJPEG、巡检实时快照）
+- 实时通信：WebSocket（执行日志、Scrcpy H.264、WDA MJPEG）
 
 ### 移动端架构与边界
 
@@ -84,7 +81,7 @@ flowchart TD
 - 移动端使用独立页头和底部导航，主入口为概览、设备、用例、场景和报告。
 - 路由通过 `meta.mobileAvailable` 声明移动端可用性；未开放的页面统一展示 PC 模式提示。
 
-当前移动端聚焦查看和轻量执行：支持设备状态与常用运维、用例/场景发起执行，以及 UI/巡检报告列表与详情查看；用例编辑、复杂场景编排、巡检配置、资产配置、调度和系统管理仍使用 PC 模式。
+当前移动端聚焦查看和轻量执行：支持设备状态与常用运维、用例/场景发起执行，以及 UI 报告列表与详情查看；用例编辑、复杂场景编排、资产配置、调度和系统管理仍使用 PC 模式。
 
 ## 5. 核心实现机制（深度）
 
@@ -99,14 +96,6 @@ Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAUL
 | `new_step_model` | 开 | 标准步骤模型读写，DB 显式 `false` 可临时回退 |
 | `ios_execution` | 关 | 允许 iOS 执行 |
 | `ws_disconnect_abort` | 关 | 用例执行 WebSocket 断开即中止 |
-| `model_inspection` | 关 | Android 模型化智能巡检总开关 |
-| `inspection_identity_v2` | 开 | 巡检 Template/State/Observation 身份模型，依赖总开关 |
-| `inspection_exploration_family_convergence` | 开 | 同构页面族增量覆盖，依赖身份模型 |
-| `inspection_similarity_convergence` | 关 | 高置信相似状态收敛，依赖身份模型 |
-| `inspection_coverage_scheduler_v2` | 关 | 覆盖导向调度，依赖身份模型 |
-| `inspection_visual_home_actions` | 关 | 首页图片入口探测，依赖覆盖调度 |
-| `compatibility_installed_replay` | 开 | 当前安装版本冻结路径回放 |
-| `compatibility_legacy_compare_creation` | 关 | 旧兼容性创建流程临时回退 |
 | `content_addressed_assets` | 关 | 内容寻址证据双写 |
 | `tiered_asset_retention` | 关 | HOT/WARM/PINNED/COLD 分层保留，依赖资产双写 |
 
@@ -224,11 +213,11 @@ Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAUL
 | 场景并发执行 | 支持 | 支持 | 设备级预检过滤 |
 | 实时设备画面 | Scrcpy 可交互 | WDA MJPEG 只读预览 | iOS 点击/框选仍使用静态截图和层级 |
 | Fastbot 探索 | 支持 | 不支持 | `P3001_FASTBOT_ANDROID_ONLY` |
-| 模型化智能巡检/路径回放 | 支持 | 不支持 | 单台设备独占执行，首期仅 Android |
+| 兼容性测试（页面合集对比） | 支持 | 不支持 | 页面合集采集截图与 UI XML 做版本/机型对比 |
 | WDA 检测 | 不适用 | 支持 | `POST /devices/{serial}/wda/check` |
 | 无线连接（免数据线） | 手动支持（无线 adb，见 `docs/ANDROID_WIRELESS_ADB.md`） | 支持（一键） | iOS 一键启用 WiFi 直连 WDA，`POST /devices/{serial}/wireless/enable`，详见 `docs/IOS_WDA_OPS.md` §3.5 |
 
-结论：当前产品形态是“Android 实时/静态录制 + iOS MJPEG 预览/静态层级录制 + Android/iOS 标准执行 + Android 专项巡检与兼容性回放”。
+结论：当前产品形态是“Android 实时/静态录制 + iOS MJPEG 预览/静态层级录制 + Android/iOS 标准执行 + Android 兼容性测试”。
 
 ## 7. 设备管理与稳定性保障
 
@@ -304,7 +293,6 @@ iOS MJPEG 由独立 relay 管理，设备端默认端口 `9100`，本地 relay �
 
 - UI 场景任务（执行前预检过滤设备）
 - Fastbot 任务（稳定性探索）
-- 模型化智能巡检任务（单 Profile、单 Android 设备、可选业务线与安装包）
 
 任务配置通过 `strategy_config` 承载扩展字段（如 `_task_type`、`env_id`、Fastbot 参数）。
 
@@ -324,7 +312,6 @@ iOS MJPEG 由独立 relay 管理，设备端默认端口 `9100`，本地 relay �
 - 下载报告：`GET /api/reports/executions/{id}/download`（支持 DB 回填生成 HTML）
 - 报告静态资源：`GET /api/report-assets/{path}`
 - 兼容性报告：`GET /api/compatibility/runs`
-- 巡检报告与 Graph：`GET /api/inspections/runs`、`GET /api/inspections/runs/{id}/graph`
 - 内容寻址资产：`GET /api/assets/status`、`GET /api/assets/{asset_id}`（仅鉴权 canonical API）
 
 Dashboard（`GET /api/reports/dashboard/overview`）输出：
@@ -358,40 +345,20 @@ Dashboard（`GET /api/reports/dashboard/overview`）输出：
 - 可选“崩溃即停”
 - 汇总 `avg/max CPU`、`avg/max Mem`、`total_crashes`、`total_anrs`
 
-## 11. 模型化智能巡检与兼容性回放
+## 11. 兼容性测试
 
-巡检入口 `backend/api/inspections.py` 负责 Profile、Run、Graph、Observation、页面族、稳定路径选择和实时票据；执行核心位于 `backend/inspection/`：
+兼容性测试只保留「页面合集」一条链路：先在页面合集中手动维护预设页面（页面名称、进入页面用例、稳定等待时间与必需文本），再新建对比任务，按页面采集截图与 UI XML 后逐页比对。
 
-- `semantics.py`：从 UI XML、截图和 Activity 构建页面模型、动作角色和安全语义。
-- `engine.py`：双业务线准备、探索 Frontier、恢复导航、预算和结果状态。
-- `replay.py`：冻结稳定路径、检查定位质量和安全边界。
-- `live.py`：发布完整最新快照和短效单次 WebSocket 票据。
-- `monitor.py`：Crash/ANR、性能、卡顿和可选 Perfetto 证据。
-- `haier_business_coverage.py`：冻结商城应用（`haier-mall-v2`）v2 核心旅程、计算证据状态，并为缺失旅程提供下一动作提示。
+- 对比维度：版本对比、机型对比（指定基准设备横向比对）。
+- 执行模式：升级兼容（先安装旧包采集基线，再覆盖安装新包且不清数据）、干净安装（分别清理安装旧包和新包，适合纯视觉回归）。
+- 旧版 APK 可选「当前版本」，不强制上传旧包。
+- 判定阈值：像素差异比例、结构相似度（SSIM）、XML 差异比例；截图尺寸变化、Crash/ANR 与必需文本缺失一并纳入结果。视觉或结构差异默认计为警告，安装失败、页面不可达、Crash/ANR、必需文本缺失判为失败。
 
-Graph 当前为 schema v8 / hierarchy v2，区分 PageTemplate、State、Observation、Transition、ExplorationFamily 与 CoverageContract。历史报告按创建时的快照和版本解释，不用新算法重算。
-
-商城应用采用“版本化核心旅程 + 定向补齐 + 开放式探索”的混合模型。Run 创建时冻结 `haier-mall-v2` 清单、版本和 SHA-256 哈希；搜索旅程固定输入非敏感关键词“冰箱”。`CoverageGoalTracker` 持续计算每条旅程的最深阶段，未完成旅程的下一动作优先于普通页面族探索，已完成必达项后继续消费剩余预算发现长尾页面。任务前 85% 用于探索，最后 15% 只复验已到达的核心终点。
-
-覆盖口径严格拆分：
-
-- `exploration_coverage` 是已发现页面族中的代表页展开率，只用于分析调度效率。
-- `selected_scope_verdict` 判断本次选择的业务线是否完整。
-- `full_app_verdict` 只有在 `guest` 与 `authenticated` 同一 Run 都执行且全部必达项通过时才为 `COMPLETE`。
-- 单项只有在同一业务线中存在真实成功 Transition、XML 可读并通过一次终点复验时才为 `COVERED`；支付边界以明确的 `BLOCKED/PAYMENT` 为成功证据。
-- `InspectionRun.status` 保留执行健康语义，`coverage_verdict` 独立保存业务完整性，不用告警数量推导覆盖结论。
-
-Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合常规核心验收，90 分钟适合长尾探索；双业务线共享任务预算，因此完整运行建议使用 120 分钟。增加时长只能减少真正的预算未到达，不能替代 `SAMPLED_OUT`、安全阻断、页面族复用或路径恢复失败的治理。
-
-兼容性链路支持：
-
-- 页面合集的版本对比和机型横向对比。
-- 巡检稳定 State/Observation 的快照、版本和机型对比。
-- 当前安装版本的冻结路径回放：先 `POST /api/compatibility/replay-preflight`，再用摘要创建 `execution_mode=installed_replay` 任务。
+发起任务时会把页面合集名称和页面列表复制进兼容性任务快照，后续编辑或删除页面合集不会影响历史报告展示。
 
 长任务通过 `backend/device_execution_lease.py` 同时持有内存限流租约和 DB owner 租约；释放时只有原 owner 可以恢复设备状态，避免并发任务互相解锁。
 
-证据在 `content_addressed_assets` 开启时双写到 `asset_store/`。`StoredAsset` 按内容哈希去重，`AssetReference` 按 owner/role 管理 HOT、WARM、PINNED、COLD 保留；兼容性冻结基线在源巡检清理后仍可独立读取。完整上线与回滚步骤见 `docs/INSPECTION_REPLAY_ASSETS.md`。
+证据在 `content_addressed_assets` 开启时双写到 `asset_store/`。`StoredAsset` 按内容哈希去重，`AssetReference` 按 owner/role 管理 HOT、WARM、PINNED、COLD 保留。
 
 ## 12. 接口自动化
 
@@ -472,14 +439,12 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 3. UI 任务先做预检过滤，再执行批次。  
 4. 执行完成后自动发送飞书卡片通知。  
 
-### 14.4 巡检流（发现 -> 审核 -> 回归）
+### 14.4 兼容性流（页面合集 -> 对比 -> 报告）
 
-1. Profile 固化双业务线入口、安全/输入/脱敏规则和预算。
-2. 商城应用 Run 同时冻结核心旅程清单、所选业务线和清单哈希。
-3. 单台 Android 设备获取 owner-safe 租约，先定向补齐核心旅程，再进行开放式探索和终点复验。
-4. 报告独立展示业务覆盖、页面族探索率、运行健康和显著盲区。
-5. 人工选择稳定 State/Observation，冻结回归路径并 PIN 证据。
-6. 兼容性任务冻结来源覆盖结论后执行快照/版本/机型对比，或回放设备当前安装版本。
+1. 在「页面合集」中维护预设页面：页面名称、进入页面用例、稳定等待时间和必需文本。
+2. 新建对比任务，选择对比维度（版本对比/机型对比）、执行模式（升级兼容/干净安装）、旧版与新版 APK（旧版可选「当前版本」）、Android 设备和判定阈值。
+3. 任务把页面合集名称和页面列表复制进快照，按页面采集截图与 UI XML。
+4. 逐页计算像素差异、SSIM 与 XML 差异并给出判定，报告展示差异图以及 Crash/ANR、必需文本缺失等结论。
 
 ## 15. 数据模型（核心表）
 
@@ -493,10 +458,6 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 | `ScheduledTask` | 定时任务配置 |
 | `FastbotTask` / `FastbotReport` | Fastbot 任务与报告 |
 | `CompatibilityRun` / `CompatibilityCell` / `CompatibilityPageResult` | 兼容性任务、设备单元和页面结果 |
-| `InspectionProfile` / `InspectionRun` / `InspectionBranchRun` | 巡检配置、任务快照、冻结覆盖清单/结论和业务线执行 |
-| `InspectionPageTemplate` / `InspectionState` / `InspectionObservation` | 页面模板、业务节点和实际采集 |
-| `InspectionTransition` / `InspectionExplorationFamily` / `InspectionCoverageContract` | 动作拓扑、页面族和覆盖契约 |
-| `InspectionFault` | 巡检故障及证据 |
 | `StoredAsset` / `AssetReference` | 不可变内容寻址资产与 owner 引用 |
 | `ApiFolder` / `ApiDefinition` / `ApiScenario` / `ApiScenarioStep` | 接口目录、接口定义（含版本与样例）、接口场景与步骤快照 |
 | `ApiRun` / `ApiStepResult` | 接口运行记录与逐步结果（冻结配置快照） |
@@ -511,7 +472,6 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 - 角色：支持 `admin/user`（用户管理接口受角色限制）  
 - 前端拦截：`401` 自动清理 token 并跳转登录  
 - 资产读取：CAS 只提供 `/api/assets/*` 鉴权端点，不提供匿名 legacy alias
-- 巡检实时票据：仅 JWT 可领取，短效且一次性消费，API Token 不进入 WebSocket URL
 
 > 生产部署建议：替换默认密钥与默认管理员初始密码，开启 HTTPS 与最小权限策略。
 
@@ -522,9 +482,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 1. `new_step_model` 默认开启，legacy 步骤在启动时自动回填标准表；如需临时回退可在 `SystemSetting` 显式写 `false`。  
 2. 跨端 Runner 已是唯一执行链路（原 `cross_platform_runner` 开关已移除），关注执行必须选择设备的交互变化。  
 3. 开启 `ios_execution`：WDA 运维稳定后逐步引入 iOS 执行。  
-4. 开启 `model_inspection`：先验证默认身份/页面族模型。
-5. 商城应用开启 `inspection_business_coverage_v2` 观察影子评估；核对清单、盲区和历史 v1 回填后，再开启 `inspection_coverage_scheduler_v2` 定向调度，最后按需开启视觉首页动作。
-6. 开启 `content_addressed_assets`：双写、回填、核对 `/api/assets/status` 后再开启 `tiered_asset_retention`。
+4. 开启 `content_addressed_assets`：双写、回填、核对 `/api/assets/status` 后再开启 `tiered_asset_retention`。
 
 配套监控建议：
 
@@ -532,7 +490,6 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 - `WDA_DOWN` 设备占比与恢复时长
 - 任务逾期未触发数量
 - 连续失败场景 Top
-- 巡检覆盖、稳定路径比例、故障类型和预算停止原因
 - 资产水位、PINNED 字节数、可回收字节数和 507 拒绝次数
 
 ## 18. 项目边界与当前形态总结
@@ -540,7 +497,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 - 当前明确定位：`Android 实时/静态录制 + iOS MJPEG 预览/静态层级录制 + Android/iOS 执行`。
 - iOS MJPEG 是只读预览；录制与定位仍依赖 WDA 静态截图和层级。
 - Fastbot 仅 Android 支持。  
-- 模型化智能巡检与兼容性路径回放首期仅 Android、单设备执行。
+- 兼容性测试仅支持 Android APK 的版本/机型对比，按页面合集采集截图与 UI XML。
 - 跨端能力依赖标准步骤模型与预检，建议将预检作为运行前必经流程。  
 
 ---
@@ -557,8 +514,7 @@ Profile 与单次 Run 均支持 5 至 120 分钟。单业务线 60 分钟适合�
 - 通知服务：`backend/notification_service.py`  
 - 报告与大盘：`backend/api/reports.py`  
 - Fastbot：`backend/api/fastbot.py`、`backend/fastbot_runner.py`  
-- 智能巡检：`backend/api/inspections.py`、`backend/inspection/`
-- 兼容性与回放：`backend/api/compatibility.py`、`backend/compatibility_replay.py`
+- 兼容性测试：`backend/api/compatibility.py`
 - 证据资产与保留：`backend/artifact_store.py`、`backend/api/assets.py`、`backend/retention_service.py`
 - 设备长任务租约：`backend/device_execution_lease.py`
 - 接口自动化：`backend/api/api_testing.py`、`backend/api_testing/`（引擎/调试会话/导入/AI）、`frontend/src/views/api-testing/`

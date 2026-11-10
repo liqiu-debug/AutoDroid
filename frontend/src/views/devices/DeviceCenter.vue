@@ -1,8 +1,7 @@
 <script setup>
 import { ref, computed, nextTick, onMounted, onBeforeUnmount, onActivated, onDeactivated } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, Delete, CircleClose, Connection, Link, Download, CopyDocument } from '@element-plus/icons-vue'
-import { useRouter } from 'vue-router'
+import { Refresh, Picture, Unlock, SwitchButton, Monitor, Edit, CircleClose, Connection } from '@element-plus/icons-vue'
 import api from '@/api'
 import { deviceDisplayName } from '@/utils/deviceName'
 import { hasSessionToken } from '@/utils/sessionExpiry'
@@ -13,7 +12,6 @@ import { useClientMode } from '@/composables/useClientMode'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 
 const { isMobileMode } = useClientMode()
-const router = useRouter()
 
 // ==================== 状态 ====================
 const devices = ref([])
@@ -35,22 +33,11 @@ const saveBinding = async () => {
 }
 const loading = ref(false)
 const loadError = ref('')
-const agentsExpanded = ref(false)
-const agentDetailsTouched = ref(false)
-const offlineAgentCount = computed(() => remoteAgents.value.filter(agent => agent.status !== 'ONLINE').length)
-const agentDetailsVisible = computed(() => agentsExpanded.value || (!agentDetailsTouched.value && offlineAgentCount.value > 0))
 const syncLoading = ref(false)
 const wdaCheckingSerial = ref('')
 const wirelessLoadingSerial = ref('')
 const deleteLoadingSerial = ref('')
 const stopLoadingSerial = ref('')
-
-// 远程接入点
-const remoteAgents = ref([])
-const agentGuideVisible = ref(false)
-const agentDeleteLoadingId = ref(null)
-const agentScriptDownloading = ref(false)
-const agentProbeLoadingId = ref(null)
 
 // 快照弹窗：Android 默认嵌实时投屏（避免整图截图挤占远程链路带宽），
 // iOS 或投屏不可用时回落到静态截图
@@ -92,51 +79,6 @@ const fetchDevices = async ({ refreshIosWda = false, silent = false } = {}) => {
     if (!silent) {
       loading.value = false
     }
-  }
-  fetchRemoteAgents()
-}
-
-/** 获取远程接入点列表（静默失败，不打扰设备主流程） */
-const fetchRemoteAgents = async () => {
-  if (!hasSessionToken()) return
-  try {
-    const { data } = await api.getDeviceAgents()
-    remoteAgents.value = data.items || []
-  } catch (e) {
-    console.error(e)
-  }
-}
-
-/** 链路速率可读化 */
-const formatBps = (bps) => {
-  const value = Number(bps) || 0
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} Mbps`
-  if (value >= 1_000) return `${Math.round(value / 1_000)} Kbps`
-  return `${value} bps`
-}
-
-/** 接入点芯片上的链路摘要：RTT + B→A 实时吞吐 */
-const agentLinkSummary = (linkQuality) => {
-  if (!linkQuality) return ''
-  const parts = []
-  if (linkQuality.rtt_ms != null) parts.push(`RTT ${Math.round(linkQuality.rtt_ms)}ms`)
-  parts.push(`↑${formatBps(linkQuality.up_bps)}`)
-  return parts.join(' · ')
-}
-
-/** 主动探测 B→A 上行带宽（探测期间会短暂挤占投屏带宽，属预期） */
-const handleProbeAgentLink = async (agent) => {
-  agentProbeLoadingId.value = agent.id
-  try {
-    const { data } = await api.probeDeviceAgentLink(agent.id)
-    ElMessage.success(
-      `${agent.name} B→A 实测吞吐 ${formatBps(data.bps)}（${Math.round(data.bytes / 1024)}KB / ${data.elapsed_ms}ms）`
-    )
-    fetchRemoteAgents()
-  } catch (e) {
-    ElMessage.error('带宽探测失败：' + (e.response?.data?.detail || e.message))
-  } finally {
-    agentProbeLoadingId.value = null
   }
 }
 
@@ -261,69 +203,6 @@ const handleReboot = async (device) => {
 }
 
 const isDeviceOffline = (device) => String(device?.status || '').trim().toUpperCase() === 'OFFLINE'
-
-// ==================== 远程接入点 ====================
-
-/** Agent 启动命令示例（自动带当前站点地址） */
-const agentCommandExample = computed(() => {
-  const origin = window.location.origin
-  return `python device_agent.py --server ${origin} --token <你的API Token> --name 工位名称`
-})
-
-/** 下载 Agent 脚本 */
-const handleDownloadAgentScript = async () => {
-  agentScriptDownloading.value = true
-  try {
-    const { data } = await api.downloadDeviceAgentScript()
-    const url = URL.createObjectURL(new Blob([data], { type: 'text/x-python' }))
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'device_agent.py'
-    link.click()
-    URL.revokeObjectURL(url)
-  } catch (e) {
-    ElMessage.error('下载失败：' + (e.response?.data?.detail || e.message))
-  } finally {
-    agentScriptDownloading.value = false
-  }
-}
-
-/** 复制 Agent 启动命令 */
-const copyAgentCommand = async () => {
-  try {
-    await navigator.clipboard.writeText(agentCommandExample.value)
-    ElMessage.success('启动命令已复制')
-  } catch (e) {
-    ElMessage.warning('复制失败，请手动选择文本复制')
-  }
-}
-
-/** 跳转 API Token 管理页 */
-const gotoApiTokens = () => {
-  agentGuideVisible.value = false
-  router.push({ name: 'api-tokens' })
-}
-
-/** 删除离线接入点 */
-const handleDeleteAgent = async (agent) => {
-  try {
-    await ElMessageBox.confirm(
-      `确定删除接入点「${agent.name}」吗？其设备端口映射将被释放，该接入点重新上线后按新端口接入（平台侧视为新设备记录）。`,
-      '删除远程接入点',
-      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
-    )
-    agentDeleteLoadingId.value = agent.id
-    await api.deleteDeviceAgent(agent.id)
-    remoteAgents.value = remoteAgents.value.filter(item => item.id !== agent.id)
-    ElMessage.success(`接入点 ${agent.name} 已删除`)
-  } catch (e) {
-    if (!['cancel', 'close'].includes(e)) {
-      ElMessage.error('删除失败：' + (e.response?.data?.detail || e.message))
-    }
-  } finally {
-    agentDeleteLoadingId.value = null
-  }
-}
 
 /** 删除离线设备 */
 const handleDeleteDevice = async (device) => {
@@ -656,9 +535,6 @@ onBeforeUnmount(() => {
         </el-tag>
       </div>
       <div class="toolbar-actions">
-        <el-button :icon="Link" @click="agentGuideVisible = true">
-          接入远程设备
-        </el-button>
         <el-button type="primary" :icon="Refresh" @click="handleSync" :loading="syncLoading">
           一键同步物理设备
         </el-button>
@@ -666,61 +542,6 @@ onBeforeUnmount(() => {
     </div>
 
     <el-alert v-if="loadError" type="error" :title="loadError" show-icon :closable="false" class="device-load-error" />
-    <!-- 远程接入点 -->
-    <div v-if="remoteAgents.length > 0" class="agent-strip">
-      <button class="agent-strip-title" :aria-expanded="agentDetailsVisible" @click="agentDetailsTouched = true; agentsExpanded = !agentsExpanded">
-        <el-icon :size="16"><Link /></el-icon>
-        <span>远程接入点 · {{ remoteAgents.length }}</span>
-        <el-tag v-if="offlineAgentCount" type="warning" size="small">{{ offlineAgentCount }} 个离线</el-tag>
-        <span class="ad-metadata">{{ agentDetailsVisible ? '收起' : '展开' }}</span>
-      </button>
-      <div v-if="agentDetailsVisible" class="agent-strip-list">
-        <div v-for="agent in remoteAgents" :key="agent.id" class="agent-chip" :class="{ offline: agent.status !== 'ONLINE' }">
-          <span class="agent-dot" :class="{ online: agent.status === 'ONLINE' }"></span>
-          <span class="agent-name">{{ agent.name }}</span>
-          <el-tooltip
-            :content="agent.status === 'ONLINE'
-              ? `在线 · ${agent.online_device_count}/${agent.device_count} 台设备在线`
-              : `离线 · 最后心跳 ${agent.last_seen_at ? agent.last_seen_at.replace('T', ' ').slice(0, 19) : '—'}`"
-            placement="top"
-          >
-            <span class="agent-meta">{{ agent.status === 'ONLINE' ? `${agent.online_device_count} 台在线` : '离线' }}</span>
-          </el-tooltip>
-          <el-tooltip
-            v-if="agent.status === 'ONLINE' && agent.link_quality"
-            placement="top"
-          >
-            <template #content>
-              RTT：{{ agent.link_quality.rtt_ms != null ? `${Math.round(agent.link_quality.rtt_ms)}ms（均值 ${agent.link_quality.rtt_avg_ms}ms）` : '待上报（Agent 需 ≥1.2.0）' }}<br />
-              实时吞吐：B→A {{ formatBps(agent.link_quality.up_bps) }} / A→B {{ formatBps(agent.link_quality.down_bps) }}<br />
-              带宽实测：{{ agent.link_quality.bandwidth_probe ? `${formatBps(agent.link_quality.bandwidth_probe.bps)} @ ${agent.link_quality.bandwidth_probe.at}` : '未探测，点「测带宽」' }}
-            </template>
-            <span class="agent-link">{{ agentLinkSummary(agent.link_quality) }}</span>
-          </el-tooltip>
-          <el-button
-            v-if="agent.status === 'ONLINE'"
-            class="agent-probe"
-            type="primary"
-            link
-            size="small"
-            :loading="agentProbeLoadingId === agent.id"
-            @click="handleProbeAgentLink(agent)"
-          >
-            测带宽
-          </el-button>
-          <el-button
-            v-if="agent.status !== 'ONLINE'"
-            class="agent-delete"
-            type="danger"
-            link
-            size="small"
-            :icon="Delete"
-            :loading="agentDeleteLoadingId === agent.id"
-            @click="handleDeleteAgent(agent)"
-          />
-        </div>
-      </div>
-    </div>
 
     <!-- 空状态 -->
     <el-empty
@@ -796,10 +617,6 @@ onBeforeUnmount(() => {
               <span class="info-label">设备编号</span>
               <el-tooltip :content="device.serial"><span class="info-value serial" tabindex="0">{{ device.serial }}</span></el-tooltip>
             </div>
-            <div v-if="device.source_serial" class="info-row">
-              <span class="info-label">真实序列号</span>
-              <el-tooltip :content="device.source_serial"><span class="info-value serial" tabindex="0">{{ device.source_serial }}</span></el-tooltip>
-            </div>
             <div class="info-row">
               <span class="info-label">屏幕分辨率</span>
               <span class="info-value">{{ device.resolution || '—' }}</span>
@@ -874,56 +691,6 @@ onBeforeUnmount(() => {
       </template>
     </el-dialog>
 
-    <!-- 接入远程设备指引 -->
-    <el-dialog
-      v-model="agentGuideVisible"
-      title="接入远程设备（设备插在自己电脑上使用平台）"
-      width="640px"
-      align-center
-    >
-      <div class="agent-guide">
-        <p class="agent-guide-intro">
-          在你自己的电脑（B 机）上运行「设备接入助手」，插在 B 机上的 Android 设备会通过反向隧道注册到本平台，
-          全功能可用（投屏、执行、巡检、Fastbot）。数据走 USB + 网络，无需手机连 WiFi。
-        </p>
-        <ol class="agent-guide-steps">
-          <li>
-            <strong>准备环境</strong>：B 机安装
-            <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python 3.8+</a>
-            与
-            <a href="https://developer.android.com/tools/releases/platform-tools" target="_blank" rel="noopener">Android platform-tools（adb）</a>，
-            手机开启「USB 调试」。
-          </li>
-          <li>
-            <strong>生成 API Token</strong>：
-            <el-button type="primary" link @click="gotoApiTokens">前往 API Token 管理页</el-button>
-            创建一个 Token（adk_ 开头，仅创建时可见）。
-          </li>
-          <li>
-            <strong>下载 Agent 脚本</strong>：
-            <el-button type="primary" link :icon="Download" :loading="agentScriptDownloading" @click="handleDownloadAgentScript">
-              下载 device_agent.py
-            </el-button>
-          </li>
-          <li>
-            <strong>在 B 机命令行运行</strong>（把 Token 与工位名换成你的）：
-            <div class="agent-command">
-              <code>{{ agentCommandExample }}</code>
-              <el-button link type="primary" :icon="CopyDocument" @click="copyAgentCommand" />
-            </div>
-          </li>
-          <li>
-            <strong>手机授权</strong>：首次接入会弹出两次「允许 USB 调试」（B 机密钥 + 平台服务器密钥），都点允许。
-            之后回到本页点「一键同步物理设备」即可看到远程设备。
-          </li>
-        </ol>
-        <div class="agent-guide-tips">
-          注意：Agent 运行期间请勿关闭其命令行窗口；执行长任务（巡检/Fastbot）时建议关闭 B 机休眠。
-          手机重启或拔插后 Agent 会自动恢复隧道。
-        </div>
-      </div>
-    </el-dialog>
-
   </div>
   <el-dialog :model-value="!!bindingDevice" title="绑定同一台手机" width="min(480px, 92vw)" @close="bindingDevice = null">
     <p>请确认两条记录属于同一台手机。绑定只合并展示，App 与 USB／WDA 状态独立判断。</p>
@@ -971,141 +738,6 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-/* 远程接入点条带 */
-.agent-strip {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 12px;
-  padding: 10px 20px;
-  background: var(--ad-surface);
-  border-radius: 8px;
-
-  flex-wrap: wrap;
-}
-
-.agent-strip-title {
-  border: 0; background: transparent; text-align: left; font-family: inherit;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ad-text);
-  flex-shrink: 0;
-}
-
-.agent-strip-list {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.agent-chip {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  background: var(--ad-success-soft);
-  border: 1px solid var(--ad-border);
-  font-size: 12px;
-}
-
-.agent-chip.offline {
-  background: var(--ad-sidebar);
-  border-color: var(--ad-border);
-}
-
-.agent-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--ad-muted);
-  flex-shrink: 0;
-}
-
-.agent-dot.online {
-  background: var(--ad-success);
-}
-
-.agent-name {
-  font-weight: 600;
-  color: var(--ad-text);
-}
-
-.agent-meta {
-  color: var(--ad-muted);
-}
-
-.agent-link {
-  color: var(--ad-primary);
-  font-family: 'Courier New', monospace;
-  font-size: 12px;
-  cursor: default;
-}
-
-.agent-probe {
-  margin-left: 2px;
-  padding: 0;
-}
-
-.agent-delete {
-  margin-left: 2px;
-  padding: 0;
-}
-
-/* 接入指引对话框 */
-.agent-guide-intro {
-  margin: 0 0 12px;
-  font-size: 13px;
-  color: var(--ad-muted);
-  line-height: 1.6;
-}
-
-.agent-guide-steps {
-  margin: 0;
-  padding-left: 20px;
-  font-size: 13px;
-  color: var(--ad-text);
-  line-height: 2;
-}
-
-.agent-guide-steps a {
-  color: var(--ad-primary);
-  text-decoration: none;
-}
-
-.agent-command {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 6px 0;
-  padding: 8px 12px;
-  background: var(--ad-bg);
-  border-radius: 6px;
-}
-
-.agent-command code {
-  flex: 1;
-  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
-  font-size: 12px;
-  color: var(--ad-primary);
-  word-break: break-all;
-  line-height: 1.5;
-}
-
-.agent-guide-tips {
-  margin-top: 12px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  background: var(--ad-warning-soft);
-  color: var(--ad-warning);
-  font-size: 12px;
-  line-height: 1.6;
 }
 
 .page-title {

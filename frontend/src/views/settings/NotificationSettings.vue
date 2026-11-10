@@ -15,7 +15,7 @@ const testingAi = ref(false)
 const activeTab = ref('notification')
 const savedSnapshot = ref('')
 const dirty = computed(() => savedSnapshot.value && JSON.stringify(form.value) !== savedSnapshot.value)
-const activeFeatureGroups = ref(['core'])
+const activeFeatureGroups = ref([])
 const activeStorageGroups = ref([])
 const assetStatus = ref(null)
 
@@ -28,13 +28,6 @@ const form = ref({
   ai_api_base: '',
   ai_model: '',
   api_testing_ai_enabled: false,
-  model_inspection: false,
-  inspection_identity_v2: false,
-  inspection_similarity_convergence: false,
-  inspection_exploration_family_convergence: false,
-  inspection_coverage_scheduler_v2: false,
-  inspection_business_coverage_v2: false,
-  inspection_visual_home_actions: false,
   content_addressed_assets: false,
   tiered_asset_retention: false,
 })
@@ -80,19 +73,6 @@ const loadSettings = async () => {
       if (s.key === 'ai_model') form.value.ai_model = s.value
       if (s.key === 'api_testing_ai_enabled') form.value.api_testing_ai_enabled = s.value === 'true'
     }
-    form.value.model_inspection = flagRes.data?.model_inspection === true
-    form.value.inspection_identity_v2 = flagRes.data?.inspection_identity_v2 === true
-    form.value.inspection_similarity_convergence = flagRes.data?.inspection_similarity_convergence === true
-    form.value.inspection_exploration_family_convergence = flagRes.data?.inspection_exploration_family_convergence === true
-    form.value.inspection_coverage_scheduler_v2 = flagRes.data?.inspection_coverage_scheduler_v2 === true
-    form.value.inspection_business_coverage_v2 = flagRes.data?.inspection_business_coverage_v2 === true
-    form.value.inspection_visual_home_actions = flagRes.data?.inspection_visual_home_actions === true
-    if (!form.value.inspection_identity_v2) {
-      form.value.inspection_similarity_convergence = false
-      form.value.inspection_exploration_family_convergence = false
-      form.value.inspection_coverage_scheduler_v2 = false
-      form.value.inspection_visual_home_actions = false
-    }
     form.value.content_addressed_assets = flagRes.data?.content_addressed_assets === true
     form.value.tiered_asset_retention = flagRes.data?.tiered_asset_retention === true
     if (!form.value.content_addressed_assets) form.value.tiered_asset_retention = false
@@ -125,17 +105,6 @@ const handleSave = async () => {
       { key: 'ai_api_base', value: form.value.ai_api_base, description: 'AI 模型 API 地址' },
       { key: 'ai_model', value: form.value.ai_model, description: 'AI 模型名称' },
       { key: 'api_testing_ai_enabled', value: form.value.api_testing_ai_enabled ? 'true' : 'false', description: '接口自动化 AI 校验建议和失败解释（可选）' },
-      {
-        key: 'model_inspection',
-        value: form.value.model_inspection ? 'true' : 'false',
-        description: 'Android 模型化智能巡检试验功能',
-      },
-      { key: 'inspection_identity_v2', value: form.value.inspection_identity_v2 ? 'true' : 'false', description: '巡检 Template/State/Observation 身份模型' },
-      { key: 'inspection_similarity_convergence', value: form.value.inspection_similarity_convergence ? 'true' : 'false', description: '巡检高置信相似状态收敛' },
-      { key: 'inspection_exploration_family_convergence', value: form.value.inspection_exploration_family_convergence ? 'true' : 'false', description: '巡检同构页面族增量覆盖' },
-      { key: 'inspection_coverage_scheduler_v2', value: form.value.inspection_coverage_scheduler_v2 ? 'true' : 'false', description: '巡检覆盖导向优先级调度器' },
-      { key: 'inspection_business_coverage_v2', value: form.value.inspection_business_coverage_v2 ? 'true' : 'false', description: '版本化核心旅程覆盖评估' },
-      { key: 'inspection_visual_home_actions', value: form.value.inspection_visual_home_actions ? 'true' : 'false', description: 'HOME 无语义图片入口探测' },
       { key: 'content_addressed_assets', value: form.value.content_addressed_assets ? 'true' : 'false', description: '内容寻址报告资产双写' },
       { key: 'tiered_asset_retention', value: form.value.tiered_asset_retention ? 'true' : 'false', description: '报告资产分层保留和清理' },
     ])
@@ -151,25 +120,6 @@ const handleSave = async () => {
     saving.value = false
   }
 }
-
-watch(() => form.value.inspection_identity_v2, enabled => {
-  if (enabled) return
-  form.value.inspection_similarity_convergence = false
-  form.value.inspection_exploration_family_convergence = false
-  form.value.inspection_coverage_scheduler_v2 = false
-  form.value.inspection_visual_home_actions = false
-})
-
-watch(() => form.value.model_inspection, enabled => {
-  if (enabled) return
-  form.value.inspection_identity_v2 = false
-  form.value.inspection_business_coverage_v2 = false
-})
-
-watch(() => form.value.inspection_coverage_scheduler_v2, enabled => {
-  if (enabled) return
-  form.value.inspection_visual_home_actions = false
-})
 
 watch(() => form.value.content_addressed_assets, enabled => {
   if (enabled) return
@@ -472,107 +422,7 @@ onMounted(loadSettings)
 
       <el-tab-pane label="试验功能" name="features">
         <el-card shadow="never" class="feature-card">
-          <template #header>
-            <div class="card-header">
-              <span>智能巡检试验功能</span>
-              <el-tag type="warning" size="small" effect="plain">试验功能</el-tag>
-            </div>
-          </template>
           <el-collapse v-model="activeFeatureGroups" class="feature-groups">
-            <el-collapse-item name="core">
-              <template #title>
-                <div class="feature-group-title">
-                  <strong>巡检核心</strong>
-                  <span>功能入口与页面身份识别</span>
-                </div>
-              </template>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">启用智能巡检</div>
-                  <div class="feature-desc">显示专项测试、巡检报告、兼容回放和定时巡检入口。</div>
-                </div>
-                <el-switch v-model="form.model_inspection" />
-              </div>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">页面身份识别</div>
-                  <div class="feature-desc">区分页面实例、采集记录与同构页面族。</div>
-                </div>
-                <div class="feature-control">
-                  <el-switch v-model="form.inspection_identity_v2" :disabled="!form.model_inspection" />
-                  <span v-if="!form.model_inspection" class="dependency-reason">需先启用智能巡检</span>
-                </div>
-              </div>
-            </el-collapse-item>
-
-            <el-collapse-item name="coverage">
-              <template #title>
-                <div class="feature-group-title">
-                  <strong>覆盖效率</strong>
-                  <span>优先探索新页面并减少重复操作</span>
-                </div>
-              </template>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">核心旅程覆盖</div>
-                  <div class="feature-desc">冻结版本化业务清单并生成影子评估；开启覆盖优先调度后同时定向补齐缺失旅程。</div>
-                </div>
-                <div class="feature-control">
-                  <el-switch v-model="form.inspection_business_coverage_v2" :disabled="!form.model_inspection" />
-                  <span v-if="!form.model_inspection" class="dependency-reason">需先启用智能巡检</span>
-                </div>
-              </div>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">同类页面复用</div>
-                  <div class="feature-desc">保留每个业务页面，仅跳过同类页面已覆盖的重复动作。</div>
-                </div>
-                <div class="feature-control">
-                  <el-switch v-model="form.inspection_exploration_family_convergence" :disabled="!form.inspection_identity_v2" />
-                  <span v-if="!form.inspection_identity_v2" class="dependency-reason">需先启用页面身份识别</span>
-                </div>
-              </div>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">覆盖优先调度</div>
-                  <div class="feature-desc">优先展开新页面族和关键业务路径。</div>
-                </div>
-                <div class="feature-control">
-                  <el-switch v-model="form.inspection_coverage_scheduler_v2" :disabled="!form.inspection_identity_v2" />
-                  <span v-if="!form.inspection_identity_v2" class="dependency-reason">需先启用页面身份识别</span>
-                </div>
-              </div>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">首页图片入口</div>
-                  <div class="feature-desc">识别没有文字说明但可以跳转的首页图片。</div>
-                </div>
-                <div class="feature-control">
-                  <el-switch v-model="form.inspection_visual_home_actions" :disabled="!form.inspection_coverage_scheduler_v2" />
-                  <span v-if="!form.inspection_coverage_scheduler_v2" class="dependency-reason">需先启用覆盖优先调度</span>
-                </div>
-              </div>
-            </el-collapse-item>
-
-            <el-collapse-item name="advanced">
-              <template #title>
-                <div class="feature-group-title">
-                  <strong>高级试验</strong>
-                  <span>需要观察误判情况后再逐步开启</span>
-                </div>
-              </template>
-              <div class="feature-setting-row">
-                <div>
-                  <div class="feature-name">相似页面收敛</div>
-                  <div class="feature-desc">仅在高置信度下复用相似页面的探索结果。</div>
-                </div>
-                <div class="feature-control">
-                  <el-switch v-model="form.inspection_similarity_convergence" :disabled="!form.inspection_identity_v2" />
-                  <span v-if="!form.inspection_identity_v2" class="dependency-reason">需先启用页面身份识别</span>
-                </div>
-              </div>
-            </el-collapse-item>
-
             <el-collapse-item name="assets">
               <template #title>
                 <div class="feature-group-title">
@@ -583,7 +433,7 @@ onMounted(loadSettings)
               <div class="feature-setting-row">
                 <div>
                   <div class="feature-name">报告资产去重</div>
-                  <div class="feature-desc">相同内容只保存一份，由巡检和兼容任务共同引用。</div>
+                  <div class="feature-desc">相同内容只保存一份，由多个任务共同引用。</div>
                 </div>
                 <el-switch v-model="form.content_addressed_assets" />
               </div>
@@ -625,7 +475,7 @@ onMounted(loadSettings)
             </div>
             <el-alert
               v-if="assetStatus && assetStatus.can_start === false"
-              title="磁盘水位达到临界值，新的巡检和兼容性任务已暂停"
+              title="磁盘水位达到临界值，新的兼容性任务已暂停"
               type="error"
               :closable="false"
               show-icon

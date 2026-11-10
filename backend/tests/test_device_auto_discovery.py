@@ -62,11 +62,6 @@ class DeviceAutoDiscoveryTests(unittest.TestCase):
             patch.object(devices_api, "_get_device_props_batch", fake_props),
             patch.object(devices_api, "refresh_app_presence", noop),
             patch.object(devices_api, "_sweep_client_presence", noop),
-            patch.object(
-                devices_api,
-                "_remote_usb_fields",
-                lambda serial: {"connection_type": None, "agent_name": None, "source_serial": None},
-            ),
         ]
         for p in self._patches:
             p.start()

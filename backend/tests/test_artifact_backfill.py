@@ -13,10 +13,6 @@ from backend.models import (
     CompatibilityCell,
     CompatibilityPageResult,
     CompatibilityRun,
-    InspectionBranchRun,
-    InspectionObservation,
-    InspectionRun,
-    InspectionState,
     StoredAsset,
 )
 from scripts.maintenance import backfill_artifacts
@@ -74,40 +70,8 @@ class ArtifactBackfillTests(unittest.TestCase):
         }
 
     def test_backfill_is_idempotent_and_skips_pass_diff(self):
-        inspection_files = self._write_report_assets("inspection/1/guest/1")
         compatibility_files = self._write_report_assets("compatibility/1/1/candidate/home")
         with Session(self.engine) as session:
-            inspection_run = InspectionRun(
-                id=1,
-                name="legacy inspection",
-                package_name="com.demo",
-                device_serial="d1",
-                status="PASS",
-            )
-            session.add(inspection_run)
-            session.add(
-                InspectionBranchRun(
-                    id=1,
-                    run_id=1,
-                    branch_key="guest",
-                    branch_name="Guest",
-                    status="PASS",
-                )
-            )
-            session.add(
-                InspectionState(
-                    id=1,
-                    run_id=1,
-                    branch_run_id=1,
-                    branch_key="guest",
-                    cluster_key="home",
-                    state_key="home-v1",
-                    stable_status="STABLE",
-                    screenshot_path=inspection_files["screenshot"],
-                    xml_path=inspection_files["xml"],
-                    thumbnail_path=inspection_files["thumbnail"],
-                )
-            )
             run = CompatibilityRun(
                 id=1,
                 name="legacy compatibility",
@@ -140,16 +104,13 @@ class ArtifactBackfillTests(unittest.TestCase):
             )
             session.commit()
 
-        first = backfill_artifacts.backfill(include_faults=False)
+        first = backfill_artifacts.backfill()
         self.assertEqual(first["failed"], 0)
         with Session(self.engine) as session:
             first_asset_count = session.exec(select(func.count(StoredAsset.id))).one()
             first_reference_count = session.exec(
                 select(func.count(AssetReference.id))
             ).one()
-            observation = session.exec(select(InspectionObservation)).one()
-            self.assertEqual(observation.capture_kind, "LEGACY")
-            self.assertTrue(observation.is_representative)
             result = session.get(CompatibilityPageResult, 1)
             self.assertTrue(result.baseline_screenshot_asset_id)
             self.assertTrue(result.candidate_screenshot_asset_id)
@@ -179,7 +140,7 @@ class ArtifactBackfillTests(unittest.TestCase):
             run = session.get(CompatibilityRun, 1)
             self.assertTrue(run.page_set_snapshot[0]["baseline_screenshot_asset_id"])
 
-        second = backfill_artifacts.backfill(include_faults=False)
+        second = backfill_artifacts.backfill()
         self.assertEqual(second["failed"], 0)
         with Session(self.engine) as session:
             self.assertEqual(
@@ -190,20 +151,11 @@ class ArtifactBackfillTests(unittest.TestCase):
                 session.exec(select(func.count(AssetReference.id))).one(),
                 first_reference_count,
             )
-            self.assertEqual(
-                session.exec(select(func.count(InspectionObservation.id))).one(),
-                1,
-            )
-
-        inspection_screenshot = self.root / "reports" / inspection_files["screenshot"]
-        inspection_xml = self.root / "reports" / inspection_files["xml"]
         compatibility_screenshot = (
             self.root / "reports" / compatibility_files["screenshot"]
         )
         compatibility_xml = self.root / "reports" / compatibility_files["xml"]
         for path in {
-            inspection_screenshot,
-            inspection_xml,
             compatibility_screenshot,
             compatibility_xml,
         }:
@@ -211,10 +163,7 @@ class ArtifactBackfillTests(unittest.TestCase):
 
         restored = backfill_artifacts.materialize_legacy_paths()
         self.assertEqual(restored["failed"], 0)
-        self.assertGreaterEqual(restored["written"], 4)
-        with Image.open(inspection_screenshot) as image:
-            self.assertEqual(image.convert("RGB").size, (10, 12))
-        self.assertEqual(inspection_xml.read_text(encoding="utf-8"), "<hierarchy/>")
+        self.assertGreaterEqual(restored["written"], 2)
         with Image.open(compatibility_screenshot) as image:
             self.assertEqual(image.convert("RGB").size, (10, 12))
         self.assertEqual(

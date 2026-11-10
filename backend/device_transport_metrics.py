@@ -1,4 +1,4 @@
-"""In-memory device transport metrics for wireless ADB and Agent tunnel diagnostics."""
+"""In-memory device transport metrics for local device and wireless ADB streaming/recording diagnostics."""
 from __future__ import annotations
 
 import threading

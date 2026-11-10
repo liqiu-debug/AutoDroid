@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from PIL import Image
-from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
@@ -33,11 +32,6 @@ from backend.models import (
     CompatibilityCell,
     CompatibilityPageResult,
     CompatibilityRun,
-    InspectionFault,
-    InspectionObservation,
-    InspectionRun,
-    InspectionState,
-    InspectionTransition,
     StoredAsset,
 )
 from backend.paths import project_path
@@ -685,20 +679,6 @@ def _inferred_owner(path: Path) -> Optional[Tuple[str, int, str]]:
     except ValueError:
         return None
     parts = relative.parts
-    if len(parts) >= 5 and parts[0] == "inspection":
-        try:
-            state_id = int(parts[3])
-        except (TypeError, ValueError):
-            return None
-        role_by_name = {
-            "screenshot.png": "screenshot",
-            "hierarchy.xml": "xml",
-            "thumbnail.jpg": "thumbnail",
-            "actions.json": "action_map",
-        }
-        role = role_by_name.get(parts[-1])
-        if role:
-            return "inspection_state", state_id, role
     if len(parts) >= 6 and parts[0] == "compatibility":
         try:
             cell_id = int(parts[2])
@@ -763,11 +743,6 @@ def mirror_final_json(path: Path, payload: Dict[str, Any]) -> Optional[str]:
 
 
 _OWNER_MODELS = {
-    "inspection_run": InspectionRun,
-    "inspection_state": InspectionState,
-    "inspection_regression": InspectionState,
-    "inspection_observation": InspectionObservation,
-    "inspection_fault": InspectionFault,
     "compatibility_run": CompatibilityRun,
     "compatibility_cell": CompatibilityCell,
     "compatibility_page_result": CompatibilityPageResult,
@@ -948,50 +923,6 @@ def cleanup_verified_legacy_files(
         Tuple[Optional[Path], Tuple[Tuple[str, int], ...], str, Optional[str]]
     ] = []
 
-    for state in session.exec(select(InspectionState)).all():
-        representative = (
-            session.get(InspectionObservation, state.representative_observation_id)
-            if state.representative_observation_id is not None
-            else None
-        )
-        owners = (("inspection_state", int(state.id)),)
-        if representative is not None:
-            owners = (("inspection_observation", int(representative.id)),) + owners
-        candidates.append(
-            (
-                _legacy_report_file(state.screenshot_path, prefix="inspection"),
-                owners,
-                "screenshot",
-                representative.screenshot_asset_id if representative else None,
-            )
-        )
-        candidates.extend(
-            [
-                (
-                    _legacy_report_file(state.xml_path, prefix="inspection"),
-                    owners,
-                    "xml",
-                    representative.xml_asset_id if representative else None,
-                ),
-                (
-                    _legacy_report_file(state.thumbnail_path, prefix="inspection"),
-                    owners,
-                    "thumbnail",
-                    representative.thumbnail_asset_id if representative else None,
-                ),
-            ]
-        )
-        if state.screenshot_path:
-            action_path = str(Path(state.screenshot_path).with_name("actions.json"))
-            candidates.append(
-                (
-                    _legacy_report_file(action_path, prefix="inspection"),
-                    owners,
-                    "action_map",
-                    representative.action_map_asset_id if representative else None,
-                )
-            )
-
     for row in session.exec(select(CompatibilityPageResult)).all():
         owner = (("compatibility_page_result", int(row.id)),)
         for role, path_value, asset_id in (
@@ -1007,24 +938,6 @@ def cleanup_verified_legacy_files(
                     owner,
                     role,
                     asset_id,
-                )
-            )
-
-    for fault in session.exec(select(InspectionFault)).all():
-        owner = (("inspection_fault", int(fault.id)),)
-        for role, path_value in (
-            ("full_log", fault.full_log_path),
-            ("screenshot", fault.screenshot_path),
-            ("xml", fault.xml_path),
-            ("replay", fault.replay_path),
-            ("trace", fault.trace_path),
-        ):
-            candidates.append(
-                (
-                    _legacy_report_file(path_value, prefix="inspection"),
-                    owner,
-                    role,
-                    None,
                 )
             )
 
@@ -1061,221 +974,6 @@ def cleanup_verified_legacy_files(
             logger.exception("failed to remove verified legacy asset: %s", target)
             summary["failed"] += 1
     return summary
-
-
-def materialize_warm_derivatives(
-    session: Session,
-    *,
-    now: Optional[datetime] = None,
-    scale: float = 0.75,
-) -> Dict[str, int]:
-    """Downsample ordinary 7-day-old inspection captures into the WARM tier."""
-    current = now or datetime.now()
-    cutoff = current - timedelta(days=HOT_RETENTION_DAYS)
-    candidates = session.exec(
-        select(InspectionObservation).where(
-            InspectionObservation.retention_class == RETENTION_HOT,
-            InspectionObservation.captured_at <= cutoff,
-        )
-    ).all()
-    state_ids = {item.state_id for item in candidates}
-    fault_state_ids = {
-        item.state_id
-        for item in session.exec(
-            select(InspectionFault).where(col(InspectionFault.state_id).in_(state_ids))
-        ).all()
-        if item.state_id is not None
-    } if state_ids else set()
-    cycle_state_ids = set()
-    if state_ids:
-        transitions = session.exec(
-            select(InspectionTransition).where(
-                or_(
-                    col(InspectionTransition.from_state_id).in_(state_ids),
-                    col(InspectionTransition.to_state_id).in_(state_ids),
-                )
-            )
-        ).all()
-        for transition in transitions:
-            topology = str(transition.topology_type or transition.relation_type or "").upper()
-            if transition.from_state_id == transition.to_state_id or topology in {
-                "CYCLE",
-                "CYCLE_BACK",
-                "LOOP",
-                "SELF_LOOP",
-            }:
-                cycle_state_ids.add(transition.from_state_id)
-                if transition.to_state_id is not None:
-                    cycle_state_ids.add(transition.to_state_id)
-
-    pinned_references = session.exec(
-        select(AssetReference).where(
-            AssetReference.retention_class == RETENTION_PINNED,
-            AssetReference.released_at == None,  # noqa: E711
-        )
-    ).all()
-    pinned_assets = {item.asset_id for item in pinned_references}
-    pinned_observations = {
-        item.owner_id
-        for item in pinned_references
-        if item.owner_type == "inspection_observation"
-    }
-    summary = {
-        "eligible": len(candidates),
-        "derived": 0,
-        "full_resolution": 0,
-        "protected": 0,
-        "non_representative": 0,
-        "missing": 0,
-        "failed": 0,
-    }
-    for observation in candidates:
-        state = session.get(InspectionState, observation.state_id)
-        evidence_text = json.dumps(
-            observation.match_evidence or {},
-            ensure_ascii=True,
-            sort_keys=True,
-            default=str,
-        ).lower()
-        protected = bool(
-            observation.id in pinned_observations
-            or observation.screenshot_asset_id in pinned_assets
-            or state is None
-            or state.selected_for_regression
-        )
-        if protected:
-            summary["protected"] += 1
-            continue
-        if not observation.is_representative:
-            summary["non_representative"] += 1
-            continue
-        preserve_full_resolution = bool(
-            state.is_opaque
-            or str(state.stable_status or "").upper() != "STABLE"
-            or observation.state_id in fault_state_ids
-            or observation.state_id in cycle_state_ids
-            or any(token in evidence_text for token in ("anomaly", "fault", "loop", "cycle"))
-        )
-        screenshot = (
-            session.get(StoredAsset, observation.screenshot_asset_id)
-            if observation.screenshot_asset_id
-            else None
-        )
-        if screenshot is None or screenshot.status != ASSET_STATUS_ACTIVE:
-            summary["missing"] += 1
-            continue
-        try:
-            if preserve_full_resolution or float(screenshot.scale or 1.0) <= float(scale):
-                derived = screenshot
-            else:
-                derived = store_warm_image_derivative(
-                    session,
-                    screenshot.id,
-                    scale=scale,
-                    commit=False,
-                )
-            observation.screenshot_asset_id = derived.id
-            observation.original_width = derived.original_width
-            observation.original_height = derived.original_height
-            observation.retention_class = RETENTION_WARM
-            observation.retained_until = observation.captured_at + timedelta(
-                days=EVIDENCE_RETENTION_DAYS
-            )
-            session.add(observation)
-            session.flush()
-            for role, asset_id, retention_class in (
-                ("screenshot", observation.screenshot_asset_id, RETENTION_WARM),
-                ("xml", observation.xml_asset_id, RETENTION_WARM),
-                ("thumbnail", observation.thumbnail_asset_id, RETENTION_COLD),
-                ("action_map", observation.action_map_asset_id, RETENTION_WARM),
-            ):
-                if not asset_id:
-                    continue
-                upsert_reference(
-                    session,
-                    asset_id=asset_id,
-                    owner_type="inspection_observation",
-                    owner_id=int(observation.id),
-                    role=role,
-                    retention_class=retention_class,
-                    expires_at=(
-                        observation.retained_until
-                        if retention_class == RETENTION_WARM
-                        else None
-                    ),
-                    commit=False,
-                )
-            session.commit()
-            summary["derived"] += 1
-            if preserve_full_resolution:
-                summary["full_resolution"] += 1
-        except Exception:
-            session.rollback()
-            logger.exception(
-                "failed to materialize WARM derivative: observation=%s",
-                observation.id,
-            )
-            summary["failed"] += 1
-    return summary
-
-
-def transition_warm_observations_to_cold(
-    session: Session,
-    *,
-    now: Optional[datetime] = None,
-) -> Dict[str, int]:
-    """Release 90-day WARM evidence while retaining thumbnail metadata."""
-    current = now or datetime.now()
-    candidates = session.exec(
-        select(InspectionObservation).where(
-            InspectionObservation.retention_class == RETENTION_WARM,
-            InspectionObservation.retained_until != None,  # noqa: E711
-            InspectionObservation.retained_until <= current,
-        )
-    ).all()
-    transitioned = 0
-    failed = 0
-    for observation in candidates:
-        try:
-            warm_rows = session.exec(
-                select(AssetReference).where(
-                    AssetReference.owner_type == "inspection_observation",
-                    AssetReference.owner_id == observation.id,
-                    col(AssetReference.role).in_(["screenshot", "xml", "action_map"]),
-                    AssetReference.released_at == None,  # noqa: E711
-                )
-            ).all()
-            _release_references(session, warm_rows, now=current)
-            if observation.thumbnail_asset_id:
-                upsert_reference(
-                    session,
-                    asset_id=observation.thumbnail_asset_id,
-                    owner_type="inspection_observation",
-                    owner_id=int(observation.id),
-                    role="thumbnail",
-                    retention_class=RETENTION_COLD,
-                    commit=False,
-                )
-            observation.screenshot_asset_id = None
-            observation.xml_asset_id = None
-            observation.action_map_asset_id = None
-            observation.retention_class = RETENTION_COLD
-            observation.retained_until = None
-            observation.asset_status = (
-                "THUMBNAIL_ONLY" if observation.thumbnail_asset_id else "METADATA_ONLY"
-            )
-            observation.metadata_only = True
-            session.add(observation)
-            session.commit()
-            transitioned += 1
-        except Exception:
-            session.rollback()
-            logger.exception(
-                "failed to transition WARM observation to COLD: observation=%s",
-                observation.id,
-            )
-            failed += 1
-    return {"eligible": len(candidates), "transitioned": transitioned, "failed": failed}
 
 
 def gc_assets(

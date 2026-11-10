@@ -6,30 +6,22 @@ import { Plus, Delete, MoreFilled, Search, Refresh, Edit } from '@element-plus/i
 import api from '@/api'
 import dayjs from 'dayjs'
 import { useRemoteSearch } from '@/composables/useRemoteSearch'
-import { useUserStore } from '@/stores/useUserStore'
 import { scheduledTaskExecution } from '@/utils/scheduledTaskPresentation'
 
 // ---- 数据 ----
 const tasks = ref([])
 const devices = ref([])
 const environments = ref([])
-const inspectionProfiles = ref([])
-const androidPackages = ref([])
 const loading = ref(false)
 const searchQuery = ref('')
 const currentPage = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
-const userStore = useUserStore()
-const canUseInspection = computed(() => Boolean(userStore.featureFlags?.model_inspection))
-// 列表不再展示运行环境信息（用户要求），因此这里不传 environments 查找表；
+// 列表不再展示运行环境信息（用户要求），因此这里不传 lookups 查找表；
 // 编辑表单里的运行环境选择与 env_id 保存逻辑保持不变。
 const taskRows = computed(() => tasks.value.map(task => ({
     ...task,
-    _execution: scheduledTaskExecution(task, {
-        inspectionProfiles: inspectionProfiles.value,
-        packages: androidPackages.value,
-    }),
+    _execution: scheduledTaskExecution(task),
 })))
 
 // 场景选择器：远程搜索，避免场景超量时静默截断
@@ -51,7 +43,7 @@ const editingId = ref(null)
 
 const form = reactive({
     name: '',
-    task_type: 'ui',  // ui | api | fastbot | inspection
+    task_type: 'ui',  // ui | api | fastbot
     api_scenario_id: null,
     scenario_id: null,
     device_serials: [],
@@ -74,10 +66,6 @@ const form = reactive({
     fb_duration_min: 30,
     fb_throttle: 500,
     fb_ignore_crashes: false,
-    // 模型化巡检专属
-    inspection_profile_id: null,
-    inspection_package_id: null,
-    inspection_branches: ['guest', 'authenticated'],
 })
 
 // ---- 方法 ----
@@ -139,46 +127,6 @@ const fetchEnvironments = async () => {
     }
 }
 
-const fetchAllAndroidPackages = async () => {
-    const all = []
-    const pageSize = 100
-    for (let page = 1; page <= 20; page += 1) {
-        const { data } = await api.getPackages({
-            page,
-            page_size: pageSize,
-            platform: 'android',
-        })
-        const items = data.items || []
-        all.push(...items)
-        if (all.length >= Number(data.total ?? all.length) || items.length < pageSize) break
-    }
-    return all
-}
-
-const fetchInspectionProfiles = async () => {
-    if (!canUseInspection.value) return
-    try {
-        const { data } = await api.getInspectionProfiles()
-        inspectionProfiles.value = data || []
-    } catch (err) {
-        console.error('获取巡检配置失败', err)
-    }
-}
-
-const fetchInspectionOptions = async () => {
-    if (!canUseInspection.value) return
-    try {
-        const [profileResponse, packageItems] = await Promise.all([
-            api.getInspectionProfiles(),
-            fetchAllAndroidPackages(),
-        ])
-        inspectionProfiles.value = profileResponse.data || []
-        androidPackages.value = packageItems
-    } catch (err) {
-        console.error('获取巡检定时任务选项失败', err)
-    }
-}
-
 const resetForm = () => {
     form.api_scenario_id = null
     form.name = ''
@@ -198,9 +146,6 @@ const resetForm = () => {
     form.fb_duration_min = 30
     form.fb_throttle = 500
     form.fb_ignore_crashes = false
-    form.inspection_profile_id = null
-    form.inspection_package_id = null
-    form.inspection_branches = ['guest', 'authenticated']
     editingId.value = null
 }
 
@@ -211,7 +156,6 @@ const handleCreate = () => {
 }
 
 const handleTaskTypeChange = value => {
-    if (value === 'inspection') fetchInspectionOptions()
     if (value === 'api') { form.device_serials = []; fetchApiScenarios() }
 }
 
@@ -239,13 +183,6 @@ const handleEdit = (row) => {
         form.fb_duration_min = Math.round((config.fb_duration || 1800) / 60)
         form.fb_throttle = config.fb_throttle || 500
         form.fb_ignore_crashes = config.fb_ignore_crashes || false
-    } else if (config._task_type === 'inspection') {
-        form.task_type = 'inspection'
-        form.scenario_id = null
-        form.inspection_profile_id = config.inspection_profile_id || null
-        form.inspection_package_id = config.inspection_package_id || null
-        form.inspection_branches = config.inspection_branches || ['guest', 'authenticated']
-        fetchInspectionOptions()
     } else {
         form.task_type = 'ui'
     }
@@ -302,11 +239,6 @@ const buildPayload = () => {
         if (form.env_id) {
             payload.strategy_config.env_id = form.env_id
         }
-    } else if (form.task_type === 'inspection') {
-        payload.strategy_config.inspection_profile_id = form.inspection_profile_id
-        payload.strategy_config.inspection_package_id = form.inspection_package_id || null
-        payload.strategy_config.inspection_branches = [...form.inspection_branches]
-        payload.enable_notification = false
     }
 
     return payload
@@ -331,9 +263,6 @@ const handleSubmit = async () => {
     if (form.task_type === 'ui' && (!form.device_serials || form.device_serials.length === 0)) return revealTaskError('UI 任务必须选择执行设备', '执行设备')
     if (form.task_type === 'fastbot' && !form.fb_package_name) return revealTaskError('请输入目标包名', '目标包名')
     if (form.task_type === 'fastbot' && (!form.device_serials || form.device_serials.length === 0)) return revealTaskError('智能探索任务必须选择执行设备', '执行设备')
-    if (form.task_type === 'inspection' && !form.inspection_profile_id) return revealTaskError('请选择巡检配置', '巡检配置')
-    if (form.task_type === 'inspection' && form.inspection_branches.length === 0) return revealTaskError('至少选择一条巡检业务线', '业务线')
-    if (form.task_type === 'inspection' && form.device_serials.length !== 1) return revealTaskError('巡检定时任务必须显式选择 1 台 Android 设备', '执行设备')
     if (form.strategy === 'WEEKLY' && form.weekly_days.length === 0) {
         return revealTaskError('请至少选择一天', '选择星期')
     }
@@ -414,7 +343,6 @@ onMounted(() => {
     fetchTasks()
     fetchDevices()
     fetchEnvironments()
-    fetchInspectionProfiles()
 })
 
 watch(() => taskRoute.fullPath, () => {
@@ -552,7 +480,6 @@ watch(() => taskRoute.fullPath, () => {
                         <el-radio-button value="ui">UI 自动化</el-radio-button>
                         <el-radio-button value="api">接口自动化</el-radio-button>
                         <el-radio-button value="fastbot">智能探索</el-radio-button>
-                        <el-radio-button v-if="canUseInspection" value="inspection">智能巡检</el-radio-button>
                     </el-radio-group>
                 </el-form-item>
 
@@ -604,53 +531,11 @@ watch(() => taskRoute.fullPath, () => {
                     </el-form-item>
                 </template>
 
-                <template v-if="form.task_type === 'inspection'">
-                    <el-form-item label="巡检配置">
-                        <el-select
-                            v-model="form.inspection_profile_id"
-                            filterable
-                            placeholder="选择巡检配置"
-                            style="width: 100%"
-                            @focus="fetchInspectionOptions"
-                        >
-                            <el-option
-                                v-for="profile in inspectionProfiles"
-                                :key="profile.id"
-                                :label="`${profile.name} · ${profile.package_name}`"
-                                :value="profile.id"
-                            />
-                        </el-select>
-                    </el-form-item>
-                    <el-form-item label="业务线">
-                        <el-checkbox-group v-model="form.inspection_branches">
-                            <el-checkbox value="guest">未登录</el-checkbox>
-                            <el-checkbox value="authenticated">已登录</el-checkbox>
-                        </el-checkbox-group>
-                    </el-form-item>
-                    <el-form-item label="安装包">
-                        <el-select
-                            v-model="form.inspection_package_id"
-                            clearable
-                            filterable
-                            placeholder="不安装，使用设备当前版本"
-                            style="width: 100%"
-                        >
-                            <el-option
-                                v-for="pkg in androidPackages"
-                                :key="pkg.id"
-                                :label="`${pkg.app_name || pkg.package_name} ${pkg.version_name || pkg.version_code || ''}`"
-                                :value="pkg.id"
-                            />
-                        </el-select>
-                    </el-form-item>
-                </template>
-
                 <el-form-item v-if="form.task_type !== 'api'" label="执行设备">
                     <el-select
                         v-model="form.device_serials"
                         placeholder="请选择运行设备"
                         multiple
-                        :multiple-limit="form.task_type === 'inspection' ? 1 : 0"
                         collapse-tags
                         clearable
                         style="width: 100%"
@@ -661,7 +546,6 @@ watch(() => taskRoute.fullPath, () => {
                             :key="d.serial"
                             :label="d.custom_name || d.market_name || d.model || d.serial"
                             :value="d.serial"
-                            :disabled="form.task_type === 'inspection' && String(d.platform || 'android').toLowerCase() !== 'android'"
                         />
                     </el-select>
                 </el-form-item>
@@ -753,7 +637,7 @@ watch(() => taskRoute.fullPath, () => {
                     />
                 </el-form-item>
 
-                <el-form-item v-if="form.task_type !== 'inspection'" label="飞书通知">
+                <el-form-item label="飞书通知">
                     <el-switch
                         v-model="form.enable_notification"
                         active-text="执行后发送通知"

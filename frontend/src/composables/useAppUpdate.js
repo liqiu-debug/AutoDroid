@@ -3,7 +3,7 @@ import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import api from '@/api'
 import { useClientApp } from '@/composables/useClientApp'
 import { compareVersions } from '@/utils/semver'
-import { createProgressNotice } from '@/utils/progressNotice'
+import { createProgressNotice, formatDownloadProgress } from '@/utils/progressNotice'
 import {
   applyUpdate,
   buildUpdateDialogHtml,
@@ -150,9 +150,9 @@ export function useAppUpdate() {
         onPhase: (evt) => {
           if (evt.phase === 'downloading' || evt.phase === 'fallback') {
             const text = evt.phase === 'downloading'
-              ? `正在下载 ${info.remoteVersion}：${evt.percent}%`
+              ? `正在下载 ${info.remoteVersion}：${formatDownloadProgress(evt)}`
               : `主下载源不可用（${evt.message || '连接失败'}），正在改用备用源…`
-            if (evt.phase === 'downloading') downloadPercent.value = evt.percent
+            if (evt.phase === 'downloading' && typeof evt.percent === 'number') downloadPercent.value = evt.percent
             if (!progressNotice) {
               progressNotice = createProgressNotice({
                 notify: ElNotification,

@@ -19,29 +19,6 @@ test('UI task includes an environment only when one is configured', () => {
   ).detail, '环境：预发布')
 })
 
-test('inspection task uses names and never leaks internal ids', () => {
-  const result = scheduledTaskExecution({
-    strategy_config: {
-      _task_type: 'inspection',
-      inspection_profile_id: 19,
-      inspection_package_id: 31,
-      inspection_branches: ['guest', 'authenticated'],
-    },
-  }, {
-    inspectionProfiles: [{ id: 19, name: '商城巡检' }],
-    packages: [{ id: 31, app_name: '智家', version_name: '8.2.0' }],
-  })
-
-  assert.deepEqual(result, {
-    type: 'inspection',
-    typeLabel: '智能巡检',
-    tagType: 'success',
-    title: '商城巡检',
-    detail: '未登录、已登录 · 智家 8.2.0',
-  })
-  assert.doesNotMatch(`${result.title} ${result.detail}`, /19|31/)
-})
-
 test('fastbot task has one concise execution summary', () => {
   assert.deepEqual(scheduledTaskExecution({
     strategy_config: {

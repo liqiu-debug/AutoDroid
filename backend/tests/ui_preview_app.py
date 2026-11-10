@@ -48,14 +48,11 @@ TASKS = [dict(id=i,name=f'夜间回归 · {i}',task_type='ui',scenario_id=i,scen
 FASTBOT = [dict(id=i,name=f'商城稳定性 · {i}',package_name='com.demo.shop',device_serial=DEVICES[0]['serial'],device_info='Pixel 9',status='COMPLETED',duration=30,minutes=30,started_at=NOW,finished_at=NOW,created_at=NOW,crash_count=0,anr_count=0,session_type='startup' if i==2 else 'fastbot',executor_name='林序') for i in range(1,7)]
 PAGESETS = [dict(id=1,name='商城核心页面',package_name='com.demo.shop',platform='android',created_at=NOW,pages=[dict(id=1,name='首页',case_id=1),dict(id=2,name='购物车',case_id=2)])]
 COMPAT = [dict(id=i,name=f'核心页面兼容性 · {i}',status='COMPLETED',created_at=NOW,started_at=NOW,finished_at=NOW,execution_mode='install',compare_mode='device',device_count=2,total_cells=2,completed_cells=2,passed_cells=2,failed_cells=0,page_set=PAGESETS[0],page_set_name='商城核心页面',package_name='com.demo.shop',cells=[]) for i in range(1,7)]
-PROFILES = [dict(id=1,name='商城巡检',package_name='com.demo.shop',platform='android',goal='探索首页与下单流程',max_steps=80,max_minutes=30,branches={'guest':{'name':'未登录','prepare_case_id':1,'entry_case_id':2,'env_id':1,'ready_assertion':{'by':'text','selector':'首页','timeout':5},'scope':'full'}},budgets={'duration_seconds':1800},monitor_options={},allowed_packages=['com.demo.shop'],created_at=NOW)]
-INSPECTIONS = [dict(id=i,name=f'商城智能巡检 · {i}',profile_id=1,profile_name='商城巡检',package_name='com.demo.shop',device_serial=DEVICES[0]['serial'],platform='android',status='COMPLETED',started_at=NOW,finished_at=NOW,created_at=NOW,steps=36,total_steps=36,stable_count=7,state_count=9,transition_count=16,stop_reason='coverage_complete',terminal_outcome='completed',replay_evidence_available=False,coverage_assessment={}) for i in range(1,5)]
 REPORT_FIXTURES = make_report_fixtures(NOW, DEVICES)
 FASTBOT = REPORT_FIXTURES['fastbot']
 COMPAT = REPORT_FIXTURES['compat']
-INSPECTIONS = REPORT_FIXTURES['inspections']
 SETTINGS = [{'key':key,'value':value} for key,value in dict(system_base_url='http://127.0.0.1:8767',api_testing_ai_enabled='true',ai_model='隔离模拟模型',ai_api_base='https://preview.invalid/v1',ai_api_key='preview-never-sent').items()]
-FLAGS = dict(model_inspection=True,inspection_identity_v2=True,inspection_similarity_convergence=True,inspection_exploration_family_convergence=True,inspection_business_coverage_v2=False,content_addressed_assets=True,tiered_asset_retention=False)
+FLAGS = dict(content_addressed_assets=True,tiered_asset_retention=False)
 
 
 def literal(value=None):
@@ -114,7 +111,6 @@ async def fixture(path: str, request: Request):
     if path=='environments': return ENVS
     if path.startswith('environments/') and path.endswith('/variables'): return [dict(id=1,key='base_url',value='https://api.demo.test',description='隔离环境地址'),dict(id=2,key='account',value='preview',description='演示账号')]
     if path in {'devices','fastbot/devices'}: return DEVICES
-    if path=='device-agents': return []
     if path=='device/dump': return DUMP
     if path.endswith('/screenshot'): return dict(screenshot=SCREEN,screenshot_format='svg+xml')
     if path=='stream/devices': return []
@@ -151,14 +147,6 @@ async def fixture(path: str, request: Request):
     if path=='compatibility/page-sets': return PAGESETS
     if path=='compatibility/runs': return page(COMPAT,request)
     if path.startswith('compatibility/runs/'): return COMPAT[(int(path.split('/')[2])-1)%6]
-    if path=='inspections/profiles': return PROFILES
-    if path=='inspections/runs': return page(INSPECTIONS,request)
-    if path.startswith('inspections/runs/'):
-        tail=path.split('/')[-1]
-        if tail=='graph': return dict(schema_version=6,hierarchy_version=1,nodes=[],links=[],tree={},stats=dict(stable_count=7,state_count=9,transition_count=16),summary={})
-        if tail=='families': return []
-        if tail=='live': return dict(status='COMPLETED',events=[])
-        return INSPECTIONS[(int(path.split('/')[2])-1)%4]
     if path=='api-testing/folders': return [dict(id=i,name=n,kind=kind,parent_id=None) for i,n in enumerate(['基础服务','交易流程','用户中心'],1) for kind in ['interface','scenario']]
     if path=='api-testing/notification-status': return dict(configured=False)
     if path=='api-testing/ai/status': return dict(enabled=True,configured=True,available=True)

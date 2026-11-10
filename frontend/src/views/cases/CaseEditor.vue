@@ -1,12 +1,11 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { Upload, VideoPlay, Back, CircleClose, Download } from '@element-plus/icons-vue'
+import { Upload, VideoPlay, Back, CircleClose } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
 import DeviceStage from '@/components/DeviceStage.vue'
 import StepBuilder from '@/components/StepBuilder.vue'
 import LogConsole from '@/components/LogConsole.vue'
 import GeneralStepsPanel from '@/components/GeneralStepsPanel.vue'
-import ExportAutoJsDialog from '@/components/ExportAutoJsDialog.vue'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -34,21 +33,6 @@ const terminatingRun = ref(false)
 const ACTIVE_RUN_POLL_INTERVAL_MS = 3000
 const envId = ref(null)
 const environments = ref([])
-
-// AutoDroid 脚本导出
-const exportDialogVisible = ref(false)
-const exportTarget = ref(null)
-const openExportDialog = async () => {
-  if (!currentCase.value.id || hasUnsavedChanges.value) {
-    if (!await caseStore.saveCase()) return
-  }
-  if (!currentCase.value.steps.length) {
-    ElMessage.warning('用例没有步骤，无法导出')
-    return
-  }
-  exportTarget.value = { type: 'case', caseId: currentCase.value.id, name: currentCase.value.name }
-  exportDialogVisible.value = true
-}
 
 // 获取 DeviceStage 的 OCR 框选模式状态
 const ocrCropMode = computed(() => {
@@ -400,7 +384,6 @@ onUnmounted(() => {
           <el-option v-for="d in recordingDevices" :key="d.serial" :label="d.custom_name || d.market_name || d.model || d.serial" :value="d.serial" :disabled="!deviceStageRef?.canObserveDevice(d)" />
         </el-select>
         <el-button :icon="Upload" @click="caseStore.saveCase" :loading="saving" :disabled="runBusy && !saving">保存</el-button>
-        <el-button :icon="Download" @click="openExportDialog" :disabled="runBusy">导出脚本</el-button>
         <el-dropdown split-button :type="isRunning ? 'danger' : 'primary'" @click="handleRun" @command="handleRunCommand" :disabled="runBusy || terminatingRun" :icon="isRunning ? CircleClose : VideoPlay">
           {{ runLabel }}
           <template #dropdown><el-dropdown-menu><el-dropdown-item command="multi" :disabled="isRunning">选择多设备运行</el-dropdown-item></el-dropdown-menu></template>
@@ -421,9 +404,6 @@ onUnmounted(() => {
       </section>
     </div>
     <LogConsole ref="logConsoleRef" :case-id="currentCase.id" @run-start="handleRunStart" @run-complete="handleRunComplete" @run-error="handleRunError" />
-
-    <!-- AutoDroid 脚本导出弹窗 -->
-    <ExportAutoJsDialog v-model="exportDialogVisible" :target="exportTarget" :env-id="envId" />
 
     <!-- 多设备运行弹窗 -->
     <el-dialog

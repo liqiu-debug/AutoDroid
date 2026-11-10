@@ -14,6 +14,7 @@ import {
   isUpdateSkipped,
   mapDesktopPlatform,
   normalizeUpdateNotes,
+  packageSizeHint,
   pickDesktopPackage,
   readSkippedUpdateVersion,
   rememberSkippedUpdateVersion,
@@ -218,12 +219,40 @@ test('runUpdateInstall streams downloading percents and resolves with a single d
     url: `${ORIGIN}/api/packages/7/download?token=tok-1`,
     fileName: 'AutoDroid-1.2.3.exe',
     version: '1.2.3',
+    // file_size 52.4 MB → 近似字节数，只给壳估算进度（不是 expectedSize 硬校验）
+    sizeHint: 54945382,
   })
   assert.deepEqual(phases.map(evt => evt.phase), ['downloading', 'downloading', 'done'])
   assert.equal(phases[0].percent, 43, 'percent is rounded')
   assert.equal(phases[1].percent, 100, 'percent is clamped to 100')
   assert.equal(phases[2].path, 'C:/updates/AutoDroid-1.2.3.exe')
   assert.equal(bridge.state.unsubscribed, true, 'progress subscription is released')
+})
+
+test('runUpdateInstall keeps an unknown percent as null instead of reporting 0%', async () => {
+  const bridge = fakeBridge({
+    events: [
+      { phase: 'downloading', percent: null, received: 4096, total: 0 },
+      { phase: 'downloading', received: 8192 },
+      { phase: 'downloading', percent: 61.4, received: 9000, total: 14000 },
+      { phase: 'done', path: '/updates/AutoDroid-1.2.3.dmg' },
+    ],
+  })
+  const phases = []
+  await runUpdateInstall({ pkg: desktopPackage(), token: 'tok-1', origin: ORIGIN, bridge, onPhase: evt => phases.push(evt) })
+  const downloading = phases.filter(evt => evt.phase === 'downloading')
+  assert.deepEqual(downloading, [
+    { phase: 'downloading', percent: null, received: 4096, total: 0 },
+    { phase: 'downloading', percent: null, received: 8192, total: 0 },
+    { phase: 'downloading', percent: 61, received: 9000, total: 14000 },
+  ])
+})
+
+test('packageSizeHint converts the MB size into an approximate byte count', () => {
+  assert.equal(packageSizeHint({ file_size: 52.4 }), 54945382)
+  assert.equal(packageSizeHint({ file_size: 0 }), 0)
+  assert.equal(packageSizeHint({ file_size: 'n/a' }), 0)
+  assert.equal(packageSizeHint(null), 0)
 })
 
 test('runUpdateInstall collapses the error event and rejection into one error phase', async () => {
@@ -350,6 +379,7 @@ test('runUpdateInstall prefers the package mirror and falls back to the release 
     url: `${ORIGIN}/api/packages/7/download?token=tok-1`,
     fileName: 'AutoDroid-1.2.3.dmg',
     version: '1.2.3',
+    sizeHint: 54945382,
   })
   assert.deepEqual(bridge.state.installCalls[1], {
     url: releaseInfo().url,

@@ -189,9 +189,3 @@ WDA 地址解析优先级：
 1. 先灰度开启 `ios_execution`，观察失败率。
 2. 监控 `WDA_DOWN` 比例与平均恢复时间。
 3. 回滚时可仅关闭 `ios_execution`，Android 不受影响。
-
-## 8. 与智能巡检的边界
-
-模型化智能巡检和基于巡检路径的兼容性回放目前只支持 Android，不会占用 iOS WDA 或 MJPEG relay。iOS 继续通过标准用例/场景执行、静态层级录制和报告链路完成自动化；不要为 iOS 设备开启或伪造巡检 Profile。
-
-跨端标准动作见 [执行规范](EXECUTION_SPEC.md)，巡检与回放的 Android 专项边界见 [巡检、回放与证据资产指南](INSPECTION_REPLAY_ASSETS.md)。

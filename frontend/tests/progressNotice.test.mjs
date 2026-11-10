@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { h, ref } from 'vue'
 
-import { createProgressNotice } from '../src/utils/progressNotice.js'
+import { createProgressNotice, formatDownloadProgress } from '../src/utils/progressNotice.js'
 
 // 真实 ElNotification：每次调用新开一个通知，同 id 不替换；句柄只有 close()。
 const fakeNotify = () => {
@@ -37,4 +37,14 @@ test('a notice the user dismissed is not reopened by later progress', () => {
   assert.equal(opened.length, 1)
   assert.equal(notice.closed, true)
   assert.equal(opened[0].closed, false, '已被用户关闭，不再重复 close')
+})
+
+test('formatDownloadProgress shows a percent when known and bytes received when not', () => {
+  assert.equal(formatDownloadProgress({ percent: 42 }), '42%')
+  assert.equal(formatDownloadProgress({ percent: 0 }), '0%')
+  assert.equal(formatDownloadProgress({ percent: 130 }), '100%')
+  assert.equal(formatDownloadProgress({ percent: null, received: 5 * 1024 * 1024 }), '已下载 5.0 MB')
+  assert.equal(formatDownloadProgress({ percent: null, received: 300 * 1024 }), '已下载 300 KB')
+  assert.equal(formatDownloadProgress({ percent: null, received: 0 }), '准备中…')
+  assert.equal(formatDownloadProgress(null), '准备中…')
 })

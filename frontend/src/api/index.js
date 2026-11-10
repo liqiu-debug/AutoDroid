@@ -554,9 +554,6 @@ export default {
     createCompatibilityRun(data) {
         return api.post('/compatibility/runs', data)
     },
-    preflightCompatibilityReplay(data) {
-        return api.post('/compatibility/replay-preflight', data, { timeout: 60000 })
-    },
     getCompatibilityRun(id, config = {}) {
         // 报告详情一次性大载荷：全局 30s（8s 只留给真轮询）
         return api.get(`/compatibility/runs/${id}`, { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
@@ -573,72 +570,6 @@ export default {
         return api.post(`/compatibility/runs/${id}/cancel`)
     },
 
-    // Model inspection
-    getInspectionProfiles() {
-        return api.get('/inspections/profiles')
-    },
-    createInspectionProfile(data) {
-        return api.post('/inspections/profiles', data)
-    },
-    updateInspectionProfile(id, data) {
-        return api.put(`/inspections/profiles/${id}`, data)
-    },
-    deleteInspectionProfile(id) {
-        return api.delete(`/inspections/profiles/${id}`)
-    },
-    createInspectionRun(data) {
-        return api.post('/inspections/runs', data)
-    },
-    getInspectionRuns(params, config = {}) {
-        return api.get('/inspections/runs', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
-    },
-    getInspectionRun(id, config = {}) {
-        // 报告详情一次性大载荷：全局 30s（8s 只留给真轮询）
-        return api.get(`/inspections/runs/${id}`, { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
-    },
-    deleteInspectionRun(id) {
-        return api.delete(`/inspections/runs/${id}`)
-    },
-    cancelInspectionRun(id) {
-        return api.post(`/inspections/runs/${id}/cancel`)
-    },
-    getInspectionGraph(id, params = {}) {
-        return api.get(`/inspections/runs/${id}/graph`, { params })
-    },
-    getInspectionFamilies(id, params = {}) {
-        return api.get(`/inspections/runs/${id}/families`, { params })
-    },
-    createInspectionLiveSession(id) {
-        return api.post(`/inspections/runs/${id}/live-session`)
-    },
-    getInspectionLive(id, config = {}) {
-        return api.get(`/inspections/runs/${id}/live`, { timeout: POLL_GET_TIMEOUT_MS, ...config })
-    },
-    getInspectionActionMap(id, stateId) {
-        return api.get(`/inspections/runs/${id}/states/${stateId}/action-map`)
-    },
-    getInspectionObservations(id, stateId, params = {}) {
-        return api.get(`/inspections/runs/${id}/states/${stateId}/observations`, { params })
-    },
-    updateInspectionRepresentative(id, stateId, observationId) {
-        return api.put(`/inspections/runs/${id}/states/${stateId}/representative-observation`, {
-            observation_id: observationId,
-        })
-    },
-    getInspectionLiveAsset(url, responseType = 'blob') {
-        const parsed = new URL(String(url || ''), window.location.origin)
-        if (parsed.origin !== window.location.origin || !parsed.pathname.startsWith('/api/inspections/')) {
-            return Promise.reject(new Error('巡检实时资产地址无效'))
-        }
-        const requestPath = `${parsed.pathname.replace(/^\/api/, '')}${parsed.search}`
-        return api.get(requestPath, { responseType, timeout: 60000 })
-    },
-    updateInspectionSelection(id, stateIds, observationIds = []) {
-        return api.put(`/inspections/runs/${id}/regression-selection`, {
-            state_ids: stateIds,
-            observation_ids: observationIds,
-        })
-    },
     getAsset(assetId, responseType = 'blob', options = {}) {
         if (assetId === null || assetId === undefined || assetId === '') {
             return Promise.reject(new Error('资产 ID 无效'))
@@ -649,13 +580,6 @@ export default {
             responseType,
             timeout: options.timeout || 60000,
             headers,
-        })
-    },
-    getInspectionAsset(id, path, responseType = 'text') {
-        return api.get(`/inspections/runs/${id}/assets`, {
-            params: { path },
-            responseType,
-            timeout: 60000,
         })
     },
 
@@ -714,22 +638,8 @@ export default {
     deleteDevice(serial) {
         return api.delete(`/devices/${serial}`)
     },
-
-    // Device Agents (远程设备接入点)
-    getDeviceAgents() {
-        return api.get('/device-agents/')
-    },
-    probeDeviceAgentLink(agentId) {
-        return api.post(`/device-agents/${agentId}/link-probe`, null, { timeout: 30000 })
-    },
     getDeviceTransportMetrics(serial) {
         return api.get(`/devices/${serial}/transport-metrics`)
-    },
-    deleteDeviceAgent(agentId) {
-        return api.delete(`/device-agents/${agentId}`)
-    },
-    downloadDeviceAgentScript() {
-        return api.get('/device-agents/agent-script', { responseType: 'blob', timeout: 60000 })
     },
 
     // App Packages (包管理)
@@ -798,25 +708,5 @@ export default {
     // AI (NL2Script) - 自然语言生成测试步骤
     generateAISteps(text) {
         return api.post('/ai/generate-steps', { text }, { timeout: 120000 })
-    },
-
-    // AutoDroid 脚本导出与设备端执行任务
-    autojs: {
-        precheckCase: (id, envId, platform) => api.get(`/autojs/cases/${id}/precheck`, { params: { ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) } }),
-        exportCase: (id, format = 'zip', envId, platform) => api.post(`/autojs/cases/${id}/export`, null, {
-            params: { format, ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) },
-            responseType: 'blob',
-            timeout: 120000
-        }),
-        exportBatch: (data) => api.post('/autojs/cases/export-batch', data, { responseType: 'blob', timeout: 120000 }),
-        precheckScenario: (id, envId, platform) => api.get(`/autojs/scenarios/${id}/precheck`, { params: { ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) } }),
-        exportScenario: (id, envId, platform) => api.post(`/autojs/scenarios/${id}/export`, null, {
-            params: { ...(envId ? { env_id: envId } : {}), ...(platform ? { platform } : {}) },
-            responseType: 'blob',
-            timeout: 120000
-        }),
-        createTask: (data) => api.post('/autojs/tasks', data),
-        listTasks: (params) => api.get('/autojs/tasks', { params }),
-        cancelTask: (taskId) => api.post(`/autojs/tasks/${taskId}/cancel`)
     }
 }
