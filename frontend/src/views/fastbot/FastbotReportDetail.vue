@@ -105,6 +105,15 @@ const localReplayEnabled = computed(() => summary.value?.local_replay_enabled ==
 const localReplayDegraded = computed(() => (
     Array.isArray(summary.value?.degraded) && summary.value.degraded.includes('local_replay')
 ))
+// 引擎写的精确原因（local_replay_status / local_replay_error）；老报告没有这两个字段，
+// 就退回概括说法 —— 没有的原因不编。
+const localReplayReason = computed(() => {
+    const status = summary.value?.local_replay_status
+    const detail = String(summary.value?.local_replay_error || '').trim()
+    if (status === 'not_ready') return `设备投屏流未就绪，录制器没起来${detail ? `（${detail}）` : ''}`
+    if (status === 'error') return `录制器启动失败${detail ? `（${detail}）` : ''}`
+    return '客户端未能启动本地回放录制（设备投屏流未就绪或不可用）'
+})
 const localReplayLabel = computed(() => {
     if (localReplayEnabled.value) return '已开启'
     return localReplayDegraded.value ? '未开启（客户端降级）' : '未开启'
@@ -490,7 +499,7 @@ watch(
                     <el-descriptions-item label="异常回放">
                         <el-tooltip
                             v-if="localReplayDegraded && !localReplayEnabled"
-                            content="客户端未能启动本地回放录制（设备投屏流未就绪或不可用），本次运行无崩溃回放"
+                            :content="`${localReplayReason}，本次运行无崩溃回放`"
                             placement="top"
                         >
                             <span>{{ localReplayLabel }}</span>

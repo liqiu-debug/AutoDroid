@@ -28,6 +28,17 @@ test('report explains a degraded local replay instead of a bare 未开启', () =
   assert.match(detail, /客户端未能启动本地回放录制/)
 })
 
+test('degraded local replay surfaces the engine reason when it recorded one', () => {
+  const detail = read('../src/views/fastbot/FastbotReportDetail.vue')
+  // 引擎按 not_ready / error 分别写 local_replay_status，报告要照实说，
+  // 否则「设备流没起来」和「录制器报错」都长成一句「客户端降级」，查不下去。
+  assert.match(detail, /summary\.value\?\.local_replay_status/)
+  assert.match(detail, /summary\.value\?\.local_replay_error/)
+  assert.match(detail, /'not_ready'/)
+  assert.match(detail, /'error'/)
+  assert.match(detail, /localReplayReason/)
+})
+
 test('crash rows expose the replay entry only for a READY replay file', () => {
   const formatters = read('../src/views/fastbot/components/reportFormatters.js')
   assert.match(formatters, /replay\?\.status === 'READY' && Boolean\(getReplayFilename\(event\)\)/)
