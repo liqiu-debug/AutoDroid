@@ -17,7 +17,11 @@ from sqlmodel import Session, select
 
 from backend.database import get_session
 from backend.models import SystemSetting
-from backend.openai_compat import LLM_TOTAL_DEADLINE_S, parse_chat_completion_payload
+from backend.openai_compat import (
+    LLM_TOTAL_DEADLINE_S,
+    extract_message_content,
+    parse_chat_completion_payload,
+)
 from backend.schemas import LogAnalysisRequest, LogAnalysisResponse
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,10 @@ CRASH_ANCHOR_PATTERNS = [
     re.compile(r'AndroidRuntime', re.IGNORECASE),
     re.compile(r'Process:.*Crashing', re.IGNORECASE),
 ]
+
+# 上游（思考型模型 + max_tokens 吃紧）会返回空正文/非文本正文，这是「点重试即可」
+# 的上游问题，走 502 而不是 500；卡顿分析共用同一条提示，保证两端文案一致。
+EMPTY_CONTENT_ERROR_DETAIL = "AI 服务未返回可分析的正文（content 为空/非文本），请点「重新分析」重试。"
 
 
 def _get_setting(session: Session, key: str, default: str = "") -> str:
@@ -418,9 +426,14 @@ async def call_llm_service(
                     detail=f"AI 服务返回格式异常（缺少 choices）: {str(data)[:200]}"
                 )
 
-            content = data["choices"][0]["message"]["content"]
-            usage = data.get("usage", {})
-            total_tokens = usage.get("total_tokens", 0)
+            # content 可能是 null / 分片数组（思考型模型把预算耗在 reasoning 上），
+            # 统一走取正文助手；拿不到正文就在这里报 502，绝不放行到响应模型校验。
+            content = extract_message_content(data)
+            if not content.strip():
+                raise HTTPException(status_code=502, detail=EMPTY_CONTENT_ERROR_DETAIL)
+
+            usage = data.get("usage")
+            total_tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
 
             return {
                 "success": True,
@@ -439,8 +452,12 @@ async def call_llm_service(
             detail=f"无法连接 AI 服务。请检查 API 地址 ({api_base}) 是否可访问。"
         )
     except Exception as e:
-        logger.error(f"LLM API 调用异常: {e}")
-        raise HTTPException(status_code=500, detail=f"AI 服务调用异常: {str(e)}")
+        # 与 analyze_log 的兜底同一口径：异常文本只进服务端日志，不进 detail
+        logger.exception("LLM API 调用异常")
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI 服务调用异常（{type(e).__name__}），请稍后重试",
+        )
 
 
 # ==================== API 路由 ====================
@@ -472,29 +489,54 @@ async def analyze_log(
     # Step 2: MD5 缓存检查
     cache_key = hashlib.md5(cleaned_log.encode('utf-8')).hexdigest()
     if not req.force_refresh and cache_key in _analysis_cache:
-        logger.info(f"命中缓存: {cache_key}")
-        return LogAnalysisResponse(
-            success=True,
-            analysis_result=_analysis_cache[cache_key],
-            token_usage=0,
-            cached=True,
+        cached_value = _analysis_cache[cache_key]
+        # 历史 bug 会把 None 等脏值写进缓存（一次失败 = 这条日志永久分析不了），
+        # 这里自愈：只认非空字符串，脏值丢弃后重新走 LLM。
+        if isinstance(cached_value, str) and cached_value.strip():
+            logger.info(f"命中缓存: {cache_key}")
+            return LogAnalysisResponse(
+                success=True,
+                analysis_result=cached_value,
+                token_usage=0,
+                cached=True,
+            )
+        logger.warning(f"丢弃无效缓存值，重新分析: {cache_key}")
+        _analysis_cache.pop(cache_key, None)
+
+    # Step 3~4: 调用 LLM、构造响应、写缓存。
+    # 整段再包一层兜底：这条链路上任何漏网异常都必须变成带 detail 的 JSON 错误，
+    # 否则 Starlette 会兜底成纯文本 Internal Server Error，前端只看得到「分析失败」。
+    try:
+        result = await call_llm_service(
+            cleaned_log=cleaned_log,
+            package_name=req.package_name,
+            device_info=req.device_info or "",
+            session=session,
         )
 
-    # Step 3: 调用 LLM
-    result = await call_llm_service(
-        cleaned_log=cleaned_log,
-        package_name=req.package_name,
-        device_info=req.device_info or "",
-        session=session,
-    )
+        analysis_result = result.get("analysis_result") if isinstance(result, dict) else None
+        if not isinstance(analysis_result, str) or not analysis_result.strip():
+            raise HTTPException(status_code=502, detail=EMPTY_CONTENT_ERROR_DETAIL)
 
-    # Step 4: 写入缓存
-    _analysis_cache[cache_key] = result["analysis_result"]
-    logger.info(f"分析完成，Token 消耗: {result['token_usage']}，缓存 Key: {cache_key}")
+        # 顺序很关键：先把响应构造出来（此时才做 pydantic 校验），成功了再写缓存。
+        # 反过来写会在构造失败时把脏值留进缓存，同一条日志从此一直报错。
+        response = LogAnalysisResponse(
+            success=True,
+            analysis_result=analysis_result,
+            token_usage=result.get("token_usage") or 0,
+            cached=False,
+        )
+        _analysis_cache[cache_key] = analysis_result
+    except HTTPException:
+        raise  # 已经是带 detail 的 JSON 错误，原样透传
+    except Exception as exc:
+        # 完整异常只进服务端日志：detail 会被前端 normalizeError 原样显示给用户，
+        # 把 str(exc) 吐出去等于把内部实现与上游响应细节泄露到界面上。
+        logger.exception("日志分析失败")
+        raise HTTPException(
+            status_code=500,
+            detail=f"日志分析失败（{type(exc).__name__}），请重试；反复失败请把时间点反馈给管理员",
+        )
 
-    return LogAnalysisResponse(
-        success=True,
-        analysis_result=result["analysis_result"],
-        token_usage=result["token_usage"],
-        cached=False,
-    )
+    logger.info(f"分析完成，Token 消耗: {response.token_usage}，缓存 Key: {cache_key}")
+    return response

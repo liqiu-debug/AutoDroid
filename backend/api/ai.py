@@ -19,7 +19,11 @@ from pydantic import BaseModel
 from backend.schemas import ActionType, SelectorType, ErrorStrategy
 from backend.database import get_session
 from backend.api.log_analysis import _get_setting
-from backend.openai_compat import LLM_TOTAL_DEADLINE_S, parse_chat_completion_payload
+from backend.openai_compat import (
+    LLM_TOTAL_DEADLINE_S,
+    extract_message_content,
+    parse_chat_completion_payload,
+)
 from backend.step_contract import (
     SELECTOR_TYPE_TO_BY,
     normalize_action,
@@ -447,7 +451,7 @@ def _normalize_generated_steps(steps_list: List[Any]) -> List[Dict[str, Any]]:
     return normalized_steps
 
 
-async def _call_llm_service(text: str, session: Session) -> str:
+async def _call_llm_service(text: str, session: Session) -> Optional[str]:
     """
     调用 LLM API 生成测试步骤
 
@@ -455,6 +459,8 @@ async def _call_llm_service(text: str, session: Session) -> str:
     - ai_api_key: API Key
     - ai_api_base: API Base URL
     - ai_model: 模型名
+
+    返回 None 表示「LLM 不可用/没给正文」，调用方降级到兜底模板步骤。
     """
     api_key = _get_setting(session, "ai_api_key", "")
     api_base = _get_setting(session, "ai_api_base", "https://api.openai.com/v1")
@@ -525,8 +531,11 @@ async def _call_llm_service(text: str, session: Session) -> str:
                 logger.error("LLM 返回缺少 choices 字段")
                 return None
 
-            content = data["choices"][0]["message"]["content"]
-            return content
+            # content 可能是 null / 分片数组；统一取正文后再判空，
+            # 空正文按「LLM 不可用」降级到兜底模板步骤，
+            # 绝不把非 str 丢给 _clean_llm_response 去 .strip()。
+            content = extract_message_content(data)
+            return content or None
 
     except (httpx.TimeoutException, asyncio.TimeoutError):
         logger.error("LLM API 调用超时")
@@ -548,6 +557,8 @@ def _clean_llm_response(content: str) -> str:
     2. ``` ... ```
     3. 纯净的 JSON 字符串
     """
+    # 上游正文可能是 null / 分片数组，这里先兜成 str，避免 .strip() 抛 AttributeError
+    content = content if isinstance(content, str) else ""
     content = content.strip()
 
     # 去除 Markdown 代码块标记
@@ -882,5 +893,9 @@ async def test_ai_connection(
             detail=f"无法连接 AI 服务。请检查 API 地址 ({api_base}) 是否可访问。"
         )
     except Exception as e:
-        logger.error(f"AI 连接测试异常: {e}")
-        raise HTTPException(status_code=500, detail=f"AI 连接测试失败: {str(e)}")
+        # 与其它 AI 调用点同一口径：异常文本只进服务端日志，不进 detail
+        logger.exception("AI 连接测试异常")
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI 连接测试失败（{type(e).__name__}），请稍后重试",
+        )

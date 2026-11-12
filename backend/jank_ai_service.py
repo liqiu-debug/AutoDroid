@@ -13,8 +13,12 @@ import httpx
 from fastapi import HTTPException
 from sqlmodel import Session
 
-from backend.api.log_analysis import _get_setting
-from backend.openai_compat import LLM_TOTAL_DEADLINE_S, parse_chat_completion_payload
+from backend.api.log_analysis import _get_setting, EMPTY_CONTENT_ERROR_DETAIL
+from backend.openai_compat import (
+    LLM_TOTAL_DEADLINE_S,
+    extract_message_content,
+    parse_chat_completion_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +226,8 @@ async def summarize_jank_analysis(
     system_prompt = _build_system_prompt(package_name, device_info)
     cache_key = hashlib.md5(f"{system_prompt}\n{payload_text}".encode("utf-8")).hexdigest()
     cached_result = None if force_refresh else _jank_ai_cache.get(cache_key)
-    if cached_result is not None:
+    # 缓存只认非空字符串：坏值一律重新分析，别拿去构造响应
+    if isinstance(cached_result, str) and cached_result.strip():
         return {
             "success": True,
             "analysis_result": cached_result,
@@ -279,16 +284,24 @@ async def summarize_jank_analysis(
             if "choices" not in data or not data["choices"]:
                 raise HTTPException(status_code=502, detail="AI 服务返回格式异常（缺少 choices）。")
 
-            content = data["choices"][0]["message"]["content"]
-            token_usage = (data.get("usage") or {}).get("total_tokens", 0)
+            # content 可能是 null / 分片数组（思考型模型把预算耗在 reasoning 上），
+            # 统一取正文后再判空；空正文在这里报 502，避免 response_model 校验炸掉。
+            content = extract_message_content(data)
+            if not content.strip():
+                raise HTTPException(status_code=502, detail=EMPTY_CONTENT_ERROR_DETAIL)
 
-            _jank_ai_cache.set(cache_key, content)
-            return {
+            usage = data.get("usage")
+            token_usage = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
+
+            result = {
                 "success": True,
                 "analysis_result": content,
                 "token_usage": token_usage,
                 "cached": False,
             }
+            # 结果构造成功才写缓存，坏值不落盘
+            _jank_ai_cache.set(cache_key, content)
+            return result
     except HTTPException:
         raise
     except (httpx.TimeoutException, asyncio.TimeoutError):
@@ -296,5 +309,9 @@ async def summarize_jank_analysis(
     except httpx.ConnectError:
         raise HTTPException(status_code=502, detail="无法连接 AI 服务，请检查 API 配置。")
     except Exception as exc:
-        logger.error("AI 卡顿分析调用失败: %s", exc)
-        raise HTTPException(status_code=500, detail=f"AI 服务调用异常: {exc}")
+        # 与 log_analysis 同一口径：异常文本只进服务端日志，不进 detail
+        logger.exception("AI 卡顿分析调用失败")
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI 服务调用异常（{type(exc).__name__}），请稍后重试",
+        )
