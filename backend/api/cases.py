@@ -23,6 +23,7 @@ from backend.feature_flags import (
     is_flag_enabled,
 )
 from backend.models import CaseFolder, Device, TestCase, TestCaseStep, User
+from backend.scenario_results import is_tolerated_failure
 from backend.run_control import (
     ABORTED_STATUS,
     QUEUED_STATUS,
@@ -417,6 +418,10 @@ def _step_ui_status(step_result: Any) -> str:
     if not isinstance(step_result, dict):
         return "FAIL"
 
+    # IGNORE 容忍的失败：行状态为 SKIP，结论不计入失败/警告（详情留痕保留）。
+    if is_tolerated_failure(step_result):
+        return "SKIP"
+
     status = str(step_result.get("status") or "").strip().upper()
     if status in {"PASS", "FAIL", "WARNING", "SKIP"}:
         return status
@@ -435,6 +440,11 @@ def _step_ui_status(step_result: Any) -> str:
 
 
 def _summarize_case_result(result: Any) -> Dict[str, Any]:
+    """用例结论：只由"未被容忍的失败"决定（IGNORE 失败归 SKIP，不计入失败/警告）。
+
+    全 SKIP 例外：所有步骤都是 SKIP（含全部被忽略）时仍归 WARNING/skipped，
+    表示"没真正验证到东西"。
+    """
     if not isinstance(result, dict):
         return {"status": "FAIL", "all_skipped": False}
 

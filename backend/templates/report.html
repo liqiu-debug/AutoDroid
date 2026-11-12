@@ -400,6 +400,10 @@
                 <div class="value">{{ failed }}</div>
                 <div class="label">失败</div>
             </div>
+            <div class="stat-card skipped">
+                <div class="value">{{ skipped }}</div>
+                <div class="label">跳过</div>
+            </div>
             <div class="stat-card duration">
                 <div class="value">{{ pass_rate }}%</div>
                 <div class="label">通过率</div>
@@ -446,10 +450,13 @@
                     </div>
                     <div class="step-duration">{{ step.duration }}s</div>
                     <div class="step-status">
-                        {% if step.status == 'success' %}通过{% else %}失败{% endif %}
+                        {% if step.status == 'success' %}通过{% elif step.status == 'skipped' %}跳过{% elif step.status == 'warning' %}告警{% else %}失败{% endif %}
                     </div>
                 </div>
                 <div class="step-details">
+                    {% if display.skip_reason %}
+                    <div class="step-skip-reason">跳过原因：{{ display.skip_reason }}</div>
+                    {% endif %}
                     {% if step.log %}
                     <div class="step-log">{{ step.log }}</div>
                     {% endif %}

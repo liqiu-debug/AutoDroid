@@ -49,11 +49,13 @@ class ReportGenerator:
         
         steps_for_report = enrich_steps_for_html(steps_results)
 
-        # 计算统计信息
+        # 统计信息：结果条数恒等于步骤条数（截断处补齐 SKIP 记录后自然闭合），
+        # 按状态显式计数，避免把 warning 混入 skipped。
         total = len(steps_for_report)
         passed = sum(1 for s in steps_for_report if s.get("status") == "success")
         failed = sum(1 for s in steps_for_report if s.get("status") == "failed")
-        skipped = total - passed - failed
+        warning = sum(1 for s in steps_for_report if s.get("status") == "warning")
+        skipped = total - passed - failed - warning
         
         total_duration = (end_time - start_time).total_seconds()
         pass_rate = (passed / total * 100) if total > 0 else 0
@@ -69,6 +71,7 @@ class ReportGenerator:
             passed=passed,
             failed=failed,
             skipped=skipped,
+            warning=warning,
             pass_rate=round(pass_rate, 1),
             steps=steps_for_report,
             variables=variables or [],

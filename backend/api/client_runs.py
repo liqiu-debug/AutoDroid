@@ -54,6 +54,7 @@ from backend.models import (
 )
 from backend.notification_service import NotificationService
 from backend.paths import project_path
+from backend.report_display import step_skip_reason
 from backend.report_generator import report_generator
 from backend.scenario_results import (
     _determine_case_status,
@@ -240,6 +241,8 @@ def _normalize_finish_status(raw: Optional[str]) -> Optional[str]:
 
 
 def _payload_steps_to_report_case(payload: ClientRunStepsPayload) -> DeviceReportCase:
+    # 上报协议不改 schema：skip_reason 只能经 output.skip_reason 透传（原样带过），
+    # 由 _build_case_result 解析到步骤结果的 skip_reason 字段供报告层读取。
     steps = [
         DeviceReportStep(
             order=step.order,
@@ -579,12 +582,15 @@ async def finish_client_run(
     session.commit()
 
     total_steps = sum(len(entry.get("steps") or []) for entry in case_entries)
-    passed_steps = sum(
-        1
+    step_statuses = [
+        str(step.get("status") or "").strip().lower()
         for entry in case_entries
         for step in (entry.get("steps") or [])
-        if step.get("status") == "success"
-    )
+    ]
+    passed_steps = sum(1 for status in step_statuses if status == "success")
+    # 跳过（含 IGNORE 容忍的失败与中止补记）不算失败，避免通知卡片把跳过计成红。
+    skipped_steps = sum(1 for status in step_statuses if status == "skipped")
+    failed_steps = max(total_steps - passed_steps - skipped_steps, 0)
     if payload.notify:
         _send_notify_card(
             display_name=display_name,
@@ -592,6 +598,7 @@ async def finish_client_run(
             overall_status=overall_status,
             total_steps=total_steps,
             passed_steps=passed_steps,
+            failed_steps=failed_steps,
             duration=duration,
             case_entries=case_entries,
             extra_error=payload.error,
@@ -614,16 +621,33 @@ async def finish_client_run(
         "duration": duration,
         "total_steps": total_steps,
         "passed_steps": passed_steps,
-        "failed_steps": total_steps - passed_steps,
+        "failed_steps": failed_steps,
+        "skipped_steps": skipped_steps,
         "finished": True,
     }
+
+
+def _report_step_with_skip_reason(step: Any) -> Any:
+    """payload -> 报告步骤结果：把 output.skip_reason 解析到顶层 skip_reason 字段。
+
+    纯增量（旧客户端 / 旧状态文件缺该键时安全回退：不补值、不报错）；
+    已带 skip_reason 的步骤原样返回。error 文本格式不动，留痕字段保留。
+    """
+    if not isinstance(step, dict) or step.get("skip_reason"):
+        return step
+    skip_reason = step_skip_reason(step)
+    if not skip_reason:
+        return step
+    merged = dict(step)
+    merged["skip_reason"] = skip_reason
+    return merged
 
 
 def _build_case_entries(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     """暂存的用例步骤 -> 报告用例条目（status 聚合对齐平台口径）。"""
     entries: List[Dict[str, Any]] = []
     for item in state.get("cases") or []:
-        steps = list(item.get("steps") or [])
+        steps = [_report_step_with_skip_reason(step) for step in (item.get("steps") or [])]
         has_warning = any(step.get("status") == "warning" for step in steps)
         case_success = bool(item.get("success"))
         entry = {
@@ -659,6 +683,7 @@ def _send_notify_card(
     overall_status: str,
     total_steps: int,
     passed_steps: int,
+    failed_steps: int,
     duration: float,
     case_entries: List[Dict[str, Any]],
     extra_error: Optional[str] = None,
@@ -680,7 +705,7 @@ def _send_notify_card(
             status=overall_status,
             total=total_steps,
             passed=passed_steps,
-            failed=total_steps - passed_steps,
+            failed=failed_steps,
             duration_seconds=duration,
             errors=errors,
             device_count=1,

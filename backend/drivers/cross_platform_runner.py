@@ -19,7 +19,12 @@ from backend.execution_errors import (
     E2006_OCR_NO_RESULT,
     ExecutionStepError,
     ExecutionStepRuntimeError,
+    SKIP_REASON_PLATFORM_MISMATCH,
+    SKIP_REASON_UPSTREAM_ABORTED,
+    SKIP_REASON_USER_ABORTED,
+    USER_ABORT_MESSAGE,
     classify_exception,
+    ignored_failure_reason,
     suggestion_for,
 )
 from backend.locator_resolution import resolve_locator_candidates
@@ -76,6 +81,14 @@ _SUPPORTED_ACTIONS_BY_PLATFORM = {
 
 def _with_error_code(code: str, message: str) -> str:
     return f"{code}: {message}"
+
+
+def _is_user_abort_result(result: Dict[str, Any]) -> bool:
+    """步骤结果是否为「用户中止」（error 为中止文案，见 _build_abort_result / sleep 中止）。
+
+    用户中止不是可被 IGNORE 容忍的失败：必须中断执行，剩余步骤补记「用户中止执行」。
+    """
+    return str((result or {}).get("error") or "").strip() == USER_ABORT_MESSAGE
 
 
 class DriverFactory:
@@ -226,6 +239,8 @@ class TestCaseRunner:
                         "execute_on": list(execute_on),
                     },
                     suggestion=suggestion_for("P1001_PLATFORM_NOT_ALLOWED") or None,
+                    # 平台跳过（P1001）沿用现状，补记跳过原因。
+                    skip_reason=SKIP_REASON_PLATFORM_MISMATCH,
                 )
 
             args = step_data.get("args") or {}
@@ -319,12 +334,20 @@ class TestCaseRunner:
     def run_all(self, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         批量执行标准步骤，应用 ABORT/CONTINUE/IGNORE 容错策略。
+
+        结果口径（见 EXECUTION_SPEC 2.2/2.3）：
+        - IGNORE 失败 → 步骤记 SKIP + skip_reason="失败已忽略：<原文>"，error 等留痕不变；
+        - ABORT 失败 / 用户中止 break 后，剩余步骤各补一条 SKIP 记录（duration=0、error=None），
+          保证 len(results) == len(steps)；补记录不触发 before_step / before_device_step。
         """
+        step_list = list(steps or [])
         results: List[Dict[str, Any]] = []
         overall_success = True
-        total_steps = len(steps or [])
+        total_steps = len(step_list)
+        # 中止后补齐剩余步骤记录的跳过原因（None 表示未截断）。
+        pending_skip_reason: Optional[str] = None
 
-        for index, step_data in enumerate(steps or [], start=1):
+        for index, step_data in enumerate(step_list, start=1):
             step_action = str((step_data or {}).get("action") or "").strip().lower() or "unknown"
             step_desc = str((step_data or {}).get("description") or "").strip()
 
@@ -349,6 +372,7 @@ class TestCaseRunner:
                     step_action,
                     step_desc or "-",
                 )
+                pending_skip_reason = SKIP_REASON_USER_ABORTED
                 break
 
             logger.info(
@@ -383,9 +407,26 @@ class TestCaseRunner:
                 if screenshot:
                     result["screenshot"] = screenshot
 
+            if status == "FAIL" and _is_user_abort_result(result):
+                # 用户中止不是可被 IGNORE 容忍的失败：中断执行，剩余步骤补记「用户中止执行」。
+                overall_success = False
+                logger.warning(
+                    "runner step end: %s/%s action=%s status=%s duration=%.3fs error=%s",
+                    index,
+                    total_steps,
+                    step_action,
+                    result.get("status"),
+                    float(result.get("duration") or 0.0),
+                    result.get("error") or "-",
+                )
+                pending_skip_reason = SKIP_REASON_USER_ABORTED
+                break
+
             if status == "FAIL" and strategy == "IGNORE":
-                result["status"] = "WARNING"
-                result["warning"] = "step failed but ignored by error_strategy=IGNORE"
+                # IGNORE 容忍：步骤记 SKIP（不再是 WARNING），error / error_code /
+                # error_context / suggestion / 截图原样留痕，结论不计入失败与告警。
+                result["status"] = "SKIP"
+                result["skip_reason"] = ignored_failure_reason(result.get("error"))
                 logger.warning(
                     "runner step end: %s/%s action=%s status=%s duration=%.3fs error=%s",
                     index,
@@ -421,6 +462,7 @@ class TestCaseRunner:
                     float(result.get("duration") or 0.0),
                     result.get("error") or "-",
                 )
+                pending_skip_reason = SKIP_REASON_UPSTREAM_ABORTED
                 break
 
             logger.info(
@@ -431,6 +473,25 @@ class TestCaseRunner:
                 result.get("status"),
                 float(result.get("duration") or 0.0),
             )
+
+        if pending_skip_reason is not None:
+            # 结果条数恒等于步骤条数：为未执行步骤各补一条 SKIP 记录（不触发任何钩子）。
+            first_padded_order = len(results) + 1
+            for order in range(first_padded_order, total_steps + 1):
+                results.append(
+                    self._padded_skip_result(
+                        step_data=step_list[order - 1],
+                        order=order,
+                        skip_reason=pending_skip_reason,
+                    )
+                )
+            if first_padded_order <= total_steps:
+                logger.warning(
+                    "runner padded unexecuted steps %s..%s as SKIP: reason=%s",
+                    first_padded_order,
+                    total_steps,
+                    pending_skip_reason,
+                )
 
         return {
             "success": overall_success,
@@ -476,11 +537,37 @@ class TestCaseRunner:
             action=action,
             status="FAIL",
             error_strategy=error_strategy,
-            error="执行已被用户中止",
+            error=USER_ABORT_MESSAGE,
             output=None,
             artifacts=None,
             duration=duration,
         )
+
+    def _padded_skip_result(
+        self,
+        step_data: Dict[str, Any],
+        order: int,
+        skip_reason: str,
+    ) -> Dict[str, Any]:
+        """中止后为「未执行」步骤补的结果记录（不触发 before_step / before_device_step）。
+
+        status=SKIP、duration=0、不截图、error 置 None；目标是结果条数恒等于步骤条数，
+        报告不再把「被截断」伪装成「总共就这么多步」。
+        """
+        raw_step = step_data if isinstance(step_data, dict) else {}
+        result = self._result(
+            step_data=raw_step,
+            action=str(raw_step.get("action") or "").strip().lower() or "unknown",
+            status="SKIP",
+            error_strategy=normalize_error_strategy(raw_step.get("error_strategy", "ABORT")),
+            error=None,
+            output=None,
+            artifacts=None,
+            duration=0.0,
+            skip_reason=skip_reason,
+        )
+        result["order"] = order
+        return result
 
     @staticmethod
     def _extract_step_artifacts(step_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -752,7 +839,7 @@ class TestCaseRunner:
             seconds = args.get("seconds", value if value is not None else 1)
             sleep_seconds = _parse_seconds(seconds, default=1.0)
             if self._sleep_or_abort(sleep_seconds):
-                raise RuntimeError("执行已被用户中止")
+                raise RuntimeError(USER_ABORT_MESSAGE)
             return None
 
         if action == "swipe":
@@ -855,7 +942,7 @@ class TestCaseRunner:
             if now >= deadline:
                 break
             if self._sleep_or_abort(min(0.4, max(0.0, deadline - now))):
-                raise RuntimeError("执行已被用户中止")
+                raise RuntimeError(USER_ABORT_MESSAGE)
 
         elapsed = time.time() - started_at
         message = (
@@ -948,6 +1035,7 @@ class TestCaseRunner:
         error_code: Optional[str] = None,
         error_context: Optional[Dict[str, Any]] = None,
         suggestion: Optional[str] = None,
+        skip_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         return {
             "action": action,
@@ -963,6 +1051,9 @@ class TestCaseRunner:
             "error_code": error_code,
             "error_context": error_context,
             "suggestion": suggestion,
+            # 跳过原因（纯增量字段）：失败已忽略：<原文> / 上游步骤失败，中止执行 /
+            # 用户中止执行 / 平台不匹配；非跳过步骤为 None。
+            "skip_reason": skip_reason,
             "output": output,
             "artifacts": artifacts,
             "step": step_data,

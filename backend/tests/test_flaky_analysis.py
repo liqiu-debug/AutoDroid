@@ -201,6 +201,37 @@ class StepFlakyTests(FlakyAnalysisTestBase):
         report = compute_flaky_report(self.session, days=30, now=self.now)
         self.assertEqual(report["step_items"], [])
 
+    def test_ignored_skip_counts_as_failure_sample(self):
+        """「失败已忽略」的跳过是被容忍的真实失败，按失败样计入样本；平台跳过仍排除。"""
+        scenario = self._add_scenario("被容忍失败场景")
+        statuses = ["PASS", "FAIL", "PASS", "FAIL", "PASS"]
+        executions = self._add_status_sequence(scenario, statuses)
+        for index, execution in enumerate(executions):
+            failed = statuses[index] != "PASS"
+            self._add_step(
+                execution,
+                1,
+                "[登录] 点击登录",
+                "SKIP" if failed else "PASS",
+                report_display=(
+                    {"skip_reason": "失败已忽略：元素未找到"} if failed else None
+                ),
+            )
+            # 平台跳过：不计入样本
+            self._add_step(
+                execution,
+                2,
+                "[登录] iOS 专属步骤",
+                "SKIP",
+                report_display={"skip_reason": "平台不匹配"},
+            )
+        self.session.commit()
+
+        report = compute_flaky_report(self.session, days=30, now=self.now)
+        names = [item["step_name"] for item in report["step_items"]]
+        self.assertIn("[登录] 点击登录", names)
+        self.assertNotIn("[登录] iOS 专属步骤", names)
+
     def test_include_steps_false_skips_step_analysis(self):
         scenario = self._add_scenario("跳过步骤分析")
         executions = self._add_status_sequence(scenario, ["PASS", "FAIL", "PASS", "FAIL", "PASS"])

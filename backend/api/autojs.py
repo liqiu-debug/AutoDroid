@@ -38,6 +38,7 @@ from backend.models import (
     User,
 )
 from backend.notification_service import NotificationService
+from backend.report_display import step_skip_reason
 from backend.report_generator import report_generator
 from backend.scenario_results import _persist_case_result_and_build_case_report
 from backend.step_contract import normalize_platform, standard_step_to_legacy
@@ -280,6 +281,12 @@ def _build_case_result(
             entry["attempts"] = attempts
         if reported_step.output:
             entry["output"] = reported_step.output
+        # 跳过原因（纯增量字段 skip_reason）：上报协议不改 schema，客户端经
+        # output.skip_reason 透传，此处解析到步骤结果顶层供报告层读取。
+        # 旧客户端没有该键时安全回退为 None（不报错、不改 error 文本）。
+        skip_reason = step_skip_reason(reported_step)
+        if skip_reason:
+            entry["skip_reason"] = skip_reason
         if reported_step.screenshot_base64:
             entry["screenshot"] = reported_step.screenshot_base64
         if status == "WARNING":
@@ -305,6 +312,11 @@ def _build_case_result(
 
 
 def _aggregate_status(case_entries: List[Dict[str, Any]], aborted: bool) -> str:
+    """执行结论 = 用例结论聚合（与 backend/scenario_results._summarize_cases_results 同口径）。
+
+    结论只由"未被容忍的失败"决定：IGNORE 失败（步骤 SKIP + skip_reason="失败已忽略：…"）
+    不拉低结论；全 SKIP 例外（含全部被忽略）仍归 WARNING——没真正验证到东西。
+    """
     if aborted:
         return "ABORTED"
     statuses = [str(entry.get("status") or "") for entry in case_entries]
@@ -312,7 +324,7 @@ def _aggregate_status(case_entries: List[Dict[str, Any]], aborted: bool) -> str:
         return "FAIL"
     if statuses and all(status == "skipped" for status in statuses):
         return "WARNING"
-    if any(status in ("warning", "skipped") for status in statuses):
+    if any(status == "warning" for status in statuses):
         return "WARNING"
     return "PASS"
 
@@ -542,12 +554,15 @@ def _persist_device_report(
         session.add(scenario)
 
     total_steps = sum(len(entry.get("steps") or []) for entry in case_entries)
-    passed_steps = sum(
-        1
+    step_statuses = [
+        str(step.get("status") or "").strip().lower()
         for entry in case_entries
         for step in (entry.get("steps") or [])
-        if step.get("status") == "success"
-    )
+    ]
+    passed_steps = sum(1 for status in step_statuses if status == "success")
+    # 跳过（含 IGNORE 容忍的失败与中止补记）不算失败，避免通知卡片把跳过计成红。
+    skipped_steps = sum(1 for status in step_statuses if status == "skipped")
+    failed_steps = max(total_steps - passed_steps - skipped_steps, 0)
 
     session.commit()
 
@@ -567,7 +582,7 @@ def _persist_device_report(
                 status=overall_status,
                 total=total_steps,
                 passed=passed_steps,
-                failed=total_steps - passed_steps,
+                failed=failed_steps,
                 duration_seconds=duration,
                 errors=errors,
                 device_count=1,

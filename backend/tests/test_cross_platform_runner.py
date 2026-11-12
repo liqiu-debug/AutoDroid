@@ -181,6 +181,8 @@ class CrossPlatformRunnerTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "SKIP")
         self.assertIn("P1001_PLATFORM_NOT_ALLOWED", str(result.get("error")))
+        # 平台跳过（P1001）沿用现状，补记 skip_reason
+        self.assertEqual(result.get("skip_reason"), "平台不匹配")
 
     def test_fail_when_locator_missing(self):
         result = self.runner.run_step(
@@ -497,7 +499,7 @@ class CrossPlatformRunnerTests(unittest.TestCase):
         self.assertEqual(result["steps"][1]["status"], "PASS")
         self.assertEqual(result["steps"][0].get("screenshot"), base64.b64encode(b"png").decode("utf-8"))
 
-    def test_ignore_strategy_maps_fail_to_warning(self):
+    def test_ignore_strategy_maps_fail_to_skip_with_skip_reason(self):
         result = self.runner.run_all(
             [
                 {
@@ -518,11 +520,43 @@ class CrossPlatformRunnerTests(unittest.TestCase):
             ]
         )
         self.assertTrue(result["success"])
-        self.assertEqual(result["steps"][0]["status"], "WARNING")
+        ignored = result["steps"][0]
+        # IGNORE 失败 → SKIP（不再是 WARNING），并补记 skip_reason；error 原文保留。
+        self.assertEqual(ignored["status"], "SKIP")
+        self.assertEqual(ignored["skip_reason"], f"失败已忽略：{ignored['error']}")
+        self.assertIn("click failed", ignored["error"])
         self.assertEqual(result["steps"][1]["status"], "PASS")
-        self.assertEqual(result["steps"][0].get("screenshot"), base64.b64encode(b"png").decode("utf-8"))
+        self.assertIsNone(result["steps"][1].get("skip_reason"))
+        self.assertEqual(ignored.get("screenshot"), base64.b64encode(b"png").decode("utf-8"))
 
-    def test_abort_strategy_stops_execution(self):
+    def test_ignore_failure_keeps_error_trace(self):
+        result = self.runner.run_all(
+            [
+                {
+                    "action": "click",
+                    "platform_overrides": {
+                        self.platform: {"selector": "fail", "by": "id"},
+                    },
+                    "execute_on": ["android"],
+                    "error_strategy": "IGNORE",
+                }
+            ]
+        )
+        self.assertTrue(result["success"])
+        ignored = result["steps"][0]
+        self.assertEqual(ignored["status"], "SKIP")
+        self.assertEqual(ignored["skip_reason"], f"失败已忽略：{ignored['error']}")
+        # 状态与结论口径变了，但错误详情留痕不动
+        self.assertIn("click failed", ignored["error"])
+        self.assertEqual(ignored["error_code"], "E2999_EXECUTION_ERROR")
+        self.assertEqual(ignored["error_context"]["action"], "click")
+        self.assertTrue(ignored["suggestion"])
+        self.assertEqual(ignored.get("screenshot"), base64.b64encode(b"png").decode("utf-8"))
+        self.assertEqual(ignored["attempts"], 1)
+
+    def test_abort_strategy_stops_execution_and_pads_remaining_steps(self):
+        before_step_actions = []
+        self.runner.before_step = before_step_actions.append
         result = self.runner.run_all(
             [
                 {
@@ -540,11 +574,119 @@ class CrossPlatformRunnerTests(unittest.TestCase):
                     },
                     "execute_on": ["android"],
                 },
+                {
+                    "action": "sleep",
+                    "args": {"seconds": 0},
+                    "execute_on": ["android"],
+                },
             ]
         )
         self.assertFalse(result["success"])
-        self.assertEqual(len(result["steps"]), 1)
+        # 结果条数恒等于步骤条数：截断不再伪装成"总共就这么多步"
+        self.assertEqual(len(result["steps"]), 3)
         self.assertEqual(result["steps"][0]["status"], "FAIL")
+        self.assertEqual(result["steps"][0]["order"], 1)
+        for offset, padded in enumerate(result["steps"][1:], start=2):
+            self.assertEqual(padded["status"], "SKIP")
+            self.assertEqual(padded["skip_reason"], "上游步骤失败，中止执行")
+            self.assertEqual(padded["order"], offset)
+            self.assertEqual(padded["duration"], 0)
+            self.assertIsNone(padded["error"])
+            self.assertIsNone(padded["error_code"])
+            self.assertNotIn("screenshot", padded)
+        # 补记录不触发 before_step（它们没执行）
+        self.assertEqual(before_step_actions, ["click"])
+
+    def test_abort_event_break_pads_remaining_steps_as_user_aborted(self):
+        abort_event = threading.Event()
+        before_step_actions = []
+
+        def before_step(action):
+            before_step_actions.append(action)
+            if len(before_step_actions) >= 2:
+                abort_event.set()
+
+        abort_runner = TestCaseRunner(
+            platform="android",
+            device_id="device-abort-pad",
+            abort_event=abort_event,
+            before_step=before_step,
+        )
+        try:
+            result = abort_runner.run_all(
+                [
+                    {
+                        "action": "click",
+                        "platform_overrides": {"android": {"selector": "ok", "by": "id"}},
+                        "execute_on": ["android"],
+                    },
+                    {
+                        "action": "click",
+                        "platform_overrides": {"android": {"selector": "ok", "by": "id"}},
+                        "execute_on": ["android"],
+                    },
+                    {
+                        "action": "click",
+                        "platform_overrides": {"android": {"selector": "ok", "by": "id"}},
+                        "execute_on": ["android"],
+                    },
+                ]
+            )
+        finally:
+            abort_runner.disconnect()
+
+        self.assertFalse(result["success"])
+        self.assertEqual(len(result["steps"]), 3)
+        self.assertEqual(result["steps"][0]["status"], "PASS")
+        self.assertEqual(result["steps"][1]["status"], "FAIL")
+        self.assertEqual(result["steps"][1]["error"], "执行已被用户中止")
+        padded = result["steps"][2]
+        self.assertEqual(padded["status"], "SKIP")
+        self.assertEqual(padded["skip_reason"], "用户中止执行")
+        self.assertEqual(padded["order"], 3)
+        self.assertIsNone(padded["error"])
+        # 补记录不触发 before_step
+        self.assertEqual(before_step_actions, ["click", "click"])
+
+    def test_user_abort_failure_is_not_tolerated_by_ignore(self):
+        abort_event = threading.Event()
+        abort_runner = TestCaseRunner(
+            platform="android",
+            device_id="device-abort-ignore",
+            abort_event=abort_event,
+            abort_on_click=abort_event,
+        )
+        try:
+            result = abort_runner.run_all(
+                [
+                    {
+                        "action": "click",
+                        "platform_overrides": {
+                            "android": {"selector": "fail-and-abort", "by": "id"},
+                        },
+                        "execute_on": ["android"],
+                        "error_strategy": "IGNORE",
+                        "retry_count": 1,
+                    },
+                    {
+                        "action": "click",
+                        "platform_overrides": {"android": {"selector": "ok", "by": "id"}},
+                        "execute_on": ["android"],
+                    },
+                ]
+            )
+        finally:
+            abort_runner.disconnect()
+
+        # 用户中止不是可被 IGNORE 容忍的失败：不得记成"失败已忽略"
+        self.assertFalse(result["success"])
+        aborted = result["steps"][0]
+        self.assertEqual(aborted["status"], "FAIL")
+        self.assertEqual(aborted["error"], "执行已被用户中止")
+        self.assertIsNone(aborted.get("skip_reason"))
+        padded = result["steps"][1]
+        self.assertEqual(padded["status"], "SKIP")
+        self.assertEqual(padded["skip_reason"], "用户中止执行")
 
     def test_extract_by_ocr_exports_runtime_variable(self):
         result = self.runner.run_all(
@@ -637,7 +779,12 @@ class CrossPlatformRunnerTests(unittest.TestCase):
                 ]
             )
             screenshot = result["steps"][0].get("screenshot")
-            self.assertEqual(result["steps"][0]["status"], "WARNING")
+            # IGNORE 失败 → SKIP + skip_reason，截图留痕保留（复用步骤 artifacts 里的截图）
+            self.assertEqual(result["steps"][0]["status"], "SKIP")
+            self.assertEqual(
+                result["steps"][0]["skip_reason"],
+                "失败已忽略：planned click failed",
+            )
             self.assertEqual(
                 screenshot,
                 base64.b64encode(b"cached-png").decode("utf-8"),
@@ -890,15 +1037,26 @@ class StepRetryTests(unittest.TestCase):
             result = runner.run_all(
                 [
                     self._flaky_click_step(retry_count=1, error_strategy="IGNORE"),
+                    {
+                        "action": "click",
+                        "platform_overrides": {"android": {"selector": "ok", "by": "id"}},
+                        "execute_on": ["android"],
+                    },
                 ]
             )
         finally:
             runner.disconnect()
 
+        # retry 先走完，IGNORE 只在最终结果上生效（SKIP + skip_reason，error 留痕）
         self.assertTrue(result["success"])
-        self.assertEqual(result["steps"][0]["status"], "WARNING")
-        self.assertEqual(result["steps"][0]["attempts"], 2)
+        ignored = result["steps"][0]
+        self.assertEqual(ignored["status"], "SKIP")
+        self.assertEqual(ignored["skip_reason"], f"失败已忽略：{ignored['error']}")
+        self.assertTrue(ignored["skip_reason"].startswith("失败已忽略"))
+        self.assertIn("attempt 2", str(ignored["error"]))
+        self.assertEqual(ignored["attempts"], 2)
         self.assertEqual(runner.driver.click_attempts, 2)
+        self.assertEqual(result["steps"][1]["status"], "PASS")
 
     def test_invalid_retry_count_is_clamped_defensively(self):
         runner = self._make_runner(click_failures_before_success=99)

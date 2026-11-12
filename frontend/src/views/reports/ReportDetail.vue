@@ -28,9 +28,13 @@ const devices = ref([])
 const loadError = ref('')
 const resultSummary = computed(() => {
     const steps = cases.value.flatMap(item => item.steps)
-    return { total: steps.length, passed: steps.filter(step => normalizeStatus(step.status) === 'PASS').length,
-        failed: steps.filter(step => ['FAIL', 'ERROR'].includes(normalizeStatus(step.status))).length,
-        warnings: steps.filter(step => normalizeStatus(step.status) === 'WARNING').length }
+    const total = steps.length
+    const passed = steps.filter(step => normalizeStatus(step.status) === 'PASS').length
+    const failed = steps.filter(step => ['FAIL', 'ERROR'].includes(normalizeStatus(step.status))).length
+    const warnings = steps.filter(step => normalizeStatus(step.status) === 'WARNING').length
+    // 跳过按残差计，保证 通过+失败+告警+跳过 = 总数（与后端 HTML 报告同口径）
+    const skipped = Math.max(total - passed - failed - warnings, 0)
+    return { total, passed, failed, warnings, skipped }
 })
 const firstIssue = computed(() => {
     const steps = cases.value.flatMap(item => item.steps.map(step => ({ ...step, caseName: item.name, collapseKey: item.collapseKey })))
@@ -120,23 +124,40 @@ const getMessageClass = (status) => {
     return 'error-text'
 }
 
+// IGNORE 容忍的失败跳过原因前缀（与 backend.report_display.IGNORED_SKIP_REASON_PREFIX 一致）
+const IGNORED_SKIP_REASON_PREFIX = '失败已忽略'
+
+// 跳过原因（纯增量字段）：优先 report_display.skip_reason，缺失时回退 error_message 显示路径
+const getStepSkipReason = (row) => String(row?.report_display?.skip_reason || '').trim()
+
+// 状态是 SKIP、但跳过原因是「失败已忽略」：被容忍的真实失败，结论不计入、详情留痕保留
+const isIgnoredFailureStep = (row) => (
+    normalizeStatus(row?.status) === 'SKIP'
+    && getStepSkipReason(row).startsWith(IGNORED_SKIP_REASON_PREFIX)
+)
+
 const formatStepMessage = (row) => {
-    if (!row?.error_message) return ''
-    return normalizeStatus(row.status) === 'SKIP'
-        ? `跳过原因: ${row.error_message}`
-        : row.error_message
+    if (normalizeStatus(row?.status) === 'SKIP') {
+        const reason = getStepSkipReason(row) || String(row?.error_message || '').trim()
+        return reason ? `跳过原因: ${reason}` : ''
+    }
+    return String(row?.error_message || '').trim()
 }
 
-// 结构化错误信息（错误码/修复建议）仅对失败/告警步骤展示
-const isFailedLikeStep = (row) => ['FAIL', 'ERROR', 'WARNING'].includes(normalizeStatus(row?.status))
+const hasStepMessage = (row) => Boolean(formatStepMessage(row))
+
+// 结构化错误信息（错误码/修复建议）仅对失败/告警步骤展示；被容忍失败的 SKIP 同样留痕
+const hasFailureDetail = (row) => (
+    ['FAIL', 'ERROR', 'WARNING'].includes(normalizeStatus(row?.status)) || isIgnoredFailureStep(row)
+)
 
 const getStepErrorCode = (row) => {
-    if (!isFailedLikeStep(row)) return ''
+    if (!hasFailureDetail(row)) return ''
     return String(row?.report_display?.error_code || '').trim()
 }
 
 const getStepSuggestion = (row) => {
-    if (!isFailedLikeStep(row)) return ''
+    if (!hasFailureDetail(row)) return ''
     return String(row?.report_display?.suggestion || '').trim()
 }
 
@@ -163,12 +184,14 @@ const getStepPreviewLabel = (row) => {
 const hasStepPreview = (row) => Boolean(getStepPreviewPath(row))
 
 const getFailureScreenshotPath = (row) => {
-    const status = normalizeStatus(row?.status)
-    if (!['FAIL', 'ERROR', 'WARNING'].includes(status)) return ''
+    if (!hasFailureDetail(row)) return ''
     return row?.screenshot_path || ''
 }
 
 const hasFailureScreenshot = (row) => Boolean(getFailureScreenshotPath(row))
+
+// 用例全部步骤都是跳过（含全部被 IGNORE 容忍）→ 归 skipped（等价后端 all_skipped 口径）
+const allStepsSkipped = (steps) => Boolean(steps?.length) && steps.every(step => normalizeStatus(step.status) === 'SKIP')
 
 const fetchDetail = async () => {
     loading.value = true
@@ -220,13 +243,14 @@ const fetchDetail = async () => {
                     c.hasError = true
                 } else if (status === 'WARNING' && c.status !== 'FAIL') {
                     c.status = 'WARNING'
-                } else if (status === 'SKIP' && c.status === 'PASS') {
-                    c.status = 'WARNING'
                 }
             })
-            
+
+            // 用例结论与后端聚合一致：结论只由未被容忍的失败决定（IGNORE 记 SKIP 不降级 PASS），
+            // 全部步骤都是跳过（含全部被忽略）时归 skipped，表示本次没有真正验证到内容。
             cases.value = Array.from(caseMap.values()).map((item, index) => ({
                 ...item,
+                status: allStepsSkipped(item.steps) ? 'skipped' : item.status,
                 collapseKey: `${index}-${item.name}`,
             }))
             activeCaseNames.value = cases.value.filter(item => item.hasError).map(item => item.collapseKey)
@@ -309,7 +333,7 @@ onMounted(() => {
 
 
         <section v-if="execution" class="report-conclusion" aria-label="执行结论">
-            <div class="conclusion-counts"><strong>{{ resultSummary.total }} 个步骤</strong><span>通过 {{ resultSummary.passed }}</span><span :class="{ 'error-text': resultSummary.failed }">失败 {{ resultSummary.failed }}</span><span>告警 {{ resultSummary.warnings }}</span></div>
+            <div class="conclusion-counts"><strong>{{ resultSummary.total }} 个步骤</strong><span>通过 {{ resultSummary.passed }}</span><span :class="{ 'error-text': resultSummary.failed }">失败 {{ resultSummary.failed }}</span><span>告警 {{ resultSummary.warnings }}</span><span>跳过 {{ resultSummary.skipped }}</span></div>
             <div v-if="firstIssue" class="first-issue">
                 <div><strong>{{ firstIssue.caseName }} · 第 {{ firstIssue.local_step_order || firstIssue.step_order }} 步</strong><p>{{ firstIssue.error_message || firstIssue.display_name }}</p><p v-if="getStepSuggestion(firstIssue)" class="suggestion-text">建议：{{ getStepSuggestion(firstIssue) }}</p></div>
                 <div class="ad-row-actions"><el-button link type="primary" @click="revealIssue">定位步骤</el-button><el-button v-if="hasFailureScreenshot(firstIssue)" link type="primary" @click="viewFailureScreenshot(firstIssue)">查看失败截图</el-button></div>
@@ -348,7 +372,7 @@ onMounted(() => {
                                         <strong>{{ row.display_name || row.step_name }}</strong>
                                         <el-tag :type="getStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
                                     </div>
-                                    <p v-if="row.error_message" :class="getMessageClass(row.status)">
+                                    <p v-if="hasStepMessage(row)" :class="getMessageClass(row.status)">
                                         <el-tag v-if="getStepErrorCode(row)" :type="getStatusTagType(row.status)" size="small" effect="plain" class="error-code-tag">{{ getStepErrorCode(row) }}</el-tag>
                                         {{ formatStepMessage(row) }}
                                     </p>
@@ -420,7 +444,7 @@ onMounted(() => {
 
 
         <section v-if="execution" class="report-conclusion" aria-label="执行结论">
-            <div class="conclusion-counts"><strong>{{ resultSummary.total }} 个步骤</strong><span>通过 {{ resultSummary.passed }}</span><span :class="{ 'error-text': resultSummary.failed }">失败 {{ resultSummary.failed }}</span><span>告警 {{ resultSummary.warnings }}</span></div>
+            <div class="conclusion-counts"><strong>{{ resultSummary.total }} 个步骤</strong><span>通过 {{ resultSummary.passed }}</span><span :class="{ 'error-text': resultSummary.failed }">失败 {{ resultSummary.failed }}</span><span>告警 {{ resultSummary.warnings }}</span><span>跳过 {{ resultSummary.skipped }}</span></div>
             <div v-if="firstIssue" class="first-issue">
                 <div><strong>{{ firstIssue.caseName }} · 第 {{ firstIssue.local_step_order || firstIssue.step_order }} 步</strong><p>{{ firstIssue.error_message || firstIssue.display_name }}</p><p v-if="getStepSuggestion(firstIssue)" class="suggestion-text">建议：{{ getStepSuggestion(firstIssue) }}</p></div>
                 <div class="ad-row-actions"><el-button link type="primary" @click="revealIssue">定位步骤</el-button><el-button v-if="hasFailureScreenshot(firstIssue)" link type="primary" @click="viewFailureScreenshot(firstIssue)">查看失败截图</el-button></div>
@@ -466,10 +490,10 @@ onMounted(() => {
                                  <template #default="{ row }">
                                      <div class="step-name">
                                          {{ row.display_name || row.step_name }}
-                                         <el-tag v-if="normalizeStatus(row.status) === 'WARNING'" size="small" type="warning" effect="light" style="margin-left: 8px;">已忽略错误</el-tag>
-                                         <el-tag v-if="normalizeStatus(row.status) === 'SKIP'" size="small" type="info" effect="light" style="margin-left: 8px;">步骤跳过</el-tag>
+                                         <el-tag v-if="isIgnoredFailureStep(row) || normalizeStatus(row.status) === 'WARNING'" size="small" type="warning" effect="light" style="margin-left: 8px;">已忽略错误</el-tag>
+                                         <el-tag v-if="normalizeStatus(row.status) === 'SKIP' && !isIgnoredFailureStep(row)" size="small" type="info" effect="light" style="margin-left: 8px;">步骤跳过</el-tag>
                                      </div>
-                                     <div v-if="row.error_message" :class="getMessageClass(row.status)">
+                                     <div v-if="hasStepMessage(row)" :class="getMessageClass(row.status)">
                                          <el-tag v-if="getStepErrorCode(row)" :type="getStatusTagType(row.status)" size="small" effect="plain" class="error-code-tag">{{ getStepErrorCode(row) }}</el-tag>
                                          {{ formatStepMessage(row) }}
                                      </div>
