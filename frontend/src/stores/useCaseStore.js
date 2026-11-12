@@ -3,6 +3,7 @@ import { ref, computed, nextTick } from 'vue'
 import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
+import { fetchAllPages } from '@/utils/paginate'
 import {
     VERSION_CONFLICT_MESSAGE,
     extractVersionState,
@@ -424,8 +425,10 @@ export const useCaseStore = defineStore('case', () => {
     async function fetchCaseList() {
         loading.value = true
         try {
-            const res = await api.getTestCases({ skip: 0, limit: 1000 })
-            caseList.value = res.data.items || res.data
+            // 分页拉全量：一次性 limit:1000 会在超过 1000 条时静默截断（见 utils/paginate.js）
+            caseList.value = await fetchAllPages(
+                ({ skip, limit }) => api.getTestCases({ skip, limit }).then(r => r.data)
+            )
         } catch (err) {
             ElMessage.error('获取用例列表失败: ' + err.message)
         } finally {
