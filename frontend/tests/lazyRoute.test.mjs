@@ -57,22 +57,57 @@ test('终态失败：自动重载一次且不重复刷（防重载环）', async
   const storage = fakeStorage()
   let reloaded = 0
   const loader = async () => { throw moduleError() }
-  const run = lazyRoute(loader, { storage, reload: () => { reloaded += 1 }, now: () => 1000 })
+  const run = lazyRoute(loader, {
+    storage, reload: () => { reloaded += 1 }, now: () => 1000, retryDelaysMs: [0, 0],
+  })
 
-  const pending = run()
+  // reload 后的 promise 带超时兜底（见下一条用例），这里吞掉它的拒绝
+  run().catch(() => {})
   await new Promise((r) => setTimeout(r, 50))
   assert.equal(reloaded, 1, '首次终态失败自动重载')
 
   // 30s 窗口内再次失败：不自动刷，转为可见提示 + 抛出
   const errors = []
   const run2 = lazyRoute(loader, {
-    storage, reload: () => { reloaded += 1 }, now: () => 1000 + 5000,
+    storage, reload: () => { reloaded += 1 }, now: () => 1000 + 5000, retryDelaysMs: [0, 0],
     onError: (message) => errors.push(message),
   })
   await assert.rejects(run2())
   assert.equal(reloaded, 1, '重载窗口内不得循环刷新')
   assert.equal(errors.length, 1, '转为可见错误提示')
   assert.match(errors[0], /加载失败/)
+})
+
+test('重载未生效时超时兜底：转为可见提示并拒绝，绝不永久挂起', async () => {
+  const storage = fakeStorage()
+  const errors = []
+  const loader = async () => { throw moduleError() }
+  const run = lazyRoute(loader, {
+    storage,
+    reload: () => { /* 模拟 reload 被拦截、页面没有换掉 */ },
+    now: () => 1000,
+    retryDelaysMs: [0, 0],
+    reloadSettleMs: 20,
+    onError: (message) => errors.push(message),
+  })
+  await assert.rejects(run(), /dynamically imported module/i)
+  assert.equal(errors.length, 1, '超时后给出可见提示而不是一直卡住')
+  assert.match(errors[0], /加载失败/)
+})
+
+test('非模块错误不自动重载（刷新只会复现并掩盖堆栈）', async () => {
+  const storage = fakeStorage()
+  let reloaded = 0
+  const loader = async () => { throw new Error('component render bug') }
+  const run = lazyRoute(loader, {
+    storage,
+    reload: () => { reloaded += 1 },
+    reloadSettleMs: 20,
+    onError: () => {},
+  })
+  await assert.rejects(run(), /component render bug/)
+  assert.equal(reloaded, 0, '代码错误不该触发页面重载')
+  assert.equal(storage.getItem('autodroid:chunk-reload-at'), null, '也不该占用重载窗口')
 })
 
 test('成功加载清除重载标记（下次失败可再自动重载）', async () => {
