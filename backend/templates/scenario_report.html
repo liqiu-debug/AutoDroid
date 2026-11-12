@@ -418,7 +418,7 @@
                         <div class="case-meta">Alias: {{ case.alias or '-' }} | ID: {{ case.case_id }}</div>
                     </div>
                     <div class="case-status {{ case.status }}">
-                        {{ '通过' if case.status == 'success' else ('警告/忽略' if case.status == 'warning' else '失败') }}
+                        {{ '通过' if case.status == 'success' else ('跳过' if case.status == 'skipped' else ('警告/忽略' if case.status == 'warning' else '失败')) }}
                     </div>
                 </div>
 

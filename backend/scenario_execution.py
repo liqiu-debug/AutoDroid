@@ -38,12 +38,42 @@ from backend.run_control import (
 from backend.scenario_results import (
     _build_cases_results_from_raw_results,
     _build_scenario_summary_message,
+    _case_failures_all_ignored,
     _convert_cross_result_to_legacy_case_result,
+    _step_is_skip_record,
     _summarize_cases_results,
+    is_tolerated_failure,
 )
 from backend.step_contract import normalize_error_strategy
 
 logger = logging.getLogger(__name__)
+
+
+def _is_routable_failure(step_result: Dict[str, Any]) -> bool:
+    """可参与失败路由的步骤失败：非成功、非告警，且未被 IGNORE 容忍。"""
+    if not isinstance(step_result, dict):
+        return False
+    if step_result.get("success") or step_result.get("is_warning"):
+        return False
+    if _step_is_skip_record(step_result):
+        return False
+    return not is_tolerated_failure(step_result)
+
+
+def _resolve_case_failure_strategy(case_result: Dict[str, Any]) -> Optional[str]:
+    """用例失败路由：取最后一个失败步骤的 error_strategy 决定 break/continue。
+
+    IGNORE 步骤（已被容忍）与 WARNING 步骤都不算失败步骤；找不到时返回 None。
+    """
+    for step_result in reversed(case_result.get("steps") or []):
+        if not _is_routable_failure(step_result):
+            continue
+        raw = (step_result.get("step") or {}).get("error_strategy", "ABORT")
+        try:
+            return normalize_error_strategy(raw)
+        except Exception:
+            return "ABORT"
+    return None
 
 
 def _resolve_device_meta(
@@ -380,21 +410,21 @@ def _run_scenario_cross_platform(
         if isinstance(exported, dict):
             scenario_context.update(exported)
 
-        if not case_result.get("success"):
-            strategy = "ABORT"
-            for step_result in reversed(case_result.get("steps", [])):
-                if not step_result.get("success") and not step_result.get("is_warning"):
-                    strategy = normalize_error_strategy(
-                        (step_result.get("step") or {}).get("error_strategy", "ABORT")
-                    )
-                    break
-
-            if strategy == "CONTINUE":
-                success = False
+        # 用例失败路由：只由"未被容忍的失败"决定；IGNORE 步骤不算失败步骤，
+        # 不中断场景也不判失败（既有语义：取最后一个失败步骤的 error_strategy）。
+        strategy = _resolve_case_failure_strategy(case_result)
+        if strategy is None and not case_result.get("success"):
+            if case_result.get("steps") and _case_failures_all_ignored(case_result):
                 continue
+            strategy = "ABORT"
+        if strategy is None:
+            continue
 
-            success = False
-            break
+        success = False
+        if strategy == "CONTINUE":
+            continue
+
+        break
 
     return {
         "success": success,

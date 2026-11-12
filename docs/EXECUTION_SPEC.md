@@ -33,6 +33,29 @@
 
 校验：`retry_count` 必须为非负整数且不超过 `3`，非法值预检失败（`P1006_INVALID_ARGS`）；legacy JSON 转换链路对非法值宽松回退（收敛到 `0-3`）。
 
+### 2.2 容错策略与结论口径（error_strategy）
+
+容错策略决定「这步失败之后怎么办」，以及它对用例 / 场景结论的影响。总原则：**结论只由未被容忍的失败决定，被容忍的异常只影响步骤行显示**。
+
+| 策略 | 步骤行状态 | 步骤行「错误 / 跳过原因」列 | 用例结论 | 场景结论 |
+| --- | --- | --- | --- | --- |
+| `ABORT`（默认） | `FAIL` | 显示 `error` | `FAIL` | `FAIL`，不再执行后续用例 |
+| `CONTINUE` | `FAIL` | 显示 `error` | `FAIL` | `FAIL`，剩余用例跑完 |
+| `IGNORE` | `SKIP` | `失败已忽略：<原始 error 文本>` | `PASS` | `PASS`，不中断、不降级 |
+
+- `IGNORE` 的步骤结果保留完整留痕（`error` / `error_code` / `error_context` / `suggestion` 与失败截图），只是状态记为 `SKIP`、不再参与结论判定。它表达的是「这步失败不影响本次验证结论」，不是「这步没跑过」——后者见 `skip_reason` 文案区分。
+- 用例所有步骤均为 `SKIP`（含全部被 `IGNORE`）时，用例归类 `WARNING` / `skipped`，表示本次没有真正验证到任何内容；这一既有口径不变。
+- 结果 dict 新增 `skip_reason`（纯增量字段，`error` 字符串格式不变）：
+  - `失败已忽略：<原始 error 文本>` —— `IGNORE` 容忍的失败；
+  - `上游步骤失败，中止执行` / `用户中止执行` —— 中止后补齐的记录（见 2.3）；
+  - 平台跳过沿用 `P1001_PLATFORM_NOT_ALLOWED`。
+- App 直跑（AutoJs6）与桌面 client-runs 的上报协议模型不含 `skip_reason` 列，统一走 `output.skip_reason` 透传；旧客户端缺该键时安全回退为空。
+- Flaky 统计沿用「`SKIP` 不计入样本」，但 `skip_reason` 为「失败已忽略：…」的步骤属于真实失败，仍计入样本，避免把稳定性信号洗掉。
+
+### 2.3 中止后补齐记录（报告缺步修复）
+
+`error_strategy=ABORT` 触发中断或用户中止后，剩余每个步骤都会补一条结果记录：`status=SKIP`、`skip_reason="上游步骤失败，中止执行"`（用户中止则 `用户中止执行`）、`duration=0`、不截图。目标是**结果条数恒等于步骤条数**，报告不会把「被截断」伪装成「总共就这么多步」。补齐的记录不触发 `before_step` / `before_device_step` 钩子（该步骤并未执行）。
+
 ## 3. 平台覆盖与兼容规则
 
 - `execute_on` 不包含当前平台：步骤状态为 `SKIP`。
@@ -165,9 +188,10 @@
 
 ## 7. 结果状态语义
 
-- 步骤级：`PASS/SKIP/WARNING/FAIL`。
-- 用例级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。
-- 场景级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。
+- 步骤级：`PASS/SKIP/WARNING/FAIL`。`SKIP` 表示该步骤没有产生有效执行结果，具体原因看 `skip_reason`：平台不匹配、中止后未执行、或失败被 `IGNORE` 容忍。
+- 用例级：`PASS/WARNING/FAIL/ABORTED`（全 `SKIP` 归类为 `WARNING`，人工终止归类为 `ABORTED`）。**被 `IGNORE` 容忍的失败不改变用例结论**，用例只由未被容忍的失败判定。
+- 场景级：`PASS/WARNING/FAIL/ABORTED`（口径同用例级；`IGNORE` 不中断场景、不拉低场景结论）。
+- 报告计数口径：通过 + 失败 + 告警 + 跳过 = 步骤总数，数字必须闭合。
 - 调度/长任务级还可能出现 `PENDING/QUEUED/RUNNING/ERROR`；`QUEUED` 表示等待执行名额或设备租约，不应当作步骤失败。
 
 ## 8. 设备独占与中止

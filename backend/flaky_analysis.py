@@ -18,7 +18,9 @@ Flaky 用例识别 + 执行结果对比（纯查询计算，不建新表）。
 
 二、步骤级 Flaky：对进入榜单的场景，将其窗口内各次执行的 TestResult 按
     (step_order, step_name) 对齐，统计"时好时坏"（既有通过又有失败）的步骤，
-    评分公式与场景级一致；SKIP 状态的步骤出现不计入样本。
+    评分公式与场景级一致；SKIP 状态的步骤出现不计入样本，但 skip_reason 为
+    「失败已忽略：…」的跳过属于被 IGNORE 容忍的真实失败，仍按失败样计入，
+    避免把"这步经常出错"的稳定性信号洗掉。
 
 三、执行对比（build_execution_compare）：仅允许同 scenario_id 的两次执行对比，
     步骤按 step_order 对齐；状态变化分类：
@@ -32,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlmodel import Session, col, select
 
 from backend.models import TestExecution, TestResult
+from backend.report_display import IGNORED_SKIP_REASON_PREFIX
 
 # 参与 flaky 统计的已完结状态（ABORTED 属于人为终止，不反映稳定性）
 FLAKY_COMPLETED_STATUSES = ("PASS", "FAIL", "WARNING", "ERROR")
@@ -58,6 +61,19 @@ def _normalize_status(status: Any) -> str:
 
 def _is_fail_like(status: Any) -> bool:
     return _normalize_status(status) in FAIL_LIKE_STATUSES
+
+
+def _is_ignored_skip(result: Any) -> bool:
+    """是否为 IGNORE 容忍的失败跳过（report_display.skip_reason 以「失败已忽略」开头）。
+
+    这类记录是被容忍的真实失败：状态虽为 SKIP，但仍应计入 Flaky 样本。
+    """
+    display = getattr(result, "report_display", None)
+    if not isinstance(display, dict):
+        return False
+    return str(display.get("skip_reason") or "").strip().startswith(
+        IGNORED_SKIP_REASON_PREFIX
+    )
 
 
 def _count_flips(pass_sequence: List[bool]) -> int:
@@ -184,7 +200,11 @@ def _compute_step_flaky(
             continue
         status = _normalize_status(result.status)
         if status == "SKIP":
-            continue
+            # 平台跳过 / 中止补记的跳过不计入样本；「失败已忽略」是被 IGNORE
+            # 容忍的真实失败，按失败样保留，否则稳定性信号会被洗掉。
+            if not _is_ignored_skip(result):
+                continue
+            status = "FAIL"
         scenario_id, seq = meta
         key = (scenario_id, int(result.step_order), str(result.step_name or ""))
         buckets.setdefault(key, []).append((seq, status))

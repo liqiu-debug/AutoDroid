@@ -25,6 +25,23 @@ DIRECTION_LABELS = {
     "left": "左滑",
     "right": "右滑",
 }
+# IGNORE 失败的跳过原因前缀（见 error_strategy 语义：失败已忽略：<原始 error 文本>）。
+# 凡以此开头的步骤结果都是"已被容忍的真实失败"：结论不计入，详情留痕保留。
+IGNORED_SKIP_REASON_PREFIX = "失败已忽略"
+
+
+def step_skip_reason(step: Any) -> str:
+    """读取步骤跳过原因（纯增量字段 skip_reason，兼容 output.skip_reason 透传）。"""
+    data = step if isinstance(step, dict) else normalize_step_payload_for_report(step)
+    direct = _clean_text(data.get("skip_reason"))
+    if direct:
+        return direct
+    return _clean_text(_object(data.get("output")).get("skip_reason"))
+
+
+def is_ignored_skip(step: Any) -> bool:
+    """是否为 IGNORE 容忍的失败跳过（skip_reason 以"失败已忽略"开头）。"""
+    return step_skip_reason(step).startswith(IGNORED_SKIP_REASON_PREFIX)
 
 
 def normalize_step_payload_for_report(step: Any) -> Dict[str, Any]:
@@ -218,10 +235,11 @@ def _build_preview(
 
 
 def _merge_error_fields(display: Dict[str, Any], step: Dict[str, Any]) -> None:
-    """并入结构化错误信息（error_code/suggestion，纯增量字段）。
+    """并入结构化错误信息（error_code/error_context/suggestion，纯增量字段）。
 
     步骤载荷可携带执行期错误码与修复建议（见 cross_platform_runner._result）；
     仅缺 suggestion 时按错误码回填默认建议，便于报告/前端统一渲染。
+    失败被 IGNORE 容忍后这些字段仍需保留作为详情留痕。
     """
     error_code = _clean_text(step.get("error_code"))
     suggestion = _clean_text(step.get("suggestion"))
@@ -231,6 +249,9 @@ def _merge_error_fields(display: Dict[str, Any], step: Dict[str, Any]) -> None:
             suggestion = suggestion_for(error_code)
     if suggestion:
         display["suggestion"] = suggestion
+    error_context = step.get("error_context")
+    if isinstance(error_context, dict) and error_context:
+        display["error_context"] = error_context
 
 
 def _merge_attempts_field(display: Dict[str, Any], step: Dict[str, Any]) -> None:
@@ -241,6 +262,16 @@ def _merge_attempts_field(display: Dict[str, Any], step: Dict[str, Any]) -> None
         return
     if attempts > 1:
         display["attempts"] = attempts
+
+
+def _merge_skip_reason_field(display: Dict[str, Any], step: Dict[str, Any]) -> None:
+    """skip_reason（纯增量字段）并入 report_display，供"跳过原因/错误"列渲染。
+
+    IGNORE 失败的取值形如"失败已忽略：<原始 error 文本>"，原始 error 仍随步骤结果保留。
+    """
+    skip_reason = step_skip_reason(step)
+    if skip_reason:
+        display["skip_reason"] = skip_reason
 
 
 def build_report_display(
@@ -263,6 +294,7 @@ def build_report_display(
     }
     _merge_error_fields(display, step_data)
     _merge_attempts_field(display, step_data)
+    _merge_skip_reason_field(display, step_data)
 
     if description:
         return display

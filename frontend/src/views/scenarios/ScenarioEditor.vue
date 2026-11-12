@@ -11,6 +11,7 @@ import {
 } from '@element-plus/icons-vue'
 import LogConsole from '@/components/LogConsole.vue'
 import { createUuid } from '@/utils/uuid'
+import { fetchAllPages } from '@/utils/paginate'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
@@ -137,14 +138,20 @@ const fetchEnvironments = async () => {
     }
 }
 
+// 分页拉全量用例：单次 limit=1000 会静默截断，导致 1000 条之后的用例
+// 在树上看得见却点不动（caseLibrary 查不到 → handleCaseTreeClick 走兜底拉取），
+// 场景步骤也只能显示「未知用例」。目录树（getFolderTree）本身是全量的，这里是唯一缺口。
+const fetchAllCases = () => fetchAllPages(
+    ({ skip, limit }) => api.getTestCases({ skip, limit }).then(r => r.data)
+)
+
 // Actions
 const fetchCases = async () => {
   try {
-    const [casesRes, treeRes] = await Promise.all([
-      api.getTestCases({ skip: 0, limit: 1000 }),
+    const [cases, treeRes] = await Promise.all([
+      fetchAllCases(),
       api.getFolderTree()
     ])
-    const cases = casesRes.data.items || casesRes.data
     caseLibrary.value = cases.map(c => ({
       ...c,
       uuid: createUuid(),
@@ -175,6 +182,20 @@ const fetchScenarioSteps = async () => {
   loading.value = true
   try {
     const res = await api.getScenarioSteps(scenarioId.value)
+    // 兜底：若仍有用例没进库（分页拉全量后理论上不会发生），按 id 单拉补齐，
+    // 避免场景步骤显示「未知用例」。
+    const missingIds = [...new Set(res.data.map(s => s.case_id))]
+        .filter(id => !caseLibrary.value.some(c => c.id === id))
+    if (missingIds.length) {
+        const fetched = await Promise.all(
+            missingIds.map(id => api.getTestCase(id).then(r => r.data).catch(() => null))
+        )
+        caseLibrary.value.push(...fetched.filter(Boolean).map(c => ({
+            ...c,
+            uuid: createUuid(),
+            type: 'case'
+        })))
+    }
     scenarioSteps.value = res.data.map(step => {
         const originalCase = caseLibrary.value.find(c => c.id === step.case_id)
         return {
@@ -605,9 +626,20 @@ const handleStepClick = (step) => {
     selectedStep.value = step
 }
 
-const handleCaseTreeClick = (data) => {
+const handleCaseTreeClick = async (data) => {
     if (data.type !== 'case') return
-    const libCase = caseLibrary.value.find(c => c.id === data.case_id)
+    let libCase = caseLibrary.value.find(c => c.id === data.case_id)
+    if (!libCase) {
+        // 兜底：库里没命中时按 id 单拉一次，点击绝不静默无反应
+        try {
+            const res = await api.getTestCase(data.case_id)
+            libCase = { ...res.data, uuid: createUuid(), type: 'case' }
+            caseLibrary.value.push(libCase)
+        } catch (err) {
+            ElMessage.error('加载用例详情失败')
+            return
+        }
+    }
     if (!libCase) return
     addCaseToScenario(libCase)
 }

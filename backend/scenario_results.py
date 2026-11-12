@@ -19,16 +19,78 @@ from sqlmodel import Session
 from backend.models import TestCase, TestResult
 from backend.report_display import (
     build_report_display,
+    is_ignored_skip,
     normalize_step_payload_for_report,
+    step_skip_reason,
     storage_report_display,
 )
-from backend.step_contract import standard_step_to_legacy
+from backend.step_contract import normalize_error_strategy, standard_step_to_legacy
 
 logger = logging.getLogger(__name__)
 
 
+def _step_error_strategy(step_result: Any) -> str:
+    """步骤容错策略（步骤结果顶层或 step 定义内，非法值归 ABORT）。"""
+    if not isinstance(step_result, dict):
+        return "ABORT"
+    raw = step_result.get("error_strategy")
+    if not raw and isinstance(step_result.get("step"), dict):
+        raw = step_result["step"].get("error_strategy")
+    try:
+        return normalize_error_strategy(raw)
+    except Exception:
+        return "ABORT"
+
+
+def _step_is_success(step_result: Dict[str, Any]) -> bool:
+    if step_result.get("success") is True:
+        return True
+    return str(step_result.get("status") or "").strip().upper() in ("PASS", "SUCCESS")
+
+
+def _step_is_skip_record(step_result: Dict[str, Any]) -> bool:
+    if step_result.get("is_skipped"):
+        return True
+    return str(step_result.get("status") or "").strip().upper() in ("SKIP", "SKIPPED")
+
+
+def _step_has_failure(step_result: Dict[str, Any]) -> bool:
+    """步骤是否带失败信号：真实失败，或 SKIP 记录里仍留有 error（如 IGNORE 失败降级）。"""
+    if is_ignored_skip(step_result):
+        return True
+    if _step_is_success(step_result) and not step_result.get("error"):
+        return False
+    if _step_is_skip_record(step_result):
+        return bool(step_result.get("error"))
+    return True
+
+
+def is_tolerated_failure(step_result: Any) -> bool:
+    """该步骤的失败是否已被 error_strategy=IGNORE 容忍。
+
+    被容忍的失败步骤结果为 SKIP，结论不计入 has_warning / has_fail，
+    但 error / error_code / error_context / suggestion / 截图仍作为详情留痕保留。
+    """
+    if not isinstance(step_result, dict):
+        return False
+    if is_ignored_skip(step_result):
+        return True
+    if not _step_has_failure(step_result):
+        return False
+    return _step_error_strategy(step_result) == "IGNORE"
+
+
+def _case_failures_all_ignored(case_result: Dict[str, Any]) -> bool:
+    """用例的失败是否全部被 IGNORE 容忍（另有成功步骤不影响判定）。"""
+    steps = [step for step in (case_result.get("steps") or []) if isinstance(step, dict)]
+    failures = [step for step in steps if _step_has_failure(step)]
+    return bool(failures) and all(is_tolerated_failure(step) for step in failures)
+
+
 def _step_ui_status(step_result: Dict[str, Any]) -> str:
     """Normalize step result to UI status: success/warning/skipped/failed."""
+    if is_tolerated_failure(step_result):
+        return "skipped"
     if step_result.get("is_warning"):
         return "warning"
     if step_result.get("is_skipped"):
@@ -70,7 +132,7 @@ def _summarize_scenario_raw_results(raw_results: List[Dict[str, Any]]) -> Dict[s
     for item in raw_results or []:
         case_res = item.get("result", {}) if isinstance(item, dict) else {}
         case_steps = case_res.get("steps", []) if isinstance(case_res, dict) else []
-        if case_res.get("is_warning"):
+        if case_res.get("is_warning") and not _case_failures_all_ignored(case_res):
             has_warning = True
 
         if not case_steps and case_res.get("success") is False:
@@ -150,19 +212,25 @@ def _determine_case_status(
     case_success: bool,
     case_is_warning: bool = False,
 ) -> str:
-    case_has_failed = any(step.get("status") == "failed" for step in formatted_steps)
-    case_has_warning = any(step.get("status") == "warning" for step in formatted_steps)
-    case_all_skipped = bool(formatted_steps) and all(
-        step.get("status") == "skipped" for step in formatted_steps
+    steps = list(formatted_steps or [])
+    # 结论只由"未被容忍的失败"决定：IGNORE 容忍的失败不计入失败/警告。
+    counted = [step for step in steps if not is_tolerated_failure(step)]
+    tolerated_failure_only = bool(steps) and len(counted) < len(steps) and not any(
+        step.get("status") in ("failed", "warning") for step in counted
     )
+
+    case_has_failed = any(step.get("status") == "failed" for step in counted)
+    case_has_warning = any(step.get("status") == "warning" for step in counted)
+    # 全 SKIP 例外：含被 IGNORE 全部忽略的情形，仍归 skipped（没真正验证到东西）。
+    case_all_skipped = bool(steps) and all(step.get("status") == "skipped" for step in steps)
 
     if case_has_failed:
         return "failed"
     if case_all_skipped:
         return "skipped"
-    if case_has_warning or case_is_warning:
+    if case_has_warning or (case_is_warning and not tolerated_failure_only):
         return "warning"
-    if case_success:
+    if case_success or tolerated_failure_only:
         return "success"
     return "failed"
 
@@ -271,6 +339,13 @@ def _persist_case_result_and_build_case_report(
             display_payload["error_code"] = error_code
         if error_suggestion:
             display_payload["suggestion"] = error_suggestion
+        error_context = step_result.get("error_context")
+        if isinstance(error_context, dict) and error_context:
+            display_payload["error_context"] = error_context
+        # 跳过原因（纯增量）：IGNORE 失败 / 平台跳过 / 中止补记的说明，随 report_display 持久化。
+        skip_reason = step_skip_reason(step_result)
+        if skip_reason:
+            display_payload["skip_reason"] = skip_reason
         # 失败重试次数（纯增量）：attempts>1 时随 report_display 持久化，供报告/Flaky 统计。
         attempts = _safe_attempts(step_result.get("attempts"))
         if attempts > 1:
@@ -332,6 +407,8 @@ def _persist_case_result_and_build_case_report(
             step_entry["attempts"] = attempts
         if step_output:
             step_entry["output"] = step_output
+        if skip_reason:
+            step_entry["skip_reason"] = skip_reason
         if screenshot_b64:
             step_entry["screenshot"] = screenshot_b64
         formatted_steps.append(step_entry)
@@ -340,7 +417,8 @@ def _persist_case_result_and_build_case_report(
     case_status = _determine_case_status(
         formatted_steps,
         case_success=bool(case_result.get("success")),
-        case_is_warning=bool(case_result.get("is_warning")),
+        case_is_warning=bool(case_result.get("is_warning"))
+        and not _case_failures_all_ignored(case_result),
     )
     case_entry = {
         "case_id": case_result.get("case_id"),
@@ -530,11 +608,22 @@ def _convert_cross_result_to_legacy_case_result(
             converted["output"] = step_item.get("output")
         if step_item.get("screenshot"):
             converted["screenshot"] = step_item.get("screenshot")
+        # 结构化错误信息与跳过原因（纯增量字段）：失败被容忍后仍需作为详情留痕保留。
+        for field in ("error_code", "error_context", "suggestion"):
+            value = step_item.get(field)
+            if value not in (None, "", {}):
+                converted[field] = value
+        skip_reason = step_skip_reason(step_item)
+        if skip_reason:
+            converted["skip_reason"] = skip_reason
         # 失败重试次数（纯增量字段，见 cross_platform_runner.run_step）。
         attempts = _safe_attempts(step_item.get("attempts"))
         if attempts > 1:
             converted["attempts"] = attempts
-        if status == "WARNING":
+        if is_tolerated_failure(converted):
+            # IGNORE 失败：行状态为 SKIP（详情留痕保留），不再计入警告/失败。
+            converted["is_skipped"] = True
+        elif status == "WARNING":
             converted["success"] = False
             converted["is_warning"] = True
             has_warning = True

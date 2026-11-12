@@ -187,8 +187,13 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
         self.assertTrue(outcome["reportPayload"]["aborted"])
         self.assertFalse(outcome["reportPayload"]["success"])
         steps = outcome["reportPayload"]["cases"][0]["steps"]
-        self.assertEqual(len(steps), 1)
+        # 中止后补齐剩余步骤：结果条数恒等于步骤条数（自检用例共 5 步）
+        self.assertEqual(len(steps), 5)
         self.assertEqual(steps[0]["error_code"], "USER_STOPPED")
+        for step in steps[1:]:
+            self.assertEqual(step["status"], "SKIP")
+            self.assertEqual(step.get("skip_reason"), "用户中止执行")
+            self.assertIsNone(step.get("error"))
 
     def test_click_failure_still_uploads_failed_report(self):
         bundle = selftest.build_selftest_bundle("ios")
@@ -207,9 +212,12 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
         self.assertFalse(outcome["result"]["success"])
         self.assertTrue(outcome["result"]["upload_ok"])
         steps = outcome["reportPayload"]["cases"][0]["steps"]
-        self.assertEqual(len(steps), 1)
+        # ABORT 中止后补齐剩余步骤：结果条数恒等于步骤条数（用例共 2 步）
+        self.assertEqual(len(steps), 2)
         self.assertEqual(steps[0]["status"], "FAIL")
         self.assertIn("点击", steps[0]["error"])
+        self.assertEqual(steps[1]["status"], "SKIP")
+        self.assertEqual(steps[1].get("skip_reason"), "上游步骤失败，中止执行")
         self.assertTrue(outcome["reportJson"]["upload_response"])
 
     def test_click_falls_back_to_coordinate_tap_when_element_click_fails(self):

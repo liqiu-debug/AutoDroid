@@ -161,11 +161,13 @@ Feature Flags（`backend/feature_flags.py`，默认值在代码内 `_FLAG_DEFAUL
 
 ### 5.5 容错策略（error_strategy）语义
 
-- `ABORT`：步骤失败立即终止
-- `CONTINUE`：标记失败但继续后续步骤/用例
-- `IGNORE`：失败降级为 warning，继续执行
+- `ABORT`（默认）：步骤失败立即终止，用例 / 场景判 `FAIL`
+- `CONTINUE`：标记失败但继续后续步骤 / 用例，用例 / 场景仍判 `FAIL`
+- `IGNORE`：失败记为**跳过**（`skip_reason=失败已忽略：<原文>`，错误详情与截图仍保留），**不影响用例 / 场景结论**（判 `PASS`）
 
-该语义在跨端执行链路中统一实现。
+总原则：结论只由未被容忍的失败决定，被容忍的异常只影响步骤行显示。用例所有步骤均为跳过时归类 `WARNING` / `skipped`（表示未真正验证到内容）。详见 `docs/EXECUTION_SPEC.md` §2.2。
+
+该语义在跨端执行链路中统一实现（云端 backend、桌面 engine、AutoJs6 设备端运行时）。
 
 ### 5.6 预检体系与错误码
 

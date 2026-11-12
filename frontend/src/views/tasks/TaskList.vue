@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, MoreFilled, Search, Refresh, Edit } from '@element-plus/icons-vue'
 import api from '@/api'
+import { fetchAllPages } from '@/utils/paginate'
 import dayjs from 'dayjs'
 import { useRemoteSearch } from '@/composables/useRemoteSearch'
 import { scheduledTaskExecution } from '@/utils/scheduledTaskPresentation'
@@ -335,8 +336,12 @@ const weekDayOptions = [
 const apiScenarios = ref([])
 const taskRoute = useRoute()
 async function fetchApiScenarios() {
-    try { apiScenarios.value = (await api.apiTesting.get('/scenarios', { limit: 1000 })).data.items }
-    catch { ElMessage.error('获取接口场景失败') }
+    try {
+        // 分页拉全量：一次性 limit:1000 会在超过 1000 条时静默截断（见 utils/paginate.js）
+        apiScenarios.value = await fetchAllPages(
+            ({ skip, limit }) => api.apiTesting.get('/scenarios', { skip, limit }).then(r => r.data)
+        )
+    } catch { ElMessage.error('获取接口场景失败') }
 }
 
 onMounted(() => {

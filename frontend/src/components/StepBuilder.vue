@@ -46,6 +46,16 @@ const assertImageMatchOptions = [
   { value: 'exists', label: '存在' },
   { value: 'not_exists', label: '不存在' }
 ]
+// 容错策略语义（结论口径见 docs/EXECUTION_SPEC.md 2.2）：
+// 中止=失败即中止用例；继续=失败但继续执行，用例判失败；忽略=失败记为跳过，不影响用例结论。
+const errorStrategyOptions = [
+  { value: 'ABORT', label: '中止', description: '失败即中止用例，后续步骤不再执行' },
+  { value: 'CONTINUE', label: '继续', description: '失败但继续执行，用例判失败' },
+  { value: 'IGNORE', label: '忽略', description: '失败记为跳过，不影响用例结论' }
+]
+const errorStrategyHint = (value) => (
+  errorStrategyOptions.find((opt) => opt.value === value)?.description || '步骤失败时的处理方式与结论口径'
+)
 const selectorTypeToBy = {
   text: 'text',
   description: 'description',
@@ -91,8 +101,18 @@ function ensureAssertImageOptions(step) {
   return step.options
 }
 
+// 步骤稳定标识：展开态按 uuid 记录，缺失时补一个（与 useCaseStore 归一一致）
+const ensureStepUuid = (step) => {
+  if (step && typeof step === 'object' && !step.uuid) {
+    step.uuid = createUuid()
+  }
+  return String(step?.uuid || '')
+}
+
 const ensureCrossPlatformConfig = (step) => {
   if (!step || typeof step !== 'object') return
+
+  ensureStepUuid(step)
 
   const executeOn = autoExecuteOnByAction(step.action)
   if (JSON.stringify(step.execute_on || []) !== JSON.stringify(executeOn)) {
@@ -357,6 +377,7 @@ watch(
   { deep: true, immediate: true }
 )
 
+// 展开态按 step.uuid 记录（删除 / 排序 / 拖入都不会串卡）；data-step-index 只用于滚动定位
 const expandedSteps = ref(new Set())
 const stepListRef = ref(null)
 const SCROLL_PADDING = 16
@@ -423,24 +444,24 @@ const actionOptions = Object.entries(ACTION_LABELS)
   .filter(([k]) => !['start_app', 'stop_app', 'back', 'home'].includes(k))
   .map(([value, label]) => ({ value, label }))
 
-const toggleExpand = (index) => {
-  const step = currentCase.value.steps[index]
-  const stepUuid = step?.uuid || null
-  const willExpand = !expandedSteps.value.has(index)
+const toggleExpand = (step) => {
+  const stepUuid = ensureStepUuid(step)
+  if (!stepUuid) return
+  const willExpand = !expandedSteps.value.has(stepUuid)
   if (step && step.action === 'extract_by_ocr') {
     ensureStepOptions(step)
   }
-  if (expandedSteps.value.has(index)) {
-    expandedSteps.value.delete(index)
+  if (willExpand) {
+    expandedSteps.value.add(stepUuid)
   } else {
-    expandedSteps.value.add(index)
+    expandedSteps.value.delete(stepUuid)
   }
-  if (willExpand && stepUuid && stepUuid === lastAddedStepUuid.value) {
+  if (willExpand && stepUuid === lastAddedStepUuid.value) {
     syncLatestExpandedStepVisibility(stepUuid)
   }
 }
 
-const isExpanded = (index) => expandedSteps.value.has(index)
+const isExpanded = (step) => expandedSteps.value.has(step?.uuid)
 
 const resetStepDetailsForAction = (step) => {
   if (!step || typeof step !== 'object') return
@@ -677,7 +698,7 @@ const handleExecuteStep = async (step) => {
           :data-step-index="index"
           :style="{ '--action-color': getActionColor(step.action) }"
         >
-          <div class="step-header" @click="toggleExpand(index)">
+          <div class="step-header" @click="toggleExpand(step)">
             <div class="drag-handle">
               <el-icon><Rank /></el-icon>
             </div>
@@ -694,14 +715,14 @@ const handleExecuteStep = async (step) => {
                 title="执行步骤"
               />
               <el-button :icon="Delete" size="small" text class="step-remove-action" @click.stop="removeStep(index)" title="删除步骤" />
-              <el-icon class="expand-icon" :class="{ expanded: isExpanded(index) }">
+              <el-icon class="expand-icon" :class="{ expanded: isExpanded(step) }">
                 <ArrowDown />
               </el-icon>
             </div>
           </div>
           
           <transition name="expand">
-            <div v-if="isExpanded(index)" class="step-body">
+            <div v-if="isExpanded(step)" class="step-body">
               <div class="form-row">
                 <label>动作</label>
                 <el-select
@@ -947,10 +968,19 @@ const handleExecuteStep = async (step) => {
                 <label>容错策略</label>
                 <div class="strategy-group">
                   <el-select v-model="step.error_strategy" size="small" placeholder="请选择容错策略">
-                    <el-option label="立即终止" value="ABORT" />
-                    <el-option label="失败但继续" value="CONTINUE" />
-                    <el-option label="忽略错误" value="IGNORE" />
+                    <el-option
+                      v-for="opt in errorStrategyOptions"
+                      :key="opt.value"
+                      :label="opt.label"
+                      :value="opt.value"
+                    >
+                      <div class="strategy-option">
+                        <span class="strategy-option-label">{{ opt.label }}</span>
+                        <span class="strategy-option-desc">{{ opt.description }}</span>
+                      </div>
+                    </el-option>
                   </el-select>
+                  <span class="strategy-hint">{{ errorStrategyHint(step.error_strategy) }}</span>
                 </div>
               </div>
 
@@ -1237,6 +1267,25 @@ const handleExecuteStep = async (step) => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.strategy-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.4;
+}
+
+.strategy-option-label {
+  font-size: 12px;
+  color: var(--ad-text);
+}
+
+.strategy-option-desc,
+.strategy-hint {
+  font-size: 12px;
+  color: var(--ad-muted);
+  line-height: 1.5;
 }
 
 .retry-group {

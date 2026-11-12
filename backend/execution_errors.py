@@ -37,6 +37,25 @@ E2999_EXECUTION_ERROR = "E2999_EXECUTION_ERROR"
 # 用户主动中止不属于需要修复的执行失败，不参与错误码归类。
 USER_ABORT_MESSAGE = "执行已被用户中止"
 
+# ------------------------------------------------------------------ #
+#  步骤跳过原因（skip_reason：步骤结果的纯增量字段）
+# ------------------------------------------------------------------ #
+
+# IGNORE 容忍的失败 → "失败已忽略：<原始 error 文本>"（error 原文保持不变）。
+# 凡以此开头的跳过都是「已被容忍的真实失败」：Flaky 统计仍计样本。
+SKIP_REASON_IGNORED_FAILURE_PREFIX = "失败已忽略："
+# 中止后为「未执行」步骤补齐的记录。
+SKIP_REASON_UPSTREAM_ABORTED = "上游步骤失败，中止执行"
+SKIP_REASON_USER_ABORTED = "用户中止执行"
+# 平台跳过（P1001_PLATFORM_NOT_ALLOWED）。
+SKIP_REASON_PLATFORM_MISMATCH = "平台不匹配"
+
+
+def ignored_failure_reason(error: Any) -> str:
+    """IGNORE 容忍失败的跳过原因：失败已忽略：<原始 error 文本>（不改动 error 本身）。"""
+    return f"{SKIP_REASON_IGNORED_FAILURE_PREFIX}{'' if error is None else str(error)}"
+
+
 # 集中维护的默认中文修复建议（错误码 -> 建议）。
 # 同时收录执行期可能透传的 P1xxx 预检码，便于消费方统一渲染。
 DEFAULT_SUGGESTIONS: Dict[str, str] = {

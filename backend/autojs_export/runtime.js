@@ -36,6 +36,17 @@ var ERR = {
     P1002: "P1002_ACTION_NOT_SUPPORTED"
 };
 
+// 步骤跳过原因（纯增量字段 skip_reason 的取值，与 PC 侧 execution_errors 对齐）：
+// - IGNORE 容忍的失败 → "失败已忽略：<原始 error 文本>"（error 原文不动）；
+// - 中止后补齐的记录 → "上游步骤失败，中止执行" / "用户中止执行"；
+// - 平台跳过（P1001）→ "平台不匹配"。
+var SKIP_REASON = {
+    IGNORED_FAILURE: "失败已忽略：",
+    UPSTREAM_ABORTED: "上游步骤失败，中止执行",
+    USER_ABORTED: "用户中止执行",
+    PLATFORM_MISMATCH: "平台不匹配"
+};
+
 var TEMPLATE_SCALES = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.2];
 var IMAGE_MATCH_THRESHOLD = 0.9;       // click_image（PC _IMAGE_MATCH_THRESHOLD）
 var IMAGE_CLICK_TIMEOUT_SECONDS = 5;   // PC _IMAGE_CLICK_TIMEOUT_SECONDS
@@ -925,6 +936,38 @@ function stopRequested(ctx) {
     return !!ctx.aborted;
 }
 
+// 跳过原因：步骤结果顶层留一份（与 PC 侧步骤结果形状对齐），同时经 output.skip_reason
+// 透传——上报协议不改 schema（DeviceReportStep 无该列，顶层会被丢弃）。
+function applySkipReason(result, reason) {
+    result.skip_reason = reason;
+    var output = (result.output && typeof result.output === "object") ? result.output : {};
+    output.skip_reason = reason;
+    result.output = output;
+}
+
+// 中止后为「未执行」步骤补的结果记录：status=SKIP、duration=0、不截图、error 置 None。
+// 目标是结果条数恒等于步骤条数，报告不再把「被截断」伪装成「总共就这么多步」。
+function buildSkippedStepResult(step, order, skipReason) {
+    var raw = step || {};
+    var action = String(raw.action || "");
+    var result = {
+        order: order,
+        action: action,
+        description: raw.description || action,
+        status: "SKIP",
+        duration: 0,
+        attempts: 1,
+        error: null,
+        error_code: null,
+        error_strategy: String(raw.error_strategy || "ABORT").toUpperCase(),
+        screenshot_base64: null,
+        output: null,
+        skip_reason: null
+    };
+    applySkipReason(result, skipReason);
+    return result;
+}
+
 function runStep(ctx, rawStep) {
     var step = renderStep(ctx, rawStep);
     var order = step.order;
@@ -941,12 +984,15 @@ function runStep(ctx, rawStep) {
         error_code: null,
         error_strategy: String(step.error_strategy || "ABORT").toUpperCase(),
         screenshot_base64: null,
-        output: null
+        output: null,
+        skip_reason: null
     };
 
     if (!stepPlatformAllowed(ctx, step)) {
         result.status = "SKIP";
         result.error_code = "P1001_PLATFORM_NOT_ALLOWED";
+        // 平台跳过（P1001）沿用现状，补记跳过原因。
+        applySkipReason(result, SKIP_REASON.PLATFORM_MISMATCH);
         logLine(ctx, "步骤 " + order + " SKIP（平台不允许）: " + description);
         return result;
     }
@@ -989,8 +1035,11 @@ function runStep(ctx, rawStep) {
         result.screenshot_base64 = screenshotBase64Jpeg(ctx);
         var strategy = String(step.error_strategy || "ABORT").toUpperCase();
         if (strategy === "IGNORE") {
-            result.status = "WARNING";
-            logLine(ctx, "步骤 " + order + " 失败（IGNORE 降级为 WARNING）: " + result.error);
+            // IGNORE 容忍：步骤记 SKIP（不再是 WARNING），error / error_code / 截图原样留痕，
+            // 只是状态与结论口径变了（结论不计入失败与告警）。
+            result.status = "SKIP";
+            applySkipReason(result, SKIP_REASON.IGNORED_FAILURE + String(result.error));
+            logLine(ctx, "步骤 " + order + " 失败已忽略（SKIP）: " + result.error);
         } else {
             logLine(ctx, "步骤 " + order + " FAIL: " + result.error);
         }
@@ -1019,17 +1068,31 @@ function runCase(ctx, caseScript, entry) {
         var step = steps[i];
         var stepResult = runStep(ctx, step);
         caseResult.steps.push(stepResult);
+
+        // 结论只由「未被容忍的失败」决定：IGNORE 失败已记 SKIP，不中断也不判失败。
+        var skipReason = null;
         if (ctx.aborted) {
             caseResult.success = false;
-            break;
-        }
-        if (stepResult.status === "FAIL") {
+            skipReason = SKIP_REASON.USER_ABORTED;
+        } else if (stepResult.status === "FAIL") {
             caseResult.success = false;
             var strategy = String(step.error_strategy || "ABORT").toUpperCase();
             if (strategy === "ABORT") {
                 logLine(ctx, "步骤 " + step.order + " ABORT：终止用例执行");
-                break;
+                skipReason = SKIP_REASON.UPSTREAM_ABORTED;
             }
+        }
+        if (skipReason) {
+            // 结果条数恒等于步骤条数：为未执行步骤各补一条 SKIP 记录（不执行、无截图）。
+            for (var j = i + 1; j < steps.length; j++) {
+                var padded = steps[j];
+                caseResult.steps.push(buildSkippedStepResult(
+                    padded,
+                    isNullish(padded.order) ? (j + 1) : padded.order,
+                    skipReason
+                ));
+            }
+            break;
         }
     }
     var snapshot = {};
