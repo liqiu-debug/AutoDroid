@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from sqlmodel import SQLModel, Session, create_engine
 
 from backend.api import auth
@@ -13,6 +14,12 @@ from backend.core.errors import install_error_handlers, location, translate
 from backend.core.security import get_password_hash
 from backend.database import get_session
 from backend.models import User
+
+
+class StrictName(BaseModel):
+    """响应模型：name 非字符串时构造必失败，用来复现 response_model 校验漏网。"""
+
+    name: str
 
 
 class ErrorMessageTests(unittest.TestCase):
@@ -57,6 +64,34 @@ class ErrorMessageTests(unittest.TestCase):
         self.assertEqual(detail[0]["loc"], ["body", "name"])
         self.assertEqual(detail[0]["msg"], "name：长度不能少于 1")
         self.assertEqual(detail[0]["type"], "string_too_short")
+
+    def test_unhandled_exception_is_json_not_plain_text(self):
+        """漏网异常必须回 JSON，且不把异常文本吐给前端。
+
+        Starlette 默认回纯文本 "Internal Server Error"，前端 normalizeError 会把
+        非 HTML 的 body 原样当 message 摆给用户 —— 用户看到的就是那句英文。
+        response_model 构造期的 pydantic ValidationError 就是这样漏出去的。
+        """
+        app = install_error_handlers(FastAPI())
+
+        @app.get("/raise")
+        def _raise():
+            raise RuntimeError("boom")
+
+        @app.get("/bad-response", response_model=StrictName)
+        def _bad_response():
+            return {"name": None}
+
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            for path, expected_type in (("/raise", "RuntimeError"), ("/bad-response", "ResponseValidationError")):
+                response = client.get(path)
+                self.assertEqual(response.status_code, 500, path)
+                self.assertEqual(response.headers["content-type"], "application/json", path)
+                self.assertIn(expected_type, response.json()["detail"], path)
+                self.assertNotIn("boom", response.json()["detail"], path)
+        finally:
+            client.close()
 
         response = self.client.post("/api/api-testing/folders", json={"kind": "nope"})
         messages = {item["loc"][-1]: item["msg"] for item in response.json()["detail"]}

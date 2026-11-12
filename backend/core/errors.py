@@ -5,11 +5,19 @@ errors in English ("Field required", "Input should be a valid integer"). The
 UI is Chinese, so this handler keeps the same shape (``loc`` / ``msg`` /
 ``type``) and translates the message by error type. Messages raised by our own
 validators (``ValueError`` with Chinese text) pass through unchanged.
+
+Also hosts the catch-all for exceptions no route handled: without it Starlette
+answers with a plain-text "Internal Server Error", which the frontend shows to
+the user verbatim (``normalizeError`` treats a non-HTML body as the message).
 """
+
+import logging
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 _MESSAGES = {
     "missing": "缺少必填项",
@@ -89,5 +97,17 @@ def install_error_handlers(app: FastAPI):
     @app.exception_handler(RequestValidationError)
     async def _validation(_request: Request, exc: RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": validation_detail(exc)})
+
+    @app.exception_handler(Exception)
+    async def _unhandled(_request: Request, exc: Exception):
+        # 没有这一层时，任何漏网异常（典型如 response_model 构造期的 pydantic
+        # ValidationError）都会被 Starlette 兜成纯文本 "Internal Server Error"，
+        # 前端只能把这句英文直接摆给用户。这里统一回 JSON：
+        # detail 只给异常类型名，完整堆栈留在服务端日志，不外泄内部实现。
+        logger.error("未处理异常", exc_info=exc)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"服务内部错误（{type(exc).__name__}），请稍后重试"},
+        )
 
     return app
