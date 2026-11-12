@@ -58,7 +58,8 @@ test('终态失败：自动重载一次且不重复刷（防重载环）', async
   let reloaded = 0
   const loader = async () => { throw moduleError() }
   const run = lazyRoute(loader, {
-    storage, reload: () => { reloaded += 1 }, now: () => 1000, retryDelaysMs: [0, 0],
+    storage, reload: () => { reloaded += 1 }, now: () => 1000,
+    retryDelaysMs: [0, 0], reloadSettleMs: 20,
   })
 
   // reload 后的 promise 带超时兜底（见下一条用例），这里吞掉它的拒绝

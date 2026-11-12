@@ -101,13 +101,14 @@ export function lazyRoute(loader, options = {}) {
         try { storage.setItem(RELOAD_GUARD_KEY, String(now())) } catch { /* 存储不可用忽略 */ }
       }
       reload()
-      // 重载生效则此 promise 随页面销毁；未生效时超时兜底，绝不永久挂起
+      // 重载生效则此 promise 随页面销毁；未生效时超时兜底，绝不永久挂起。
+      // 注意：不要 unref 这个定时器——unref 后事件循环可能先空转退出，
+      // 兜底就永远不触发（CI 上表现为 "Promise resolution is still pending"）。
       return new Promise((_resolve, reject) => {
-        const timer = setTimeout(() => {
+        setTimeout(() => {
           onError(RESOURCE_LOAD_FAILED_MESSAGE, lastError)
           reject(lastError)
         }, options.reloadSettleMs || RELOAD_SETTLE_TIMEOUT_MS)
-        if (typeof timer.unref === 'function') timer.unref()
       })
     }
 
