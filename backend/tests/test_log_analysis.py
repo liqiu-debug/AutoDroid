@@ -83,6 +83,148 @@ class CleanLogForAiTests(unittest.TestCase):
         self.assertIn("java.lang.NullPointerException", cleaned)
         self.assertIn("MainActivity.onCreate", cleaned)
 
+    def test_clean_log_for_ai_keeps_business_context_around_the_anchor(self):
+        """崩溃正文之外要带上「被测 App 当时在干什么」，不管它排在锚点前还是后。
+
+        只取锚点之后的话这些行全丢，LLM 拿到的就是一个孤立的栈，指不出触发页面。
+        """
+        log = "\n".join(
+            [
+                "03-27 11:59:58.000  1974  2100 I ActivityManager: Start proc 12345:com.ehaier.zgq.shop.mall/u0a123 for activity com.ehaier.mall.MainActivity",
+                "03-27 11:59:59.000 2100 2100 D SomeVendorNoise: transport layer chatter one",
+                "03-27 11:59:59.100 2100 2100 D SomeVendorNoise: transport layer chatter two",
+                "03-27 11:59:59.200 2100 2100 D ViewRootImpl: dispatchKeyEvent KEYCODE_DPAD_RIGHT",
+            ]
+            + CRASH_LOG.splitlines()
+        )
+
+        cleaned = clean_log_for_ai(log, PACKAGE_NAME)
+
+        self.assertIn("Start proc 12345:com.ehaier.zgq.shop.mall", cleaned)
+        self.assertIn("dispatchKeyEvent KEYCODE_DPAD_RIGHT", cleaned)
+        # 厂商噪音既不带包名也不带生命周期事件，不该占预算
+        self.assertNotIn("transport layer chatter", cleaned)
+        # 正文不受影响
+        self.assertIn("FATAL EXCEPTION: main", cleaned)
+        self.assertIn("MainActivity.onCreate", cleaned)
+
+    def test_clean_log_for_ai_collapses_repeated_same_shape_lines(self):
+        """同一句话按帧刷屏时按形态收敛，不能把预算全吃掉。
+
+        厂商真会这么干（实测 isLandscapeFullscreenEnabled 连刷十几次），
+        按原文去重拦不住 —— 时间戳每次都不同。
+        """
+        spam = [
+            f"03-27 11:59:{index:02d}.000  1974  2100 D ActivityTaskManager: "
+            f"The isLandscapeFullscreenEnabled is: {PACKAGE_NAME}/com.ehaier.mall.MainActivity"
+            for index in range(30)
+        ]
+        log = "\n".join(spam + CRASH_LOG.splitlines())
+
+        cleaned = clean_log_for_ai(log, PACKAGE_NAME)
+
+        shape_hits = sum(1 for line in cleaned.splitlines() if "isLandscapeFullscreenEnabled" in line)
+        self.assertLessEqual(shape_hits, 2)
+        self.assertGreater(shape_hits, 0)
+        self.assertIn("MainActivity.onCreate", cleaned)
+
+    def test_clean_log_for_ai_never_trades_the_stack_for_context(self):
+        """上下文再多也不能挤掉崩溃正文，总行数仍不超 100。
+
+        正文本身必须超过 100 行才压得到预算 —— 正文只有几行的话，上下文再满也不会
+        把正文挤掉，断言就成了恒真的。
+        """
+        long_stack = [
+            f"03-27 12:00:00.000 12345 12345 E AndroidRuntime:     at {PACKAGE_NAME}."
+            f"{'Abcdefghij' * 3}{index}(MainActivity.kt:{index})"
+            for index in range(120)
+        ]
+        spam = [
+            f"03-27 11:59:{index % 60:02d}.{index % 1000:03d}  1974  2100 I ActivityManager: "
+            f"Displayed {PACKAGE_NAME}/com.ehaier.mall.MainActivity"
+            f"{chr(65 + index // 26)}{chr(65 + index % 26)}: +{index}ms"
+            for index in range(200)
+        ]
+        log = "\n".join(spam + CRASH_LOG.splitlines()[:3] + long_stack)
+
+        cleaned = clean_log_for_ai(log, PACKAGE_NAME)
+        lines = cleaned.splitlines()
+
+        self.assertLessEqual(len(lines), 100)
+        # 正文已满 100 行时，上下文额度为 0 —— 一条上下文都不该挤进来
+        self.assertFalse(any("Displayed " in line for line in lines))
+        self.assertIn("FATAL EXCEPTION: main", cleaned)
+        self.assertIn("java.lang.NullPointerException", cleaned)
+
+    def test_clean_log_for_ai_picks_lines_nearest_the_event_in_time(self):
+        """必须按时间远近挑，不能按行号远近 —— 新快照布局下行号跟时间不是一回事。
+
+        生产快照是「正文段在前、上下文段在后」（见 fastbot/logcat.py 的
+        _compose_snapshot），上下文段里行号越大 = 时间越晚，而锚点在正文段里。
+        按行号算会挑到上下文段最旧的一端，把事件前最近的行全丢。
+        """
+        far_before = [
+            f"03-27 11:59:00.{index:03d}  1974  2100 I ActivityManager: "
+            f"Displayed {PACKAGE_NAME}/far.before."
+            f"{chr(65 + index // 26)}{chr(65 + index % 26)}"
+            for index in range(30)
+        ]
+        near_before = [
+            f"03-27 11:59:59.{index:03d}  1974  2100 I ActivityManager: "
+            f"Displayed {PACKAGE_NAME}/near.before.{index}"
+            for index in range(3)
+        ]
+        near_after = [
+            f"03-27 12:00:00.{index:03d}  1974  2100 I ActivityManager: "
+            f"Displayed {PACKAGE_NAME}/near.after.{index}"
+            for index in range(3)
+        ]
+        far_after = [
+            f"03-27 12:00:30.{index:03d}  1974  2100 I ActivityManager: "
+            f"Displayed {PACKAGE_NAME}/far.after."
+            f"{chr(65 + index // 26)}{chr(65 + index % 26)}"
+            for index in range(30)
+        ]
+        # 崩溃正文段在前，上下文段在后，两段之间是 _compose_snapshot 的分隔行
+        log = "\n".join(
+            ["----- logcat crash buffer -----"]
+            + CRASH_LOG.splitlines()
+            + ["----- logcat context (main,system) -----"]
+            + far_before
+            + near_before
+            + near_after
+            + far_after
+        )
+
+        cleaned = clean_log_for_ai(log, PACKAGE_NAME)
+
+        # 离事件最近的几行必须留，不管它们排在锚点后多远
+        for expected in ("near.before.0", "near.before.1", "near.before.2",
+                         "near.after.0", "near.after.1", "near.after.2"):
+            self.assertIn(expected, cleaned, expected)
+        # 离事件最远的那一端不占预算
+        self.assertLessEqual(sum(1 for line in cleaned.splitlines() if "far.before." in line), 12)
+        self.assertLessEqual(len(cleaned.splitlines()), 100)
+        # 正文不受影响
+        self.assertIn("FATAL EXCEPTION: main", cleaned)
+        self.assertIn("MainActivity.onCreate", cleaned)
+
+    def test_clean_log_for_ai_anr_path_also_keeps_context(self):
+        """ANR 与崩溃走同一套上下文口径。"""
+        log = "\n".join(
+            [
+                "03-27 11:06:30.000  1974  2100 I ActivityManager: "
+                "Start proc 31955:com.ehaier.zgq.shop.mall/u0a123 for activity com.ehaier.mall.MainActivity",
+            ]
+            + ANR_LOG.splitlines()
+        )
+
+        cleaned = clean_log_for_ai(log, PACKAGE_NAME)
+
+        self.assertIn("Start proc 31955:com.ehaier.zgq.shop.mall", cleaned)
+        self.assertIn("ANR in com.ehaier.zgq.shop.mall", cleaned)
+        self.assertLessEqual(len(cleaned.splitlines()), 100)
+
 
 class AnalyzeLogApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
