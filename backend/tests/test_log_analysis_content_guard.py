@@ -15,14 +15,16 @@ ValidationError，而这一步没有 try，于是被 Starlette 兜底成纯文�
 4. usage 为 null 不再 AttributeError。
 
 全部离线：LLM 调用与 httpx 一律替身，绝不联网。
+
+本仓的测试约定是 unittest（CI 跑 `python -m unittest discover`），所以这里不引 pytest。
 """
 
 import asyncio
 import hashlib
 import json
+import unittest
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from fastapi import HTTPException
 
 from backend import jank_ai_service
@@ -90,17 +92,19 @@ class _FakeAsyncClient:
         return type(self).response
 
 
-@pytest.fixture(autouse=True)
-def _reset_state():
+class _GuardTestCase(unittest.TestCase):
     """每个用例都从干净的缓存/替身状态开始，避免用例间互相污染。"""
-    _analysis_cache.clear()
-    jank_ai_service._jank_ai_cache.clear()
-    _FakeAsyncClient.response = None
-    _FakeAsyncClient.call_count = 0
-    _FakeAsyncClient.last_json = None
-    yield
-    _analysis_cache.clear()
-    jank_ai_service._jank_ai_cache.clear()
+
+    def setUp(self):
+        _analysis_cache.clear()
+        jank_ai_service._jank_ai_cache.clear()
+        _FakeAsyncClient.response = None
+        _FakeAsyncClient.call_count = 0
+        _FakeAsyncClient.last_json = None
+
+    def tearDown(self):
+        _analysis_cache.clear()
+        jank_ai_service._jank_ai_cache.clear()
 
 
 def _run_analyze(force_refresh: bool = False):
@@ -132,12 +136,12 @@ def _run_llm(raw_text: str):
 # ==================== parse_chat_completion_payload 归一化 ====================
 
 
-class TestParseChatCompletionPayload:
+class TestParseChatCompletionPayload(_GuardTestCase):
     def test_json_branch_normalizes_null_content_to_empty_string(self):
         data = parse_chat_completion_payload(_completion_json(None))
 
-        assert data["choices"][0]["message"]["content"] == ""
-        assert extract_message_content(data) == ""
+        self.assertEqual(data["choices"][0]["message"]["content"], "")
+        self.assertEqual(extract_message_content(data), "")
 
     def test_json_branch_flattens_list_content(self):
         data = parse_chat_completion_payload(
@@ -149,33 +153,33 @@ class TestParseChatCompletionPayload:
             )
         )
 
-        assert data["choices"][0]["message"]["content"] == "定位到主线程阻塞"
-        assert isinstance(data["choices"][0]["message"]["content"], str)
+        self.assertEqual(data["choices"][0]["message"]["content"], "定位到主线程阻塞")
+        self.assertIsInstance(data["choices"][0]["message"]["content"], str)
 
     def test_json_branch_keeps_plain_string_content(self):
         data = parse_chat_completion_payload(_completion_json("### 根因分析\nNPE"))
 
-        assert data["choices"][0]["message"]["content"] == "### 根因分析\nNPE"
+        self.assertEqual(data["choices"][0]["message"]["content"], "### 根因分析\nNPE")
 
     def test_json_branch_accepts_empty_content(self):
         # 连接探针（max_tokens=4）依赖「空内容也算连通」，这里绝不能抛异常
         data = parse_chat_completion_payload(_completion_json(""))
 
-        assert extract_message_content(data) == ""
+        self.assertEqual(extract_message_content(data), "")
 
     def test_json_branch_normalizes_null_usage_to_dict(self):
         data = parse_chat_completion_payload(
             '{"choices":[{"message":{"content":"ok"}}],"usage":null}'
         )
 
-        assert data["usage"] == {}
+        self.assertEqual(data["usage"], {})
         # 归一化后调用方可以安全地 usage.get(...)
-        assert data["usage"].get("total_tokens", 0) == 0
+        self.assertEqual(data["usage"].get("total_tokens", 0), 0)
 
     def test_json_branch_normalizes_missing_usage_to_dict(self):
         data = parse_chat_completion_payload('{"choices":[{"message":{"content":"ok"}}]}')
 
-        assert data["usage"] == {}
+        self.assertEqual(data["usage"], {})
 
     def test_sse_branch_behavior_unchanged(self):
         data = parse_chat_completion_payload(
@@ -188,40 +192,40 @@ class TestParseChatCompletionPayload:
             )
         )
 
-        assert data["choices"][0]["message"]["role"] == "assistant"
-        assert data["choices"][0]["message"]["content"] == "定位到主线程阻塞"
-        assert data["usage"]["total_tokens"] == 56
+        self.assertEqual(data["choices"][0]["message"]["role"], "assistant")
+        self.assertEqual(data["choices"][0]["message"]["content"], "定位到主线程阻塞")
+        self.assertEqual(data["usage"]["total_tokens"], 56)
 
     def test_sse_branch_still_rejects_empty_content(self):
         # SSE 分支原有的「空内容 = 响应无效」语义保持不变
-        with pytest.raises(ValueError):
+        with self.assertRaises(ValueError):
             parse_chat_completion_payload(
                 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\ndata: [DONE]'
             )
 
 
-class TestExtractMessageContent:
+class TestExtractMessageContent(_GuardTestCase):
     def test_returns_empty_string_for_missing_or_non_text_shapes(self):
-        assert extract_message_content(None) == ""
-        assert extract_message_content({"choices": []}) == ""
-        assert extract_message_content({"choices": "oops"}) == ""
-        assert extract_message_content({"choices": [None]}) == ""
-        assert extract_message_content({"choices": [{"message": None}]}) == ""
-        assert extract_message_content({"choices": [{"message": {"content": 123}}]}) == ""
+        self.assertEqual(extract_message_content(None), "")
+        self.assertEqual(extract_message_content({"choices": []}), "")
+        self.assertEqual(extract_message_content({"choices": "oops"}), "")
+        self.assertEqual(extract_message_content({"choices": [None]}), "")
+        self.assertEqual(extract_message_content({"choices": [{"message": None}]}), "")
+        self.assertEqual(extract_message_content({"choices": [{"message": {"content": 123}}]}), "")
 
     def test_flattens_list_content(self):
-        assert (
+        self.assertEqual(
             extract_message_content(
                 {"choices": [{"message": {"content": [{"type": "text", "text": "hi"}]}}]}
-            )
-            == "hi"
+            ),
+            "hi",
         )
 
 
 # ==================== analyze_log 正文守卫 ====================
 
 
-class TestAnalyzeLogContentGuard:
+class TestAnalyzeLogContentGuard(_GuardTestCase):
     def test_null_content_maps_to_502_and_leaves_cache_clean(self):
         with patch(
             "backend.api.log_analysis.call_llm_service",
@@ -229,12 +233,12 @@ class TestAnalyzeLogContentGuard:
                 return_value={"success": True, "analysis_result": None, "token_usage": 0}
             ),
         ):
-            with pytest.raises(HTTPException) as excinfo:
+            with self.assertRaises(HTTPException) as ctx:
                 _run_analyze()
 
-        assert excinfo.value.status_code == 502
-        assert excinfo.value.detail == EMPTY_CONTENT_ERROR_DETAIL
-        assert _analysis_cache == {}
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(ctx.exception.detail, EMPTY_CONTENT_ERROR_DETAIL)
+        self.assertEqual(_analysis_cache, {})
 
     def test_list_content_maps_to_502(self):
         with patch(
@@ -247,11 +251,11 @@ class TestAnalyzeLogContentGuard:
                 }
             ),
         ):
-            with pytest.raises(HTTPException) as excinfo:
+            with self.assertRaises(HTTPException) as ctx:
                 _run_analyze()
 
-        assert excinfo.value.status_code == 502
-        assert _analysis_cache == {}
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(_analysis_cache, {})
 
     def test_empty_content_maps_to_502(self):
         with patch(
@@ -260,11 +264,11 @@ class TestAnalyzeLogContentGuard:
                 return_value={"success": True, "analysis_result": "   ", "token_usage": 0}
             ),
         ):
-            with pytest.raises(HTTPException) as excinfo:
+            with self.assertRaises(HTTPException) as ctx:
                 _run_analyze()
 
-        assert excinfo.value.status_code == 502
-        assert _analysis_cache == {}
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(_analysis_cache, {})
 
     def test_plain_string_content_is_returned_and_cached(self):
         with patch(
@@ -276,12 +280,12 @@ class TestAnalyzeLogContentGuard:
             first = _run_analyze()
             second = _run_analyze()
 
-        assert first.success is True
-        assert first.analysis_result == "### 根因分析"
-        assert first.token_usage == 9
-        assert first.cached is False
-        assert second.cached is True
-        assert second.analysis_result == "### 根因分析"
+        self.assertIs(first.success, True)
+        self.assertEqual(first.analysis_result, "### 根因分析")
+        self.assertEqual(first.token_usage, 9)
+        self.assertIs(first.cached, False)
+        self.assertIs(second.cached, True)
+        self.assertEqual(second.analysis_result, "### 根因分析")
 
     def test_failed_analysis_does_not_poison_cache_for_next_request(self):
         """一次 None 正文不得让这条日志永久分析不了。"""
@@ -292,17 +296,17 @@ class TestAnalyzeLogContentGuard:
             ]
         )
         with patch("backend.api.log_analysis.call_llm_service", new=llm_mock):
-            with pytest.raises(HTTPException) as excinfo:
+            with self.assertRaises(HTTPException) as ctx:
                 _run_analyze()
-            assert excinfo.value.status_code == 502
+            self.assertEqual(ctx.exception.status_code, 502)
 
             # 不带 force_refresh：必须重新调 LLM，而不是命中脏缓存再炸一次
             retry = _run_analyze()
 
-        assert llm_mock.await_count == 2
-        assert retry.success is True
-        assert retry.analysis_result == "第二次成功"
-        assert retry.cached is False
+        self.assertEqual(llm_mock.await_count, 2)
+        self.assertIs(retry.success, True)
+        self.assertEqual(retry.analysis_result, "第二次成功")
+        self.assertIs(retry.cached, False)
 
         # 成功后才允许命中缓存
         with patch(
@@ -310,8 +314,8 @@ class TestAnalyzeLogContentGuard:
             new=AsyncMock(side_effect=AssertionError("命中缓存时不应再调 LLM")),
         ):
             cached = _run_analyze()
-        assert cached.cached is True
-        assert cached.analysis_result == "第二次成功"
+        self.assertIs(cached.cached, True)
+        self.assertEqual(cached.analysis_result, "第二次成功")
 
     def test_legacy_non_string_cache_values_are_discarded(self):
         """存量脏缓存值（历史 bug 写进去的 None）要自愈，不要拿去构造响应。"""
@@ -324,10 +328,10 @@ class TestAnalyzeLogContentGuard:
         with patch("backend.api.log_analysis.call_llm_service", new=llm_mock):
             resp = _run_analyze()
 
-        assert llm_mock.await_count == 1
-        assert resp.success is True
-        assert resp.analysis_result == "重新分析结果"
-        assert resp.cached is False
+        self.assertEqual(llm_mock.await_count, 1)
+        self.assertIs(resp.success, True)
+        self.assertEqual(resp.analysis_result, "重新分析结果")
+        self.assertIs(resp.cached, False)
 
     def test_llm_unexpected_error_maps_to_json_500(self):
         """兜底异常必须带 detail，不能产出纯文本 Internal Server Error。
@@ -339,47 +343,47 @@ class TestAnalyzeLogContentGuard:
             "backend.api.log_analysis.call_llm_service",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ):
-            with pytest.raises(HTTPException) as excinfo:
+            with self.assertRaises(HTTPException) as ctx:
                 _run_analyze()
 
-        assert excinfo.value.status_code == 500
-        assert "RuntimeError" in str(excinfo.value.detail)
-        assert "boom" not in str(excinfo.value.detail)
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertIn("RuntimeError", str(ctx.exception.detail))
+        self.assertNotIn("boom", str(ctx.exception.detail))
 
 
 # ==================== call_llm_service 取正文 ====================
 
 
-class TestCallLlmServiceContent:
+class TestCallLlmServiceContent(_GuardTestCase):
     def test_null_content_maps_to_502(self):
-        with pytest.raises(HTTPException) as excinfo:
+        with self.assertRaises(HTTPException) as ctx:
             _run_llm(_completion_json(None))
 
-        assert excinfo.value.status_code == 502
-        assert excinfo.value.detail == EMPTY_CONTENT_ERROR_DETAIL
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(ctx.exception.detail, EMPTY_CONTENT_ERROR_DETAIL)
 
     def test_list_content_is_flattened_to_text(self):
         result = _run_llm(
             _completion_json([{"type": "text", "text": "定位到"}, {"type": "text", "text": "死锁"}])
         )
 
-        assert result["success"] is True
-        assert result["analysis_result"] == "定位到死锁"
-        assert result["token_usage"] == 7
+        self.assertIs(result["success"], True)
+        self.assertEqual(result["analysis_result"], "定位到死锁")
+        self.assertEqual(result["token_usage"], 7)
 
     def test_null_usage_yields_zero_tokens(self):
         result = _run_llm(
             '{"choices":[{"message":{"content":"ok"}}],"usage":null}'
         )
 
-        assert result["analysis_result"] == "ok"
-        assert result["token_usage"] == 0
+        self.assertEqual(result["analysis_result"], "ok")
+        self.assertEqual(result["token_usage"], 0)
 
 
 # ==================== jank 卡顿分析共用同一套守卫 ====================
 
 
-class TestJankAiContentGuard:
+class TestJankAiContentGuard(_GuardTestCase):
     def _artifact(self):
         return {
             "trigger_time": "10:00:00",
@@ -408,12 +412,12 @@ class TestJankAiContentGuard:
             side_effect=["test-key", "https://api.openai.com/v1", "gpt-4o-mini"],
         ), patch("backend.jank_ai_service.httpx.AsyncClient", _FakeAsyncClient):
             _FakeAsyncClient.response = _FakeResponse(_completion_json(None))
-            with pytest.raises(HTTPException) as excinfo:
+            with self.assertRaises(HTTPException) as ctx:
                 self._summarize()
 
-        assert excinfo.value.status_code == 502
-        assert excinfo.value.detail == EMPTY_CONTENT_ERROR_DETAIL
-        assert len(jank_ai_service._jank_ai_cache) == 0
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(ctx.exception.detail, EMPTY_CONTENT_ERROR_DETAIL)
+        self.assertEqual(len(jank_ai_service._jank_ai_cache), 0)
 
     def test_retry_after_empty_content_succeeds(self):
         with patch(
@@ -421,21 +425,21 @@ class TestJankAiContentGuard:
             side_effect=["test-key", "https://api.openai.com/v1", "gpt-4o-mini"] * 2,
         ), patch("backend.jank_ai_service.httpx.AsyncClient", _FakeAsyncClient):
             _FakeAsyncClient.response = _FakeResponse(_completion_json(None))
-            with pytest.raises(HTTPException):
+            with self.assertRaises(HTTPException):
                 self._summarize()
 
             _FakeAsyncClient.response = _FakeResponse(_completion_json("### 现象摘要\n测试结果"))
             result = self._summarize()
 
-        assert result["success"] is True
-        assert result["analysis_result"] == "### 现象摘要\n测试结果"
-        assert result["cached"] is False
+        self.assertIs(result["success"], True)
+        self.assertEqual(result["analysis_result"], "### 现象摘要\n测试结果")
+        self.assertIs(result["cached"], False)
 
 
 # ==================== NL2Script 降级语义 ====================
 
 
-class TestNl2ScriptFallback:
+class TestNl2ScriptFallback(_GuardTestCase):
     def test_null_content_degrades_to_mock_steps(self):
         with patch(
             "backend.api.ai._get_setting",
@@ -446,9 +450,9 @@ class TestNl2ScriptFallback:
                 ai_api.generate_steps(ai_api.GenerateStepsRequest(text="登录"), session=object())
             )
 
-        assert resp.success is True
-        assert resp.data  # 兜底模板步骤
-        assert "兜底" in (resp.message or "")
+        self.assertIs(resp.success, True)
+        self.assertTrue(resp.data, "应退化成兜底模板步骤")
+        self.assertIn("兜底", resp.message or "")
 
     def test_list_content_is_flattened_before_json_parse(self):
         steps = json.dumps(
@@ -473,6 +477,6 @@ class TestNl2ScriptFallback:
                 ai_api.generate_steps(ai_api.GenerateStepsRequest(text="点击登录"), session=object())
             )
 
-        assert resp.success is True
-        assert resp.data[0]["action"] == "click"
-        assert resp.data[0]["description"] == "点击登录按钮"
+        self.assertIs(resp.success, True)
+        self.assertEqual(resp.data[0]["action"], "click")
+        self.assertEqual(resp.data[0]["description"], "点击登录按钮")
