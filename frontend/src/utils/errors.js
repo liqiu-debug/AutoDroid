@@ -39,6 +39,10 @@ export function describeDetail(detail) {
 
 export const isCanceled = error => !!error && (error.name === 'CanceledError' || error.code === 'ERR_CANCELED')
 
+// 网关错误页（Cloudflare 的 `error code: 502`、各反代的纯文本提示）不是应用消息，
+// 当正文显示会把英文原样摆给用户；让它落到 STATUS_TEXT 的中文兜底。
+const isGatewayErrorPage = text => /^error code:\s*\d+$/i.test(String(text).trim())
+
 export function describeError(error) {
   if (!error) return '操作失败'
   if (isCanceled(error)) return ''
@@ -51,7 +55,7 @@ export function describeError(error) {
   const data = response.data
   let text = ''
   if (data && typeof data === 'object' && !(typeof Blob !== 'undefined' && data instanceof Blob)) text = describeDetail(data.detail) || describeDetail(data.message) || ''
-  else if (typeof data === 'string' && data && !/<\s*(!doctype|html)/i.test(data)) text = data.trim().slice(0, 200)
+  else if (typeof data === 'string' && data && !isGatewayErrorPage(data) && !/<\s*(!doctype|html)/i.test(data)) text = data.trim().slice(0, 200)
   return text || STATUS_TEXT[response.status] || `请求失败（HTTP ${response.status}）`
 }
 
