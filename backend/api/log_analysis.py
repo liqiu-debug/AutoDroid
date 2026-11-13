@@ -39,6 +39,30 @@ CRASH_ANCHOR_PATTERNS = [
     re.compile(r'Process:.*Crashing', re.IGNORECASE),
 ]
 
+# 崩溃正文之外还要带上「被测 App 当时在干什么」。线上产物 522 行里只有 21 行带被测
+# 包名，只取锚点之后的话这些行全丢，LLM 拿到的就是一个孤立的栈，指不出触发页面。
+CONTEXT_MAX_LINES = 24
+# 同一条日志形态最多留几行。厂商会把同一句话按帧刷（实测「isLandscapeFullscreenEnabled」
+# 连刷十几次），按原文去重拦不住，得先把时间戳/数值抹平再算形态。
+CONTEXT_MAX_PER_SHAPE = 2
+CONTEXT_PATTERNS = [
+    re.compile(r'\b(?:Force finishing|Killing|Start proc|Displayed|Restarting|ANR in|FATAL|not responding|Reason:|onPause|onStop|onDestroy|onCreate)\b'),
+    # 这条故意连厂商 tag 一起收：KEYLOG_*PhoneWindowManager* / ViewRootImpl* 会刷屏，
+    # 但它们编码的正是 Fastbot 在崩溃前注入的按键序列，是定位触发场景的关键线索。
+    # 刷屏由下面的形态收敛去管，不靠这条收紧。
+    re.compile(r'WindowManager|Choreographer|ViewRootImpl|System\.err'),
+    re.compile(r'Build fingerprint'),
+    re.compile(r'\b(?:Process|PID):'),
+]
+
+# logcat 行首的设备时间（无年份，但快照窗口只有几秒，够用来比远近）
+TIMESTAMP_PATTERN = re.compile(r'^(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})\.(\d{3})')
+
+# 快照里「正文段」与「上下文段」的分隔行（见 fastbot/logcat.py 的 _compose_snapshot），
+# 以及 logcat 自己的 buffer 分隔行。前向扫描撞上它必须停：否则会把上下文段开头一整段
+# 当成正文吃进 kept_lines，上下文于是无从挑起，还白占正文预算。
+SECTION_SEPARATOR_PATTERN = re.compile(r'^-{3,}\s*(?:logcat\b|beginning of\b)')
+
 # 上游（思考型模型 + max_tokens 吃紧）会返回空正文/非文本正文，这是「点重试即可」
 # 的上游问题，走 502 而不是 500；卡顿分析共用同一条提示，保证两端文案一致。
 EMPTY_CONTENT_ERROR_DETAIL = "AI 服务未返回可分析的正文（content 为空/非文本），请点「重新分析」重试。"
@@ -53,6 +77,94 @@ def _get_setting(session: Session, key: str, default: str = "") -> str:
 
 
 # ==================== 日志清洗算法 ====================
+
+def _line_time(line: str) -> Optional[float]:
+    """取 logcat 行首的设备时间（秒），取不到返回 None。"""
+    match = TIMESTAMP_PATTERN.match(line)
+    if not match:
+        return None
+    month, day, hour, minute, second, millis = (int(part) for part in match.groups())
+    # 没有年份：用「月*31+日」当粗略序数，够在几秒宽的窗口里比远近
+    return (((month * 31 + day) * 24 + hour) * 60 + minute) * 60 + second + millis / 1000.0
+
+
+def _line_shape(line: str) -> str:
+    """抹掉时间戳与多位数字后的形态，用来认出「同一句话刷屏」。
+
+    只抹两位以上的数字、保留个位数：类名/Activity 名/window id 里的个位数是真差异
+    （`WebViewActivity1` 与 `WebViewActivity2` 是两个页面），全抹会把它们误判成一条；
+    而 pid/tid/eventTime 这类多位数每次都变，不抹就认不出刷屏。
+    """
+    return re.sub(r'\d{2,}', '#', TIMESTAMP_PATTERN.sub('', line))
+
+
+def _collect_context_lines(
+    lines: List[str],
+    package_name: str,
+    already_kept: Set[str],
+    anchor_idx: int,
+    budget: int,
+) -> List[str]:
+    """围绕事件时刻挑出「被测 App 当时在干什么」的行，按文件顺序返回。
+
+    只挑与被测包或系统生命周期相关的行：厂商噪音占了绝大多数，全收等于没收。
+
+    远近必须按**时间**算，不能按行号：快照是「正文段在前、上下文段在后」，而
+    `logcat -b main,system` 的输出又是每个 buffer 组内各自升序 —— 行号顺序跟时间
+    顺序不是一回事。按行号算会挑到离事件最远的那一端，把事件前最近的行全丢。
+    """
+    if budget <= 0:
+        return []
+
+    package_name = (package_name or "").strip()
+    anchor_time = _line_time(lines[anchor_idx]) if 0 <= anchor_idx < len(lines) else None
+
+    candidates = []
+    for index, line in enumerate(lines):
+        key = line.strip()
+        if not key or key in already_kept:
+            continue
+        related = bool(package_name and package_name in line)
+        if not related and not any(pattern.search(line) for pattern in CONTEXT_PATTERNS):
+            continue
+        if anchor_time is not None:
+            line_time = _line_time(line)
+            # 行首不是标准 logcat 时间（多行 entry 的续行等）当最远
+            distance = abs(line_time - anchor_time) if line_time is not None else float('inf')
+        else:
+            # 锚点自己都没有时间，整份日志的时间口径不可信，退回按行号远近
+            distance = abs(index - anchor_idx)
+        candidates.append((distance, index, line))
+
+    # 按「离事件多近」挑满预算，同形态的刷屏行只留前几条，再回到文件顺序输出，
+    # 让 LLM 能按时间戳还原现场
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    picked = []
+    per_shape: dict = {}
+    for distance, index, line in candidates:
+        shape = _line_shape(line)
+        if per_shape.get(shape, 0) >= CONTEXT_MAX_PER_SHAPE:
+            continue
+        per_shape[shape] = per_shape.get(shape, 0) + 1
+        picked.append((distance, index, line))
+        if len(picked) >= budget:
+            break
+
+    picked.sort(key=lambda item: item[1])
+    return [line for _, _, line in picked]
+
+
+def _crash_anchor_index(lines: List[str], start_indices: List[int]) -> int:
+    """定位「本次崩溃」那一行：取**最后**一个 FATAL EXCEPTION。
+
+    crash buffer 里可能还留着本次运行更早的崩溃，取第一个会围绕错误事件挑上下文。
+    与 ANR 路径取 anr_indices[-1] 保持一致；大小写跟 CRASH_ANCHOR_PATTERNS[0] 一样不敏感。
+    """
+    for index in range(len(lines) - 1, -1, -1):
+        if re.search(r'FATAL EXCEPTION', lines[index], re.IGNORECASE):
+            return index
+    return start_indices[-1] if start_indices else 0
+
 
 def clean_log_for_ai(full_log: str, package_name: str) -> str:
     """
@@ -125,6 +237,10 @@ def clean_log_for_ai(full_log: str, package_name: str) -> str:
             # 空行跳过
             if not stripped:
                 continue
+
+            # 撞上段落/buffer 分隔就停：后面是上下文段，不是本次崩溃正文
+            if SECTION_SEPARATOR_PATTERN.match(stripped):
+                break
 
             # 遇到下一个 FATAL/AndroidRuntime 标记，停止当前块
             is_new_block = False
@@ -201,13 +317,19 @@ def clean_log_for_ai(full_log: str, package_name: str) -> str:
 
     # 如果清洗后太少，补充原始日志尾部
     if len(result) < 5:
-        result = lines[-80:]
+        return '\n'.join(lines[-80:])
 
-    # 限制上限
+    # 崩溃正文之外补上事件前后的业务上下文，排在正文前面（行内时间戳足够还原顺序）。
+    # 正文先占预算，上下文只用剩下的额度 —— 绝不为了上下文去截正文，正文尾部是
+    # Caused by 因果链。正文自身的 100 行上限沿用改动前的语义（超出从尾部截）。
     if len(result) > 100:
         result = result[:100]
+    context_budget = min(CONTEXT_MAX_LINES, 100 - len(result))
+    context_lines = _collect_context_lines(
+        lines, package_name, seen, _crash_anchor_index(lines, start_indices), context_budget
+    )
 
-    return '\n'.join(result)
+    return '\n'.join(context_lines + result)
 
 
 def _clean_anr_log_for_ai(lines: List[str], package_name: str, anr_indices: List[int]) -> str:
@@ -287,7 +409,14 @@ def _clean_anr_log_for_ai(lines: List[str], package_name: str, anr_indices: List
         fallback_start = max(0, start_idx - 5)
         return '\n'.join(lines[fallback_start:min(fallback_start + 100, len(lines))])
 
-    return '\n'.join(kept_lines[:100])
+    # 与崩溃路径同一套：正文先占预算，上下文只用剩下的额度，不为上下文截正文
+    if len(kept_lines) > 100:
+        kept_lines = kept_lines[:100]
+    context_budget = min(CONTEXT_MAX_LINES, 100 - len(kept_lines))
+    context_lines = _collect_context_lines(
+        lines, package_name, seen, start_idx, context_budget
+    )
+    return '\n'.join(context_lines + kept_lines)
 
 
 # ==================== LLM 调用 ====================
