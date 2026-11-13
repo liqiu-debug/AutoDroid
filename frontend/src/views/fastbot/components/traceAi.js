@@ -36,5 +36,9 @@ export const requestTraceAiSummary = async (taskId, artifact, options = {}) => {
     if (!data.success) {
         throw new Error('AI 总结生成失败')
     }
+    if (forceRefresh && data.cached) {
+        // 点了「重新生成」却拿到缓存结果 = 首次响应丢了、重试降级过，得说出来
+        ElMessage.info('重新生成未成功，已返回缓存结果')
+    }
     return data
 }

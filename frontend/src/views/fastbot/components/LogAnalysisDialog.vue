@@ -70,6 +70,11 @@ const analyzeLog = async (options = {}) => {
             aiTokenUsage.value = data.token_usage || 0
             aiCached.value = data.cached || false
             showAiResult.value = true
+            if (forceRefresh && data.cached) {
+                // 点了「重新分析」却拿到缓存结果 = 首次响应丢了、重试降级过，
+                // 得说出来，别让人以为重新生成过了
+                ElMessage.info('重新生成未成功，已返回缓存结果')
+            }
         } else {
             ElMessage.error('分析失败，请重试')
         }
