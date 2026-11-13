@@ -1,5 +1,6 @@
 import { ElMessage } from 'element-plus'
 import api from '@/api'
+import { requestWithTransientRetry } from '@/utils/retryTransient'
 
 /**
  * 获取 Perfetto Trace 的 AI 总结。
@@ -22,10 +23,15 @@ export const requestTraceAiSummary = async (taskId, artifact, options = {}) => {
         }
     }
 
-    const res = await api.analyzeFastbotTrace(taskId, {
-        trace_path: artifact.path,
-        force_refresh: forceRefresh,
-    })
+    // 传输级重试同 analyzeLog：服务端也缓存 trace 总结，502 多半是回程被掐断，
+    // 重试直接命中缓存；重试时把 force_refresh 降成 false，别为丢失的响应再烧一遍 token
+    const res = await requestWithTransientRetry(
+        (payload) => api.analyzeFastbotTrace(taskId, payload),
+        {
+            trace_path: artifact.path,
+            force_refresh: forceRefresh,
+        },
+    )
     const data = res.data
     if (!data.success) {
         throw new Error('AI 总结生成失败')
