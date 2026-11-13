@@ -4,6 +4,7 @@ import { MagicStick, RefreshRight } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import MarkdownIt from 'markdown-it'
 import api from '@/api'
+import { requestWithTransientRetry } from '@/utils/retryTransient'
 
 const props = defineProps({
     packageName: { type: String, default: '' },
@@ -51,12 +52,17 @@ const analyzeLog = async (options = {}) => {
     const forceRefresh = Boolean(options.forceRefresh)
     aiAnalyzing.value = true
     try {
-        const res = await api.analyzeLog({
-            log_text: logContent.value,
-            package_name: props.packageName || '',
-            device_info: props.deviceSerial || '',
-            force_refresh: forceRefresh,
-        })
+        // 走传输级重试：服务端按清洗后日志的 md5 缓存结果，偶发 502 只是响应回程被掐断，
+        // 重试多半直接命中缓存秒回（详见 utils/retryTransient.js）
+        const res = await requestWithTransientRetry(
+            (payload) => api.analyzeLog(payload),
+            {
+                log_text: logContent.value,
+                package_name: props.packageName || '',
+                device_info: props.deviceSerial || '',
+                force_refresh: forceRefresh,
+            },
+        )
         const data = res.data
         if (data.success) {
             aiResult.value = data.analysis_result
