@@ -151,7 +151,7 @@ function stepBuilderSetup(steps) {
     createUuid: () => `generated-${Math.random().toString(16).slice(2)}`,
     ...actionConstants,
   }
-  const exports = 'currentCase,lastAddedStepUuid,expandedSteps,toggleExpand,isExpanded,ensureStepUuid,errorStrategyOptions,errorStrategyHint'
+  const exports = 'currentCase,lastAddedStepUuid,expandedSteps,toggleExpand,isExpanded,ensureStepUuid,errorStrategyOptions'
   const state = new Function(...Object.keys(dependencies), source + `\nreturn {${exports}}`)(...Object.values(dependencies))
   return state
 }
@@ -198,16 +198,13 @@ test('无 uuid 的步骤补 uuid，展开态仍有稳定键', () => {
   assert.equal(state.isExpanded(legacy), true)
 })
 
-test('容错策略选项说明新语义：中止=中止用例、继续=用例判失败、忽略=记跳过不影响结论', () => {
+test('容错策略只显示终止、继续、忽略，保留原有策略值', () => {
   const source = sourceOf('components/StepBuilder.vue')
   assert.match(source, /v-for="opt in errorStrategyOptions"/)
   const state = stepBuilderSetup([uiStep('u1')])
-  const byValue = Object.fromEntries(state.errorStrategyOptions.map(opt => [opt.value, opt.description]))
+  const byValue = Object.fromEntries(state.errorStrategyOptions.map(opt => [opt.value, opt.label]))
   assert.deepEqual(Object.keys(byValue).sort(), ['ABORT', 'CONTINUE', 'IGNORE'])
-  assert.equal(byValue.ABORT, '失败即中止用例，后续步骤不再执行')
-  assert.equal(byValue.CONTINUE, '失败但继续执行，用例判失败')
-  assert.equal(byValue.IGNORE, '失败记为跳过，不影响用例结论')
-  assert.equal(state.errorStrategyHint('ABORT'), '失败即中止用例，后续步骤不再执行')
-  assert.equal(state.errorStrategyHint('CONTINUE'), '失败但继续执行，用例判失败')
-  assert.equal(state.errorStrategyHint('IGNORE'), '失败记为跳过，不影响用例结论')
+  assert.equal(byValue.ABORT, '终止')
+  assert.equal(byValue.CONTINUE, '继续')
+  assert.equal(byValue.IGNORE, '忽略')
 })

@@ -228,14 +228,18 @@ test('changing the edited step during upload cannot overwrite its new action', a
   assert.equal(context.crop.imageCropMode.value, false)
 })
 
-test('step editor preserves both image actions and their metadata without preview requests', () => {
+function editorSetup(api = {}, props = { deviceSerial: 'ios-device' }) {
   const source = stripImports(read('../src/components/StepBuilder.vue').match(/<script setup>([\s\S]*?)<\/script>/)[1])
   const deps = {
-    ref, nextTick, onMounted() {}, watch, defineProps: () => ({ deviceSerial: 'ios-device' }), defineEmits: () => () => {},
+    ref, nextTick, onMounted() {}, watch, defineProps: () => props, defineEmits: () => () => {},
     useCaseStore: () => ({}), storeToRefs: () => ({ currentCase: ref({ steps: [] }), lastAddedStepUuid: ref(null) }),
-    api: {}, apiClient: {}, ElMessage: notices, createUuid: () => 'generated', ...actionConstants, ...imageOptions
+    api, apiClient: api, ElMessage: notices, createUuid: () => 'generated', ...actionConstants, ...imageOptions
   }
-  const editor = new Function(...Object.keys(deps), source + '\nreturn {buildExecutableStep}')(...Object.values(deps))
+  return new Function(...Object.keys(deps), source + '\nreturn {buildExecutableStep,previewImageMatch,imagePreviewResult}')(...Object.values(deps))
+}
+
+test('step editor preserves both image actions and their metadata without preview requests', () => {
+  const editor = editorSetup()
   for (const action of ['click_image', 'assert_image']) {
     const step = { uuid: 'step', action, selector: 'android.png', args: { image_path: 'stale.png', match_mode: 'not_exists' },
       options: { image_options: copy(maps), match_mode: 'not_exists' }, platform_overrides: { android: { by: 'image', selector: 'android.png' }, ios: { by: 'image', selector: 'ios.png' } } }
@@ -246,6 +250,54 @@ test('step editor preserves both image actions and their metadata without previe
     assert.equal(executable.platform_overrides.ios.selector, 'ios.png')
     if (action === 'assert_image') assert.equal(executable.args.match_mode, 'not_exists')
   }
+})
+
+test('optional preview uses the current platform template for both image actions and never executes', async () => {
+  for (const action of ['click_image', 'assert_image']) {
+    const requests = []
+    const result = { status: 'matched', candidates: [{ accepted: true }] }
+    const api = {
+      ensureImageMatcher: async () => {},
+      getDeviceDump: async serial => {
+        assert.equal(serial, 'ios-device')
+        return { data: { screenshot: 'SCREEN', device_info: { platform: 'ios' } } }
+      },
+      matchImage: async payload => { requests.push(payload); return { data: result } },
+      executeStep: () => { assert.fail('preview must never execute a device step') },
+      interactDevice: () => { assert.fail('preview must never tap a device') }
+    }
+    const editor = editorSetup(api)
+    const step = { action, selector: 'android.png', options: { image_options: copy(maps) },
+      platform_overrides: { android: { by: 'image', selector: 'android.png' }, ios: { by: 'image', selector: 'ios.png' } } }
+    await editor.previewImageMatch(step)
+    assert.deepEqual(requests, [{ screenshot_base64: 'SCREEN', image_path: 'ios.png', image_options: maps.ios }])
+    assert.deepEqual(editor.imagePreviewResult.value, result)
+  }
+})
+
+test('a device change invalidates an optional preview already in flight', async () => {
+  const props = reactive({ deviceSerial: 'ios-device' })
+  let resolve
+  const api = {
+    ensureImageMatcher: async () => {},
+    getDeviceDump: async () => ({ data: { screenshot: 'SCREEN', device_info: { platform: 'ios' } } }),
+    matchImage: () => new Promise(done => { resolve = done })
+  }
+  const editor = editorSetup(api, props)
+  const pending = editor.previewImageMatch({ action: 'assert_image', selector: 'target.png', options: {} })
+  for (let i = 0; i < 10 && !resolve; i++) await Promise.resolve()
+  props.deviceSerial = 'other-device'
+  resolve({ data: { status: 'matched', candidates: [{ accepted: true }] } })
+  await pending
+  assert.equal(editor.imagePreviewResult.value.status, 'unstable')
+  assert.deepEqual(editor.imagePreviewResult.value.candidates, [])
+})
+
+test('assertion preview treats duplicate verified targets as present', () => {
+  const result = { status: 'ambiguous', candidates: [{ accepted: true }, { accepted: false }, { accepted: true }] }
+  assert.match(imageOptions.imageMatchPreviewText(result, 'assert_image'), /2 个合格目标，图像存在/)
+  assert.match(imageOptions.imageMatchPreviewText(result, 'click_image'), /多个相似目标/)
+  assert.match(imageOptions.imageMatchPreviewText({ status: 'unsupported' }, 'assert_image'), /请升级/)
 })
 
 test('image assertion errors retain existence meaning when several matches are present', () => {

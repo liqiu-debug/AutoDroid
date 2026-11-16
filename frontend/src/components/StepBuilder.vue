@@ -9,7 +9,8 @@ import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
-import { getImageOptionsMap, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
+import { getImageOptionsMap, selectImageOptions, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
+import ImageMatchPreview from './ImageMatchPreview.vue'
 
 const caseStore = useCaseStore()
 const { currentCase, lastAddedStepUuid } = storeToRefs(caseStore)
@@ -48,15 +49,12 @@ const assertImageMatchOptions = [
   { value: 'not_exists', label: '不存在' }
 ]
 // 容错策略语义（结论口径见 docs/EXECUTION_SPEC.md 2.2）：
-// 中止=失败即中止用例；继续=失败但继续执行，用例判失败；忽略=失败记为跳过，不影响用例结论。
+// 终止=失败即结束用例；继续=失败但继续执行，用例判失败；忽略=失败记为跳过，不影响用例结论。
 const errorStrategyOptions = [
-  { value: 'ABORT', label: '中止', description: '失败即中止用例，后续步骤不再执行' },
-  { value: 'CONTINUE', label: '继续', description: '失败但继续执行，用例判失败' },
-  { value: 'IGNORE', label: '忽略', description: '失败记为跳过，不影响用例结论' }
+  { value: 'ABORT', label: '终止' },
+  { value: 'CONTINUE', label: '继续' },
+  { value: 'IGNORE', label: '忽略' }
 ]
-const errorStrategyHint = (value) => (
-  errorStrategyOptions.find((opt) => opt.value === value)?.description || '步骤失败时的处理方式与结论口径'
-)
 const selectorTypeToBy = {
   text: 'text',
   description: 'description',
@@ -262,6 +260,49 @@ const syncExtractOcrRegion = (step) => {
 
 const onImagePathChange = step => {
   replaceDefaultImagePath(step, String(step.selector || ''))
+}
+
+const imagePreviewVisible = ref(false)
+const imagePreviewBusy = ref(false)
+const imagePreviewScreenshot = ref('')
+const imagePreviewResult = ref(null)
+const imagePreviewStep = ref(null)
+const imagePreviewKey = step => JSON.stringify([props.deviceSerial, step?.action, step?.selector, step?.platform_overrides, getImageOptionsMap(step)])
+const staleImagePreview = () => ({ status: 'unstable', reason: '设备或模板已变化，请重新验证定位', candidates: [] })
+watch(() => imagePreviewStep.value && imagePreviewKey(imagePreviewStep.value), (key, oldKey) => {
+  if (key !== oldKey && imagePreviewResult.value) imagePreviewResult.value = staleImagePreview()
+}, { flush: 'sync' })
+
+const previewImageMatch = async step => {
+  if (imagePreviewBusy.value) return
+  if (!props.deviceSerial) { ElMessage.warning('请先选择一台调试设备'); return }
+  imagePreviewBusy.value = true
+  imagePreviewVisible.value = true
+  imagePreviewResult.value = null
+  imagePreviewScreenshot.value = ''
+  imagePreviewStep.value = step
+  const requestedKey = imagePreviewKey(step)
+  const serial = props.deviceSerial
+  const isCurrent = () => imagePreviewVisible.value && requestedKey === imagePreviewKey(step)
+  try {
+    await api.ensureImageMatcher()
+    if (!isCurrent()) { imagePreviewResult.value = staleImagePreview(); return }
+    const { data: dump } = await api.getDeviceDump(serial, {
+      includeScreenshot: true, includeHierarchy: false, includeDeviceInfo: true
+    })
+    if (!isCurrent()) { imagePreviewResult.value = staleImagePreview(); return }
+    if (!dump.screenshot) throw new Error('未获取到当前设备截图')
+    imagePreviewScreenshot.value = `data:image/${dump.screenshot_format || 'png'};base64,${dump.screenshot}`
+    const platform = dump.device_info?.platform === 'ios' ? 'ios' : 'android'
+    const imagePath = step.platform_overrides?.[platform]?.selector || step.selector
+    const config = selectImageOptions(step, platform)
+    const { data } = await api.matchImage({ screenshot_base64: dump.screenshot, image_path: imagePath, ...(config ? { image_options: config } : {}) })
+    if (imagePreviewVisible.value) imagePreviewResult.value = isCurrent() ? data : staleImagePreview()
+  } catch (err) {
+    if (imagePreviewVisible.value) imagePreviewResult.value = isCurrent()
+      ? { status: 'unsupported', reason: err.response?.data?.detail || err.message || '定位验证失败', candidates: [] }
+      : staleImagePreview()
+  } finally { imagePreviewBusy.value = false }
 }
 
 // AI 生成相关状态
@@ -616,6 +657,10 @@ const handleExecuteStep = async (step) => {
 
 <template>
   <div class="step-builder">
+    <el-dialog v-model="imagePreviewVisible" title="图像定位验证" width="720px" append-to-body>
+      <div v-if="imagePreviewBusy" class="image-preview-loading">正在验证当前设备定位…</div>
+      <ImageMatchPreview v-else :screenshot="imagePreviewScreenshot" :result="imagePreviewResult" :action="imagePreviewStep?.action" />
+    </el-dialog>
     <div class="builder-header">
       <div class="header-left">
         <span class="title">步骤编排</span>
@@ -860,6 +905,9 @@ const handleExecuteStep = async (step) => {
                     </el-button>
                   </div>
                 </div>
+                <div class="form-row image-preview-action">
+                  <el-button size="small" :loading="imagePreviewBusy" @click="previewImageMatch(step)">验证当前设备定位</el-button>
+                </div>
               </template>
               <template v-if="step.action === 'extract_by_ocr'">
                 <div class="form-row">
@@ -981,14 +1029,8 @@ const handleExecuteStep = async (step) => {
                       :key="opt.value"
                       :label="opt.label"
                       :value="opt.value"
-                    >
-                      <div class="strategy-option">
-                        <span class="strategy-option-label">{{ opt.label }}</span>
-                        <span class="strategy-option-desc">{{ opt.description }}</span>
-                      </div>
-                    </el-option>
+                    />
                   </el-select>
-                  <span class="strategy-hint">{{ errorStrategyHint(step.error_strategy) }}</span>
                 </div>
               </div>
 
@@ -1277,25 +1319,6 @@ const handleExecuteStep = async (step) => {
   gap: 4px;
 }
 
-.strategy-option {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  line-height: 1.4;
-}
-
-.strategy-option-label {
-  font-size: 12px;
-  color: var(--ad-text);
-}
-
-.strategy-option-desc,
-.strategy-hint {
-  font-size: 12px;
-  color: var(--ad-muted);
-  line-height: 1.5;
-}
-
 .retry-group {
   flex: 1;
   display: flex;
@@ -1378,5 +1401,6 @@ const handleExecuteStep = async (step) => {
 .step-actions :deep(.el-button) { color: var(--ad-muted); }
 .step-actions :deep(.step-run-action:hover) { color: var(--ad-primary); }
 .step-actions :deep(.step-remove-action:hover) { color: var(--ad-danger); }
-
+.image-preview-action { justify-content: flex-end; }
+.image-preview-loading { padding: 36px 0; text-align: center; color: var(--ad-muted); }
 </style>

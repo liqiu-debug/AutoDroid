@@ -21,6 +21,12 @@ export function imageMatchStatusText(result) {
   return warningText ? `${text}；${warningText}` : text
 }
 
+export function imageMatchPreviewText(result, action = 'click_image') {
+  const accepted = (result?.candidates || []).filter(candidate => candidate.accepted).length
+  if (action === 'assert_image' && accepted) return `当前截图找到 ${accepted} 个合格目标，图像存在`
+  return imageMatchStatusText(result)
+}
+
 export function imageExecutionFailure(result, action = 'click_image') {
   // Assertion failures must explain exists/not_exists, even for duplicate targets.
   if (action === 'assert_image' && /[\u3400-\u9fff]/.test(String(result?.error || ''))) return result.error
