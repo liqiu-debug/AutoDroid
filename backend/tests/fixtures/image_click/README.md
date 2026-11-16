@@ -1,1 +1,3 @@
 These small PNG crops are regression fixtures from the local 2026-11-16 Android image-click audit. Source screen: artifacts/image-click-audit-20261116/current-android-screen.png. Search templates must reject shield/card crops; check-in template must match its icon. No device is accessed by tests.
+
+`order-1-thin.png` and `order-2-thin.png` are deterministic button images drawn with OpenCV 5.0.0 (Hershey Simplex, scale 0.7, thickness 2, antialiasing). GitHub CI exposed that their shared label and border diluted the changed digit in the original 4×4 foreground check. Stored pixels keep this negative regression independent of the installed OpenCV drawing version.

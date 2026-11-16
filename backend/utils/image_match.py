@@ -20,6 +20,7 @@ PROFILE = {
     "edge_coverage": 0.88, "foreground_error": 0.12, "tile_error": 0.22,
     "color_error": 0.08, "ambiguity_margin": 0.03,
     "nms_iou": 0.35, "max_candidates": 64,
+    "local_window": 16, "local_stride": 8, "local_min_foreground": 8,
 }
 
 
@@ -113,14 +114,26 @@ def _verify(crop, template, score: float) -> Dict[str, Any]:
             mask = foreground[ys, xs]
             if mask.sum() >= 8:
                 worst = max(worst, float(difference[ys, xs][mask].mean()))
+    # A shared border or long label must not dilute one changed character.
+    # Overlapping pixel windows also catch differences crossing grid boundaries.
+    side, stride = PROFILE["local_window"], PROFILE["local_stride"]
+    sums = cv2.integral(difference * foreground)
+    counts = cv2.integral(foreground.astype(np.uint8))
+    ys, xs = np.arange(0, h, stride)[:, None], np.arange(0, w, stride)[None, :]
+    ye, xe = np.minimum(ys + side, h), np.minimum(xs + side, w)
+    totals = sums[ye, xe] - sums[ys, xe] - sums[ye, xs] + sums[ys, xs]
+    samples = counts[ye, xe] - counts[ys, xe] - counts[ye, xs] + counts[ys, xs]
+    active = samples >= PROFILE["local_min_foreground"]
+    local_error = float((totals[active] / samples[active]).max()) if active.any() else error
     color_active = bool(((template.max(axis=2).astype(float) - template.min(axis=2)) >= 32).mean() >= 0.1
                         or ((crop.max(axis=2).astype(float) - crop.min(axis=2)) >= 32).mean() >= 0.1)
     color_error = float(np.abs(template.astype(float) - crop.astype(float))[foreground].mean() / 255.0) if color_active else None
     accepted = (score >= PROFILE["accept_ncc"] and coverage >= PROFILE["edge_coverage"]
-                and error <= PROFILE["foreground_error"] and worst <= PROFILE["tile_error"]
+                and error <= PROFILE["foreground_error"] and max(worst, local_error) <= PROFILE["tile_error"]
                 and (color_error is None or color_error <= PROFILE["color_error"]))
     return {"accepted": bool(accepted), "edge_coverage": round(coverage, 6), "foreground_error": round(error, 6),
-            "tile_error": round(worst, 6), "color_error": round(color_error, 6) if color_error is not None else None,
+            "tile_error": round(worst, 6), "local_error": round(local_error, 6),
+            "color_error": round(color_error, 6) if color_error is not None else None,
             "reason": "accepted" if accepted else "verification_failed"}
 
 

@@ -87,6 +87,18 @@ class StrictImageMatchTests(unittest.TestCase):
         other[template[:, :, 0] < 100] = (230, 15, 15)
         self.assertEqual(match_image(frame(other), template)["status"], "not_found")
 
+    def test_changed_digit_is_not_diluted_by_shared_label_and_border(self):
+        fixtures = Path(__file__).parent / "fixtures" / "image_click"
+        one = cv2.imread(str(fixtures / "order-1-thin.png"))
+        two = cv2.imread(str(fixtures / "order-2-thin.png"))
+        for template, wrong in ((one, two), (two, one)):
+            with self.subTest(template=hashlib.sha256(template.tobytes()).hexdigest()):
+                self.assertEqual(match_image(frame(wrong), template)["status"], "not_found")
+                self.assertEqual(match_image(frame(template), template)["status"], "matched")
+                _, encoded = cv2.imencode(".jpg", template, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                compressed = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                self.assertEqual(match_image(frame(compressed), template)["status"], "matched")
+
     def test_size_change_uses_recorded_resolution(self):
         template = icon()
         scaled = cv2.resize(template, (60, 60))
