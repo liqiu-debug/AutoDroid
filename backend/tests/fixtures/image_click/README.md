@@ -1,0 +1,1 @@
+These small PNG crops are regression fixtures from the local 2026-11-16 Android image-click audit. Source screen: artifacts/image-click-audit-20261116/current-android-screen.png. Search templates must reject shield/card crops; check-in template must match its icon. No device is accessed by tests.

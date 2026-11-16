@@ -10,6 +10,7 @@
 node 缺失时跳过（不影响后端测试套件）。
 """
 import json
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -28,7 +29,7 @@ NODE = shutil.which("node")
 @unittest.skipUnless(NODE, "需要 node 运行设备端 JS 链路试验台")
 class IOSRuntimeHarnessTests(unittest.TestCase):
 
-    def action_bundle(self, action, overrides=""):
+    def action_bundle(self, action, overrides="", image_options=None, retry_count=0, match_mode=None):
         args = {
             "input": {"text": "新内容"}, "assert_text": {"expected_text": "设置"},
             "assert_image": {"image": "target.png"}, "click_image": {"image": "target.png"},
@@ -37,12 +38,16 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
             "start_app": {"bundle_id": "com.apple.Preferences"},
             "stop_app": {"bundle_id": "com.apple.Preferences"},
         }.get(action, {})
+        if image_options is not None:
+            args["image_options"] = image_options
+        if match_mode is not None:
+            args["match_mode"] = match_mode
         locators = [{"by": "text", "selector": "设置"}] if action in ("click", "input", "wait_until_exists") else []
         bundle = selftest.build_selftest_bundle("ios")
         bundle["assets"] = {"target.png": "aW1hZ2U="}  # Native image decode is stubbed here.
-        bundle["case_files"][0]["content"] = _case_module_source({"case_id": 0, "name": action, "steps": [
-            selftest._step(1, action, args=args, locators=locators, timeout=1)
-        ]})
+        step = selftest._step(1, action, args=args, locators=locators, timeout=1)
+        step["retry_count"] = retry_count
+        bundle["case_files"][0]["content"] = _case_module_source({"case_id": 0, "name": action, "steps": [step]})
         bundle["main_js"] = (
             "global.__adt.findElements = function () { return [1]; };\n"
             "global.__adt.ocr = function () { return ['HARNESS']; };\n"
@@ -73,7 +78,7 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
         failures = {
             "click": "elementClick", "input": "elementSetText", "swipe": "drag",
             "back": "pressBack", "home": "pressHome", "start_app": "launchApp", "stop_app": "terminateApp",
-            "click_image": "tap", "assert_image": "matchTemplate", "extract_by_ocr": "ocr",
+            "click_image": "tap", "assert_image": "matchImageStrict", "extract_by_ocr": "ocr",
             "assert_text": "findElements", "wait_until_exists": "findElements",
         }
         for action, primitive in failures.items():
@@ -108,6 +113,186 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
             "var testClock = Date.now(); Date.now = function () { return testClock += 1000; };"))
         self.assertFalse(outcome["result"]["success"])
         self.assertIn("未进入前台", outcome["reportPayload"]["cases"][0]["steps"][0]["error"])
+
+    def test_image_click_requires_two_stable_frames_and_never_uses_ocr(self):
+        outcome = self._run_harness(self.action_bundle("click_image"))
+        self.assertTrue(outcome["result"]["success"], outcome["logs"])
+        names = [call["name"] for call in outcome["apiCalls"]]
+        self.assertEqual(names.count("matchImageStrict"), 2)
+        self.assertEqual(names.count("tap"), 1)
+        self.assertNotIn("ocr", names)
+        self.assertNotIn("matchTemplate", names)
+        self.assertGreaterEqual(sum(call["args"]["ms"] for call in outcome["apiCalls"] if call["name"] == "sleep"), 150)
+        diagnostic = outcome["reportPayload"]["cases"][0]["steps"][0]["output"]["image_match"]
+        self.assertEqual(diagnostic["stable_frames"], 2)
+
+    def test_image_click_old_native_capability_fails_without_tapping(self):
+        outcome = self._run_harness(self.action_bundle("click_image", "global.__adt.matchImageStrict = undefined;"))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["error_code"], "E2013_IMAGE_MATCH_UNSUPPORTED")
+        self.assertEqual(step["output"]["image_match"]["status"], "unsupported")
+        self.assertFalse(any(c["name"] in ("tap", "matchTemplate", "ocr") for c in outcome["apiCalls"]))
+
+    def test_image_click_unvalidated_native_stops_before_matching(self):
+        outcome = self._run_harness(self.action_bundle("click_image", """
+global.__adt.strictMatcherCapabilities=function(){return {matcher_version:'strict-v1',validated:false};};
+"""))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["error_code"], "E2013_IMAGE_MATCH_UNSUPPORTED")
+        self.assertEqual(step["output"]["image_match"]["reason"], "strict_matcher_not_validated")
+        self.assertFalse(any(c["name"] in ("tap", "matchImageStrict") for c in outcome["apiCalls"]))
+
+    def test_image_click_native_result_after_deadline_cannot_tap(self):
+        outcome = self._run_harness(self.action_bundle("click_image", """
+var imageClock=0; Date.now=function(){return imageClock;};
+var originalStrict=global.__adt.matchImageStrict;
+global.__adt.matchImageStrict=function(a,b,c){var match=originalStrict(a,b,c);imageClock+=1200;return match;};
+"""))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["error_code"], "E2012_IMAGE_UNSTABLE")
+        self.assertEqual(step["output"]["image_match"]["reason"], "deadline_exceeded")
+        self.assertFalse(any(c["name"] == "tap" for c in outcome["apiCalls"]))
+
+    def test_image_click_hash_mismatch_is_rejected_before_matching(self):
+        outcome = self._run_harness(self.action_bundle("click_image", image_options={"template_sha256": "0" * 64}))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["error_code"], "E2201_INVALID_ARGS")
+        self.assertEqual(step["output"]["image_match"]["reason"], "template_hash_mismatch")
+        self.assertFalse(any(c["name"] in ("tap", "matchImageStrict") for c in outcome["apiCalls"]))
+
+    def test_image_click_passes_bound_anchor_and_source_dimensions_to_native(self):
+        config = {"template_sha256": hashlib.sha256(b"image").hexdigest(), "tap_anchor": [0.1, 0.9],
+                  "source_size": [1170, 2532], "search_region": [0, 0, 0.5, 0.5]}
+        outcome = self._run_harness(self.action_bundle("click_image", image_options=config))
+        self.assertTrue(outcome["result"]["success"], outcome["logs"])
+        taps = [call["args"] for call in outcome["apiCalls"] if call["name"] == "tap"]
+        self.assertEqual(taps, [{"x": 64, "y": 126}])
+        matches = [call["args"]["options"] for call in outcome["apiCalls"] if call["name"] == "matchImageStrict"]
+        for options in matches:
+            self.assertEqual({key: options[key] for key in config}, config)
+            self.assertGreater(options["timeout_ms"], 0)
+
+    def test_image_click_ambiguous_and_blank_templates_never_fall_back(self):
+        for status, code in (("ambiguous", "E2010_IMAGE_AMBIGUOUS"), ("invalid_template", "E2011_IMAGE_TEMPLATE_INVALID")):
+            with self.subTest(status=status):
+                override = "var imageClock=0; Date.now=function(){return imageClock+=20;};" + (
+                    "global.__adt.matchImageStrict=function(){return {status:'%s',reason:'fixture',matcher_version:'strict-v1',"
+                    "candidates:[{rect:[1,2,3,4]}],quality:{},timings:{}};};" % status)
+                outcome = self._run_harness(self.action_bundle("click_image", override))
+                step = outcome["reportPayload"]["cases"][0]["steps"][0]
+                self.assertEqual(step["error_code"], code)
+                self.assertEqual(step["output"]["image_match"]["candidates"][0]["rect"], [1, 2, 3, 4])
+                self.assertFalse(any(c["name"] in ("tap", "matchTemplate", "ocr") for c in outcome["apiCalls"]))
+
+    def test_image_click_moving_target_times_out_without_tapping(self):
+        override = """
+var imageClock=0, imageFrames=0; Date.now=function(){return imageClock+=20;};
+global.__adt.matchImageStrict=function(){
+    var x=(imageFrames++ % 2) ? 160 : 60;
+    return {status:'matched',reason:'fixture',matcher_version:'strict-v1',
+        rect:[x,90,40,40],point:[x+20,110],candidates:[],quality:{},timings:{}};
+};
+"""
+        outcome = self._run_harness(self.action_bundle("click_image", override))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["error_code"], "E2012_IMAGE_UNSTABLE")
+        self.assertFalse(any(c["name"] == "tap" for c in outcome["apiCalls"]))
+
+    def test_image_click_failed_tap_is_not_resubmitted_by_step_retry(self):
+        outcome = self._run_harness(self.action_bundle("click_image", """
+var originalTap=global.__adt.tap; global.__adt.tap=function(x,y){originalTap(x,y);return false;};
+""", retry_count=3))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["error_code"], "E2009_CLICK_NO_EFFECT")
+        self.assertEqual(step["attempts"], 1)
+        self.assertEqual(sum(call["name"] == "tap" for call in outcome["apiCalls"]), 1)
+        self.assertTrue(step["output"]["image_match"]["tap_submitted"])
+
+    def test_image_click_user_stop_after_matching_prevents_tap(self):
+        outcome = self._run_harness(self.action_bundle("click_image", """
+var shouldStopImage=false;
+global.__AUTODROID_SHOULD_STOP__=function(){return shouldStopImage;};
+var originalImageMatch=global.__adt.matchImageStrict;
+global.__adt.matchImageStrict=function(a,b,c){var match=originalImageMatch(a,b,c);shouldStopImage=true;return match;};
+"""))
+        step = outcome["reportPayload"]["cases"][0]["steps"][0]
+        self.assertEqual(step["output"]["image_match"]["reason"], "execution_stopped")
+        self.assertFalse(any(c["name"] == "tap" for c in outcome["apiCalls"]))
+
+    def test_legacy_embedded_template_refreshes_existing_same_name_cache(self):
+        bundle = self.action_bundle("click_image")
+        expected_hash = hashlib.sha256(b"image").hexdigest()
+        bundle["main_js"] = bundle["main_js"].replace(
+            "AUTODROID_RUNTIME.createContext(manifest, baseDir)",
+            'AUTODROID_RUNTIME.createContext(manifest, baseDir, {"target.png":"aW1hZ2U="})',
+        )
+        bundle["main_js"] = (
+            "var staleCache=files.join(files.getSdcardPath(),'autodroid_cache','target.png');\n"
+            "files.ensureDir(staleCache);files.writeBytes(staleCache,android.util.Base64.decode('c3RhbGU='));\n"
+            "var originalImageRead=global.__adt.imageFromFile;\n"
+            "global.__adt.imageFromFile=function(path){"
+            f"if(global.__adt.fileSha256(path)!=='{expected_hash}') throw new Error('stale template');"
+            "return originalImageRead(path);};\n"
+            + bundle["main_js"]
+        )
+        outcome = self._run_harness(bundle)
+        self.assertTrue(outcome["result"]["success"], outcome["logs"])
+        self.assertEqual(sum(call["name"] == "tap" for call in outcome["apiCalls"]), 1)
+
+    def test_image_assertion_accepts_duplicate_verified_targets_without_tapping(self):
+        override = """
+global.__adt.matchImageStrict=function(){return {status:'ambiguous',reason:'multiple_verified_targets',matcher_version:'strict-v1',
+    candidates:[{accepted:true,rect:[10,20,30,40]},{accepted:true,rect:[100,200,30,40]}],quality:{},timings:{}};};
+"""
+        exists = self._run_harness(self.action_bundle("assert_image", override))
+        self.assertTrue(exists["result"]["success"], exists["logs"])
+        evidence = exists["reportPayload"]["cases"][0]["steps"][0]["output"]["image_match"]
+        self.assertEqual(evidence["status"], "ambiguous")
+        absent = self._run_harness(self.action_bundle("assert_image", override, match_mode="not_exists"))
+        self.assertFalse(absent["result"]["success"])
+        self.assertEqual(absent["reportPayload"]["cases"][0]["steps"][0]["error_code"], "E2004_ASSERT_IMAGE_FAILED")
+        for outcome in (exists, absent):
+            self.assertFalse(any(c["name"] in ("tap", "matchTemplate", "ssim") for c in outcome["apiCalls"]))
+
+    def test_image_assertion_cannot_interpret_unsafe_result_as_absence(self):
+        for status in ("unsupported", "invalid_template", "unstable", "ambiguous"):
+            with self.subTest(status=status):
+                override = "global.__adt.matchImageStrict=function(){return " + json.dumps({
+                    "status": status, "reason": "fixture", "matcher_version": "strict-v1", "candidates": [], "quality": {}, "timings": {}}) + ";};"
+                outcome = self._run_harness(self.action_bundle("assert_image", override, match_mode="not_exists"))
+                self.assertFalse(outcome["result"]["success"], outcome["logs"])
+                step = outcome["reportPayload"]["cases"][0]["steps"][0]
+                self.assertEqual(step["output"]["image_match"]["status"], status)
+                self.assertFalse(any(c["name"] in ("tap", "matchTemplate", "ssim") for c in outcome["apiCalls"]))
+
+    def test_image_not_exists_requires_two_verified_absent_frames(self):
+        override = "global.__adt.matchImageStrict=function(){return " + json.dumps({
+            "status": "not_found", "reason": "no_verified_candidate", "matcher_version": "strict-v1", "candidates": [], "quality": {}, "timings": {}}) + ";};"
+        outcome = self._run_harness(self.action_bundle("assert_image", override, match_mode="not_exists"))
+        self.assertTrue(outcome["result"]["success"], outcome["logs"])
+        evidence = outcome["reportPayload"]["cases"][0]["steps"][0]["output"]["image_match"]
+        self.assertEqual(evidence["confirmed_frames"], 2)
+        self.assertFalse(any(c["name"] == "tap" for c in outcome["apiCalls"]))
+
+    def test_image_not_exists_fails_when_second_frame_contains_target(self):
+        override = """
+var imageAssertionFrame=0, originalAssertionStrict=global.__adt.matchImageStrict;
+global.__adt.matchImageStrict=function(a,b,c){
+    if(imageAssertionFrame++>0)return originalAssertionStrict(a,b,c);
+    return {status:'not_found',reason:'no_verified_candidate',matcher_version:'strict-v1',candidates:[],quality:{},timings:{}};
+};
+"""
+        outcome = self._run_harness(self.action_bundle("assert_image", override, match_mode="not_exists"))
+        self.assertFalse(outcome["result"]["success"])
+        self.assertEqual(outcome["reportPayload"]["cases"][0]["steps"][0]["error_code"], "E2004_ASSERT_IMAGE_FAILED")
+
+    def test_image_assertion_requires_native_capability_and_bound_hash(self):
+        unavailable = self._run_harness(self.action_bundle("assert_image", "global.__adt.matchImageStrict=undefined;", match_mode="not_exists"))
+        self.assertFalse(unavailable["result"]["success"])
+        self.assertEqual(unavailable["reportPayload"]["cases"][0]["steps"][0]["error_code"], "E2013_IMAGE_MATCH_UNSUPPORTED")
+        mismatch = self._run_harness(self.action_bundle("assert_image", image_options={"template_sha256": "0" * 64}))
+        self.assertFalse(mismatch["result"]["success"])
+        self.assertEqual(mismatch["reportPayload"]["cases"][0]["steps"][0]["error_code"], "E2201_INVALID_ARGS")
 
     def _run_harness(self, bundle: dict) -> dict:
         with tempfile.TemporaryDirectory() as tmp:

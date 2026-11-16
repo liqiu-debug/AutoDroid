@@ -114,14 +114,18 @@ test('swift runtime names are not treated as text', () => {
   assert.equal(findBestRecordableNode(nodes, px(50), px(50)), null)
 })
 
-test('android behavior is unchanged', () => {
+test('large Android views also use a local tap-area image selection', () => {
   const android = [
     { x1: 0, y1: 0, x2: 1080, y2: 2400, className: 'android.widget.FrameLayout', depth: 1, isLeaf: false, childCount: 2, area: 2592000, text: '', contentDesc: '', resourceId: '' },
     { x1: 0, y1: 0, x2: 500, y2: 500, className: 'android.view.View', depth: 5, isLeaf: true, childCount: 0, area: 250000, text: '', contentDesc: '', resourceId: '' }
   ]
-  assert.equal(findBestNodeAtPoint(android, 100, 100).className, 'android.view.View')
+  const fallback = findBestNodeAtPoint(android, 100, 100)
+  assert.equal(fallback.className, '')
+  assert.ok(fallback.x2 - fallback.x1 <= 160)
   assert.equal(findBestNodeAtPoint(android, 900, 2000), null, '安卓没有候选时仍不弹提示')
   assert.equal(findBestRecordableNode(android, 100, 100), null)
+  const small = { ...android[1], x2: 140, y2: 140, x1: 100, y1: 100, area: 1600 }
+  assert.equal(findBestNodeAtPoint([android[0], small], 120, 120).className, 'android.view.View')
 })
 
 test('live iOS view has no loading mask; crop mode keeps it', () => {

@@ -1,8 +1,9 @@
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { getErrorDetail } from '@/utils/errors'
+import { anchorFromSelection, pointFromAnchor, makeRecordedImageOptions, bindRecordedImage, parseSearchRegion } from '@/utils/imageOptions'
 
 const QUICK_IMAGE_PROMPT_WIDTH = 248
 const QUICK_IMAGE_HINT_KEYWORDS = ['无 Desc/Text', '图像点击', '未识别到可录制元素']
@@ -22,19 +23,6 @@ const isSameStepTarget = (currentStep, nextStep) => {
   return currentStep === nextStep
 }
 
-const isSameSelection = (left, right) => {
-  if (!left || !right) return false
-  return ['x1', 'y1', 'x2', 'y2'].every((key) => Number(left[key]) === Number(right[key]))
-}
-
-const getSelectionCenterPoint = (selection) => {
-  if (!selection) return null
-  return {
-    x: Math.round((Number(selection.x1 || 0) + Number(selection.x2 || 0)) / 2),
-    y: Math.round((Number(selection.y1 || 0) + Number(selection.y2 || 0)) / 2)
-  }
-}
-
 const cropTemplateFromBase64 = async (screenshotBase64, selection) => {
   const res = await api.cropTemplate(
     screenshotBase64,
@@ -43,7 +31,7 @@ const cropTemplateFromBase64 = async (screenshotBase64, selection) => {
     selection.x2,
     selection.y2
   )
-  return res.data.image_path
+  return res.data
 }
 
 const resolveQuickImagePromptPosition = (hostWidth, hostHeight, baseLeft, baseTop) => {
@@ -69,9 +57,10 @@ export function useScreenCrop({
   liveMode,
   isIosLivePreview,
   selectedSerial,
+  selectedPlatform,
   getMappedCoordinates,
   ensureInteractionReady,
-  executeRawTapAndRefresh,
+  executeImageStepAndRefresh,
   updateStateFromDump,
   shouldRequestDeviceInfo
 }) {
@@ -93,6 +82,37 @@ export function useScreenCrop({
   const quickImageCapture = ref(null)
   const pendingQuickImageDraft = ref(null)
   const skipNextStaticDump = ref(false)
+  const imageTapAnchor = ref([0.5, 0.5])
+  const imageSearchRegion = ref('')
+  const imageMatchResult = ref(null)
+  const imageValidationBusy = ref(false)
+  const imageTemplate = ref(null)
+  const validatedImageKey = ref('')
+  const imageOverlayRevision = ref(0)
+  let imageValidationRevision = 0
+  const currentImagePlatform = () => selectedPlatform?.value === 'ios' ? 'ios' : 'android'
+
+  const invalidateImageValidation = () => {
+    imageValidationRevision += 1
+    imageMatchResult.value = null
+    validatedImageKey.value = ''
+  }
+
+  const setImageAnchor = (index, value) => {
+    if (value === null || value === undefined || value === '') return
+    const number = Number(value)
+    if (!Number.isFinite(number) || number < 0 || number > 1) return
+    imageTapAnchor.value = imageTapAnchor.value.map((item, i) => i === index ? number : item)
+    invalidateImageValidation()
+  }
+
+  watch([screenshot, selectedSerial, () => currentImagePlatform()], () => {
+    if (imageCropMode.value) invalidateImageValidation()
+  }, { flush: 'sync' })
+  watch([imageCropMode, imageMatchResult], async () => {
+    await nextTick()
+    imageOverlayRevision.value += 1
+  })
 
   // 判断是否处于任何框选模式
   const isAnyCropMode = computed(() => ocrCropMode.value || imageCropMode.value)
@@ -115,6 +135,9 @@ export function useScreenCrop({
     quickImageCapture.value = null
     imageCropMode.value = false
     imageCropStep.value = null
+    invalidateImageValidation()
+    imageTemplate.value = null
+    imageSearchRegion.value = ''
     resetCropSelection()
     if (notify) {
       ElMessage.info('已退出图像截取模式')
@@ -124,6 +147,10 @@ export function useScreenCrop({
   const cancelQuickImageCapture = () => {
     stopImageCrop()
   }
+
+  watch(() => imageCropStep.value?.action, action => {
+    if (imageCropMode.value && imageCropStep.value && !['click_image', 'assert_image'].includes(action)) stopImageCrop()
+  }, { flush: 'sync' })
 
   const getScreenshotBase64 = () => screenshot.value.replace(/^data:image\/\w+;base64,/, '')
 
@@ -204,28 +231,101 @@ export function useScreenCrop({
     }
   }
 
-  const addQuickImageStep = (imagePath, node) => {
-    caseStore.addStep({
+  const addQuickImageStep = (imagePath, imageOptions) => {
+    const step = {
       action: 'click_image',
       selector: imagePath,
       selector_type: 'image',
       value: '',
       description: '',
-      error_strategy: 'ABORT'
-    })
+      error_strategy: 'ABORT',
+      options: { image_options: imageOptions },
+      args: { image_path: imagePath, image_options: imageOptions },
+      platform_overrides: { [currentImagePlatform()]: { selector: imagePath, by: 'image' } }
+    }
+    caseStore.addStep(step)
+    return step
   }
 
-  const finalizeQuickImageStep = async ({ screenshotBase64, selection, node, tapX, tapY, executeTap }) => {
+  const imageValidationKey = () => JSON.stringify({
+    screenshot: screenshot.value, selection: getCurrentCropSelection(), anchor: imageTapAnchor.value,
+    region: imageSearchRegion.value, serial: selectedSerial.value, platform: currentImagePlatform(),
+    step: imageCropStep.value ? {
+      action: imageCropStep.value.action, selector: imageCropStep.value.selector,
+      args: imageCropStep.value.args, options: imageCropStep.value.options,
+      platform_overrides: imageCropStep.value.platform_overrides
+    } : null
+  })
+  const imageSelectionReady = computed(() => Boolean(imageCropMode.value && getCurrentCropSelection() && !ocrCropDragging.value))
+  const canConfirmImage = computed(() => imageMatchResult.value?.status === 'matched'
+    && Array.isArray(imageMatchResult.value.point) && imageMatchResult.value.point.length === 2
+    && imageMatchResult.value.point.every(value => Number.isFinite(value))
+    && validatedImageKey.value === imageValidationKey() && !imageValidationBusy.value)
+
+  const validateImageSelection = async () => {
+    const selection = getCurrentCropSelection()
+    if (!selection || imageValidationBusy.value || !imageCropMode.value) return false
+    invalidateImageValidation()
+    const revision = imageValidationRevision
+    const key = imageValidationKey()
+    imageValidationBusy.value = true
+    loading.value = true
+    try {
+      await api.ensureImageMatcher()
+      if (revision !== imageValidationRevision || !imageCropMode.value) return false
+      const region = parseSearchRegion(imageSearchRegion.value)
+      const templateKey = JSON.stringify({ screenshot: screenshot.value, selection })
+      if (imageTemplate.value?.key !== templateKey) {
+        const metadata = await cropTemplateFromBase64(getScreenshotBase64(), selection)
+        if (revision !== imageValidationRevision) return false
+        imageTemplate.value = { key: templateKey, ...metadata }
+      }
+      const imageOptions = makeRecordedImageOptions(imageTemplate.value, imageTapAnchor.value)
+      if (region) imageOptions.search_region = region
+      const response = await api.matchImage({
+        screenshot_base64: getScreenshotBase64(),
+        image_path: imageTemplate.value.image_path,
+        image_options: imageOptions
+      })
+      if (revision !== imageValidationRevision || key !== imageValidationKey()) return false
+      imageMatchResult.value = response.data
+      validatedImageKey.value = key
+      return response.data.status === 'matched'
+    } catch (err) {
+      if (revision === imageValidationRevision) {
+        imageMatchResult.value = { status: 'unsupported', reason: getErrorDetail(err, '图像验证失败，请更新客户端后重试'), candidates: [] }
+      }
+      return false
+    } finally {
+      imageValidationBusy.value = false
+      loading.value = false
+    }
+  }
+
+  const finalizeQuickImageStep = async () => {
+    if (!canConfirmImage.value || !ensureInteractionReady('保存图像步骤')) return false
     loading.value = true
     let success = false
     try {
-      const imagePath = await cropTemplateFromBase64(screenshotBase64, selection)
-      addQuickImageStep(imagePath, node)
+      const imagePath = imageTemplate.value.image_path
+      const options = makeRecordedImageOptions(imageTemplate.value, imageTapAnchor.value)
+      const region = parseSearchRegion(imageSearchRegion.value)
+      if (region) options.search_region = region
+      const platform = currentImagePlatform()
+      const executeTap = Boolean(quickImageCapture.value?.executeTap)
+      let recordedStep
+      if (imageCropStep.value) {
+        bindRecordedImage(imageCropStep.value, platform, imagePath, options)
+        recordedStep = imageCropStep.value
+      } else {
+        recordedStep = addQuickImageStep(imagePath, { [platform]: options })
+      }
 
       let tapError = ''
       if (executeTap) {
         try {
-          await executeRawTapAndRefresh(tapX, tapY)
+          // Re-localize the live device through the same guarded runtime used by replay.
+          await executeImageStepAndRefresh(recordedStep)
         } catch (err) {
           tapError = getErrorDetail(err, '实际点击失败')
         }
@@ -234,7 +334,7 @@ export function useScreenCrop({
       if (tapError) {
         ElMessage.warning(`图像点击步骤已添加，但实际点击失败：${tapError}`)
       } else {
-        ElMessage.success(executeTap ? '已转为图像点击并完成实际点击' : '已添加图像点击步骤')
+        ElMessage.success(executeTap ? '已保存图像步骤并完成实际点击' : '图像模板及点击位置已保存')
       }
       success = true
     } catch (err) {
@@ -254,6 +354,7 @@ export function useScreenCrop({
     const coords = getMappedCoordinates(event.clientX, event.clientY)
     if (!coords) return
     ocrCropDragging.value = true
+    if (imageCropMode.value) invalidateImageValidation()
     ocrCropStart.value = coords
     ocrCropCurrent.value = coords
     event.preventDefault()
@@ -283,43 +384,16 @@ export function useScreenCrop({
       return
     }
 
-    if (imageCropMode.value && quickImageCapture.value) {
+    if (imageCropMode.value) {
       ocrCropStart.value = start
       ocrCropCurrent.value = end
+      imageTapAnchor.value = [0.5, 0.5]
+      invalidateImageValidation()
       if (event) {
         event.preventDefault()
         event.stopPropagation()
       }
       return
-    }
-
-    // 图像模板截取模式
-    if (imageCropMode.value && imageCropStep.value) {
-      try {
-        // 从当前截图获取 base64（去除 data:image/png;base64, 前缀）
-        const b64 = screenshot.value.replace(/^data:image\/\w+;base64,/, '')
-        const res = await api.cropTemplate(b64, x1, y1, x2, y2)
-        const imagePath = res.data.image_path
-
-        // 回填步骤
-        imageCropStep.value.selector = imagePath
-        imageCropStep.value.selector_type = 'image'
-        if (!imageCropStep.value.platform_overrides || typeof imageCropStep.value.platform_overrides !== 'object') {
-          imageCropStep.value.platform_overrides = {}
-        }
-        imageCropStep.value.platform_overrides.android = {
-          selector: imagePath,
-          by: 'image'
-        }
-        ElMessage.success('图像模板已截取并保存')
-      } catch (err) {
-        console.error('截取图像模板失败:', err)
-        ElMessage.error('截取图像模板失败: ' + (err.response?.data?.detail || err.message))
-      }
-
-      imageCropMode.value = false
-      imageCropStep.value = null
-      resetCropSelection()
     }
 
     // OCR 框选模式
@@ -427,7 +501,9 @@ export function useScreenCrop({
     }
     resetCropSelection()
     applyCropBoundsToOverlay(initialSelection)
-    ElMessage.info('已切换为图像点击，可直接确认或拖拽调整截取区域')
+    imageTapAnchor.value = anchorFromSelection(initialSelection, { x: draft.x, y: draft.y })
+    invalidateImageValidation()
+    ElMessage.info('请确认截取区域与红色点击位置，再验证定位')
   }
 
   const beginQuickImageCapture = async (draft = quickImagePrompt.value) => {
@@ -482,26 +558,11 @@ export function useScreenCrop({
   }
 
   const confirmQuickImageCapture = async () => {
-    if (!quickImageCapture.value) return
-
-    const selection = getCurrentCropSelection()
-    if (!selection) {
-      ElMessage.warning('请先框选图像区域')
+    if (!canConfirmImage.value) {
+      ElMessage.warning('请先验证定位，确认唯一目标与点击位置')
       return
     }
-
-    const draft = quickImageCapture.value
-    const tapPoint = isSameSelection(selection, draft.initialSelection)
-      ? { x: draft.x, y: draft.y }
-      : getSelectionCenterPoint(selection)
-    const success = await finalizeQuickImageStep({
-      screenshotBase64: getScreenshotBase64(),
-      selection,
-      node: draft.node,
-      tapX: tapPoint?.x ?? draft.x,
-      tapY: tapPoint?.y ?? draft.y,
-      executeTap: draft.executeTap
-    })
+    const success = await finalizeQuickImageStep()
     if (success) {
       cancelQuickImageCapture()
     }
@@ -525,7 +586,7 @@ export function useScreenCrop({
     ElMessage.info('请在截图上按住鼠标拖拽框选 OCR 区域')
   }
 
-  const startImageCrop = (step) => {
+  const startImageCrop = async (step) => {
     if (imageCropMode.value && imageCropStep.value && isSameStepTarget(imageCropStep.value, step)) {
       stopImageCrop({ notify: true })
       return
@@ -541,15 +602,29 @@ export function useScreenCrop({
     }
     clearQuickImagePrompt()
     stopImageCrop()
+    if (isIosLivePreview.value) {
+      loading.value = true
+      try {
+        const res = await api.getDeviceDump(selectedSerial.value, {
+          includeScreenshot: true, includeHierarchy: false, includeDeviceInfo: shouldRequestDeviceInfo()
+        })
+        updateStateFromDump(res.data)
+      } catch (err) {
+        ElMessage.error('获取截取画面失败：' + getErrorDetail(err, '请重试'))
+        return
+      } finally { loading.value = false }
+    }
     ocrCropMode.value = false
     ocrCropStep.value = null
     imageCropMode.value = true
     imageCropStep.value = step
+    imageTapAnchor.value = [0.5, 0.5]
     resetCropSelection()
     ElMessage.info('请在截图上按住鼠标拖拽框选目标元素区域')
   }
 
   const getCropOverlayStyle = () => {
+    void imageOverlayRevision.value
     if (!isAnyCropMode.value || !ocrCropStart.value || !ocrCropCurrent.value || !imgRef.value || !canvasRef.value) {
       return { display: 'none' }
     }
@@ -558,10 +633,12 @@ export function useScreenCrop({
     const canvasRect = canvasRef.value.getBoundingClientRect()
     const offsetX = imgRect.left - canvasRect.left
     const offsetY = imgRect.top - canvasRect.top
-    const x1 = Math.min(ocrCropStart.value.canvasX, ocrCropCurrent.value.canvasX)
-    const y1 = Math.min(ocrCropStart.value.canvasY, ocrCropCurrent.value.canvasY)
-    const x2 = Math.max(ocrCropStart.value.canvasX, ocrCropCurrent.value.canvasX)
-    const y2 = Math.max(ocrCropStart.value.canvasY, ocrCropCurrent.value.canvasY)
+    const scaleX = imgRect.width / imgRef.value.naturalWidth
+    const scaleY = imgRect.height / imgRef.value.naturalHeight
+    const x1 = Math.min(ocrCropStart.value.realX, ocrCropCurrent.value.realX) * scaleX
+    const y1 = Math.min(ocrCropStart.value.realY, ocrCropCurrent.value.realY) * scaleY
+    const x2 = Math.max(ocrCropStart.value.realX, ocrCropCurrent.value.realX) * scaleX
+    const y2 = Math.max(ocrCropStart.value.realY, ocrCropCurrent.value.realY) * scaleY
 
     return {
       display: 'block',
@@ -575,6 +652,34 @@ export function useScreenCrop({
       pointerEvents: 'none',
       boxSizing: 'border-box',
       borderRadius: '4px'
+    }
+  }
+
+  const getImagePointStyle = () => {
+    void imageOverlayRevision.value
+    const selection = getCurrentCropSelection()
+    if (!imageCropMode.value || !selection || !imgRef.value || !canvasRef.value) return { display: 'none' }
+    const [x, y] = imageMatchResult.value?.status === 'matched' && Array.isArray(imageMatchResult.value.point)
+      ? imageMatchResult.value.point : pointFromAnchor(selection, imageTapAnchor.value)
+    const img = imgRef.value.getBoundingClientRect()
+    const canvas = canvasRef.value.getBoundingClientRect()
+    return {
+      left: `${img.left - canvas.left + x * img.width / imgRef.value.naturalWidth}px`,
+      top: `${img.top - canvas.top + y * img.height / imgRef.value.naturalHeight}px`
+    }
+  }
+
+  const getImageCandidateStyle = (candidate) => {
+    void imageOverlayRevision.value
+    if (!imgRef.value || !canvasRef.value || !Array.isArray(candidate.rect)) return { display: 'none' }
+    const [x, y, width, height] = candidate.rect
+    const img = imgRef.value.getBoundingClientRect()
+    const canvas = canvasRef.value.getBoundingClientRect()
+    return {
+      left: `${img.left - canvas.left + x * img.width / imgRef.value.naturalWidth}px`,
+      top: `${img.top - canvas.top + y * img.height / imgRef.value.naturalHeight}px`,
+      width: `${width * img.width / imgRef.value.naturalWidth}px`,
+      height: `${height * img.height / imgRef.value.naturalHeight}px`
     }
   }
 
@@ -592,6 +697,17 @@ export function useScreenCrop({
     skipNextStaticDump,
     isAnyCropMode,
     activeImageCropStepUuid,
+    imageTapAnchor,
+    imageSearchRegion,
+    imageMatchResult,
+    imageValidationBusy,
+    imageSelectionReady,
+    canConfirmImage,
+    setImageAnchor,
+    invalidateImageValidation,
+    validateImageSelection,
+    getImagePointStyle,
+    getImageCandidateStyle,
     resetCropSelection,
     clearQuickImagePrompt,
     stopImageCrop,

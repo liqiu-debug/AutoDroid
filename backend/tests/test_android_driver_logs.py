@@ -1,7 +1,4 @@
 import unittest
-import itertools
-import os
-import tempfile
 from unittest.mock import Mock, patch
 
 from backend.drivers.android_driver import AndroidDriver
@@ -63,22 +60,19 @@ class AndroidDriverLogTests(unittest.TestCase):
         self.assertIn("text_len='9'", output)
         self.assertNotIn("secret123", output)
 
-    def test_click_image_prefers_text_hint_for_confirm_template(self):
+    def test_click_image_never_substitutes_global_confirmation_text(self):
         driver = self._new_driver()
-        driver._device.image = Mock()
         driver._template_confirm_text_hint = Mock(return_value="确定")
-        driver.click = Mock(return_value=None)
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            AndroidDriver.click_image(driver, tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        driver.click.assert_called_once_with(selector="确定", by="text")
+        driver.click = Mock()
+        driver._resolve_template_image_path = Mock(return_value="offline.png")
+        evidence = {"status": "matched", "point": [10, 20]}
+        with patch("backend.drivers.android_driver.locate_stable_image", return_value=evidence), patch("backend.drivers.android_driver.android_tap_once") as tap:
+            AndroidDriver.click_image(driver, "offline.png")
+        driver._template_confirm_text_hint.assert_not_called()
+        driver.click.assert_not_called()
         driver._device.image.wait.assert_not_called()
+        self.assertEqual(tap.call_args.args[1:3], (10, 20))
+        driver._device.click.assert_not_called()
 
     def test_assert_text_matches_joined_page_text_when_target_sequence_appears_late(self):
         driver = self._new_driver()
@@ -114,69 +108,36 @@ class AndroidDriverLogTests(unittest.TestCase):
         self.assertIn("购物车订单购物车支付成功", str(context.exception))
         self.assertIn("Android.assert_text failed", "\n".join(logs.output))
 
-    def test_click_image_uses_template_wait_and_click_point(self):
+    def test_click_image_uses_verified_anchor_and_returns_evidence(self):
         driver = self._new_driver()
-        driver._device.image = Mock()
-        driver._device.image.wait.return_value = {"point": [10.9, 20.1], "similarity": 0.96}
-        driver._template_confirm_text_hint = Mock(return_value="")
-        driver._capture_page_signature_quick = Mock(return_value="sig")
+        driver._resolve_template_image_path = Mock(return_value="offline.png")
+        evidence = {"status": "matched", "point": [10.9, 20.1]}
+        options = {"template_sha256": "a" * 64, "tap_anchor": [.2, .4]}
+        with patch("backend.drivers.android_driver.locate_stable_image", return_value=evidence) as locate, patch("backend.drivers.android_driver.android_tap_once") as tap:
+            result = AndroidDriver.click_image(driver, "offline.png", image_options=options, timeout=3)
+        locate.assert_called_once()
+        self.assertEqual(locate.call_args.args[1:], ("offline.png", options, 3))
+        self.assertEqual(result, {"image_match": evidence})
+        self.assertEqual(tap.call_count, 1)
+        self.assertEqual(tap.call_args.args[1:3], (10.9, 20.1))
 
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            AndroidDriver.click_image(driver, tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        driver._device.image.wait.assert_called_once_with(tmp_path, timeout=5, threshold=0.9)
-        driver._device.click.assert_called_once_with(10, 20)
-
-    def test_click_image_retries_once_when_match_slow_and_page_unchanged(self):
+    def test_click_image_does_not_repeat_tap_when_page_signature_is_unchanged(self):
         driver = self._new_driver()
-        driver._device.image = Mock()
-        driver._device.image.wait.return_value = {"point": [30.0, 40.0], "similarity": 0.95}
-        driver._template_confirm_text_hint = Mock(return_value="")
-        driver._capture_page_signature_quick = Mock(side_effect=["sig-a", "sig-a", "sig-b"])
+        driver._resolve_template_image_path = Mock(return_value="offline.png")
+        driver._capture_page_signature_quick = Mock(return_value="unchanged")
+        with patch("backend.drivers.android_driver.locate_stable_image", return_value={"point": [30, 40]}), patch("backend.drivers.android_driver.android_tap_once") as tap:
+            AndroidDriver.click_image(driver, "offline.png")
+        self.assertEqual(tap.call_count, 1)
+        driver._capture_page_signature_quick.assert_not_called()
 
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            mock_times = itertools.chain([1000.0, 1001.0, 1004.5, 1005.0], itertools.repeat(1005.0))
-            with patch(
-                "backend.drivers.android_driver.time.time",
-                side_effect=lambda: next(mock_times),
-            ):
-                AndroidDriver.click_image(driver, tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        self.assertEqual(driver._device.click.call_count, 2)
-
-    def test_click_image_raises_when_retry_still_has_no_effect(self):
+    def test_click_image_unknown_tap_result_marks_submission_and_never_repeats(self):
         driver = self._new_driver()
-        driver._device.image = Mock()
-        driver._device.image.wait.return_value = {"point": [30.0, 40.0], "similarity": 0.95}
-        driver._template_confirm_text_hint = Mock(return_value="")
-        driver._capture_page_signature_quick = Mock(side_effect=["sig-a", "sig-a", "sig-a"])
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            mock_times = itertools.chain([1000.0, 1001.0, 1004.5, 1005.0], itertools.repeat(1005.0))
-            with patch(
-                "backend.drivers.android_driver.time.time",
-                side_effect=lambda: next(mock_times),
-            ):
-                with self.assertRaises(RuntimeError) as context:
-                    AndroidDriver.click_image(driver, tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        self.assertIn("tap-no-effect", str(context.exception))
-        self.assertEqual(driver._device.click.call_count, 2)
+        driver._resolve_template_image_path = Mock(return_value="offline.png")
+        with patch("backend.drivers.android_driver.locate_stable_image", return_value={"point": [30, 40]}), patch("backend.drivers.android_driver.android_tap_once", side_effect=RuntimeError("transport failed")) as tap:
+            with self.assertRaises(RuntimeError) as error:
+                AndroidDriver.click_image(driver, "offline.png")
+        self.assertTrue(error.exception.context["tap_submitted"])
+        self.assertEqual(tap.call_count, 1)
 
 
 if __name__ == "__main__":

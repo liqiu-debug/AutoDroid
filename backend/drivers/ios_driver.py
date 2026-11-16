@@ -40,6 +40,10 @@ from backend.execution_errors import (
 from backend.utils import evaluate_page_text_assertion
 from backend.ocr_service import start_ocr_prewarm
 
+from backend.utils.image_click import bounded_image_read, locate_stable_image
+from backend.utils.image_assert import assert_image_presence
+from backend.utils.image_tap import ios_tap_once
+
 logger = logging.getLogger(__name__)
 
 
@@ -552,124 +556,51 @@ class IOSDriver(
             self._log_action_failure("swipe", started_at, exc, direction=direction)
             raise
 
-    def click_image(self, image_path: str) -> None:
+    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
         started_at = time.time()
+        step_deadline = time.monotonic() + timeout
         target = ""
         try:
             target = self._resolve_template_image_path(image_path, action_name="click_image")
-            center_x, center_y, score = self._locate_image_target(
-                image_path=target,
-                threshold=self._IMAGE_MATCH_THRESHOLD,
-                action_name="click_image",
-            )
-            logger.info(
-                "iOS.click_image: path=%s, score=%.4f, point=(%.1f, %.1f)",
-                target,
-                score,
-                center_x,
-                center_y,
-            )
-            self.click_by_coordinates(center_x, center_y)
+            if abort_event is not None and abort_event.is_set():
+                from backend.execution_errors import USER_ABORT_MESSAGE
+                raise RuntimeError(USER_ABORT_MESSAGE)
+            # Resolve the read-only session before capturing the target, so a
+            # session discovery round-trip cannot stale a verified coordinate.
+            session_id = bounded_image_read(lambda: self.client.session().session_id, step_deadline)
+            diagnostic = locate_stable_image(self.screenshot, target, image_options, max(0.001, step_deadline - time.monotonic()), abort_event=abort_event)
+            x, y = diagnostic["point"]
+            deadline = diagnostic.pop("_deadline", time.monotonic() + timeout)
+            if abort_event is not None and abort_event.is_set():
+                from backend.execution_errors import USER_ABORT_MESSAGE
+                raise RuntimeError(USER_ABORT_MESSAGE)
+            try:
+                ios_tap_once(self.wda_url, session_id, x / self.scale, y / self.scale, deadline)
+            except Exception as tap_exc:
+                raise ExecutionStepRuntimeError(
+                    E2009_CLICK_NO_EFFECT, "图像点击提交结果未知，请检查设备状态",
+                    context={"image_match": diagnostic, "tap_submitted": True},
+                ) from tap_exc
             self._log_action_success(
-                "click_image",
-                started_at,
-                image_path=target,
-                score=round(score, 4),
-                x=round(center_x, 1),
-                y=round(center_y, 1),
+                "click_image", started_at, image_path=target, strategy="strict-v1",
+                x=round(x, 2), y=round(y, 2), stable_frames=2,
             )
+            logger.info("iOS.click_image evidence: %s", diagnostic)
+            return {"image_match": diagnostic}
         except Exception as exc:
-            self._log_action_failure(
-                "click_image",
-                started_at,
-                exc,
-                image_path=target,
-            )
+            self._log_action_failure("click_image", started_at, exc, image_path=target)
             raise
 
-    def assert_image(self, image_path: str, match_mode: str = "exists") -> None:
+    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
         started_at = time.time()
         target = ""
-        normalized_mode = "not_exists" if str(match_mode or "").strip().lower() == "not_exists" else "exists"
-        logger.info(
-            "iOS.assert_image start: path=%s match_mode=%s",
-            image_path,
-            normalized_mode,
-        )
         try:
             target = self._resolve_template_image_path(image_path, action_name="assert_image")
-
-            if normalized_mode == "exists":
-                center_x, center_y, score = self._locate_image_target(
-                    image_path=target,
-                    threshold=self._IMAGE_MATCH_THRESHOLD,
-                    action_name="assert_image",
-                )
-                self._log_action_success(
-                    "assert_image",
-                    started_at,
-                    image_path=target,
-                    match_mode=normalized_mode,
-                    score=round(score, 4),
-                    x=round(center_x, 1),
-                    y=round(center_y, 1),
-                )
-                return
-
-            first_match = self._try_locate_image_target(
-                image_path=target,
-                threshold=self._IMAGE_MATCH_THRESHOLD,
-                action_name="assert_image",
-            )
-            if first_match is None:
-                self._log_action_success(
-                    "assert_image",
-                    started_at,
-                    image_path=target,
-                    match_mode=normalized_mode,
-                )
-                return
-
-            if first_match is not None:
-                center_x, center_y, score = first_match
-                if score >= self._IMAGE_ASSERT_FAST_FAIL_SCORE:
-                    raise ExecutionStepAssertionError(
-                        E2004_ASSERT_IMAGE_FAILED,
-                        f"断言失败: 期望页面不存在图像 {target!r}，但已高置信度匹配到目标 "
-                        f"(score={score:.4f}, x={center_x:.1f}, y={center_y:.1f})",
-                        context={"image_path": target, "match_mode": normalized_mode},
-                    )
-
-            time.sleep(self._IMAGE_ASSERT_RECHECK_DELAY_SECONDS)
-            second_match = self._try_locate_image_target(
-                image_path=target,
-                threshold=self._IMAGE_MATCH_THRESHOLD,
-                action_name="assert_image",
-            )
-            confirmed_match = second_match if second_match is not None else None
-            if confirmed_match is not None:
-                center_x, center_y, score = confirmed_match
-                raise ExecutionStepAssertionError(
-                    E2004_ASSERT_IMAGE_FAILED,
-                    f"断言失败: 期望页面不存在图像 {target!r}，但仍匹配到目标 "
-                    f"(score={score:.4f}, x={center_x:.1f}, y={center_y:.1f})",
-                    context={"image_path": target, "match_mode": normalized_mode},
-                )
-
-            self._log_action_success(
-                "assert_image",
-                started_at,
-                image_path=target,
-                match_mode=normalized_mode,
-            )
+            result = assert_image_presence(self.screenshot, target, match_mode, image_options, timeout, abort_event)
+            self._log_action_success("assert_image", started_at, image_path=target, match_mode=match_mode, strategy="strict-v1")
+            return result
         except Exception as exc:
-            self._log_action_failure(
-                "assert_image",
-                started_at,
-                exc,
-                image_path=target or image_path,
-                match_mode=normalized_mode,
-            )
+            self._log_action_failure("assert_image", started_at, exc, image_path=target or image_path, match_mode=match_mode)
             raise
 
     def extract_by_ocr(self, region: str, extract_rule: Optional[Dict[str, Any]] = None) -> str:

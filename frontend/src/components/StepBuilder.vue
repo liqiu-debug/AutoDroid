@@ -9,6 +9,8 @@ import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
+import { getImageOptionsMap, selectImageOptions, setImageOptionsMap, replaceDefaultImagePath, parseSearchRegion, imageExecutionFailure } from '@/utils/imageOptions'
+import ImageMatchPreview from './ImageMatchPreview.vue'
 
 const caseStore = useCaseStore()
 const { currentCase, lastAddedStepUuid } = storeToRefs(caseStore)
@@ -199,6 +201,9 @@ const buildExecutableStep = (step) => {
       ios: step?.platform_overrides?.ios ? { ...step.platform_overrides.ios } : null
     }
   }
+  if (['click_image', 'assert_image'].includes(step.action)) {
+    payloadStep.args = { ...(step.args || {}), image_path: String(step.selector || ''), image_options: getImageOptionsMap(step) }
+  }
 
   const selectorType = String(payloadStep.selector_type || '').trim()
   payloadStep.selector_type = selectorType || null
@@ -254,6 +259,91 @@ const syncExtractOcrRegion = (step) => {
   if (!step || typeof step !== 'object') return
   step.selector_type = 'text'
   syncNonLogicalSelectorToAndroidOverride(step)
+}
+
+const imageConfigPlatforms = ref({})
+const imageSearchDrafts = ref({})
+const imagePreviewVisible = ref(false)
+const imagePreviewBusy = ref(false)
+const imagePreviewScreenshot = ref('')
+const imagePreviewResult = ref(null)
+const imageConfigPlatform = step => imageConfigPlatforms.value[step.uuid] || 'android'
+const imageConfig = step => getImageOptionsMap(step)[imageConfigPlatform(step)] || null
+const imageSearchKey = step => `${step.uuid}:${imageConfigPlatform(step)}`
+const imageSearchText = step => imageSearchDrafts.value[imageSearchKey(step)]
+  ?? (imageConfig(step)?.search_region ? JSON.stringify(imageConfig(step).search_region) : '')
+const imagePreviewStep = ref(null)
+const imagePreviewKey = step => JSON.stringify([props.deviceSerial, step?.action, step?.selector, step?.platform_overrides, getImageOptionsMap(step)])
+watch(() => imagePreviewStep.value && imagePreviewKey(imagePreviewStep.value), (key, oldKey) => {
+  if (key !== oldKey && imagePreviewResult.value?.status === 'matched') {
+    imagePreviewResult.value = { status: 'unstable', reason: '设备或模板设置已变化，请重新验证定位', candidates: [] }
+  }
+}, { flush: 'sync' })
+
+const onImagePathChange = step => {
+  replaceDefaultImagePath(step, String(step.selector || ''))
+  for (const key of Object.keys(imageSearchDrafts.value)) {
+    if (key.startsWith(`${step.uuid}:`)) delete imageSearchDrafts.value[key]
+  }
+}
+
+const updateImageAnchor = (step, index, value) => {
+  if (value === null || value === undefined || value === '') return
+  const map = getImageOptionsMap(step)
+  const config = map[imageConfigPlatform(step)]
+  const number = Number(value)
+  if (!config || !Number.isFinite(number) || number < 0 || number > 1) return
+  config.tap_anchor = [...(config.tap_anchor || [0.5, 0.5])]
+  config.tap_anchor[index] = number
+  setImageOptionsMap(step, map)
+}
+
+const updateImageSearchRegion = step => {
+  const map = getImageOptionsMap(step)
+  const config = map[imageConfigPlatform(step)]
+  if (!config) return true
+  try {
+    const region = parseSearchRegion(imageSearchText(step))
+    if (region) config.search_region = region
+    else delete config.search_region
+    setImageOptionsMap(step, map)
+    delete imageSearchDrafts.value[imageSearchKey(step)]
+    return true
+  } catch (err) {
+    delete imageSearchDrafts.value[imageSearchKey(step)]
+    ElMessage.warning('未应用搜索区域：' + err.message)
+    return false
+  }
+}
+
+const previewImageMatch = async step => {
+  if (imagePreviewBusy.value || !updateImageSearchRegion(step)) return
+  if (!props.deviceSerial) { ElMessage.warning('请先选择一台调试设备'); return }
+  imagePreviewBusy.value = true
+  imagePreviewVisible.value = true
+  imagePreviewResult.value = null
+  imagePreviewScreenshot.value = ''
+  imagePreviewStep.value = step
+  const previewKey = () => imagePreviewKey(step)
+  const requestedKey = previewKey()
+  try {
+    await api.ensureImageMatcher()
+    const { data: dump } = await api.getDeviceDump(props.deviceSerial, {
+      includeScreenshot: true, includeHierarchy: false, includeDeviceInfo: true
+    })
+    if (!dump.screenshot) throw new Error('未获取到当前设备截图')
+    imagePreviewScreenshot.value = `data:image/${dump.screenshot_format || 'png'};base64,${dump.screenshot}`
+    const platform = dump.device_info?.platform === 'ios' ? 'ios' : 'android'
+    const imagePath = step.platform_overrides?.[platform]?.selector || step.selector
+    const config = selectImageOptions(step, platform)
+    const { data } = await api.matchImage({ screenshot_base64: dump.screenshot, image_path: imagePath, ...(config ? { image_options: config } : {}) })
+    if (imagePreviewVisible.value) {
+      imagePreviewResult.value = requestedKey === previewKey() ? data
+        : { status: 'unstable', reason: '设备或模板设置已变化，请重新验证定位', candidates: [] }
+    }
+  } catch (err) {
+    imagePreviewResult.value = { status: 'unsupported', reason: err.response?.data?.detail || err.message || '定位验证失败', candidates: [] }
+  } finally { imagePreviewBusy.value = false }
 }
 
 // AI 生成相关状态
@@ -474,6 +564,7 @@ const resetStepDetailsForAction = (step) => {
   step.error_strategy = 'ABORT'
   step.retry_count = 0
   step.options = {}
+  step.args = {}
   step.platform_overrides = {
     android: null,
     ios: null
@@ -594,7 +685,7 @@ const handleExecuteStep = async (step) => {
       ElMessage.success('步骤执行成功')
       emit('refresh-needed', res.data.dump)
     } else {
-      ElMessage.error('步骤执行失败: ' + res.data.result.error)
+      ElMessage.error('步骤执行失败: ' + (step.action === 'click_image' ? imageExecutionFailure(res.data.result) : res.data.result.error))
     }
   } catch (err) {
     ElMessage.error('执行出错: ' + (err.response?.data?.detail || err.message))
@@ -607,6 +698,10 @@ const handleExecuteStep = async (step) => {
 
 <template>
   <div class="step-builder">
+    <el-dialog v-model="imagePreviewVisible" title="图像定位验证（只定位）" width="720px" append-to-body>
+      <div v-if="imagePreviewBusy" class="image-preview-loading">正在获取当前画面并验证定位…</div>
+      <ImageMatchPreview v-else :screenshot="imagePreviewScreenshot" :result="imagePreviewResult" />
+    </el-dialog>
     <div class="builder-header">
       <div class="header-left">
         <span class="title">步骤编排</span>
@@ -836,7 +931,7 @@ const handleExecuteStep = async (step) => {
                       v-model="step.selector"
                       size="small"
                       placeholder="例如: static/images/element_xxx.png"
-                      @input="syncNonLogicalSelectorToAndroidOverride(step)"
+                      @input="onImagePathChange(step)"
                     >
                       <template #prepend>图像路径</template>
                     </el-input>
@@ -849,6 +944,24 @@ const handleExecuteStep = async (step) => {
                     >
                       {{ isImageCropActive(step) ? '取消截取' : '去截取' }}
                     </el-button>
+                  </div>
+                </div>
+                <div class="form-row">
+                  <label>图像设置</label>
+                  <div class="image-config-fields">
+                    <el-select :model-value="imageConfigPlatform(step)" @update:model-value="value => imageConfigPlatforms[step.uuid] = value" size="small">
+                      <el-option label="Android" value="android" /><el-option label="iOS" value="ios" /><el-option label="通用" value="default" />
+                    </el-select>
+                    <template v-if="imageConfig(step)">
+                      <div class="image-anchor-inputs">
+                        <label>点击横向 <el-input-number :model-value="imageConfig(step).tap_anchor?.[0] ?? 0.5" @update:model-value="value => updateImageAnchor(step, 0, value)" :min="0" :max="1" :step="0.05" :precision="3" size="small" /></label>
+                        <label>点击纵向 <el-input-number :model-value="imageConfig(step).tap_anchor?.[1] ?? 0.5" @update:model-value="value => updateImageAnchor(step, 1, value)" :min="0" :max="1" :step="0.05" :precision="3" size="small" /></label>
+                      </div>
+                      <el-input :model-value="imageSearchText(step)" @update:model-value="value => imageSearchDrafts[imageSearchKey(step)] = value" @change="updateImageSearchRegion(step)" size="small" placeholder="搜索区域 [左,上,右,下]，0–1；留空为全屏" />
+                      <span class="image-config-hint">点击位置相对模板，0 为左／上，1 为右／下。录制尺寸 {{ imageConfig(step).source_size?.join(' × ') }}。</span>
+                    </template>
+                    <span v-else class="image-config-hint">此平台尚未绑定模板设置。重新截取可保存点击位置；已有路径沿用中心点击。</span>
+                    <el-button size="small" :loading="imagePreviewBusy" @click="previewImageMatch(step)">验证当前设备定位</el-button>
                   </div>
                 </div>
               </template>
@@ -1370,4 +1483,11 @@ const handleExecuteStep = async (step) => {
 .step-actions :deep(.el-button) { color: var(--ad-muted); }
 .step-actions :deep(.step-run-action:hover) { color: var(--ad-primary); }
 .step-actions :deep(.step-remove-action:hover) { color: var(--ad-danger); }
+.image-config-fields { display: flex; flex-direction: column; align-items: stretch; gap: 8px; min-width: 0; flex: 1; }
+.image-config-fields > .el-button { align-self: flex-start; }
+.image-anchor-inputs { display: flex; flex-wrap: wrap; gap: 8px; }
+.image-anchor-inputs label { display: flex; align-items: center; gap: 4px; font-size: 12px; white-space: nowrap; }
+.image-anchor-inputs :deep(.el-input-number) { width: 112px; }
+.image-config-hint { color: var(--ad-muted); font-size: 12px; line-height: 1.6; }
+.image-preview-loading { padding: 36px 0; text-align: center; color: var(--ad-muted); }
 </style>

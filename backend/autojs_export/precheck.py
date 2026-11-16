@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +13,7 @@ from backend.autojs_export.generator import (
     LOCATOR_ACTIONS,
     find_unresolved_placeholders,
 )
+from backend.utils.image_match_options import normalize_image_options
 
 SUPPORTED_BY = {"id", "resourceid", "resource_id", "text", "label", "name", "description", "desc", "content-desc"}
 
@@ -74,6 +76,19 @@ def precheck_case_script(
                 issues.append(
                     _issue(order, "error", "EXPORT_IMAGE_MISSING", f"{action} 步骤缺少有效模板图（image_path 非法或为空）")
                 )
+
+        if action in {"click_image", "assert_image"} and "image_options" in args:
+            try:
+                if not isinstance(args["image_options"], dict):
+                    raise ValueError("image_options 必须是对象")
+                config = normalize_image_options(args["image_options"])
+                if config and project_root is not None:
+                    ref = next((rel for name, rel in case_script.get("template_refs") or [] if name == args.get("image")), None)
+                    target = Path(project_root) / ref if ref else None
+                    if target is not None and target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() != config["template_sha256"]:
+                        raise ValueError("模板图已变化，请重新确认该平台点击位置及搜索区域")
+            except ValueError as exc:
+                issues.append(_issue(order, "error", "P1006_INVALID_ARGS", str(exc)))
 
         if action in ("start_app", "stop_app"):
             app_identifier = (args.get("bundle_id") or args.get("app_id")) if str(platform).lower() == "ios" else (args.get("package") or args.get("app_id"))

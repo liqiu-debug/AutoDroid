@@ -147,7 +147,51 @@ api.interceptors.response.use(
     }
 )
 
+const IMAGE_MATCHER_UPGRADE_MESSAGE = '请升级桌面客户端以使用高精度图像功能'
+let imageClientInfoPromise = null
+const imageMatcherSupported = info => {
+    const capability = info?.image_matcher
+    return capability?.version === 'strict-v1' && capability.validated === true
+        && capability.preview === true && capability.metadata === true
+}
+const imageClientInfo = () => {
+    if (!imageClientInfoPromise) {
+        imageClientInfoPromise = api.get('/client/info', { silent401: true }).then(response => response?.data || {}).catch(error => {
+            if (error.response?.status === 404 && !desktopBridge()) return { clientMode: false }
+            imageClientInfoPromise = null
+            throw new Error(error.response?.status === 404 ? IMAGE_MATCHER_UPGRADE_MESSAGE : '无法确认图像匹配能力，请检查桌面客户端连接后重试')
+        })
+    }
+    return imageClientInfoPromise
+}
+const assertImageMatcher = async () => {
+    const info = await imageClientInfo()
+    if (info.clientMode === true && !imageMatcherSupported(info)) throw new Error(IMAGE_MATCHER_UPGRADE_MESSAGE)
+}
+const imageSteps = value => Array.isArray(value) ? value : Array.isArray(value?.items) ? value.items : null
+const requiresImageMatcher = action => ['click_image', 'assert_image'].includes(String(action || '').toLowerCase())
+const containsImageAction = steps => steps.some(step => requiresImageMatcher(step?.action))
+const assertCaseImageMatcher = async id => {
+    const info = await imageClientInfo()
+    if (info.clientMode !== true || imageMatcherSupported(info)) return
+    let steps
+    try { steps = imageSteps((await api.get(`/cases/${id}/steps`)).data) } catch { /* legacy case below */ }
+    if (!steps) {
+        const entity = (await api.get(`/cases/${id}`)).data
+        steps = imageSteps(entity?.steps)
+    }
+    if (!steps || containsImageAction(steps)) throw new Error(IMAGE_MATCHER_UPGRADE_MESSAGE)
+}
+const assertScenarioImageMatcher = async id => {
+    const info = await imageClientInfo()
+    if (info.clientMode !== true || imageMatcherSupported(info)) return
+    const steps = imageSteps((await api.get(`/scenarios/${id}/steps`)).data)
+    if (!steps || steps.some(step => !step?.case_id)) throw new Error(IMAGE_MATCHER_UPGRADE_MESSAGE)
+    await Promise.all([...new Set(steps.map(step => step.case_id))].map(assertCaseImageMatcher))
+}
+
 export default {
+    ensureImageMatcher: assertImageMatcher,
     // Typed, device-independent HTTP automation. Uses the same auth interceptors.
     apiTesting: {
         // 一次性 GET（详情/首载大载荷）：默认全局 30s；真轮询调用处显式传
@@ -214,24 +258,28 @@ export default {
     createTestCase(data) {
         return api.post('/cases/', data)
     },
-    runTestCase(id) {
+    async runTestCase(id) {
+        await assertCaseImageMatcher(id)
         // Sync run (deprecated for long runs but kept for simple ones)
         return api.post(`/cases/${id}/run`, null, { timeout: 300000 })
     },
-    runTestCaseAsync(id, envId, deviceSerial) {
+    async runTestCaseAsync(id, envId, deviceSerial) {
+        await assertCaseImageMatcher(id)
         let qs = []
         if (envId) qs.push(`env_id=${envId}`)
         if (deviceSerial) qs.push(`device_serial=${deviceSerial}`)
         const qsStr = qs.length ? `?${qs.join('&')}` : ''
         return api.post(`/cases/${id}/run${qsStr}`)
     },
-    runTestCaseBatch(id, envId, deviceSerials) {
+    async runTestCaseBatch(id, envId, deviceSerials) {
+        await assertCaseImageMatcher(id)
         return api.post(`/cases/${id}/run-batch`, {
             env_id: envId || null,
             device_serials: Array.isArray(deviceSerials) ? deviceSerials : (deviceSerials ? [deviceSerials] : [])
         })
     },
-    precheckTestCase(id, envId, deviceSerial) {
+    async precheckTestCase(id, envId, deviceSerial) {
+        await assertCaseImageMatcher(id)
         let qs = []
         if (envId) qs.push(`env_id=${envId}`)
         if (deviceSerial) qs.push(`device_serial=${deviceSerial}`)
@@ -317,11 +365,17 @@ export default {
     interactDevice(x, y, operation, xml_dump, action_data, serial, record_step = true, include_screenshot = true) {
         return api.post('/device/interact', { x, y, operation, xml_dump, action_data, device_serial: serial, record_step, include_screenshot })
     },
-    executeStep(step) {
+    async executeStep(step) {
+        if (requiresImageMatcher(step?.step?.action)) await assertImageMatcher()
         return api.post('/device/execute_step', step)
     },
-    cropTemplate(screenshot_base64, x1, y1, x2, y2) {
+    async cropTemplate(screenshot_base64, x1, y1, x2, y2) {
+        await assertImageMatcher()
         return api.post('/device/crop_template', { screenshot_base64, x1, y1, x2, y2 })
+    },
+    async matchImage(payload) {
+        await assertImageMatcher()
+        return api.post('/device/match_image', payload)
     },
 
     getScenarios(params) {
@@ -346,13 +400,15 @@ export default {
     deleteScenario(id) {
         return api.delete(`/scenarios/${id}`)
     },
-    runScenario(id, envId, deviceSerials) {
+    async runScenario(id, envId, deviceSerials) {
+        await assertScenarioImageMatcher(id)
         return api.post(`/scenarios/${id}/run`, {
             env_id: envId || null,
             device_serials: Array.isArray(deviceSerials) ? deviceSerials : (deviceSerials ? [deviceSerials] : [])
         })
     },
-    precheckScenario(id, envId, deviceSerial) {
+    async precheckScenario(id, envId, deviceSerial) {
+        await assertScenarioImageMatcher(id)
         let qs = []
         if (envId) qs.push(`env_id=${envId}`)
         if (deviceSerial) qs.push(`device_serial=${deviceSerial}`)

@@ -9,6 +9,7 @@ Cross-platform case runner.
 from __future__ import annotations
 
 import base64
+import inspect
 import logging
 import re
 import threading
@@ -17,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Type
 
 from backend.execution_errors import (
     E2006_OCR_NO_RESULT,
+    E2012_IMAGE_UNSTABLE,
     ExecutionStepError,
     ExecutionStepRuntimeError,
     SKIP_REASON_PLATFORM_MISMATCH,
@@ -29,11 +31,13 @@ from backend.execution_errors import (
 )
 from backend.locator_resolution import resolve_locator_candidates
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
+from backend.utils.image_match_options import select_image_options
 from backend.step_contract import (
     MAX_RETRY_COUNT,
     normalize_action,
     normalize_error_strategy,
     normalize_execute_on,
+    step_image_options,
 )
 
 from .android_driver import AndroidDriver
@@ -160,18 +164,33 @@ class TestCaseRunner:
         """
         retry_count = _parse_retry_count((step_data or {}).get("retry_count"))
         started_at = time.time()
+        try:
+            image_action = normalize_action(step_data.get("action")) in {"click_image", "assert_image"}
+        except ValueError:
+            image_action = False
+        image_deadline = (time.monotonic() + _parse_timeout(step_data.get("timeout"), default=10)
+                          if image_action else None)
 
-        result = self._run_step_attempt(step_data)
+        result = self._run_step_attempt(step_data, image_deadline=image_deadline)
         attempts = 1
         while attempts <= retry_count and result.get("status") == "FAIL":
+            context = result.get("error_context") or {}
+            image_match = context.get("image_match") or {}
+            if context.get("tap_submitted") or image_match.get("tap_submitted"):
+                break
+            remaining = image_deadline - time.monotonic() if image_deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                break
             # 短退避后重试；abort 触发时立即停止重试并走中止路径。
-            if self._sleep_or_abort(RETRY_BACKOFF_SECONDS):
+            if self._sleep_or_abort(min(RETRY_BACKOFF_SECONDS, remaining) if remaining is not None else RETRY_BACKOFF_SECONDS):
                 result = self._build_abort_result(
                     step_data=step_data,
                     action=str(result.get("action") or "unknown"),
                     error_strategy=str(result.get("error_strategy") or "ABORT"),
                     duration=time.time() - started_at,
                 )
+                break
+            if image_deadline is not None and time.monotonic() >= image_deadline:
                 break
             attempts += 1
             logger.info(
@@ -181,18 +200,20 @@ class TestCaseRunner:
                 result.get("action"),
                 result.get("error") or "-",
             )
-            result = self._run_step_attempt(step_data)
+            result = self._run_step_attempt(step_data, image_deadline=image_deadline)
 
         result["attempts"] = attempts
-        if attempts > 1:
+        if attempts > 1 or image_deadline is not None:
             # 汇总首次尝试开始至今的总耗时（含退避间隔）。
             result["duration"] = round(time.time() - started_at, 3)
         return result
 
-    def _run_step_attempt(self, step_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _run_step_attempt(self, step_data: Dict[str, Any], image_deadline: Optional[float] = None) -> Dict[str, Any]:
         """执行单次尝试并返回结构化结果（不含重试语义）。"""
         started_at = time.time()
         step_context: Dict[str, Any] = {}
+        if image_deadline is not None:
+            step_context["image_deadline"] = image_deadline
 
         raw_action = step_data.get("action")
         action = str(raw_action or "").strip().lower() or "unknown"
@@ -276,6 +297,11 @@ class TestCaseRunner:
                     )
                 )
 
+            if action in {"click_image", "assert_image"} and image_deadline is not None:
+                timeout = min(timeout, image_deadline - time.monotonic())
+                if timeout <= 0:
+                    raise ExecutionStepRuntimeError(E2012_IMAGE_UNSTABLE, "图像点击定位超时，未执行点击",
+                        context={"image_match": {"status": "unstable", "reason": "deadline_exceeded", "matcher_version": "strict-v1", "candidates": [], "point": None, "quality": {}, "timings": {}}})
             dispatch_output = self._dispatch(
                 step_data=step_data,
                 action=action,
@@ -313,13 +339,14 @@ class TestCaseRunner:
                 platform=self.platform,
                 action=action,
             )
+            diagnostic = exc.context.get("image_match") if isinstance(exc, ExecutionStepError) else None
             return self._result(
                 step_data=step_data,
                 action=action,
                 status="FAIL",
                 error_strategy=strategy,
                 error=str(exc),
-                output=None,
+                output={"image_match": diagnostic} if isinstance(diagnostic, dict) else None,
                 artifacts=self._extract_step_artifacts(step_context),
                 duration=time.time() - started_at,
                 error_code=error_code or None,
@@ -732,6 +759,12 @@ class TestCaseRunner:
             return None
 
         if action == "click_image":
+            image_deadline = (step_context or {}).get("image_deadline")
+            if image_deadline is not None:
+                timeout = min(timeout, image_deadline - time.monotonic())
+                if timeout <= 0:
+                    raise ExecutionStepRuntimeError(E2012_IMAGE_UNSTABLE, "图像点击定位超时，未执行点击",
+                        context={"image_match": {"status": "unstable", "reason": "deadline_exceeded", "matcher_version": "strict-v1", "candidates": [], "point": None, "quality": {}, "timings": {}}})
             image_path = _resolve_image_path(
                 step_data=step_data,
                 args=args,
@@ -739,6 +772,7 @@ class TestCaseRunner:
                 platform=self.platform,
                 value=value,
             )
+            image_path = _render_runtime_value(image_path, self.runtime_variables)
             if image_path is None:
                 raise ValueError(
                     _with_error_code(
@@ -754,10 +788,34 @@ class TestCaseRunner:
                         "click_image 动作 image_path 不能为空",
                     )
                 )
-            self.driver.click_image(path)
-            return None
+            try:
+                image_options = step_image_options(step_data, args)
+                config = select_image_options(image_options, self.platform) if image_options is not None else None
+            except ValueError as exc:
+                raise ValueError(_with_error_code("P1006_INVALID_ARGS", str(exc))) from exc
+            parameters = inspect.signature(self.driver.click_image).parameters
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            def supports(name):
+                return name in parameters or accepts_kwargs
+            kwargs = {}
+            if config is not None:
+                if not supports("image_options"):
+                    raise NotImplementedError(_with_error_code("P1002_ACTION_NOT_SUPPORTED", "当前图像驱动不支持模板配置"))
+                kwargs["image_options"] = config
+            if supports("timeout"):
+                kwargs["timeout"] = timeout
+            if supports("abort_event"):
+                kwargs["abort_event"] = self.abort_event
+            output = self.driver.click_image(path, **kwargs)
+            return output if isinstance(output, dict) else None
 
         if action == "assert_image":
+            image_deadline = (step_context or {}).get("image_deadline")
+            if image_deadline is not None:
+                timeout = min(timeout, image_deadline - time.monotonic())
+                if timeout <= 0:
+                    raise ExecutionStepRuntimeError(E2012_IMAGE_UNSTABLE, "图像断言超时，无法判定",
+                        context={"image_match": {"status": "unstable", "reason": "deadline_exceeded", "matcher_version": "strict-v1", "candidates": [], "point": None, "quality": {}, "timings": {}}})
             image_path = _resolve_image_path(
                 step_data=step_data,
                 args=args,
@@ -765,6 +823,7 @@ class TestCaseRunner:
                 platform=self.platform,
                 value=value,
             )
+            image_path = _render_runtime_value(image_path, self.runtime_variables)
             if image_path is None:
                 raise ValueError(
                     _with_error_code(
@@ -788,8 +847,24 @@ class TestCaseRunner:
                         f"assert_image 不支持的 match_mode: {match_mode}",
                     )
                 )
-            self.driver.assert_image(path, match_mode=match_mode)
-            return None
+            try:
+                image_options = step_image_options(step_data, args)
+                config = select_image_options(image_options, self.platform) if image_options is not None else None
+            except ValueError as exc:
+                raise ValueError(_with_error_code("P1006_INVALID_ARGS", str(exc))) from exc
+            parameters = inspect.signature(self.driver.assert_image).parameters
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            kwargs = {"match_mode": match_mode}
+            if config is not None:
+                if "image_options" not in parameters and not accepts_kwargs:
+                    raise NotImplementedError(_with_error_code("P1002_ACTION_NOT_SUPPORTED", "当前图像断言驱动不支持模板配置"))
+                kwargs["image_options"] = config
+            if "timeout" in parameters or accepts_kwargs:
+                kwargs["timeout"] = timeout
+            if "abort_event" in parameters or accepts_kwargs:
+                kwargs["abort_event"] = self.abort_event
+            output = self.driver.assert_image(path, **kwargs)
+            return output if isinstance(output, dict) else None
 
         if action == "extract_by_ocr":
             region = _resolve_extract_region(
@@ -1149,12 +1224,16 @@ def _resolve_image_path(
     value: Optional[Any],
 ) -> Optional[Any]:
     selector = _first_locator_selector(locator_candidates)
+    overrides = step_data.get("platform_overrides")
+    current = overrides.get(platform) if isinstance(overrides, dict) else None
+    platform_image = current.get("selector") if isinstance(current, dict) and str(current.get("by") or "").lower() == "image" else None
     options = step_data.get("options")
     option_image_path = None
     if isinstance(options, dict):
         option_image_path = options.get("image_path") or options.get("path")
     return (
-        args.get("image_path")
+        platform_image
+        or args.get("image_path")
         or args.get("path")
         or selector
         or step_data.get("selector")

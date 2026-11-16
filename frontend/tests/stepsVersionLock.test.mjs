@@ -12,6 +12,7 @@ import {
 } from '../src/utils/versionToken.js'
 import * as actionConstants from '../src/utils/actionConstants.js'
 import * as statusMeta from '../src/utils/statusMeta.js'
+import * as imageOptions from '../src/utils/imageOptions.js'
 
 // P4 功能1（步骤写入乐观锁）前端侧：PUT /api/cases/{id}/steps 与场景 steps 写入口
 // 带 If-Match + ?version=（整数令牌）；非整数/失配令牌平台返回 409（无 400 路径），
@@ -67,6 +68,7 @@ function storeSetup(overrides = {}) {
     defineStore: (_name, factory) => factory, ref, computed, nextTick, api,
     ElMessage: messages(notices), createUuid: () => `step-${++serial}`,
     versionStateFrom, extractVersionState, isVersionConflict, VERSION_CONFLICT_MESSAGE,
+    ...imageOptions,
   }
   const store = new Function(...Object.keys(dependencies), source + '\nreturn useCaseStore()')(...Object.values(dependencies))
   return { store, calls, notices, api }

@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
 
 const bundlePath = process.argv[2];
 const workdirArgIndex = process.argv.indexOf('--workdir');
@@ -143,6 +144,24 @@ const adt = {
   matchTemplate() {
     record('matchTemplate');
     return null;
+  },
+  matchImageStrict(image, template, options) {
+    const anchor = options.tap_anchor || [0.5, 0.5];
+    const result = {status: 'matched', reason: 'unique_verified_target', matcher_version: 'strict-v1',
+      rect: [60, 90, 40, 40], point: [60 + 40 * anchor[0], 90 + 40 * anchor[1]],
+      candidates: [{rect: [60, 90, 40, 40], accepted: true}], quality: {}, timings: {}};
+    record('matchImageStrict', {image, template, options}, result);
+    return result;
+  },
+  strictMatcherCapabilities() {
+    // Explicitly approved fixture; production runners must pass native validation.
+    record('strictMatcherCapabilities');
+    return {matcher_version: 'strict-v1', validated: true, fixture: true};
+  },
+  fileSha256(target) {
+    const result = crypto.createHash('sha256').update(fs.readFileSync(resolvePath(target))).digest('hex');
+    record('fileSha256', {target}, result);
+    return result;
   },
   ssim() {
     record('ssim');

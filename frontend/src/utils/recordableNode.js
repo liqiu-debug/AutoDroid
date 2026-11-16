@@ -183,15 +183,12 @@ export const findBestNodeAtPoint = (nodes, realX, realY) => {
   const candidates = filterPointCandidates(nodes, realX, realY)
   const source = Array.isArray(nodes) ? nodes : []
 
-  if (source.some(isIosNode)) {
-    const maxArea = Math.max(getMaxArea(source), 1)
-    const croppable = candidates.filter((node) => isUsableImageTemplate(node, maxArea))
-    return croppable.length ? sortByScore(croppable, buildAnyNodeScore) : buildIosTapAreaNode(realX, realY)
-  }
-
-  if (!candidates.length) return null
-
-  return sortByScore(candidates, buildAnyNodeScore)
+  const maxArea = Math.max(getMaxArea(source), 1)
+  const croppable = candidates.filter((node) => isUsableImageTemplate(node, maxArea))
+  if (croppable.length) return sortByScore(croppable, buildAnyNodeScore)
+  // Large Android View containers need the same local selection as iOS.
+  if (candidates.length || source.some(isIosNode)) return buildIosTapAreaNode(realX, realY)
+  return null
 }
 
 export const findBestRecordableNode = (nodes, realX, realY) => {

@@ -73,7 +73,11 @@ class Step(BaseModel):
     @field_validator("options", mode="before")
     @classmethod
     def normalize_option_variable_placeholders(cls, value):
-        return normalize_variable_placeholders(value)
+        value = normalize_variable_placeholders(value)
+        if isinstance(value, dict) and "image_options" in value:
+            from backend.step_contract import normalize_image_options_map
+            value = {**value, "image_options": normalize_image_options_map(value["image_options"])}
+        return value
 
 class Variable(BaseModel):
     key: str
@@ -1041,6 +1045,14 @@ class TestCaseStepWrite(BaseModel):
     def normalize_variable_placeholders_in_fields(cls, value):
         return normalize_variable_placeholders(value)
 
+    @field_validator("args")
+    @classmethod
+    def validate_image_options(cls, value):
+        if "image_options" in value:
+            from backend.step_contract import normalize_image_options_map
+            value = {**value, "image_options": normalize_image_options_map(value["image_options"])}
+        return value
+
 class TestCaseStepCreate(TestCaseStepWrite):
     """跨端测试步骤 — 创建入参"""
     case_id: int = Field(..., description="所属用例 ID")
@@ -1061,6 +1073,14 @@ class TestCaseStepUpdate(BaseModel):
     @classmethod
     def normalize_variable_placeholders_in_fields(cls, value):
         return normalize_variable_placeholders(value)
+
+    @field_validator("args")
+    @classmethod
+    def validate_image_options(cls, value):
+        if isinstance(value, dict) and "image_options" in value:
+            from backend.step_contract import normalize_image_options_map
+            value = {**value, "image_options": normalize_image_options_map(value["image_options"])}
+        return value
 
 class TestCaseStepRead(TestCaseStepWrite):
     """跨端测试步骤 — 读取响应（包含 id/case_id）"""

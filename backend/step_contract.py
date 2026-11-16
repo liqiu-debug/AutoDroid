@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional
 
 from backend.utils.pydantic_compat import dump_model
+from backend.utils.image_match_options import normalize_image_options
 
 VALID_ACTIONS = {
     "click",
@@ -230,6 +231,29 @@ def _to_dict(step: Any) -> Dict[str, Any]:
     raise ValueError(f"unsupported step object: {type(step)}")
 
 
+def normalize_image_options_map(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Validate every platform entry; never discard an invalid inactive entry."""
+    if not isinstance(raw, dict):
+        raise ValueError("image_options must be a platform object")
+    unknown = set(raw) - {"android", "ios", "default"}
+    if unknown:
+        raise ValueError("unsupported platform in image_options: " + ", ".join(sorted(map(str, unknown))))
+    if any(not isinstance(config, dict) or not config for config in raw.values()):
+        raise ValueError("image_options platform configuration must be a nonempty object")
+    return {platform: normalize_image_options(config) for platform, config in raw.items()}
+
+
+def step_image_options(step: Dict[str, Any], args: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read standard/legacy image settings, validating both when both exist."""
+    arguments = args if isinstance(args, dict) else step.get("args")
+    options = step.get("options")
+    standard = normalize_image_options_map(arguments["image_options"]) if isinstance(arguments, dict) and "image_options" in arguments else None
+    legacy = normalize_image_options_map(options["image_options"]) if isinstance(options, dict) and "image_options" in options else None
+    if standard is not None and legacy is not None and standard != legacy:
+        raise ValueError("args.image_options conflicts with options.image_options")
+    return standard if standard is not None else legacy
+
+
 def _safe_timeout(value: Any, default: int = 10) -> int:
     try:
         timeout = int(value)
@@ -322,11 +346,18 @@ def legacy_step_to_standard(step: Any, case_id: int, order: int) -> Dict[str, An
     elif action == "click_image":
         if selector not in (None, ""):
             args = {"image_path": str(selector)}
+        image_options = step_image_options(raw)
+        if image_options is not None:
+            args["image_options"] = image_options
     elif action == "extract_by_ocr":
         args = {
             "region": selector,
             "extract_rule": raw.get("options") or {},
         }
+    if action == "assert_image":
+        image_options = step_image_options(raw)
+        if image_options is not None:
+            args["image_options"] = image_options
 
     return {
         "case_id": case_id,
@@ -389,12 +420,20 @@ def standard_step_to_legacy(step: Any) -> Dict[str, Any]:
             if str(args.get("match_mode") or "").strip().lower() == "not_exists"
             else "exists"
         }
+    elif action == "click_image":
+        image_options = step_image_options(raw)
+        if image_options is not None:
+            options["image_options"] = image_options
     elif action == "extract_by_ocr":
         extract_rule = args.get("extract_rule")
         if isinstance(extract_rule, dict):
             options = extract_rule
         elif isinstance(extract_rule, str):
             options = {"extract_rule": extract_rule}
+    if action == "assert_image":
+        image_options = step_image_options(raw)
+        if image_options is not None:
+            options["image_options"] = image_options
 
     return {
         "action": action,

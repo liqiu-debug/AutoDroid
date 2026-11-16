@@ -33,6 +33,10 @@ from backend.utils.ocr_compat import extract_ocr_text, run_paddle_ocr
 from backend.ocr_service import get_ocr_engine
 from backend.utils.template_match import find_template_match, image_to_bgr, load_image_bgr
 
+from backend.utils.image_click import locate_stable_image
+from backend.utils.image_assert import assert_image_presence
+from backend.utils.image_tap import android_tap_once
+
 logger = logging.getLogger(__name__)
 
 
@@ -1066,179 +1070,47 @@ class AndroidDriver(BaseDriver):
             self._log_action_failure("stop_app", started_at, exc, app_id=app_id)
             raise
 
-    def click_image(self, image_path: str) -> None:
+    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
         started_at = time.time()
         target = ""
-        text_hint = ""
         try:
             target = self._resolve_template_image_path(image_path, action_name="click_image")
-
-            text_hint = self._template_confirm_text_hint(target)
-            if text_hint:
-                try:
-                    self.click(selector=text_hint, by="text")
-                    self._log_action_success(
-                        "click_image",
-                        started_at,
-                        image_path=target,
-                        strategy="text-hint",
-                        hint=text_hint,
-                    )
-                    return
-                except Exception as hint_exc:
-                    logger.info(
-                        "Android.click_image text-hint fallback failed, fallback to template match: hint=%s error=%s",
-                        text_hint,
-                        hint_exc,
-                    )
-
-            wait_started = time.time()
-            match = self._find_image_match(
-                target,
-                timeout=self._IMAGE_CLICK_TIMEOUT_SECONDS,
-                threshold=self._IMAGE_MATCH_THRESHOLD,
-            )
-            match_elapsed = time.time() - wait_started
-            if not isinstance(match, dict):
+            if abort_event is not None and abort_event.is_set():
+                from backend.execution_errors import USER_ABORT_MESSAGE
+                raise RuntimeError(USER_ABORT_MESSAGE)
+            diagnostic = locate_stable_image(lambda: self._device.screenshot(format="opencv"), target, image_options, timeout, abort_event=abort_event)
+            x, y = diagnostic["point"]
+            deadline = diagnostic.pop("_deadline", time.monotonic() + timeout)
+            if abort_event is not None and abort_event.is_set():
+                from backend.execution_errors import USER_ABORT_MESSAGE
+                raise RuntimeError(USER_ABORT_MESSAGE)
+            try:
+                android_tap_once(self._device, x, y, deadline)
+            except Exception as tap_exc:
                 raise ExecutionStepRuntimeError(
-                    E2005_IMAGE_NOT_MATCHED,
-                    f"图像模板匹配失败: 未在屏幕上找到匹配的图像区域 ({target})",
-                    context={"image_path": target},
-                )
-            point = match.get("point")
-            if not isinstance(point, (list, tuple)) or len(point) < 2:
-                raise ExecutionStepRuntimeError(
-                    E2005_IMAGE_NOT_MATCHED,
-                    f"图像模板匹配失败: 匹配结果缺少坐标 point ({target})",
-                    context={"image_path": target},
-                )
-            x = float(point[0])
-            y = float(point[1])
-            similarity = float(match.get("similarity") or 0.0)
-
-            before_signature = self._capture_page_signature_quick()
-            self._device.click(int(x), int(y))
-            time.sleep(0.12)
-            after_signature = self._capture_page_signature_quick()
-
-            # 当匹配耗时很长且点击后页面无变化时，进行一次同位重试，减少“看起来成功但没触发”的误报。
-            retried = False
-            if (
-                before_signature
-                and after_signature
-                and before_signature == after_signature
-                and match_elapsed >= 3.0
-            ):
-                retried = True
-                self._device.click(int(x), int(y))
-                time.sleep(0.12)
-                retry_signature = self._capture_page_signature_quick()
-                if retry_signature and retry_signature == before_signature:
-                    raise ExecutionStepRuntimeError(
-                        E2009_CLICK_NO_EFFECT,
-                        "图像模板匹配点击后页面未变化（tap-no-effect）",
-                        context={"image_path": target, "x": round(x, 1), "y": round(y, 1)},
-                    )
-
+                    E2009_CLICK_NO_EFFECT, "图像点击提交结果未知，请检查设备状态",
+                    context={"image_match": diagnostic, "tap_submitted": True},
+                ) from tap_exc
             self._log_action_success(
-                "click_image",
-                started_at,
-                image_path=target,
-                timeout=self._IMAGE_CLICK_TIMEOUT_SECONDS,
-                strategy="template-match",
-                similarity=round(similarity, 4),
-                x=round(x, 1),
-                y=round(y, 1),
-                retried=retried,
-                hint=text_hint,
+                "click_image", started_at, image_path=target, strategy="strict-v1",
+                x=round(x, 2), y=round(y, 2), stable_frames=2,
             )
+            logger.info("Android.click_image evidence: %s", diagnostic)
+            return {"image_match": diagnostic}
         except Exception as exc:
-            self._log_action_failure(
-                "click_image",
-                started_at,
-                exc,
-                image_path=target,
-                hint=text_hint,
-            )
+            self._log_action_failure("click_image", started_at, exc, image_path=target)
             raise
 
-    def assert_image(self, image_path: str, match_mode: str = "exists") -> None:
+    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
         started_at = time.time()
         target = ""
-        normalized_mode = "not_exists" if str(match_mode or "").strip().lower() == "not_exists" else "exists"
-        logger.info(
-            "Android.assert_image start: path=%s match_mode=%s",
-            image_path,
-            normalized_mode,
-        )
         try:
             target = self._resolve_template_image_path(image_path, action_name="assert_image")
-
-            if normalized_mode == "exists":
-                match = self._find_image_match_strict(target)
-                if not isinstance(match, dict):
-                    raise ExecutionStepAssertionError(
-                        E2004_ASSERT_IMAGE_FAILED,
-                        f"断言失败: 期望页面存在图像 {target!r}，但未匹配到",
-                        context={"image_path": target, "match_mode": normalized_mode},
-                    )
-                self._log_action_success(
-                    "assert_image",
-                    started_at,
-                    image_path=target,
-                    match_mode=normalized_mode,
-                    **self._extract_image_match_meta(match),
-                )
-                return
-
-            first_match = self._find_image_match_strict(target)
-            if first_match is None:
-                self._log_action_success(
-                    "assert_image",
-                    started_at,
-                    image_path=target,
-                    match_mode=normalized_mode,
-                )
-                return
-
-            if self._is_strong_image_match(first_match):
-                meta = self._extract_image_match_meta(first_match)
-                raise ExecutionStepAssertionError(
-                    E2004_ASSERT_IMAGE_FAILED,
-                    f"断言失败: 期望页面不存在图像 {target!r}，但已高置信度匹配到目标"
-                    + (
-                        f" (similarity={meta.get('similarity')}, ssim={meta.get('ssim')}, x={meta.get('x')}, y={meta.get('y')})"
-                        if meta else ""
-                    ),
-                    context={"image_path": target, "match_mode": normalized_mode},
-                )
-
-            time.sleep(self._IMAGE_ASSERT_RECHECK_DELAY_SECONDS)
-            second_match = self._find_image_match_strict(target)
-            confirmed_match = second_match if second_match is not None else None
-            if confirmed_match is not None:
-                meta = self._extract_image_match_meta(confirmed_match)
-                raise ExecutionStepAssertionError(
-                    E2004_ASSERT_IMAGE_FAILED,
-                    f"断言失败: 期望页面不存在图像 {target!r}，但仍匹配到目标"
-                    + (f" (similarity={meta.get('similarity')}, x={meta.get('x')}, y={meta.get('y')})" if meta else ""),
-                    context={"image_path": target, "match_mode": normalized_mode},
-                )
-
-            self._log_action_success(
-                "assert_image",
-                started_at,
-                image_path=target,
-                match_mode=normalized_mode,
-            )
+            result = assert_image_presence(lambda: self._device.screenshot(format="opencv"), target, match_mode, image_options, timeout, abort_event)
+            self._log_action_success("assert_image", started_at, image_path=target, match_mode=match_mode, strategy="strict-v1")
+            return result
         except Exception as exc:
-            self._log_action_failure(
-                "assert_image",
-                started_at,
-                exc,
-                image_path=target or image_path,
-                match_mode=normalized_mode,
-            )
+            self._log_action_failure("assert_image", started_at, exc, image_path=target or image_path, match_mode=match_mode)
             raise
 
     def extract_by_ocr(self, region: str, extract_rule: Optional[Dict[str, Any]] = None) -> str:

@@ -28,7 +28,9 @@ from backend.step_contract import (
     normalize_error_strategy,
     normalize_execute_on,
     normalize_platform,
+    step_image_options,
 )
+from backend.utils.image_match_options import select_image_options
 from backend.utils.pydantic_compat import dump_model
 from backend.utils.variable_render import render_step_data
 
@@ -231,7 +233,10 @@ def build_script_step(
             "match_mode": match_mode,
         }
     elif action in IMAGE_TEMPLATE_ACTIONS:
-        image_path = args.get("image_path") or args.get("path") or step.get("value")
+        overrides = step.get("platform_overrides")
+        override = overrides.get(platform) if isinstance(overrides, dict) else None
+        platform_image = override.get("selector") if isinstance(override, dict) and str(override.get("by") or "").lower() == "image" else None
+        image_path = platform_image or args.get("image_path") or args.get("path") or step.get("selector") or step.get("value")
         asset = _resolve_image_asset(image_path)
         if asset:
             asset_name, rel_path = asset
@@ -243,6 +248,9 @@ def build_script_step(
         if action == "assert_image":
             match_mode = "not_exists" if str(args.get("match_mode") or "").strip().lower() == "not_exists" else "exists"
             script_step["args"]["match_mode"] = match_mode
+        image_options = step_image_options(step, args)
+        if image_options is not None:
+            script_step["args"]["image_options"] = select_image_options(image_options, platform)
     elif action == "extract_by_ocr":
         region = _parse_region(args.get("region") if args.get("region") is not None else step.get("value"))
         extract_rule = args.get("extract_rule")

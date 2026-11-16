@@ -4,6 +4,7 @@ import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { fetchAllPages } from '@/utils/paginate'
+import { cloneImageOptions, getImageOptionsMap } from '@/utils/imageOptions'
 import {
     VERSION_CONFLICT_MESSAGE,
     extractVersionState,
@@ -208,6 +209,7 @@ function standardStepToUiStep(step) {
             selector = String(args.image_path || args.path || '')
         }
         selectorType = 'image'
+        if (args.image_options) options.image_options = cloneImageOptions(args.image_options)
     }
     if ((value === undefined || value === null || value === '') && action === 'sleep' && args.seconds !== undefined) {
         value = String(args.seconds)
@@ -248,6 +250,7 @@ function standardStepToUiStep(step) {
         selector_type: selectorType,
         value: value === undefined || value === null ? '' : String(value),
         options,
+        args: { ...args },
         description: step?.description || '',
         timeout: step?.timeout || 10,
         error_strategy: step?.error_strategy || 'ABORT',
@@ -355,8 +358,10 @@ function uiStepToStandardStep(step, order) {
         args.match_mode = normalized.options?.match_mode === 'not_contains' ? 'not_contains' : 'contains'
     } else if (action === 'click_image') {
         args.image_path = selector
+        args.image_options = getImageOptionsMap(normalized)
     } else if (action === 'assert_image') {
         args.image_path = selector
+        args.image_options = getImageOptionsMap(normalized)
         args.match_mode = normalized.options?.match_mode === 'not_exists' ? 'not_exists' : 'exists'
     } else if (action === 'swipe') {
         args.direction = String(selector || 'up').toLowerCase()

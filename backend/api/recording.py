@@ -49,6 +49,7 @@ from backend.step_contract import (
     standard_step_to_legacy,
 )
 from backend.utils import calculate_element_from_coordinates
+from backend.utils.image_match_preview import crop_metadata, preview_image_match
 
 logger = logging.getLogger(__name__)
 
@@ -728,7 +729,32 @@ def crop_template(req: CropTemplateRequest):
     image_path = f"static/images/{image_filename}"
     logger.info(f"手动截取模板图已保存: {image_path} ({rx2-rx1}x{ry2-ry1})")
 
-    return {"image_path": image_path}
+    with open(os.path.join(image_dir, image_filename), "rb") as image_file:
+        image_bytes = image_file.read()
+    return {"image_path": image_path, **crop_metadata(image_bytes, req.screenshot_base64)}
+
+
+class MatchImageRequest(BaseModel):
+    screenshot_base64: str
+    image_path: str
+    image_options: Optional[Dict[str, Any]] = None
+
+
+@router.post("/api/device/match_image")
+@router.post("/device/match_image", include_in_schema=False)
+def preview_match_image(req: MatchImageRequest):
+    """Localize against the provided screenshot; never acquire a device or tap."""
+    from pathlib import Path
+
+    image_root = (Path(__file__).resolve().parents[2] / "static" / "images").resolve()
+    project_root = image_root.parent.parent
+    target = (project_root / req.image_path).resolve()
+    if not target.is_relative_to(image_root) or not target.is_file():
+        raise HTTPException(status_code=400, detail="模板图不存在或路径无效，请重新截取")
+    try:
+        return preview_image_match(req.screenshot_base64, target.read_bytes(), req.image_options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/api/device/inspect")

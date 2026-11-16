@@ -8,7 +8,7 @@
  * 与 PC 执行链路（backend/drivers/android_driver.py + cross_platform_runner.py）
  * 保持语义一致：定位候选链、textContains 降级、错误码 E2xxx、
  * retry_count 重试、error_strategy（ABORT/CONTINUE/IGNORE）、
- * 图像多尺度匹配（0.8-1.2 + TM_CCOEFF_NORMED + SSIM 二次校验）、
+ * 图像点击/断言 strict-v1 原生验证、图像点击稳定两帧、
  * OCR 提取规则（regex/boundary/preset）。
  *
  * 环境要求：AutoDroid Runner（Android 7.0+，无障碍服务已开启；图像/OCR 步骤
@@ -30,6 +30,10 @@ var ERR = {
     E2007: "E2007_INPUT_FAILED",
     E2008: "E2008_APP_CONTROL_FAILED",
     E2009: "E2009_CLICK_NO_EFFECT",
+    E2010: "E2010_IMAGE_AMBIGUOUS",
+    E2011: "E2011_IMAGE_TEMPLATE_INVALID",
+    E2012: "E2012_IMAGE_UNSTABLE",
+    E2013: "E2013_IMAGE_MATCH_UNSUPPORTED",
     E2201: "E2201_INVALID_ARGS",
     E2999: "E2999_EXECUTION_ERROR",
     P1003: "P1003_SELECTOR_MISSING",
@@ -47,17 +51,8 @@ var SKIP_REASON = {
     PLATFORM_MISMATCH: "平台不匹配"
 };
 
-var TEMPLATE_SCALES = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.2];
-var IMAGE_MATCH_THRESHOLD = 0.9;       // click_image（PC _IMAGE_MATCH_THRESHOLD）
-var IMAGE_CLICK_TIMEOUT_SECONDS = 5;   // PC _IMAGE_CLICK_TIMEOUT_SECONDS
-var ASSERT_TEMPLATE_THRESHOLD = 0.95;  // PC _ASSERT_IMAGE_TEMPLATE_THRESHOLD
-var ASSERT_SSIM_THRESHOLD = 0.9;       // PC _ASSERT_IMAGE_SSIM_THRESHOLD
 var RETRY_BACKOFF_MS = 1000;           // PC RETRY_BACKOFF_SECONDS
 var CLICK_TIMEOUT_SECONDS = 5;         // PC click/input 的 el.exists(timeout=5)
-var CONFIRM_HINT_TOKENS = [
-    "我知道了", "知道了", "确定", "确认", "允许", "同意", "好的",
-    "ok", "yes", "allow", "confirm"
-];
 
 // ---------------------------------------------------------------------------
 // 基础工具
@@ -130,7 +125,7 @@ function captureScreenInner(ctx) {
     return img;
 }
 
-function captureScreen(ctx) {
+function captureScreen(ctx, stepDeadline) {
     var holder = { img: null, error: null, done: false };
     var worker = threads.start(function () {
         try {
@@ -140,10 +135,15 @@ function captureScreen(ctx) {
         }
         holder.done = true;
     });
-    var deadline = Date.now() + SCREENSHOT_TIMEOUT_MS;
+    var deadline = Math.min(Date.now() + SCREENSHOT_TIMEOUT_MS, stepDeadline || Infinity);
     while (!holder.done && Date.now() < deadline) {
+        if (stepDeadline && stopRequested(ctx)) {
+            try { worker.interrupt(); } catch (ignoredStop) { }
+            strictImageFailure({status: "unstable", reason: "execution_stopped"});
+        }
         sleepMs(100);
     }
+    if (stepDeadline && stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
     if (!holder.done) {
         try { worker.interrupt(); } catch (e) { }
         fail(ERR.E2999, "截图超时（" + (SCREENSHOT_TIMEOUT_MS / 1000) + " 秒）：无障碍截图/投屏权限疑似异常，请在系统设置中检查并重新开启无障碍服务");
@@ -277,79 +277,19 @@ function pageSignature() {
 }
 
 // ---------------------------------------------------------------------------
-// 图像匹配（复刻 PC find_template_match：多尺度 + TM_CCOEFF_NORMED + 可选 SSIM）
+// 图像模板加载与原始文件校验
 // ---------------------------------------------------------------------------
-function matchTemplateMultiScale(shot, template, threshold, ssimThreshold) {
-    try {
-        return withImageScope(function () { return matchTemplateMultiScaleInner(shot, template, threshold, ssimThreshold); });
-    } finally {
-        if (images.__endScope) images.release(shot);
-    }
-}
-
-function matchTemplateMultiScaleInner(shot, template, threshold, ssimThreshold) {
-    var shotGray = images.grayscale(shot);
-    var tplGray = images.grayscale(template);
-    var best = null;
-    for (var i = 0; i < TEMPLATE_SCALES.length; i++) {
-        var scale = TEMPLATE_SCALES[i];
-        var scaled = scale === 1.0
-            ? tplGray
-            : images.scale(tplGray, scale, scale);
-        var tw = scaled.width;
-        var th = scaled.height;
-        if (tw > shotGray.width || th > shotGray.height) continue;
-        var result = images.matchTemplate(shotGray, scaled, { threshold: threshold, max: 5 });
-        var match = result.best();
-        if (match && (!best || match.similarity > best.similarity)) {
-            best = {
-                similarity: match.similarity,
-                point: match.point,
-                width: tw,
-                height: th,
-                template: scaled
-            };
-        }
-    }
-    if (!best || best.similarity < threshold) {
-        return null;
-    }
-    var ssimScore = null;
-    if (!isNullish(ssimThreshold)) {
-        try {
-            var crop = images.clip(
-                shotGray,
-                Math.round(best.point.x),
-                Math.round(best.point.y),
-                best.width,
-                best.height
-            );
-            ssimScore = images.ssim(crop, best.template);
-            if (ssimScore < ssimThreshold) {
-                return null;
-            }
-        } catch (e) {
-            ssimScore = null; // SSIM 不可用时仅以模板阈值判定
-        }
-    }
-    return {
-        similarity: best.similarity,
-        ssim: ssimScore,
-        // Auto.js 匹配点为左上角，点击取中心（与 PC 返回中心点对齐）
-        x: best.point.x + best.width / 2,
-        y: best.point.y + best.height / 2
-    };
-}
-
-function loadTemplateAsset(ctx, assetName) {
+function loadTemplateAsset(ctx, assetName, expectedHash) {
     if (!assetName) {
         fail(ERR.E2201, "缺少模板图引用");
     }
     // 单文件模式：模板图以 base64 内嵌，首次使用时落盘到缓存目录
     if (ctx.embeddedAssets && ctx.embeddedAssets[assetName]) {
         var cacheDir = files.join(files.getSdcardPath(), "autodroid_cache");
-        var cachePath = files.join(cacheDir, assetName);
-        if (!files.exists(cachePath)) {
+        var cachePath = files.join(cacheDir, expectedHash ? expectedHash + "_" + assetName : assetName);
+        // Legacy steps have no bound hash: the same asset filename may carry
+        // different bytes in a later bundle, so refresh its cached contents.
+        if (!expectedHash || !files.exists(cachePath)) {
             try {
                 files.ensureDir(cachePath);
                 var bytes = android.util.Base64.decode(ctx.embeddedAssets[assetName], android.util.Base64.DEFAULT);
@@ -358,6 +298,7 @@ function loadTemplateAsset(ctx, assetName) {
                 fail(ERR.E2005, "内嵌模板图落盘失败: " + assetName + " (" + (e.message || e) + ")");
             }
         }
+        verifyTemplateHash(cachePath, expectedHash);
         var cached = images.read(cachePath);
         if (!cached) {
             fail(ERR.E2005, "内嵌模板图解码失败: " + assetName);
@@ -368,6 +309,7 @@ function loadTemplateAsset(ctx, assetName) {
     if (!files.exists(path)) {
         fail(ERR.E2005, "模板图文件不存在: " + path);
     }
+    verifyTemplateHash(path, expectedHash);
     var img = images.read(path);
     if (!img) {
         fail(ERR.E2005, "模板图解码失败: " + path);
@@ -375,30 +317,17 @@ function loadTemplateAsset(ctx, assetName) {
     return img;
 }
 
-function ocrTemplateHint(ctx, assetName, templateImg) {
-    // 镜像 PC _template_confirm_text_hint：OCR 模板图，命中确认类词条则返回提示文本
-    if (ctx.hintCache[assetName] !== undefined) {
-        return ctx.hintCache[assetName];
+function verifyTemplateHash(path, expectedHash) {
+    if (!expectedHash) return;
+    if (typeof images.templateSha256 !== "function") {
+        strictImageFailure({status: "unsupported", reason: "template_hash_unavailable"});
     }
-    var hint = "";
-    try {
-        var texts = ocr.recognizeText(templateImg);
-        var joined = normalizeTextForMatch((texts || []).join(""));
-        if (joined) {
-            for (var i = 0; i < CONFIRM_HINT_TOKENS.length; i++) {
-                var token = CONFIRM_HINT_TOKENS[i];
-                var normalizedToken = normalizeTextForMatch(token);
-                if (normalizedToken && joined.indexOf(normalizedToken) >= 0) {
-                    hint = token;
-                    break;
-                }
-            }
-        }
-    } catch (e) {
-        hint = "";
+    var actualHash;
+    try { actualHash = String(images.templateSha256(path) || "").toLowerCase(); }
+    catch (hashError) { strictImageFailure({status: "unsupported", reason: "template_hash_unavailable"}); }
+    if (actualHash !== expectedHash) {
+        strictImageFailure({status: "invalid_options", reason: "template_hash_mismatch"});
     }
-    ctx.hintCache[assetName] = hint;
-    return hint;
 }
 
 // ---------------------------------------------------------------------------
@@ -618,83 +547,230 @@ ACTIONS.assert_text = function (ctx, step) {
 
 ACTIONS.assert_image = function (ctx, step) {
     var mode = String(step.args.match_mode || "exists").toLowerCase();
-    var template = loadTemplateAsset(ctx, step.args.image);
-    var shot = captureScreen(ctx);
-    var match = matchTemplateMultiScale(shot, template, ASSERT_TEMPLATE_THRESHOLD, ASSERT_SSIM_THRESHOLD);
-
-    if (mode === "not_exists") {
-        if (match) {
-            // 二次确认，降低误报（镜像 PC 双重校验）
-            sleepMs(200);
-            var again = matchTemplateMultiScale(captureScreen(ctx), template, ASSERT_TEMPLATE_THRESHOLD, ASSERT_SSIM_THRESHOLD);
-            if (again) {
-                fail(ERR.E2004, "断言失败: 期望页面不存在图像 " + step.args.image + "，但匹配到 (similarity=" + again.similarity.toFixed(4) + ")");
-            }
+    var template = null;
+    var deadline = Date.now() + Number(step.timeout || 10) * 1000;
+    try {
+        if (["exists", "not_exists"].indexOf(mode) < 0) strictImageFailure({status: "invalid_options", reason: "invalid_assertion_mode"});
+        if (!isFinite(deadline) || Number(step.timeout || 10) <= 0) strictImageFailure({status: "invalid_options", reason: "invalid_timeout"});
+        if (typeof images.matchImageStrict !== "function" || typeof images.strictMatcherCapabilities !== "function") {
+            strictImageFailure({status: "unsupported", reason: "strict_matcher_unavailable"});
         }
-        return;
-    }
-    if (!match) {
-        fail(ERR.E2004, "断言失败: 期望页面存在图像 " + step.args.image + "，但未匹配到");
-    }
-    ctx.lastImageMatch = match;
+        var capabilities = images.strictMatcherCapabilities();
+        if (!capabilities || capabilities.matcher_version !== "strict-v1" || capabilities.validated !== true) {
+            strictImageFailure({status: "unsupported", reason: "strict_matcher_not_validated"});
+        }
+        if (step.args.hasOwnProperty("image_options") && isNullish(step.args.image_options)) {
+            strictImageFailure({status: "invalid_options", reason: "image_options_must_be_object"});
+        }
+        var options = strictImageOptions(step.args.hasOwnProperty("image_options") ? step.args.image_options : {});
+        template = loadTemplateAsset(ctx, step.args.image, options.template_sha256);
+        var readFrame = function () {
+            if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+            var found = withImageScope(function () {
+                var shot = captureScreen(ctx, deadline);
+                try {
+                    if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+                    var callOptions = {};
+                    for (var key in options) callOptions[key] = options[key];
+                    callOptions.deadline_ms = deadline;
+                    callOptions.timeout_ms = Math.max(0, deadline - Date.now());
+                    var result = images.matchImageStrict(shot, template, callOptions);
+                    return result && JSON.parse(JSON.stringify(result));
+                } finally { releaseStrictImage(shot); }
+            });
+            if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+            if (Date.now() >= deadline) strictImageFailure({status: "unstable", reason: "deadline_exceeded"});
+            if (!found || found.matcher_version !== "strict-v1" || !(found.candidates instanceof Array) ||
+                ["matched", "not_found", "ambiguous", "invalid_template", "invalid_options", "unstable", "unsupported"].indexOf(found.status) < 0) {
+                strictImageFailure({status: "unsupported", reason: "invalid_matcher_contract"});
+            }
+            found.assertion_mode = mode;
+            if (["invalid_template", "invalid_options", "unstable", "unsupported"].indexOf(found.status) >= 0) strictImageFailure(found);
+            var exists = found.candidates.some(function (candidate) { return candidate && candidate.accepted === true; });
+            if (!exists && found.status !== "not_found") strictImageFailure(found);
+            return {diagnostic: found, exists: exists};
+        };
+        var first = readFrame();
+        if (mode === "exists") {
+            if (!first.exists) strictImageFailure(first.diagnostic, ERR.E2004);
+            ctx.lastImageMatch = first.diagnostic;
+            return {output: {image_match: first.diagnostic}};
+        }
+        if (first.exists) strictImageFailure(first.diagnostic, ERR.E2004);
+        strictImagePause(ctx, 200, deadline);
+        var second = readFrame();
+        if (second.exists) strictImageFailure(second.diagnostic, ERR.E2004);
+        second.diagnostic.confirmed_frames = 2;
+        return {output: {image_match: second.diagnostic}};
+    } catch (error) {
+        if (error.context && error.context.image_match) {
+            error.message = (error.code === ERR.E2004 ? "图像断言失败: " : "图像断言无法判定: ") +
+                mode + " (" + error.context.image_match.reason + ")";
+            throw error;
+        }
+        strictImageFailure({status: Date.now() >= deadline ? "unstable" : "unsupported",
+            reason: Date.now() >= deadline ? "deadline_exceeded" : "native_matcher_error", detail: String(error.message || error)});
+    } finally { if (template) releaseStrictImage(template); }
 };
 
+function strictImageFailure(diagnostic, code) {
+    diagnostic.matcher_version = diagnostic.matcher_version || "strict-v1";
+    diagnostic.candidates = diagnostic.candidates || [];
+    diagnostic.quality = diagnostic.quality || {};
+    diagnostic.timings = diagnostic.timings || {};
+    var codes = {ambiguous: ERR.E2010, invalid_template: ERR.E2011, unstable: ERR.E2012,
+        unsupported: ERR.E2013, invalid_options: ERR.E2201};
+    var error = new StepError(code || codes[diagnostic.status] || ERR.E2005,
+        (diagnostic.tap_submitted ? "图像点击已提交但执行失败: " : "图像点击未执行: ") + diagnostic.status + " (" + diagnostic.reason + ")");
+    error.context = {image_match: diagnostic};
+    error.non_retryable = true;
+    throw error;
+}
+
+function strictImageOptions(raw) {
+    if (isNullish(raw)) return {};
+    if (!raw || typeof raw !== "object" || raw instanceof Array) {
+        strictImageFailure({status: "invalid_options", reason: "image_options_must_be_object"});
+    }
+    var keys = Object.keys(raw);
+    if (!keys.length) return {};
+    var allowed = ["template_sha256", "tap_anchor", "source_size", "search_region"];
+    for (var i = 0; i < keys.length; i++) {
+        if (allowed.indexOf(keys[i]) < 0) strictImageFailure({status: "invalid_options", reason: "unknown_image_option"});
+    }
+    if (typeof raw.template_sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(raw.template_sha256)) {
+        strictImageFailure({status: "invalid_options", reason: "template_hash_required"});
+    }
+    var options = {template_sha256: raw.template_sha256.toLowerCase(), tap_anchor: [0.5, 0.5]};
+    function numbers(value, length) {
+        if (!(value instanceof Array) || value.length !== length) return false;
+        for (var n = 0; n < length; n++) if (typeof value[n] !== "number" || !isFinite(value[n])) return false;
+        return true;
+    }
+    if (raw.hasOwnProperty("tap_anchor")) {
+        if (!numbers(raw.tap_anchor, 2) || raw.tap_anchor[0] < 0 || raw.tap_anchor[0] > 1 || raw.tap_anchor[1] < 0 || raw.tap_anchor[1] > 1) {
+            strictImageFailure({status: "invalid_options", reason: "invalid_tap_anchor"});
+        }
+        options.tap_anchor = raw.tap_anchor.slice();
+    }
+    if (raw.hasOwnProperty("source_size")) {
+        if (!numbers(raw.source_size, 2) || raw.source_size[0] <= 0 || raw.source_size[1] <= 0 ||
+            Math.floor(raw.source_size[0]) !== raw.source_size[0] || Math.floor(raw.source_size[1]) !== raw.source_size[1]) {
+            strictImageFailure({status: "invalid_options", reason: "invalid_source_size"});
+        }
+        options.source_size = raw.source_size.slice();
+    }
+    if (raw.hasOwnProperty("search_region")) {
+        var r = raw.search_region;
+        if (!numbers(r, 4) || !(0 <= r[0] && r[0] < r[2] && r[2] <= 1 && 0 <= r[1] && r[1] < r[3] && r[3] <= 1)) {
+            strictImageFailure({status: "invalid_options", reason: "invalid_search_region"});
+        }
+        options.search_region = r.slice();
+    }
+    return options;
+}
+
+function strictImageStable(first, second) {
+    if (!first || first.status !== "matched" || second.status !== "matched") return false;
+    var a = first.rect, b = second.rect;
+    var iw = Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0]));
+    var ih = Math.max(0, Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]));
+    var overlap = iw * ih / (a[2] * a[3] + b[2] * b[3] - iw * ih);
+    var dx = first.point[0] - second.point[0], dy = first.point[1] - second.point[1];
+    return overlap >= 0.9 && Math.sqrt(dx * dx + dy * dy) <= Math.max(2, 0.02 * Math.min(a[2], a[3]));
+}
+
+function releaseStrictImage(image) {
+    if (images.__endScope) images.release(image);
+    else if (image && typeof image.recycle === "function") image.recycle();
+}
+
+function strictImagePause(ctx, duration, deadline) {
+    var remaining = duration;
+    while (remaining > 0 && Date.now() < deadline) {
+        if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+        var part = Math.min(50, remaining, Math.max(0, deadline - Date.now()));
+        sleepMs(part);
+        remaining -= part;
+    }
+    if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+}
+
 ACTIONS.click_image = function (ctx, step) {
-    var startedAt = Date.now();
-    var assetName = step.args.image;
-    var template = loadTemplateAsset(ctx, assetName);
-    var hint = "";
-
-    // 策略 1：模板图 OCR 文本提示（镜像 PC text-hint）
+    if (typeof images.matchImageStrict !== "function" || typeof images.strictMatcherCapabilities !== "function") {
+        strictImageFailure({status: "unsupported", reason: "strict_matcher_unavailable"});
+    }
+    var capabilities;
+    try { capabilities = images.strictMatcherCapabilities(); }
+    catch (capabilityError) { strictImageFailure({status: "unsupported", reason: "strict_matcher_unavailable"}); }
+    if (!capabilities || capabilities.matcher_version !== "strict-v1" || capabilities.validated !== true) {
+        strictImageFailure({status: "unsupported", reason: "strict_matcher_not_validated"});
+    }
+    var raw = step.args.hasOwnProperty("image_options") ? step.args.image_options : {};
+    if (step.args.hasOwnProperty("image_options") && isNullish(raw)) {
+        strictImageFailure({status: "invalid_options", reason: "image_options_must_be_object"});
+    }
+    var options = strictImageOptions(raw);
+    var timeout = Number(step.timeout || 10);
+    if (!isFinite(timeout) || timeout <= 0) strictImageFailure({status: "invalid_options", reason: "invalid_timeout"});
+    var startedAt = Date.now(), deadline = startedAt + timeout * 1000;
+    var template = loadTemplateAsset(ctx, step.args.image, options.template_sha256);
+    var previous = null, last = {status: "not_found", reason: "no_verified_candidate"};
     try {
-        hint = ocrTemplateHint(ctx, assetName, template);
-    } catch (e) {
-        hint = "";
-    }
-    if (hint) {
-        try {
-            var el = text(hint).findOne(2000) || textContains(hint).findOne(1000);
-            if (el && clickNodeRobust(el)) {
-                logLine(ctx, "click_image 文本提示命中: " + hint);
-                return;
+        while (Date.now() < deadline) {
+            if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+            var match = withImageScope(function () {
+                var shot = captureScreen(ctx, deadline);
+                try {
+                    if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+                    var callOptions = {};
+                    for (var key in options) callOptions[key] = options[key];
+                    callOptions.deadline_ms = deadline;
+                    callOptions.timeout_ms = Math.max(0, deadline - Date.now());
+                    var found = images.matchImageStrict(shot, template, callOptions);
+                    // Normalize bridge-owned arrays/objects to this JS engine's realm.
+                    if (found && typeof found === "object") found = JSON.parse(JSON.stringify(found));
+                    if (!found || ["matched", "not_found", "ambiguous", "invalid_template", "invalid_options", "unstable", "unsupported"].indexOf(found.status) < 0 || found.matcher_version !== "strict-v1") {
+                        strictImageFailure({status: "unsupported", reason: "invalid_matcher_contract"});
+                    }
+                    if (found.status === "matched") {
+                        var p = found.point, r = found.rect;
+                        if (!(p instanceof Array) || p.length !== 2 || !(r instanceof Array) || r.length !== 4 ||
+                            p.concat(r).some(function (n) { return typeof n !== "number" || !isFinite(n); }) ||
+                            p[0] < 0 || p[1] < 0 || p[0] >= shot.width || p[1] >= shot.height || r[2] <= 0 || r[3] <= 0) {
+                            strictImageFailure({status: "unsupported", reason: "invalid_match_coordinates"});
+                        }
+                    }
+                    return found;
+                } finally { releaseStrictImage(shot); }
+            });
+            last = match;
+            if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+            if (["ambiguous", "invalid_template", "invalid_options", "unsupported"].indexOf(match.status) >= 0) strictImageFailure(match);
+            if (Date.now() >= deadline) strictImageFailure({status: "unstable", reason: "deadline_exceeded", candidates: match.candidates});
+            if (strictImageStable(previous, match)) {
+                match.timings = match.timings || {};
+                match.timings.total_ms = Date.now() - startedAt;
+                match.stable_frames = 2;
+                if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
+                match.tap_submitted = true;
+                var clicked;
+                try { clicked = click(Math.floor(match.point[0]), Math.floor(match.point[1])); }
+                catch (tapError) { match.reason = "tap_result_unknown"; strictImageFailure(match, ERR.E2009); }
+                if (clicked === false) { match.reason = "tap_returned_false"; strictImageFailure(match, ERR.E2009); }
+                return {output: {image_match: match}};
             }
-        } catch (e2) {
-            // 回退模板匹配
+            previous = match.status === "matched" ? match : null;
+            strictImagePause(ctx, 150, deadline);
         }
-    }
-
-    // 策略 2：多尺度模板匹配（镜像 PC 重试窗口 IMAGE_CLICK_TIMEOUT_SECONDS）
-    var deadline = Date.now() + IMAGE_CLICK_TIMEOUT_SECONDS * 1000;
-    var match = null;
-    do {
-        match = matchTemplateMultiScale(captureScreen(ctx), template, IMAGE_MATCH_THRESHOLD, null);
-        if (match) break;
-        sleepMs(500);
-    } while (Date.now() < deadline);
-
-    if (!match) {
-        fail(ERR.E2005, "图像模板匹配失败: 未在屏幕上找到匹配的图像区域 (" + assetName + ")");
-    }
-    var matchElapsed = (Date.now() - startedAt) / 1000;
-
-    var before = pageSignature();
-    if (!click(Math.round(match.x), Math.round(match.y))) {
-        fail(ERR.E2009, "图像已匹配，但点击返回失败");
-    }
-    sleepMs(120);
-    var after = pageSignature();
-
-    // 匹配耗时很长且点击后页面无变化时，同位重试一次（镜像 PC tap-no-effect 检测）
-    if (before && after && before === after && matchElapsed >= 3.0) {
-        if (!click(Math.round(match.x), Math.round(match.y))) {
-            fail(ERR.E2009, "图像已匹配，但重试点击返回失败");
-        }
-        sleepMs(120);
-        var retry = pageSignature();
-        if (retry && retry === before) {
-            fail(ERR.E2009, "图像模板匹配点击后页面未变化（tap-no-effect）");
-        }
-    }
+        if (last.status === "matched") { last.status = "unstable"; last.reason = "target_not_stable"; }
+        strictImageFailure(last);
+    } catch (error) {
+        if (error.context && error.context.image_match) throw error;
+        strictImageFailure({status: Date.now() >= deadline ? "unstable" : "unsupported",
+            reason: Date.now() >= deadline ? "deadline_exceeded" : "native_matcher_error",
+            detail: String(error.message || error)});
+    } finally { releaseStrictImage(template); }
 };
 
 ACTIONS.extract_by_ocr = function (ctx, step) {
@@ -1020,6 +1096,7 @@ function runStep(ctx, rawStep) {
         } catch (e) {
             lastError = e;
             result.attempts = attempt;
+            if (e.non_retryable) break;
             if (attempt < totalAttempts) {
                 logLine(ctx, "步骤 " + order + " 第 " + attempt + " 次失败，1s 后重试: " + (e.message || e));
                 sleepMs(RETRY_BACKOFF_MS);
@@ -1032,6 +1109,10 @@ function runStep(ctx, rawStep) {
         result.status = "FAIL";
         result.error = lastError.message || String(lastError);
         result.error_code = lastError.code || ERR.E2999;
+        if (lastError.context && lastError.context.image_match) {
+            result.error_context = lastError.context;
+            result.output = {image_match: lastError.context.image_match};
+        }
         result.screenshot_base64 = screenshotBase64Jpeg(ctx);
         var strategy = String(step.error_strategy || "ABORT").toUpperCase();
         if (strategy === "IGNORE") {

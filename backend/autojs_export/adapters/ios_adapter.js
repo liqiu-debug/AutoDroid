@@ -310,6 +310,24 @@
                 matches: function () { return this.__all.slice(); }
             };
         },
+        matchImageStrict: function (image, template, options) {
+            if (typeof ADT.matchImageStrict !== "function") {
+                return { status: "unsupported", reason: "native_strict_matcher_unavailable", matcher_version: "strict-v1", candidates: [], point: null, quality: {}, timings: {} };
+            }
+            return ADT.matchImageStrict(image.__h, template.__h, options || {});
+        },
+        strictMatcherCapabilities: function () {
+            if (typeof ADT.strictMatcherCapabilities !== "function") {
+                return { matcher_version: "strict-v1", validated: false, reason: "native_strict_matcher_unavailable" };
+            }
+            return ADT.strictMatcherCapabilities();
+        },
+        templateSha256: function (path) {
+            if (typeof ADT.fileSha256 !== "function") throw new Error("native_template_sha256_unavailable");
+            var digest = ADT.fileSha256(String(path));
+            if (!digest) throw new Error("template_sha256_failed");
+            return String(digest);
+        },
         ssim: function (a, b) { return Number(ADT.ssim(a.__h, b.__h)) || 0; },
         findImage: function () { return null; },
         release: function (image) {

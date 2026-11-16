@@ -292,7 +292,7 @@ class IOSVisionMixin:
         if not target:
             raise ValueError(f"{action_name} 需要 image_path")
         if not os.path.isabs(target):
-            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
             target = os.path.abspath(os.path.join(project_root, target))
         if not os.path.exists(target):
             raise FileNotFoundError(f"图像文件不存在: {target}")

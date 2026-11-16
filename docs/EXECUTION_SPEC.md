@@ -115,8 +115,16 @@
 - `assert_image`
   - 必填 `args.image_path` 或可回退出的 `selector`。
   - `args.match_mode` 支持 `exists` / `not_exists`，默认 `exists`。
+  - 复用 `strict-v1` 的候选与结构验证及平台独立 `image_options`（字段同 `click_image`），不执行点击。`exists` 只需至少一个通过验证的候选，重复目标也可通过；`not_exists` 要求连续两帧均明确 `not_found`，任一帧出现合格候选即失败。
+  - 模板无效、能力缺失、超时或只有未通过验证的歧义结果均不得视为“不存在”。原生能力与文件 hash 校验失败直接报告，禁止降低验证要求。
 - `click_image`
   - 必填 `args.image_path` 或可回退出的 `selector`。
+  - 优先使用当前平台明确的 `by=image` override 模板路径，再回退到通用路径。
+  - `args.image_options` 按 `android` / `ios` / `default` 保存独立配置；旧模型对应 `options.image_options`。配置存在但缺少当前平台且无 `default` 时拒绝执行。
+  - 非空平台配置必须含模板原始文件的 `template_sha256`（64 位十六进制）；可配置 `tap_anchor: [u,v]`（模板内 0..1，默认中心）、`source_size: [width,height]`（录制截图像素）、`search_region: [x1,y1,x2,y2]`（屏幕内 0..1）。所有字段均严格校验，模板字节变化后须重新确认配置。
+  - `strict-v1` 验证多候选及局部结构，唯一目标连续两帧稳定后点击一次；无匹配、重复目标、模板无效或目标不稳定均拒绝点击，不以 OCR 文本点击替代。定位使用步骤 `timeout`（默认 10 秒），不放宽匹配条件。
+  - 诊断通过 `output.image_match` 保留，含 `status/reason/matcher_version/candidates/point/quality/timings`；失败时同时记录到 `error_context.image_match`。已提交但结果未知的点击不自动重试。
+  - 手机脚本执行端须提供已验收的 `images.matchImageStrict` 及 `strictMatcherCapabilities().validated=true`；缺少能力或尚未验收时报告 unsupported，禁止回退旧匹配算法。
 - `extract_by_ocr`
   - 必填 `args.region` 或可回退出的 `selector`。
   - 区域格式为 `[x1, y1, x2, y2]`，支持绝对像素，也支持 `0-1` 相对坐标。
@@ -176,6 +184,10 @@
 | `E2007_INPUT_FAILED` | 输入失败 | 确认目标为可输入控件且已获得焦点；可先点击输入框再输入，或检查键盘是否弹出。 |
 | `E2008_APP_CONTROL_FAILED` | 应用启动/停止失败 | 检查 app_key 映射的包名/BundleID 是否正确、应用是否已安装在该设备上。 |
 | `E2009_CLICK_NO_EFFECT` | 点击无效果（点击已执行但页面未变化） | 检查元素是否可点击或被遮挡，必要时改用坐标点击/图像点击。 |
+| `E2010_IMAGE_AMBIGUOUS` | 多个相似图像目标或候选存在歧义 | 限定搜索区域，或截取具有独特特征的模板。 |
+| `E2011_IMAGE_TEMPLATE_INVALID` | 模板无效或缺少可识别轮廓 | 重新截取完整清晰的目标。 |
+| `E2012_IMAGE_UNSTABLE` | 目标在预算内未稳定或匹配超时 | 等待页面稳定，或调整步骤超时。 |
+| `E2013_IMAGE_MATCH_UNSUPPORTED` | 执行端能力或截图比例不支持 | 更新运行端，或重新录制对应设备模板。 |
 | `E2101_DEVICE_CONNECTION_LOST` | Android 设备连接丢失 | 检查 USB/网络连接与 adb devices 状态，必要时重新插拔设备或重新初始化 uiautomator2 服务。 |
 | `E2102_WDA_SESSION_ERROR` | iOS WDA 会话异常 | 确认 WebDriverAgent 正在运行且端口转发正常，必要时重启 WDA 后重试。 |
 | `E2201_INVALID_ARGS` | 执行期参数非法（预检已拦截的沿用 `P1006`） | 检查步骤的 args/value/selector 配置是否符合执行规范。 |
