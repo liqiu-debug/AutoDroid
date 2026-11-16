@@ -60,7 +60,7 @@ export function useScreenCrop({
   selectedPlatform,
   getMappedCoordinates,
   ensureInteractionReady,
-  executeImageStepAndRefresh,
+  executeRawTapAndRefresh,
   updateStateFromDump,
   shouldRequestDeviceInfo
 }) {
@@ -241,8 +241,14 @@ export function useScreenCrop({
     const platform = currentImagePlatform()
     const capture = quickImageCapture.value
     const step = imageCropStep.value
-    // Keep the original tap internally; manual template selection uses the centre.
-    const anchor = capture ? anchorFromSelection(selection, { x: capture.x, y: capture.y }) : [0.5, 0.5]
+    // Recording already has a user-selected point. Preserve it while it remains
+    // inside the crop; a new crop excluding that point uses its own centre.
+    const includesOriginalPoint = capture && Number.isFinite(capture.x) && Number.isFinite(capture.y)
+      && capture.x >= selection.x1 && capture.x < selection.x2
+      && capture.y >= selection.y1 && capture.y < selection.y2
+    const tapPoint = includesOriginalPoint ? { x: capture.x, y: capture.y }
+      : { x: (selection.x1 + selection.x2) / 2, y: (selection.y1 + selection.y2) / 2 }
+    const anchor = anchorFromSelection(selection, tapPoint)
     const isCurrent = () => imageCropMode.value && revision === imageCaptureRevision && key === imageCaptureKey()
     loading.value = true
     imageSaveBusy.value = true
@@ -252,19 +258,18 @@ export function useScreenCrop({
       const metadata = await cropTemplateFromBase64(screenshotBase64, selection)
       if (!isCurrent()) return false
       const options = makeRecordedImageOptions(metadata, anchor)
-      let recordedStep
       if (step) {
         bindRecordedImage(step, platform, metadata.image_path, options)
-        recordedStep = step
       } else {
-        recordedStep = addQuickImageStep(metadata.image_path, { [platform]: options })
+        addQuickImageStep(metadata.image_path, { [platform]: options })
       }
       const executeTap = Boolean(capture?.executeTap)
       let tapError = ''
       if (executeTap) {
         try {
-          // The ordinary execution path checks fresh frames and refuses ambiguity.
-          await executeImageStepAndRefresh(recordedStep)
+          // This is the explicit recording gesture, not replay localization.
+          // Replay and optional preview continue to use the strict matcher.
+          await executeRawTapAndRefresh(tapPoint.x, tapPoint.y)
         } catch (err) {
           tapError = getErrorDetail(err, '实际点击失败')
         }

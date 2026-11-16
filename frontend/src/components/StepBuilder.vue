@@ -905,7 +905,8 @@ const handleExecuteStep = async (step) => {
                     </el-button>
                   </div>
                 </div>
-                <div class="form-row image-preview-action">
+                <div class="form-row">
+                  <label>图像设置</label>
                   <el-button size="small" :loading="imagePreviewBusy" @click="previewImageMatch(step)">验证当前设备定位</el-button>
                 </div>
               </template>
@@ -1401,6 +1402,5 @@ const handleExecuteStep = async (step) => {
 .step-actions :deep(.el-button) { color: var(--ad-muted); }
 .step-actions :deep(.step-run-action:hover) { color: var(--ad-primary); }
 .step-actions :deep(.step-remove-action:hover) { color: var(--ad-danger); }
-.image-preview-action { justify-content: flex-end; }
 .image-preview-loading { padding: 36px 0; text-align: center; color: var(--ad-muted); }
 </style>

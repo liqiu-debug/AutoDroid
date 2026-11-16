@@ -6,7 +6,6 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import { findBestRecordableNode } from '@/utils/recordableNode'
 import { getErrorDetail } from '@/utils/errors'
-import { imageExecutionFailure } from '@/utils/imageOptions'
 import { useStageLifecycle } from '@/composables/useStageLifecycle'
 import { useDeviceStreams } from '@/composables/useDeviceStreams'
 import { useDeviceDump } from '@/composables/useDeviceDump'
@@ -207,16 +206,6 @@ const executeRawTapAndRefresh = async (x, y) => {
   return res
 }
 
-const executeImageStepAndRefresh = async (step) => {
-  const res = await api.executeStep({
-    step, device_serial: selectedSerial.value, include_screenshot: !liveMode.value,
-    variables: caseStore.currentCase?.variables || []
-  })
-  if (res?.data?.dump) updateStateFromDump(res.data.dump)
-  if (!res?.data?.result?.success) throw new Error(imageExecutionFailure(res?.data?.result))
-  return res
-}
-
 function ensureInteractionReady(actionLabel = '录制') {
   if (!selectedSerial.value) {
     ElMessage.warning('请先选择一台调试设备')
@@ -279,7 +268,7 @@ const {
   selectedPlatform: selectedRecordingPlatform,
   getMappedCoordinates,
   ensureInteractionReady,
-  executeImageStepAndRefresh,
+  executeRawTapAndRefresh,
   updateStateFromDump: dump.updateStateFromDump,
   shouldRequestDeviceInfo: dump.shouldRequestDeviceInfo
 })

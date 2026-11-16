@@ -79,12 +79,13 @@ test('screen-edge selection preserves the original tap as a template anchor', ()
   assert.throws(() => imageOptions.makeRecordedImageOptions({}, anchor), /更新/)
 })
 
-function cropSetup({ platform = 'android', executionError } = {}) {
-  const steps = [], taps = [], executions = [], requests = [], crops = []
+function cropSetup({ platform = 'android', tapError } = {}) {
+  const steps = [], taps = [], tapAttempts = [], executions = [], requests = [], crops = []
   const api = {
     ensureImageMatcher: async () => {},
     cropTemplate: async (...args) => { crops.push(args); return { data: { image_path: 'static/images/new.png', template_sha256: sha, source_size: [1080, 2400], quality: { valid: true } } } },
-    matchImage: async payload => { requests.push(copy(payload)); throw new Error('recording must not require a preview request') }
+    matchImage: async payload => { requests.push(copy(payload)); throw new Error('recording must not require a preview request') },
+    executeStep: async payload => { executions.push(copy(payload)); throw new Error('recording must not start image replay') }
   }
   const source = stripImports(read('../src/composables/useScreenCrop.js')).replace(/export /g, '')
   const messages = []
@@ -98,21 +99,20 @@ function cropSetup({ platform = 'android', executionError } = {}) {
     screenshot, selectedSerial: serial, selectedPlatform: ref(platform), loading: ref(false), liveMode: ref(false), isIosLivePreview: ref(false),
     getMappedCoordinates: (x, y) => ({ canvasX: x / 2, canvasY: y / 2, realX: x, realY: y }),
     ensureInteractionReady: () => true,
-    executeImageStepAndRefresh: async step => {
-      executions.push(copy(step))
-      if (executionError) throw new Error(executionError)
-      const [u, v] = step.args.image_options[platform].tap_anchor
-      taps.push([Math.round(365 + 170 * u), Math.round(165 + 170 * v)])
+    executeRawTapAndRefresh: async (x, y) => {
+      tapAttempts.push([x, y])
+      if (tapError) throw new Error(tapError)
+      taps.push([x, y])
     },
     updateStateFromDump() {}, shouldRequestDeviceInfo: () => false
   })
   const begin = () => crop.beginQuickImageCapture({ host: 'static', node: { x1: 400, y1: 200, x2: 500, y2: 300 }, x: 410, y: 250, executeTap: true })
-  return { crop, api, begin, steps, taps, executions, requests, crops, screenshot, serial, messages }
+  return { crop, api, begin, steps, taps, tapAttempts, executions, requests, crops, screenshot, serial, messages }
 }
 
 const cropEvent = (x, y) => ({ clientX: x, clientY: y, preventDefault() {}, stopPropagation() {} })
 
-test('quick image recording needs one confirmation and preserves the original tap internally', async () => {
+test('quick image recording saves the anchor and submits one coordinate tap without image replay', async () => {
   const context = cropSetup({ platform: 'ios' })
   await context.begin()
   assert.equal(context.taps.length, 0)
@@ -122,20 +122,21 @@ test('quick image recording needs one confirmation and preserves the original ta
   assert.deepEqual(context.taps, [[410, 250]])
   const anchor = context.steps[0].options.image_options.ios.tap_anchor
   assert.deepEqual(anchor, [45 / 170, 85 / 170])
-  assert.deepEqual(context.executions[0].args.image_options.ios, context.steps[0].options.image_options.ios)
+  assert.deepEqual(context.executions, [])
   assert.equal(context.steps[0].options.image_options.android, undefined)
   assert.equal(context.crop.imageCropMode.value, false)
 })
 
-test('ambiguous execution reports the reason without adding a second confirmation or tapping', async () => {
-  const context = cropSetup({ executionError: '存在多个相似目标，已停止点击，请重新圈选' })
+test('a failed recording tap retains the step and reports the error without retrying', async () => {
+  const context = cropSetup({ tapError: '设备连接已断开' })
   await context.begin()
   await context.crop.confirmQuickImageCapture()
   assert.deepEqual(context.requests, [])
   assert.deepEqual(context.taps, [])
-  assert.equal(context.executions.length, 1)
+  assert.equal(context.tapAttempts.length, 1)
+  assert.deepEqual(context.executions, [])
   assert.equal(context.steps.length, 1, 'the recorded step remains available to edit')
-  assert.match(context.messages.find(message => message.level === 'warning').text, /多个相似目标/)
+  assert.match(context.messages.find(message => message.level === 'warning').text, /设备连接已断开/)
 })
 
 test('an old Desktop stops recording before uploading or executing', async () => {
@@ -167,12 +168,13 @@ test('a cancelled or changed device capture cannot save or tap after upload comp
   }
 })
 
-test('double confirmation submits one crop and one guarded image click', async () => {
+test('double confirmation submits one crop and one recording tap', async () => {
   const context = cropSetup()
   await context.begin()
   await Promise.all([context.crop.confirmQuickImageCapture(), context.crop.confirmQuickImageCapture()])
   assert.equal(context.crops.length, 1)
-  assert.equal(context.executions.length, 1)
+  assert.equal(context.tapAttempts.length, 1)
+  assert.deepEqual(context.executions, [])
   assert.equal(context.steps.length, 1)
 })
 
@@ -184,6 +186,41 @@ test('adjusting a quick crop preserves the original tap within the new selection
   assert.equal(context.crops.length, 0)
   await context.crop.confirmQuickImageCapture()
   assert.deepEqual(context.steps[0].args.image_options.android.tap_anchor, [0.2, 0.4])
+  assert.deepEqual(context.taps, [[410, 250]])
+})
+
+test('a new crop outside the original tap uses the new centre for recording and the saved anchor', async () => {
+  const context = cropSetup()
+  await context.begin()
+  context.crop.onCanvasMouseDown(cropEvent(600, 400))
+  await context.crop.onCanvasMouseUp(cropEvent(700, 500))
+  await context.crop.confirmQuickImageCapture()
+  assert.deepEqual(context.taps, [[650, 450]])
+  assert.deepEqual(context.steps[0].args.image_options.android.tap_anchor, [0.5, 0.5])
+})
+
+test('an unsuccessful template save never submits a recording tap', async () => {
+  const context = cropSetup()
+  context.api.cropTemplate = async () => { throw new Error('上传失败') }
+  await context.begin()
+  await context.crop.confirmQuickImageCapture()
+  assert.deepEqual(context.tapAttempts, [])
+  assert.deepEqual(context.steps, [])
+})
+
+test('recording coordinates use the existing interaction route without adding another step', async () => {
+  const source = read('../src/components/DeviceStage.vue')
+    .match(/const executeRawTapAndRefresh = async[\s\S]*?\n}\n/)[0]
+  const calls = [], updates = []
+  const api = {
+    interactDevice: async (...args) => { calls.push(args); return { data: { dump: { screenshot: 'NEW' } } } },
+    executeStep: () => assert.fail('a recording gesture must not enter the replay runner')
+  }
+  const tap = new Function('api', 'hierarchyXml', 'selectedSerial', 'liveMode', 'updateStateFromDump',
+    source + '\nreturn executeRawTapAndRefresh')(api, ref('XML'), ref('ios-device'), ref(false), dump => updates.push(dump))
+  await tap(410, 250)
+  assert.deepEqual(calls, [[410, 250, 'click', 'XML', null, 'ios-device', false, true]])
+  assert.deepEqual(updates, [{ screenshot: 'NEW' }])
 })
 
 for (const action of ['click_image', 'assert_image']) {
@@ -202,6 +239,7 @@ for (const action of ['click_image', 'assert_image']) {
       assert.equal(step.options.image_options.android.template_sha256, sha)
       assert.deepEqual(step.options.image_options.ios, maps.ios)
       assert.deepEqual(context.executions, [])
+      assert.deepEqual(context.tapAttempts, [])
       assert.deepEqual(context.requests, [])
       assert.equal(context.crop.imageCropMode.value, false)
     })
