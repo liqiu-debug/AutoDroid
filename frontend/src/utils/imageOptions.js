@@ -2,18 +2,18 @@
 export const IMAGE_OPTION_PLATFORMS = ['android', 'ios', 'default']
 
 export function imageMatchStatusText(result) {
-  const labels = { matched: '找到唯一目标，请核对绿色框和红色点击点', not_found: '当前画面未找到目标',
-    ambiguous: '存在多个相似目标，请调整模板或限定搜索区域', invalid_template: '模板特征不足，请重新框选',
-    unstable: '目标位置尚未稳定，请重试', unsupported: '当前客户端不支持此定位验证' }
+  const labels = { matched: '已找到目标', not_found: '当前画面未找到目标',
+    ambiguous: '存在多个相似目标，请重新圈选更有区分度的模板', invalid_template: '模板特征不足，请重新框选',
+    unstable: '目标位置尚未稳定，请重试', unsupported: '当前客户端不支持高精度图像匹配，请升级' }
   const reasons = {
     template_too_small: '选区过小，请扩大到完整目标',
     constant_template: '选区接近纯色，请包含目标轮廓或文字',
     no_foreground: '选区缺少可区分的轮廓，请缩小背景并包含目标',
-    template_hash_mismatch: '模板已更换，请重新截取以更新点击位置',
+    template_hash_mismatch: '模板已更换，请重新截取以更新模板信息',
     aspect_ratio_changed: '当前画面方向或宽高比与录制不一致，请重新截取对应模板',
-    deadline_exceeded: '定位验证超时，请缩小搜索区域后重试'
+    deadline_exceeded: '图像定位超时，请检查当前画面或重新截取模板'
   }
-  if (!result) return '拖拽框选，红点是实际点击位置；验证过程只定位'
+  if (!result) return '请圈选完整的目标图像'
   const reason = String(result.reason || '')
   const text = reasons[reason] || (/[\u3400-\u9fff]/.test(reason) ? reason : labels[result.status]) || '定位验证失败'
   const warnings = { low_contrast: '选区对比度较低', sparse_features: '选区可区分特征较少', dense_texture: '选区纹理过密' }
@@ -21,11 +21,13 @@ export function imageMatchStatusText(result) {
   return warningText ? `${text}；${warningText}` : text
 }
 
-export function imageExecutionFailure(result) {
+export function imageExecutionFailure(result, action = 'click_image') {
+  // Assertion failures must explain exists/not_exists, even for duplicate targets.
+  if (action === 'assert_image' && /[\u3400-\u9fff]/.test(String(result?.error || ''))) return result.error
   const diagnostic = result?.output?.image_match
   if (diagnostic && diagnostic.status !== 'matched') return imageMatchStatusText(diagnostic)
   const error = String(result?.error || '')
-  return /[\u3400-\u9fff]/.test(error) ? error : '图像点击失败，请检查当前画面或重新截取模板'
+  return /[\u3400-\u9fff]/.test(error) ? error : `${action === 'assert_image' ? '图像断言' : '图像点击'}失败，请检查当前画面或重新截取模板`
 }
 
 export function cloneImageOptions(value) {
@@ -43,7 +45,7 @@ export function getImageOptionsMap(step) {
 export function selectImageOptions(step, platform) {
   const options = getImageOptionsMap(step)
   const selected = options[platform] || options.default
-  if (Object.keys(options).length && !selected) throw new Error('此设备平台尚未配置图像模板，请先截取并确认点击位置')
+  if (Object.keys(options).length && !selected) throw new Error('此设备平台尚未配置图像模板，请在该平台重新截取')
   return selected || null
 }
 

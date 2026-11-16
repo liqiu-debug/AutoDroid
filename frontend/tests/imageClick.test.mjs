@@ -79,18 +79,17 @@ test('screen-edge selection preserves the original tap as a template anchor', ()
   assert.throws(() => imageOptions.makeRecordedImageOptions({}, anchor), /更新/)
 })
 
-function cropSetup({ match, platform = 'android' } = {}) {
+function cropSetup({ platform = 'android', executionError } = {}) {
   const steps = [], taps = [], executions = [], requests = [], crops = []
   const api = {
     ensureImageMatcher: async () => {},
     cropTemplate: async (...args) => { crops.push(args); return { data: { image_path: 'static/images/new.png', template_sha256: sha, source_size: [1080, 2400], quality: { valid: true } } } },
-    matchImage: async payload => {
-      requests.push(copy(payload))
-      return { data: match ? await match(payload) : { status: 'matched', matcher_version: 'test', point: [410, 250], candidates: [{ rect: [365, 165, 170, 170], point: [410, 250], similarity: 1, accepted: true }] } }
-    }
+    matchImage: async payload => { requests.push(copy(payload)); throw new Error('recording must not require a preview request') }
   }
   const source = stripImports(read('../src/composables/useScreenCrop.js')).replace(/export /g, '')
-  const deps = { ref, computed, nextTick, watch, api, ElMessage: notices, useCaseStore: () => ({ addStep: step => steps.push(copy(step)) }), getErrorDetail: (err, fallback) => err?.message || fallback, ...imageOptions }
+  const messages = []
+  const localNotices = Object.fromEntries(['info', 'warning', 'success', 'error'].map(level => [level, text => messages.push({ level, text })]))
+  const deps = { ref, computed, nextTick, watch, api, ElMessage: localNotices, useCaseStore: () => ({ addStep: step => steps.push(copy(step)) }), getErrorDetail: (err, fallback) => err?.message || fallback, ...imageOptions }
   const useScreenCrop = new Function(...Object.keys(deps), source + '\nreturn useScreenCrop')(...Object.values(deps))
   const screenshot = ref('data:image/png;base64,SCREEN'), serial = ref('device-a')
   const crop = useScreenCrop({
@@ -101,140 +100,157 @@ function cropSetup({ match, platform = 'android' } = {}) {
     ensureInteractionReady: () => true,
     executeImageStepAndRefresh: async step => {
       executions.push(copy(step))
+      if (executionError) throw new Error(executionError)
       const [u, v] = step.args.image_options[platform].tap_anchor
       taps.push([Math.round(365 + 170 * u), Math.round(165 + 170 * v)])
     },
     updateStateFromDump() {}, shouldRequestDeviceInfo: () => false
   })
   const begin = () => crop.beginQuickImageCapture({ host: 'static', node: { x1: 400, y1: 200, x2: 500, y2: 300 }, x: 410, y: 250, executeTap: true })
-  return { crop, api, begin, steps, taps, executions, requests, crops, screenshot, serial }
+  return { crop, api, begin, steps, taps, executions, requests, crops, screenshot, serial, messages }
 }
 
-test('recording is click-free until validated and saves the same anchor used by the actual click', async () => {
+const cropEvent = (x, y) => ({ clientX: x, clientY: y, preventDefault() {}, stopPropagation() {} })
+
+test('quick image recording needs one confirmation and preserves the original tap internally', async () => {
   const context = cropSetup({ platform: 'ios' })
   await context.begin()
-  await context.crop.confirmQuickImageCapture()
-  assert.equal(context.steps.length, 0)
   assert.equal(context.taps.length, 0)
-  assert.equal(await context.crop.validateImageSelection(), true)
-  assert.equal(context.taps.length, 0, 'validation only locates')
-  assert.equal(context.crop.canConfirmImage.value, true)
-  const anchor = context.requests[0].image_options.tap_anchor
-  assert.equal(anchor[0], 45 / 170)
   await context.crop.confirmQuickImageCapture()
-  assert.deepEqual(context.taps, [[410, 250]])
-  assert.deepEqual(context.steps[0].options.image_options.ios.tap_anchor, anchor)
-  assert.deepEqual(context.executions[0].args.image_options.ios, context.steps[0].options.image_options.ios, 'recording clicks execute the same guarded image step as replay')
-  assert.equal(context.steps[0].options.image_options.android, undefined)
-})
-
-test('ambiguous targets prevent recording and clicks even when the user confirms', async () => {
-  const context = cropSetup({ match: () => ({ status: 'ambiguous', point: null, candidates: [{ rect: [0, 0, 10, 10] }, { rect: [40, 0, 10, 10] }] }) })
-  await context.begin()
-  assert.equal(await context.crop.validateImageSelection(), false)
-  await context.crop.confirmQuickImageCapture()
-  assert.deepEqual(context.taps, [])
-  assert.deepEqual(context.steps, [])
-})
-
-test('an old Desktop stops validation before crop uploads or preview requests', async () => {
-  const context = cropSetup()
-  context.api.ensureImageMatcher = async () => { throw new Error('请升级桌面客户端以使用高精度图像功能') }
-  await context.begin()
-  assert.equal(await context.crop.validateImageSelection(), false)
-  assert.deepEqual(context.crops, [])
   assert.deepEqual(context.requests, [])
-  assert.equal(context.crop.canConfirmImage.value, false)
-  assert.match(context.crop.imageMatchResult.value.reason, /请升级桌面客户端/)
-})
-
-test('anchor or screenshot edits invalidate a passing preview and pending old responses', async () => {
-  const context = cropSetup()
-  await context.begin()
-  await context.crop.validateImageSelection()
-  context.crop.setImageAnchor(0, 0.8)
-  assert.equal(context.crop.canConfirmImage.value, false)
-  assert.equal(context.crop.imageMatchResult.value, null)
-  await context.crop.validateImageSelection()
-  context.screenshot.value = 'data:image/png;base64,NEW_SCREEN'
-  assert.equal(context.crop.canConfirmImage.value, false)
-
-  let resolve
-  context.api.matchImage = () => new Promise(done => { resolve = done })
-  const validating = context.crop.validateImageSelection()
-  for (let i = 0; i < 10 && !resolve; i++) await Promise.resolve()
-  context.crop.cancelQuickImageCapture()
-  resolve({ data: { status: 'matched', point: [410, 250], candidates: [] } })
-  assert.equal(await validating, false)
-  assert.equal(context.crop.canConfirmImage.value, false)
-  assert.equal(context.crop.imageMatchResult.value, null)
-  assert.deepEqual(context.taps, [])
-})
-
-test('ordinary image recapture waits for validation, then binds metadata to the selected platform', async () => {
-  const context = cropSetup()
-  const step = { uuid: 'saved', action: 'click_image', selector: 'old.png', args: { image_path: 'old.png' }, options: { image_options: copy(maps) } }
-  await context.crop.startImageCrop(step)
-  const event = (x, y) => ({ clientX: x, clientY: y, preventDefault() {}, stopPropagation() {} })
-  context.crop.onCanvasMouseDown(event(365, 165))
-  await context.crop.onCanvasMouseUp(event(535, 335))
-  assert.equal(step.selector, 'old.png', 'mouse-up must not silently replace the saved template')
-  await context.crop.validateImageSelection()
-  await context.crop.confirmQuickImageCapture()
-  assert.equal(step.selector, 'static/images/new.png')
-  assert.equal(step.options.image_options.android.template_sha256, sha)
-  assert.deepEqual(step.options.image_options.ios, maps.ios)
-  assert.deepEqual(context.taps, [])
-})
-
-test('changing the edited step invalidates crop confirmation instead of overwriting the new action', async () => {
-  const context = cropSetup()
-  const step = reactive({ uuid: 'saved', action: 'click_image', selector: 'old.png', args: {}, options: {} })
-  await context.crop.startImageCrop(step)
-  const event = (x, y) => ({ clientX: x, clientY: y, preventDefault() {}, stopPropagation() {} })
-  context.crop.onCanvasMouseDown(event(365, 165))
-  await context.crop.onCanvasMouseUp(event(535, 335))
-  await context.crop.validateImageSelection()
-  assert.equal(context.crop.canConfirmImage.value, true)
-  step.action = 'assert_text'
-  step.selector = ''
-  step.options = {}
-  assert.equal(context.crop.canConfirmImage.value, false)
-  await context.crop.confirmQuickImageCapture()
-  assert.equal(step.selector, '')
+  assert.equal(context.crops.length, 1)
+  assert.deepEqual(context.taps, [[410, 250]])
+  const anchor = context.steps[0].options.image_options.ios.tap_anchor
+  assert.deepEqual(anchor, [45 / 170, 85 / 170])
+  assert.deepEqual(context.executions[0].args.image_options.ios, context.steps[0].options.image_options.ios)
+  assert.equal(context.steps[0].options.image_options.android, undefined)
   assert.equal(context.crop.imageCropMode.value, false)
 })
 
-test('step-editor preview selects the current device platform and only calls screenshot/match APIs', async () => {
-  const step = reactive({ uuid: 'saved', action: 'click_image', selector: 'android.png', options: { image_options: copy(maps) }, args: { image_path: 'old-args.png' }, platform_overrides: { android: { selector: 'android.png', by: 'image' }, ios: { selector: 'ios.png', by: 'image' } } })
-  const calls = []
-  const api = {
-    ensureImageMatcher: async () => {},
-    getDeviceDump: async () => { calls.push('dump'); return { data: { screenshot: 'SCREEN', screenshot_format: 'png', device_info: { platform: 'ios' } } } },
-    matchImage: async payload => { calls.push(copy(payload)); return { data: { status: 'matched', point: [10, 20], candidates: [] } } },
-    executeStep: () => { throw new Error('preview must never execute a step') }
+test('ambiguous execution reports the reason without adding a second confirmation or tapping', async () => {
+  const context = cropSetup({ executionError: '存在多个相似目标，已停止点击，请重新圈选' })
+  await context.begin()
+  await context.crop.confirmQuickImageCapture()
+  assert.deepEqual(context.requests, [])
+  assert.deepEqual(context.taps, [])
+  assert.equal(context.executions.length, 1)
+  assert.equal(context.steps.length, 1, 'the recorded step remains available to edit')
+  assert.match(context.messages.find(message => message.level === 'warning').text, /多个相似目标/)
+})
+
+test('an old Desktop stops recording before uploading or executing', async () => {
+  const context = cropSetup()
+  context.api.ensureImageMatcher = async () => { throw new Error('请升级桌面客户端以使用高精度图像功能') }
+  await context.begin()
+  await context.crop.confirmQuickImageCapture()
+  assert.deepEqual(context.crops, [])
+  assert.deepEqual(context.requests, [])
+  assert.deepEqual(context.executions, [])
+  assert.match(context.messages.find(message => message.level === 'error').text, /请升级桌面客户端/)
+})
+
+test('a cancelled or changed device capture cannot save or tap after upload completes', async () => {
+  for (const cancel of [ctx => ctx.crop.cancelQuickImageCapture(), ctx => { ctx.serial.value = 'device-b' },
+                        ctx => { ctx.screenshot.value = 'data:image/png;base64,NEW_SCREEN' }]) {
+    const context = cropSetup()
+    await context.begin()
+    let resolve
+    const upload = context.api.cropTemplate
+    context.api.cropTemplate = (...args) => new Promise(done => { resolve = async () => done(await upload(...args)) })
+    const saving = context.crop.confirmQuickImageCapture()
+    for (let i = 0; i < 10 && !resolve; i++) await Promise.resolve()
+    cancel(context)
+    await resolve()
+    await saving
+    assert.deepEqual(context.steps, [])
+    assert.deepEqual(context.taps, [])
   }
+})
+
+test('double confirmation submits one crop and one guarded image click', async () => {
+  const context = cropSetup()
+  await context.begin()
+  await Promise.all([context.crop.confirmQuickImageCapture(), context.crop.confirmQuickImageCapture()])
+  assert.equal(context.crops.length, 1)
+  assert.equal(context.executions.length, 1)
+  assert.equal(context.steps.length, 1)
+})
+
+test('adjusting a quick crop preserves the original tap within the new selection', async () => {
+  const context = cropSetup()
+  await context.begin()
+  context.crop.onCanvasMouseDown(cropEvent(390, 210))
+  await context.crop.onCanvasMouseUp(cropEvent(490, 310))
+  assert.equal(context.crops.length, 0)
+  await context.crop.confirmQuickImageCapture()
+  assert.deepEqual(context.steps[0].args.image_options.android.tap_anchor, [0.2, 0.4])
+})
+
+for (const action of ['click_image', 'assert_image']) {
+  for (const matchMode of action === 'assert_image' ? ['exists', 'not_exists'] : ['exists']) {
+    test(`${action}/${matchMode} recapture saves on mouse-up without preview or device action`, async () => {
+      const context = cropSetup()
+      const step = { uuid: 'saved', action, selector: 'old.png', args: { image_path: 'old.png', match_mode: matchMode }, options: { image_options: copy(maps), match_mode: matchMode } }
+      await context.crop.startImageCrop(step)
+      context.crop.onCanvasMouseDown(cropEvent(365, 165))
+      await context.crop.onCanvasMouseUp(cropEvent(535, 335))
+      assert.equal(step.selector, 'static/images/new.png')
+      assert.equal(step.action, action)
+      assert.equal(step.args.match_mode, matchMode)
+      assert.equal(step.options.match_mode, matchMode)
+      assert.deepEqual(step.options.image_options.android.tap_anchor, [0.5, 0.5])
+      assert.equal(step.options.image_options.android.template_sha256, sha)
+      assert.deepEqual(step.options.image_options.ios, maps.ios)
+      assert.deepEqual(context.executions, [])
+      assert.deepEqual(context.requests, [])
+      assert.equal(context.crop.imageCropMode.value, false)
+    })
+  }
+}
+
+test('changing the edited step during upload cannot overwrite its new action', async () => {
+  const context = cropSetup()
+  const step = reactive({ uuid: 'saved', action: 'click_image', selector: 'old.png', args: {}, options: {} })
+  await context.crop.startImageCrop(step)
+  let resolve
+  const upload = context.api.cropTemplate
+  context.api.cropTemplate = (...args) => new Promise(done => { resolve = async () => done(await upload(...args)) })
+  context.crop.onCanvasMouseDown(cropEvent(365, 165))
+  const saving = context.crop.onCanvasMouseUp(cropEvent(535, 335))
+  for (let i = 0; i < 10 && !resolve; i++) await Promise.resolve()
+  step.action = 'assert_text'
+  step.selector = ''
+  step.options = {}
+  await resolve()
+  await saving
+  assert.equal(step.selector, '')
+  assert.deepEqual(context.taps, [])
+  assert.equal(context.crop.imageCropMode.value, false)
+})
+
+test('step editor preserves both image actions and their metadata without preview requests', () => {
   const source = stripImports(read('../src/components/StepBuilder.vue').match(/<script setup>([\s\S]*?)<\/script>/)[1])
   const deps = {
     ref, nextTick, onMounted() {}, watch, defineProps: () => ({ deviceSerial: 'ios-device' }), defineEmits: () => () => {},
-    useCaseStore: () => ({}), storeToRefs: () => ({ currentCase: ref({ steps: [step] }), lastAddedStepUuid: ref(null) }),
-    api, apiClient: api, ElMessage: notices, createUuid: () => 'generated', ...actionConstants, ...imageOptions
+    useCaseStore: () => ({}), storeToRefs: () => ({ currentCase: ref({ steps: [] }), lastAddedStepUuid: ref(null) }),
+    api: {}, apiClient: {}, ElMessage: notices, createUuid: () => 'generated', ...actionConstants, ...imageOptions
   }
-  const editor = new Function(...Object.keys(deps), source + '\nreturn {previewImageMatch,buildExecutableStep,imagePreviewResult,updateImageAnchor}')(...Object.values(deps))
-  const executable = editor.buildExecutableStep(step)
-  assert.equal(executable.args.image_path, 'android.png', 'current edited path replaces a stale saved args path')
-  assert.deepEqual(executable.args.image_options, maps)
-  await editor.previewImageMatch(step)
-  assert.equal(calls.length, 2)
-  assert.equal(calls[1].image_path, 'ios.png')
-  assert.deepEqual(calls[1].image_options, maps.ios)
-  assert.equal(editor.imagePreviewResult.value.status, 'matched')
-  editor.updateImageAnchor(step, 0, .8)
-  assert.equal(editor.imagePreviewResult.value.status, 'unstable', 'an already-visible passing preview cannot survive metadata edits')
-  delete step.options.image_options.ios
-  calls.length = 0
-  await editor.previewImageMatch(step)
-  assert.equal(calls.length, 1, 'missing platform metadata must not call legacy match without config')
-  assert.equal(editor.imagePreviewResult.value.status, 'unsupported')
-  assert.match(editor.imagePreviewResult.value.reason, /平台尚未配置/)
+  const editor = new Function(...Object.keys(deps), source + '\nreturn {buildExecutableStep}')(...Object.values(deps))
+  for (const action of ['click_image', 'assert_image']) {
+    const step = { uuid: 'step', action, selector: 'android.png', args: { image_path: 'stale.png', match_mode: 'not_exists' },
+      options: { image_options: copy(maps), match_mode: 'not_exists' }, platform_overrides: { android: { by: 'image', selector: 'android.png' }, ios: { by: 'image', selector: 'ios.png' } } }
+    const executable = editor.buildExecutableStep(step)
+    assert.equal(executable.action, action)
+    assert.equal(executable.args.image_path, 'android.png')
+    assert.deepEqual(executable.args.image_options, maps)
+    assert.equal(executable.platform_overrides.ios.selector, 'ios.png')
+    if (action === 'assert_image') assert.equal(executable.args.match_mode, 'not_exists')
+  }
+})
+
+test('image assertion errors retain existence meaning when several matches are present', () => {
+  const error = '断言失败：页面存在通过严格验证的图像目标'
+  const result = { error, output: { image_match: { status: 'ambiguous', candidates: [{ accepted: true }, { accepted: true }] } } }
+  assert.equal(imageOptions.imageExecutionFailure(result, 'assert_image'), error)
+  assert.match(imageOptions.imageExecutionFailure(result, 'click_image'), /多个相似目标/)
 })

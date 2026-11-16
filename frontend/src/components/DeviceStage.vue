@@ -6,7 +6,7 @@ import { ElMessage } from 'element-plus'
 import api from '@/api'
 import { findBestRecordableNode } from '@/utils/recordableNode'
 import { getErrorDetail } from '@/utils/errors'
-import { imageMatchStatusText, imageExecutionFailure } from '@/utils/imageOptions'
+import { imageExecutionFailure } from '@/utils/imageOptions'
 import { useStageLifecycle } from '@/composables/useStageLifecycle'
 import { useDeviceStreams } from '@/composables/useDeviceStreams'
 import { useDeviceDump } from '@/composables/useDeviceDump'
@@ -255,17 +255,8 @@ const {
   skipNextStaticDump,
   isAnyCropMode,
   activeImageCropStepUuid,
-  imageTapAnchor,
-  imageSearchRegion,
-  imageMatchResult,
-  imageValidationBusy,
+  imageSaveBusy,
   imageSelectionReady,
-  canConfirmImage,
-  setImageAnchor,
-  invalidateImageValidation,
-  validateImageSelection,
-  getImagePointStyle,
-  getImageCandidateStyle,
   clearQuickImagePrompt,
   cancelQuickImageCapture,
   onCanvasMouseDown,
@@ -788,13 +779,6 @@ defineExpose({
       <!-- Hover Overlay -->
       <div class="hover-overlay" :style="getOverlayStyle()"></div>
       <div class="crop-overlay" :style="getCropOverlayStyle()"></div>
-      <div v-if="imageCropMode" class="image-tap-point" :style="getImagePointStyle()" title="实际点击位置"></div>
-      <template v-if="imageCropMode && imageMatchResult">
-        <div v-for="(candidate, index) in imageMatchResult.candidates || []" :key="index"
-          class="image-match-candidate" :class="{ accepted: candidate.accepted }" :style="getImageCandidateStyle(candidate)">
-          <span>{{ index + 1 }} · {{ Number(candidate.similarity || 0).toFixed(3) }}</span>
-        </div>
-      </template>
 
       <div
         v-if="quickImagePrompt?.host === 'static' && !isAnyCropMode"
@@ -823,31 +807,25 @@ defineExpose({
         <div v-if="hoveredNode.contentDesc" class="tip-row"><b>Desc:</b> {{ hoveredNode.contentDesc }}</div>
         <div class="tip-row"><b>Class:</b> {{ hoveredNode.className }}</div>
       </div>
-      <div v-if="isAnyCropMode && (!imageCropMode || !imageSelectionReady)" class="crop-tip">
+      <div v-if="isAnyCropMode" class="crop-tip">
         {{
           imageCropMode
-            ? '图像截取：拖拽选择区域，红点为点击位置'
+            ? (quickImageCapture ? '图像点击快捷模式：可直接确认，或拖拽调整截取区域' : '图像截取模式：按住鼠标左键拖拽选择目标元素区域')
             : 'OCR 框选模式：按住鼠标左键拖拽选择区域'
         }}
       </div>
     </div>
       <div
-        v-if="imageCropMode"
+        v-if="imageCropMode && quickImageCapture"
         class="quick-image-toolbar"
         @mousedown.stop
         @mouseup.stop
         @click.stop
       >
-        <div class="image-anchor-controls">
-          <label>点击横向 <el-input-number :model-value="imageTapAnchor[0]" @update:model-value="value => setImageAnchor(0, value)" :min="0" :max="1" :step="0.05" :precision="3" size="small" /></label>
-          <label>点击纵向 <el-input-number :model-value="imageTapAnchor[1]" @update:model-value="value => setImageAnchor(1, value)" :min="0" :max="1" :step="0.05" :precision="3" size="small" /></label>
-          <el-input v-model="imageSearchRegion" @input="invalidateImageValidation" size="small" placeholder="可选搜索区域 [左,上,右,下]，0–1" />
-        </div>
-        <span class="image-match-status" :class="{ success: canConfirmImage }">{{ imageMatchStatusText(imageMatchResult) }}</span>
+        <span>将当前操作录成图像点击</span>
         <div class="quick-image-toolbar-actions">
-          <el-button size="small" :loading="imageValidationBusy" :disabled="!imageSelectionReady || loading" @click.stop="validateImageSelection">验证定位</el-button>
-          <el-button size="small" type="primary" :disabled="!canConfirmImage || loading" @click.stop="confirmQuickImageCapture">
-            {{ quickImageCapture?.executeTap ? '保存并点击' : '保存模板' }}
+          <el-button size="small" type="primary" :loading="imageSaveBusy" :disabled="!imageSelectionReady || loading" @click.stop="confirmQuickImageCapture">
+            确认图像点击
           </el-button>
           <el-button size="small" @click.stop="cancelQuickImageCapture">
             取消
@@ -1232,15 +1210,7 @@ defineExpose({
   gap: 8px;
 }
 
-.image-anchor-controls { display: flex; flex-wrap: wrap; gap: 8px; }
-.image-anchor-controls label { display: flex; align-items: center; gap: 4px; font-size: 12px; }
-.image-anchor-controls :deep(.el-input-number) { width: 120px; }
-.image-match-status { line-height: 1.5; }
-.image-match-status.success { color: var(--el-color-success); }
-.image-tap-point { position: absolute; width: 14px; height: 14px; border: 2px solid white; border-radius: 50%; background: #f04438; transform: translate(-50%, -50%); pointer-events: none; z-index: 24; box-shadow: 0 0 0 2px #f04438; }
-.image-match-candidate { position: absolute; border: 2px solid #e6a23c; pointer-events: none; box-sizing: border-box; z-index: 22; }
-.image-match-candidate.accepted { border-color: #17a36b; }
-.image-match-candidate span { position: absolute; bottom: 100%; left: -2px; background: #fff; color: #222; font-size: 11px; padding: 1px 4px; white-space: nowrap; }
+
 
 
 .stage-toolbar { display: flex; gap: 8px; padding: 4px 12px; flex-wrap: wrap; }
