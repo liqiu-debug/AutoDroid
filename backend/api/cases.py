@@ -871,6 +871,19 @@ def duplicate_test_case(
     return _enrich_case_read(new_case, session)
 
 
+@router.get("/{case_id}/execution-data")
+def get_case_execution_data(
+    case_id: int,
+    env_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user_readonly),
+):
+    """Read raw execution inputs once, without running checks or migrating steps."""
+    from backend.execution_data import case_execution_data
+
+    return case_execution_data(session, case_id, env_id)
+
+
 @router.get("/{case_id}/steps", response_model=List[TestCaseStepRead])
 def get_case_standard_steps(
     case_id: int,

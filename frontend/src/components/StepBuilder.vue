@@ -9,7 +9,7 @@ import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
-import { getImageOptionsMap, selectImageOptions, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
+import { getImageOptionsMap, selectImageOptions, selectImagePath, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
 import ImageMatchPreview from './ImageMatchPreview.vue'
 
 const caseStore = useCaseStore()
@@ -294,7 +294,7 @@ const previewImageMatch = async step => {
     if (!dump.screenshot) throw new Error('未获取到当前设备截图')
     imagePreviewScreenshot.value = `data:image/${dump.screenshot_format || 'png'};base64,${dump.screenshot}`
     const platform = dump.device_info?.platform === 'ios' ? 'ios' : 'android'
-    const imagePath = step.platform_overrides?.[platform]?.selector || step.selector
+    const imagePath = selectImagePath(step, platform)
     const config = selectImageOptions(step, platform)
     const { data } = await api.matchImage({ screenshot_base64: dump.screenshot, image_path: imagePath, ...(config ? { image_options: config } : {}) })
     if (imagePreviewVisible.value) imagePreviewResult.value = isCurrent() ? data : staleImagePreview()

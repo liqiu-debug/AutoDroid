@@ -5,6 +5,9 @@ import { Plus, Search, VideoPlay, Edit, Delete, Refresh, MoreFilled,
          Check, Close, Timer, CircleClose, FolderOpened } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
+import { submissionNotice } from '@/utils/uiRunPresentation'
+import { submitExecution, pendingExecution, settlePendingExecution, UNKNOWN_LAUNCH_MESSAGE } from '@/utils/executionLaunch'
+import { getErrorDetail } from '@/utils/errors'
 import FolderTreePanel from '@/components/FolderTreePanel.vue'
 import { deviceStatusLabel, deviceStatusTagType, runStatusColor } from '@/utils/statusMeta'
 import { useUserStore } from '@/stores/useUserStore'
@@ -125,6 +128,8 @@ const handleEdit = (id) => {
 // ==================== Run Configuration ====================
 const runDialogVisible = ref(false)
 const runPhase = ref('')
+const pendingLaunch = ref(null)
+const pendingLaunchLabel = computed(() => pendingLaunch.value ? (pendingLaunch.value.retryable ? '确认原启动结果' : '结果待确认') : '开始执行')
 const runBusy = computed(() => Boolean(runPhase.value))
 const terminatingIds = ref(new Set())
 const foldersVisible = ref(true)
@@ -136,44 +141,7 @@ const runForm = reactive({
 const environments = ref([])
 const devices = ref([])
 
-const summarizeScenarioPrecheckFailure = (payload) => {
-    if (!payload || typeof payload !== 'object') return '预检失败'
-
-    const failCase = (payload.cases || []).find(item => item?.status === 'FAIL')
-    if (failCase) {
-        const caseName = failCase.alias || failCase.case_name || `Case#${failCase.case_id || '?'}`
-        const reason = failCase.reason || '用例预检失败'
-        return `${caseName}: ${reason}`
-    }
-
-    if (!payload.has_runnable_cases) return '全部用例将被跳过（当前设备无可执行步骤）'
-    return '预检失败'
-}
-
-const summarizeHttpDetail = (err) => {
-    const detail = err?.response?.data?.detail
-    if (typeof detail === 'string' && detail) return detail
-    if (detail && typeof detail === 'object') {
-        if (detail.message) return detail.message
-        if (Array.isArray(detail.items) && detail.items.length > 0) {
-            const first = detail.items[0]
-            if (first?.device_serial || first?.reason) {
-                return `${first.device_serial || '未知设备'} - ${first.reason || '预检失败'}`
-            }
-        }
-    }
-    return err?.message || '请求失败'
-}
-
-const precheckScenarioOnDevice = async (scenarioId, serial, selectedEnvironment = runForm.envId) => {
-    try {
-        const { data } = await api.precheckScenario(scenarioId, selectedEnvironment, serial)
-        if (data?.ok) return { ok: true }
-        return { ok: false, reason: summarizeScenarioPrecheckFailure(data) }
-    } catch (err) {
-        return { ok: false, reason: `预检接口调用失败: ${summarizeHttpDetail(err)}` }
-    }
-}
+const summarizeHttpDetail = err => getErrorDetail(err)
 
 const fetchRunConfigOptions = async () => {
     try {
@@ -223,6 +191,7 @@ const scenarioStatusText = (item) => {
 const buildActiveScenarioEntry = (items, fallback = {}) => {
     const entry = {
         batch_id: items[0]?.batch_id ?? fallback.batch_id,
+        run_ids: items.map(item => item.run_id).filter(Boolean),
         execution_ids: items.map(item => item.execution_id).filter(Boolean),
         device_serials: items.map(item => item.device_serial).filter(Boolean)
     }
@@ -239,6 +208,37 @@ const buildActiveScenarioEntry = (items, fallback = {}) => {
 
 const handleRunClick = async (row) => {
     if (runBusy.value || terminatingIds.value.has(row.id)) return
+    if (activeScenarioRuns.value[row.id] && !activeScenarioRuns.value[row.id].unknown) return terminateScenarioRun(row)
+    const retained = pendingExecution('scenario', row.id)
+    if (retained) {
+        pendingLaunch.value = retained
+        runningScenarioId.value = row.id
+        runForm.envId = retained.envId ?? null
+        runForm.deviceSerials = [...retained.devices]
+        if (retained.transport === 'websocket') {
+            try {
+                const { data } = await api.getActiveRuns('scenario', row.id)
+                const items = data?.items || []
+                if (items.length) {
+                    activeScenarioRuns.value = { ...activeScenarioRuns.value, [row.id]: buildActiveScenarioEntry(items) }
+                    settlePendingExecution('scenario', row.id)
+                    pendingLaunch.value = null
+                    startActiveRunPolling()
+                    ElMessage.info('已恢复正在执行的任务')
+                    return
+                }
+                if (retained.accepted) {
+                    settlePendingExecution('scenario', row.id)
+                    pendingLaunch.value = null
+                }
+            } catch {}
+        }
+    }
+    if (pendingLaunch.value) {
+        if (Number(row.id) !== Number(pendingLaunch.value.targetId)) return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+        runDialogVisible.value = true
+        return
+    }
     if (isScenarioRunActive(row)) {
         await terminateScenarioRun(row)
         return
@@ -250,80 +250,43 @@ const handleRunClick = async (row) => {
 
 const confirmRun = async () => {
     if (runBusy.value) return
+    pendingLaunch.value = pendingLaunch.value || pendingExecution('scenario', runningScenarioId.value)
+    if (pendingLaunch.value && !pendingLaunch.value.retryable) return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
     if (!runningScenarioId.value) return
-    if (!runForm.deviceSerials || runForm.deviceSerials.length === 0) {
-        ElMessage.warning('请至少选择一台设备')
-        return
-    }
-    const targetId = runningScenarioId.value
-    const selectedEnvironment = runForm.envId
-    const selectedDevices = [...runForm.deviceSerials]
-    runPhase.value = 'prechecking'
+    if (!pendingLaunch.value && !runForm.deviceSerials?.length) return ElMessage.warning('请至少选择一台设备')
+    const selection = pendingLaunch.value || { kind: 'scenario', targetId: runningScenarioId.value, envId: runForm.envId, devices: [...runForm.deviceSerials] }
+    const targetId = selection.targetId
+    runPhase.value = 'submitting'
     try {
-        const runnable = []
-        const blocked = []
-        for (const serial of selectedDevices) {
-            const check = await precheckScenarioOnDevice(targetId, serial, selectedEnvironment)
-            if (check.ok) runnable.push(serial)
-            else blocked.push({ device_serial: serial, reason: check.reason })
-        }
-
-        if (runnable.length === 0) {
-            const first = blocked[0]
-            ElMessage.error(`运行前预检未通过：${first ? `${first.device_serial} - ${first.reason}` : '无可执行设备'}`)
-            return
-        }
-
-        runPhase.value = 'submitting'
-        const { data } = await api.runScenario(targetId, selectedEnvironment, runnable)
-        const backendBlocked = Array.isArray(data?.blocked_prechecks) ? data.blocked_prechecks : []
-        const allBlocked = blocked.concat(backendBlocked)
-
-        // 并发超限的任务会进入 FIFO 队列而非失败：区分"已开始 / 已加入队列"
+        const { data, launch } = await submitExecution(api, selection, pendingLaunch.value)
+        const notice = submissionNotice(data, launch.devices)
         const runs = Array.isArray(data?.runs) ? data.runs : []
-        const queuedRuns = runs.filter(item => item.queued)
-        const startedCount = runs.length - queuedRuns.length
-        const queuePositions = queuedRuns.map(item => item.queue_position).filter(p => Number.isFinite(p))
-        const minQueuePosition = queuePositions.length ? Math.min(...queuePositions) : null
-
-        let startMsg
-        if (queuedRuns.length === 0) {
-            startMsg = `场景已在 ${runnable.length} 台设备开始批次执行`
-        } else if (startedCount === 0) {
-            startMsg = `并发已满，场景已加入执行队列（${queuedRuns.length} 台${minQueuePosition ? `，最前第 ${minQueuePosition} 位` : ''}）`
-        } else {
-            startMsg = `已开始 ${startedCount} 台；${queuedRuns.length} 台已加入队列${minQueuePosition ? `（最前第 ${minQueuePosition} 位）` : ''}`
-        }
-
-        if (allBlocked.length > 0) {
-            const first = allBlocked[0]
-            ElMessage.warning(`${startMsg}；${allBlocked.length} 台预检失败（示例：${first.device_serial} - ${first.reason}）`)
-        } else if (queuedRuns.length > 0) {
-            ElMessage.info(startMsg)
-        } else {
-            ElMessage.success(startMsg)
-        }
-
-        runDialogVisible.value = false
-        // Optimistic update
-        const item = scenarios.value.find(s => s.id === targetId)
-        if (item) item.last_run_status = startedCount > 0 || queuedRuns.length === 0 ? 'RUNNING' : 'QUEUED'
-        const activeEntry = {
+        const queued = runs.filter(item => item.queued || String(item.status).toUpperCase() === 'QUEUED')
+        const positions = queued.map(item => item.queue_position).filter(Number.isFinite)
+        ElMessage[notice.warning ? 'warning' : queued.length ? 'info' : 'success'](notice.text)
+        const row = scenarios.value.find(item => item.id === targetId)
+        if (row) row.last_run_status = runs.length && queued.length === runs.length ? 'QUEUED' : 'RUNNING'
+        const entry = {
             batch_id: data?.batch_id,
-            execution_ids: data?.execution_ids || [],
-            device_serials: runnable
+            run_ids: data?.run_ids || runs.map(item => item.run_id).filter(Boolean),
+            execution_ids: data?.execution_ids || runs.map(item => item.execution_id).filter(Boolean),
+            device_serials: notice.devices,
         }
-        if (queuedRuns.length > 0) {
-            activeEntry.queue = { count: queuedRuns.length, position: minQueuePosition }
-        }
-        activeScenarioRuns.value = {
-            ...activeScenarioRuns.value,
-            [targetId]: activeEntry
-        }
+        if (queued.length) entry.queue = { count: queued.length, position: positions.length ? Math.min(...positions) : null }
+        activeScenarioRuns.value = { ...activeScenarioRuns.value, [targetId]: entry }
+        pendingLaunch.value = null
+        runDialogVisible.value = false
         startActiveRunPolling()
-        fetchScenarios()
     } catch (err) {
-        ElMessage.error('启动失败: ' + summarizeHttpDetail(err))
+        if (err.launchPending) {
+            pendingLaunch.value = err.launchPending
+            activeScenarioRuns.value = { ...activeScenarioRuns.value, [targetId]: { unknown: true, device_serials: selection.devices } }
+            startActiveRunPolling()
+            ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+        } else {
+            pendingLaunch.value = null
+            ElMessage.error('启动失败: ' + getErrorDetail(err))
+        }
     } finally {
         runPhase.value = ''
     }
@@ -338,6 +301,7 @@ const terminateScenarioRun = async (row) => {
             kind: 'scenario',
             target_id: row.id,
             batch_id: active.batch_id || null,
+            run_ids: active.run_ids || [],
             execution_ids: active.execution_ids || [],
             device_serials: active.device_serials || []
         })
@@ -383,11 +347,13 @@ const pollActiveScenarioRuns = async () => {
             const { data } = await api.getActiveRuns('scenario', Number(scenarioId))
             const items = data?.items || []
             if (items.length === 0) {
+                if (next[scenarioId]?.unknown) continue
                 delete next[scenarioId]
                 changed = true
                 continue
             }
             next[scenarioId] = buildActiveScenarioEntry(items, next[scenarioId])
+
             // 排队任务获得槽位后（QUEUED -> RUNNING）同步本地行状态
             const item = scenarios.value.find(s => s.id === Number(scenarioId))
             if (item && normalizeRunStatus(item.last_run_status) === 'queued' && !next[scenarioId].queue) {
@@ -660,7 +626,8 @@ onUnmounted(stopActiveRunPolling)
 
         <!-- Run Configuration Dialog -->
         <el-dialog v-model="runDialogVisible" title="运行配置" width="400px" :close-on-click-modal="!runBusy" :close-on-press-escape="!runBusy" :show-close="!runBusy">
-            <el-form :disabled="runBusy" :model="runForm" label-width="100px">
+            <el-alert v-if="pendingLaunch" title="启动结果待确认；确认按钮仅查询或重试原请求，请先查看执行状态" type="warning" :closable="false" show-icon />
+            <el-form :disabled="runBusy || Boolean(pendingLaunch)" :model="runForm" label-width="100px">
                 <el-form-item label="目标设备">
                     <el-select v-model="runForm.deviceSerials" multiple collapse-tags placeholder="选择设备 (可选)" clearable style="width: 100%">
                         <el-option
@@ -686,7 +653,7 @@ onUnmounted(stopActiveRunPolling)
                     </div>
                 </el-form-item>
                 <el-form-item label="运行环境">
-                    <el-select :disabled="runBusy" v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
+                    <el-select :disabled="runBusy || Boolean(pendingLaunch)" v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
                         <el-option
                             v-for="env in environments"
                             :key="env.id"
@@ -699,7 +666,7 @@ onUnmounted(stopActiveRunPolling)
             <template #footer>
                 <div class="dialog-footer">
                     <el-button :disabled="runBusy" @click="runDialogVisible = false">取消</el-button>
-                    <el-button type="primary" :loading="runBusy" :disabled="runBusy" @click="confirmRun">{{ runPhase === 'prechecking' ? '预检中' : runPhase === 'submitting' ? '启动中' : '开始执行' }}</el-button>
+                    <el-button type="primary" :loading="runBusy" :disabled="runBusy || Boolean(pendingLaunch && !pendingLaunch.retryable)" @click="confirmRun">{{ runPhase === 'submitting' ? '启动中' : pendingLaunchLabel }}</el-button>
                 </div>
             </template>
         </el-dialog>
@@ -715,7 +682,7 @@ onUnmounted(stopActiveRunPolling)
     >
         <div class="mobile-run-form">
             <label class="mobile-run-label">目标设备</label>
-            <el-checkbox-group :disabled="runBusy" v-model="runForm.deviceSerials" class="mobile-device-checks">
+            <el-checkbox-group :disabled="runBusy || Boolean(pendingLaunch)" v-model="runForm.deviceSerials" class="mobile-device-checks">
                 <el-checkbox
                     v-for="dev in devices"
                     :key="dev.serial"
@@ -735,7 +702,7 @@ onUnmounted(stopActiveRunPolling)
             </div>
 
             <label class="mobile-run-label">运行环境</label>
-            <el-select :disabled="runBusy" v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
+            <el-select :disabled="runBusy || Boolean(pendingLaunch)" v-model="runForm.envId" placeholder="选择环境 (可选)" clearable style="width: 100%">
                 <el-option
                     v-for="env in environments"
                     :key="env.id"
@@ -748,7 +715,7 @@ onUnmounted(stopActiveRunPolling)
         <template #footer>
             <div class="mobile-drawer-footer">
                 <el-button :disabled="runBusy" @click="runDialogVisible = false">取消</el-button>
-                <el-button type="primary" :loading="runBusy" :disabled="runBusy" @click="confirmRun">{{ runPhase === 'prechecking' ? '预检中' : runPhase === 'submitting' ? '启动中' : '开始执行' }}</el-button>
+                <el-button type="primary" :loading="runBusy" :disabled="runBusy || Boolean(pendingLaunch && !pendingLaunch.retryable)" @click="confirmRun">{{ runPhase === 'submitting' ? '启动中' : pendingLaunchLabel }}</el-button>
             </div>
         </template>
     </el-drawer>

@@ -46,7 +46,36 @@ def normalize_image_options(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
-def select_image_options(options: Any, platform: str) -> Dict[str, Any]:
+def preserve_image_references(step: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep implicit platform template identities before rewriting the default path.
+
+    Older steps bind a platform's metadata to args.image_path/path without an
+    explicit override. Preparing or caching a different platform's image must
+    not move that binding onto the newly selected default path.
+    """
+    legacy = step.get("options")
+    legacy = legacy if isinstance(legacy, dict) else {}
+    options = args.get("image_options", legacy.get("image_options"))
+    original_path = (args.get("image_path") or args.get("path") or step.get("selector")
+                     or legacy.get("image_path") or legacy.get("path") or step.get("value"))
+    if not isinstance(options, dict) or not original_path:
+        return step
+    overrides = dict(step.get("platform_overrides") or {})
+    for platform in ("android", "ios"):
+        if platform in options and platform not in overrides:
+            overrides[platform] = {"selector": original_path, "by": "image"}
+    return {**step, "platform_overrides": overrides}
+
+
+def select_image_options(options: Any, platform: str, *, image_path=None,
+                         platform_overrides=None, default_image_path=None) -> Dict[str, Any]:
+    """Select settings for the selected template, including single-platform recordings.
+
+    A borrowed template keeps its fingerprint and template-relative tap anchor.
+    Screenshot dimensions and search regions belong to the recording platform.
+    A separate legacy platform template can still run without metadata; it must
+    never inherit another template's fingerprint or anchor.
+    """
     if options is None:
         return {}
     if not isinstance(options, dict) or set(options) - {"android", "ios", "default"}:
@@ -60,4 +89,14 @@ def select_image_options(options: Any, platform: str) -> Dict[str, Any]:
         return normalized[platform]
     if "default" in normalized:
         return normalized["default"]
+    other = "ios" if platform == "android" else "android" if platform == "ios" else None
+    if other in normalized:
+        overrides = platform_overrides if isinstance(platform_overrides, dict) else {}
+        donor = overrides.get(other)
+        donor_path = (donor.get("selector") if isinstance(donor, dict)
+                      and str(donor.get("by") or "").lower() == "image" else None) or default_image_path
+        if image_path is not None and donor_path is not None and str(image_path).strip() != str(donor_path).strip():
+            return {}
+        return {key: value for key, value in normalized[other].items()
+                if key in {"template_sha256", "tap_anchor"}}
     raise ValueError(f"image_options 缺少 {platform} 平台配置，请确认该平台模板和点击位置")

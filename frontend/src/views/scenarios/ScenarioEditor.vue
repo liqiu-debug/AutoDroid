@@ -3,7 +3,9 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { VueDraggable } from 'vue-draggable-plus'
 import api from '@/api'
-import { describeRunSubmission } from '@/utils/uiRunPresentation'
+import { submissionNotice } from '@/utils/uiRunPresentation'
+import { submitExecution, pendingExecution, rememberWebsocketExecution, settlePendingExecution, UNKNOWN_LAUNCH_MESSAGE } from '@/utils/executionLaunch'
+import { getErrorDetail } from '@/utils/errors'
 import { ElMessage } from 'element-plus'
 import {
   VideoPlay, Delete, Rank, Document,
@@ -42,8 +44,16 @@ const caseTreeRef = ref(null)
 const loading = ref(false)
 const running = ref(false)
 const runPhase = ref('')
+const pendingLaunch = ref(null)
+const wsOutcomeUnknown = ref(false)
+let executionSocket = null
+let launchTimer = null
+const clearLaunchTimer = () => {
+  if (launchTimer !== null) clearTimeout(launchTimer)
+  launchTimer = null
+}
 const runBusy = computed(() => Boolean(runPhase.value) || isSaving.value)
-const runLabel = computed(() => ({ saving: '保存中', prechecking: '预检中', submitting: '启动中' }[runPhase.value] || (running.value ? '终止' : (!scenarioId.value || isDirty.value ? '保存并运行' : '运行'))))
+const runLabel = computed(() => ({ saving: '保存中', prechecking: '预检中', submitting: '启动中' }[runPhase.value] || (pendingLaunch.value || wsOutcomeUnknown.value ? '结果待确认' : running.value ? '终止' : (!scenarioId.value || isDirty.value ? '保存并运行' : '运行'))))
 const activeRun = ref(null)
 const terminatingRun = ref(false)
 const ACTIVE_RUN_POLL_INTERVAL_MS = 3000
@@ -123,6 +133,7 @@ onMounted(async () => {
     }
     updateSnapshot()
     fetchEnvironments()
+    pendingLaunch.value = pendingExecution('scenario', scenarioId.value)
     restoreActiveRun()
 })
 
@@ -298,20 +309,7 @@ const summarizeScenarioPrecheckFailure = (payload) => {
   return '预检失败'
 }
 
-const summarizeHttpDetail = (err) => {
-  const detail = err?.response?.data?.detail
-  if (typeof detail === 'string' && detail) return detail
-  if (detail && typeof detail === 'object') {
-    if (detail.message) return detail.message
-    if (Array.isArray(detail.items) && detail.items.length > 0) {
-      const first = detail.items[0]
-      if (first?.device_serial || first?.reason) {
-        return `${first.device_serial || '未知设备'} - ${first.reason || '预检失败'}`
-      }
-    }
-  }
-  return err?.message || '请求失败'
-}
+const summarizeHttpDetail = err => getErrorDetail(err)
 
 const precheckScenarioOnDevice = async (serial, selectedEnvironment = envId.value, targetId = scenarioId.value) => {
   try {
@@ -324,19 +322,29 @@ const precheckScenarioOnDevice = async (serial, selectedEnvironment = envId.valu
 }
 
 const runScenario = async (selectedSerial) => {
+  if (!runBusy.value && running.value && activeRun.value && !activeRun.value.unknown) return terminateActiveRun()
+  pendingLaunch.value = pendingLaunch.value || pendingExecution('scenario', scenarioId.value)
   if (runBusy.value) return false
+  if (pendingLaunch.value || wsOutcomeUnknown.value) {
+    await restoreActiveRun()
+    ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+    return false
+  }
   if (running.value) {
     await terminateActiveRun()
     return false
   }
   const selectedEnvironment = envId.value
+  let connected = false
   runPhase.value = 'saving'
   try {
   if (!await ensureSaved()) return false
   const targetId = scenarioId.value
+  await api.ensureScenarioExecutionAllowed(targetId)
+  const info = await api.getExecutionCapabilities()
   runPhase.value = 'prechecking'
 
-  if (selectedSerial) {
+  if (!(info.clientMode === true && info.execution_preflight_v1 === true) && selectedSerial) {
     const check = await precheckScenarioOnDevice(selectedSerial, selectedEnvironment, targetId)
     if (!check.ok) {
       ElMessage.error(`运行前预检失败: ${check.reason}`)
@@ -345,10 +353,10 @@ const runScenario = async (selectedSerial) => {
   }
 
   runPhase.value = 'submitting'
-  running.value = true
   activeRun.value = {
     kind: 'scenario',
     target_id: Number(targetId),
+    unknown: true,
     device_serials: selectedSerial ? [selectedSerial] : []
   }
   if (logConsoleRef.value) {
@@ -367,15 +375,38 @@ const runScenario = async (selectedSerial) => {
       wsUrl += `?${queryParams.join('&')}`
   }
   
+  const previous = executionSocket
+  clearLaunchTimer()
+  rememberWebsocketExecution('scenario', targetId, selectedSerial ? [selectedSerial] : [])
   const ws = new WebSocket(wsUrl)
+  executionSocket = ws
+  previous?.close()
+  connected = true
+  let terminal = false
+  let connectionLost = false
+  const isCurrent = () => executionSocket === ws
+  const markUnknown = () => {
+    if (!isCurrent() || terminal || connectionLost) return
+    connectionLost = true
+    clearLaunchTimer()
+    const accepted = Boolean(activeRun.value?.run_ids?.length || activeRun.value?.execution_ids?.length)
+    wsOutcomeUnknown.value = !accepted
+    runPhase.value = ''
+    if (activeRun.value) activeRun.value.unknown = !accepted
+    startActiveRunPolling()
+    ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+  }
+  launchTimer = setTimeout(markUnknown, 60000)
   
   ws.onopen = () => {
+      if (!isCurrent()) return
       if (logConsoleRef.value) {
           logConsoleRef.value.appendLog({ status: 'info', log: '🔌 WebSocket 连接已建立' })
       }
   }
 
   ws.onmessage = (event) => {
+      if (!isCurrent()) return
       try {
           const data = JSON.parse(event.data)
           if (data.type === 'log') {
@@ -393,15 +424,27 @@ const runScenario = async (selectedSerial) => {
                    })
                }
           } else if (data.type === 'run_start') {
+              clearLaunchTimer()
+              runPhase.value = ''
+              running.value = true
+              wsOutcomeUnknown.value = false
+              rememberWebsocketExecution('scenario', targetId, data.device_serial ? [data.device_serial] : [], true)
+              pendingLaunch.value = null
               startActiveRunPolling()
               activeRun.value = {
                   kind: 'scenario',
                   target_id: Number(targetId),
                   batch_id: data.batch_id,
+                  run_ids: data.run_id ? [data.run_id] : [],
                   execution_ids: data.execution_id ? [data.execution_id] : [],
                   device_serials: data.device_serial ? [data.device_serial] : []
               }
           } else if (data.type === 'run_complete') {
+              clearLaunchTimer()
+              terminal = true
+              settlePendingExecution('scenario', targetId)
+              wsOutcomeUnknown.value = false
+              runPhase.value = ''
               running.value = false
               activeRun.value = null
               stopActiveRunPolling()
@@ -423,34 +466,18 @@ const runScenario = async (selectedSerial) => {
       }
   }
 
-  ws.onerror = (e) => {
-      console.error('WebSocket error', e)
-      if (logConsoleRef.value) {
-          logConsoleRef.value.appendLog({ status: 'failed', log: '❌ WebSocket 连接错误' })
-      }
-      running.value = false
-      ElMessage.error('连接服务失败')
-  }
-
-  ws.onclose = () => {
-      if (running.value) {
-           running.value = false
-           activeRun.value = null
-           stopActiveRunPolling()
-           if (logConsoleRef.value) {
-               logConsoleRef.value.appendLog({ status: 'warning', log: '🔌 连接已断开' })
-           }
-      }
-  }
+  ws.onerror = () => markUnknown()
+  ws.onclose = () => markUnknown()
   return true
   } catch (err) {
+    settlePendingExecution('scenario', scenarioId.value)
     running.value = false
     activeRun.value = null
     stopActiveRunPolling()
     ElMessage.error('启动失败: ' + summarizeHttpDetail(err))
     return false
   } finally {
-    runPhase.value = ''
+    if (!connected) runPhase.value = ''
   }
 }
 
@@ -462,70 +489,53 @@ const multiRunForm = ref({
 })
 
 const submitMultiRun = async () => {
-  if (runBusy.value || running.value) return
-  if (multiRunForm.value.deviceSerials.length === 0) {
-    ElMessage.warning('请至少选择一台设备')
+  pendingLaunch.value = pendingLaunch.value || pendingExecution('scenario', scenarioId.value)
+  if (runBusy.value || (running.value && !pendingLaunch.value) || wsOutcomeUnknown.value) return
+  if (pendingLaunch.value && !pendingLaunch.value.retryable) return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+  if (!pendingLaunch.value && !multiRunForm.value.deviceSerials.length) return ElMessage.warning('请至少选择一台设备')
+  if (!pendingLaunch.value && multiRunForm.value.deviceSerials.length === 1) {
+    const started = await runScenario(multiRunForm.value.deviceSerials[0])
+    if (started) runDialogVisible.value = false
     return
   }
-
-  // Single Selection: Use Real-time WebSocket execution
-  if (multiRunForm.value.deviceSerials.length === 1) {
-      const started = await runScenario(multiRunForm.value.deviceSerials[0])
-      if (started) runDialogVisible.value = false
-      return
-  }
-
-  // Multiple Selection: Background Batch Execution
   const selectedEnvironment = envId.value
   const selectedDevices = [...multiRunForm.value.deviceSerials]
   runPhase.value = 'saving'
   try {
-    if (!await ensureSaved()) return
-    const targetId = scenarioId.value
-    runPhase.value = 'prechecking'
-    const runnable = []
-    const blocked = []
-    for (const serial of selectedDevices) {
-      const check = await precheckScenarioOnDevice(serial, selectedEnvironment, targetId)
-      if (check.ok) runnable.push(serial)
-      else blocked.push({ device_serial: serial, reason: check.reason })
-    }
-
-    if (runnable.length === 0) {
-      const first = blocked[0]
-      ElMessage.error(`运行前预检未通过：${first ? `${first.device_serial} - ${first.reason}` : '无可执行设备'}`)
-      return
-    }
-
+    if (!pendingLaunch.value && !await ensureSaved()) return
+    const selection = pendingLaunch.value || { kind: 'scenario', targetId: scenarioId.value, envId: selectedEnvironment, devices: selectedDevices }
     runPhase.value = 'submitting'
-    const { data } = await api.runScenario(targetId, selectedEnvironment, runnable)
-    const backendBlocked = Array.isArray(data?.blocked_prechecks) ? data.blocked_prechecks : []
-    const allBlocked = blocked.concat(backendBlocked)
-    const submissionText = describeRunSubmission(data, runnable.length)
-    if (allBlocked.length > 0) {
-      const first = allBlocked[0]
-      ElMessage.warning(`${submissionText}；${allBlocked.length} 台预检失败（示例：${first.device_serial} - ${first.reason}）`)
-    } else {
-      ElMessage.success(submissionText)
-    }
+    const { data, launch } = await submitExecution(api, selection, pendingLaunch.value)
+    const notice = submissionNotice(data, launch.devices)
+    ElMessage[notice.warning ? 'warning' : 'success'](notice.text)
     activeRun.value = {
-      kind: 'scenario',
-      target_id: Number(scenarioId.value),
-      batch_id: data?.batch_id,
-      execution_ids: data?.execution_ids || [],
-      device_serials: runnable
+      kind: 'scenario', target_id: Number(launch.targetId), batch_id: data?.batch_id,
+      run_ids: data?.run_ids || data?.runs?.map(item => item.run_id).filter(Boolean) || [],
+      execution_ids: data?.execution_ids || data?.runs?.map(item => item.execution_id).filter(Boolean) || [],
+      device_serials: notice.devices,
     }
+    pendingLaunch.value = null
     running.value = true
     startActiveRunPolling()
     runDialogVisible.value = false
   } catch (err) {
-    ElMessage.error('启动批量执行失败: ' + summarizeHttpDetail(err))
+    if (err.launchPending) {
+      pendingLaunch.value = err.launchPending
+      activeRun.value = { kind: 'scenario', target_id: Number(err.launchPending.targetId), unknown: true, device_serials: err.launchPending.devices }
+      startActiveRunPolling()
+      ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+    } else {
+      pendingLaunch.value = null
+      ElMessage.error('启动批量执行失败: ' + getErrorDetail(err))
+    }
   } finally {
     runPhase.value = ''
   }
 }
 
 const openRunDialog = async () => {
+  if (!runBusy.value && running.value && activeRun.value && !activeRun.value.unknown) return terminateActiveRun()
+  if (pendingLaunch.value || wsOutcomeUnknown.value) return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
   if (runBusy.value || terminatingRun.value) return
   if (running.value) {
     await terminateActiveRun()
@@ -548,9 +558,17 @@ const terminateActiveRun = async () => {
       kind: 'scenario',
       target_id: Number(scenarioId.value),
       batch_id: activeRun.value.batch_id || null,
+      run_ids: activeRun.value.run_ids || [],
       execution_ids: activeRun.value.execution_ids || [],
       device_serials: activeRun.value.device_serials || []
     })
+    const unresolved = pendingLaunch.value || pendingExecution('scenario', scenarioId.value)
+    if (!unresolved || unresolved.transport === 'websocket') {
+      settlePendingExecution('scenario', scenarioId.value)
+      pendingLaunch.value = null
+    } else {
+      pendingLaunch.value = unresolved
+    }
     ElMessage.warning('已发送终止请求')
     logConsoleRef.value?.markAborted?.()
     running.value = false
@@ -568,15 +586,34 @@ const restoreActiveRun = async () => {
   try {
     const { data } = await api.getActiveRuns('scenario', Number(scenarioId.value))
     const items = data?.items || []
-    if (items.length === 0) return
+    if (items.length === 0) {
+      const retained = pendingLaunch.value || pendingExecution('scenario', scenarioId.value)
+      if (retained?.transport === 'websocket' && retained.accepted) {
+        settlePendingExecution('scenario', scenarioId.value)
+        pendingLaunch.value = null
+        wsOutcomeUnknown.value = false
+        runPhase.value = ''
+        running.value = false
+        activeRun.value = null
+        stopActiveRunPolling()
+      }
+      return
+    }
     activeRun.value = {
       kind: 'scenario',
       target_id: Number(scenarioId.value),
       batch_id: items[0]?.batch_id,
+      run_ids: items.map(item => item.run_id).filter(Boolean),
       execution_ids: items.map(item => item.execution_id).filter(Boolean),
       device_serials: items.map(item => item.device_serial).filter(Boolean)
     }
     running.value = true
+    wsOutcomeUnknown.value = false
+    if (pendingExecution('scenario', scenarioId.value)?.transport === 'websocket' || pendingLaunch.value?.transport === 'websocket') {
+      settlePendingExecution('scenario', scenarioId.value)
+      pendingLaunch.value = null
+    }
+    runPhase.value = ''
     startActiveRunPolling()
   } catch {}
 }
@@ -586,9 +623,18 @@ const pollActiveRun = async () => {
   try {
     const { data } = await api.getActiveRuns('scenario', Number(scenarioId.value))
     if ((data?.items || []).length === 0) {
+      if (activeRun.value.unknown) return
+      if (pendingExecution('scenario', scenarioId.value)?.transport === 'websocket' || pendingLaunch.value?.transport === 'websocket') {
+        settlePendingExecution('scenario', scenarioId.value)
+        pendingLaunch.value = null
+      }
+      wsOutcomeUnknown.value = false
+      runPhase.value = ''
       running.value = false
       activeRun.value = null
       stopActiveRunPolling()
+    } else if (activeRun.value.unknown) {
+      await restoreActiveRun()
     }
   } catch {}
 }
@@ -608,7 +654,13 @@ const stopActiveRunPolling = () => {
   activeRunPollLoop.stop()
 }
 
-onUnmounted(stopActiveRunPolling)
+onUnmounted(() => {
+  clearLaunchTimer()
+  stopActiveRunPolling()
+  const previous = executionSocket
+  executionSocket = null
+  previous?.close()
+})
 
 const isDeviceSelectable = (device) => device?.status === 'IDLE'
 
@@ -705,6 +757,10 @@ const getStepTitle = (step) => {
         <el-button :type="running ? 'danger' : 'primary'" :icon="running ? CircleClose : VideoPlay" @click="openRunDialog" :disabled="runBusy || terminatingRun">{{ runLabel }}</el-button>
       </div>
     </header>
+    <el-alert v-if="pendingLaunch || wsOutcomeUnknown" :title="UNKNOWN_LAUNCH_MESSAGE" type="warning" :closable="false" show-icon>
+      <el-button v-if="pendingLaunch?.retryable" :disabled="runBusy" @click="submitMultiRun">确认原启动结果</el-button>
+      <el-button :disabled="runBusy" @click="restoreActiveRun">查看执行状态</el-button>
+    </el-alert>
     <el-container class="scenario-builder">
     
     <!-- Left: Case Library -->

@@ -63,9 +63,6 @@ RECORDING_IOS_IDLE_TTL_SECONDS = 45.0
 # Android u2 连接缓存空闲回收时间；u2 Device 本身无长连接资源，仅避免无限膨胀
 RECORDING_ANDROID_IDLE_TTL_SECONDS = 300.0
 
-# dump 截图统一编码为 JPEG 的质量：截图是图像模板裁剪的素材源，
-# q90 的压缩痕迹对灰度模板匹配（阈值 0.95）影响可忽略，体积比 PNG 小 5-10 倍
-RECORDING_SCREENSHOT_JPEG_QUALITY = 90
 NETWORK_DEVICE_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
 
 # 大 JSON 响应 gzip 阈值：层级 XML 压缩比 5-10×，浏览器与平台之间
@@ -304,9 +301,9 @@ def _image_bytes_format(raw: bytes) -> str:
 def _take_screenshot_payload(device, serial: Optional[str] = None) -> Tuple[str, str]:
     """截取设备屏幕，返回 (base64, 图像格式)。
 
-    PIL 图像统一编码为原分辨率 JPEG（体积小、编码快）；驱动直接返回的
-    压缩字节流按魔数标注格式后透传，不做二次编码。分辨率保持原样：
-    截图是模板裁剪素材源，模板匹配多尺度范围有限（0.8-1.2），不可缩放。
+    PIL 图像编码为原分辨率无损 PNG；驱动返回的原始压缩字节流透传。
+    dump 同时用于模板裁剪和定位验证，必须保留执行截图中的像素，
+    避免 JPEG 噪点成为细线图标的匹配特征。设备展示预览使用独立链路。
     """
     started_at = time.monotonic()
     try:
@@ -318,12 +315,12 @@ def _take_screenshot_payload(device, serial: Optional[str] = None) -> Tuple[str,
             )
             return base64.b64encode(raw).decode("utf-8"), _image_bytes_format(raw)
         buffered = io.BytesIO()
-        image.convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
+        image.convert("RGB").save(buffered, format="PNG", compress_level=1)
         raw = buffered.getvalue()
         device_transport_metrics.record(
             str(serial or ""), "recording_screenshot", time.monotonic() - started_at, byte_count=len(raw)
         )
-        return base64.b64encode(raw).decode("utf-8"), "jpeg"
+        return base64.b64encode(raw).decode("utf-8"), "png"
     except Exception:
         device_transport_metrics.record(
             str(serial or ""), "recording_screenshot", time.monotonic() - started_at, success=False

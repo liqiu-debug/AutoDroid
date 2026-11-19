@@ -30,9 +30,20 @@ STATUS_LABELS = {
 
 def image_failure(diagnostic):
     status = diagnostic["status"]
+    label = STATUS_LABELS.get(status, status)
+    suggestion = None
+    if status == "unstable":
+        label = {
+            "deadline_exceeded": "图像定位计算超时，未完成匹配验证",
+            "screenshot_deadline": "获取设备截图超时，未完成图像定位",
+        }.get(diagnostic.get("reason"), label)
+        suggestion = {
+            "deadline_exceeded": "请检查定位耗时，缩小模板或搜索区域，必要时调整步骤超时。",
+            "screenshot_deadline": "请检查设备连接与截图服务是否响应，恢复后重试。",
+        }.get(diagnostic.get("reason"))
     return ExecutionStepRuntimeError(STATUS_CODES.get(status, E2005_IMAGE_NOT_MATCHED),
-                                     f"{STATUS_LABELS.get(status, status)}: {diagnostic.get('reason', '')}",
-                                     context={"image_match": diagnostic})
+                                     f"{label}: {diagnostic.get('reason', '')}",
+                                     context={"image_match": diagnostic}, suggestion=suggestion)
 
 
 def bounded_image_read(capture, deadline):
@@ -88,6 +99,8 @@ def locate_stable_image(capture, image_path, image_options=None, timeout=10, abo
                              "point": None, "candidates": [], "timings": {}}) from exc
     previous = None
     saw_match = False
+    last_complete = None
+    frames_checked = 0
     last = {"status": "not_found", "reason": "no_verified_candidate", "matcher_version": MATCHER_VERSION,
             "point": None, "candidates": [], "timings": {}}
     while time.monotonic() < deadline:
@@ -101,6 +114,9 @@ def locate_stable_image(capture, image_path, image_options=None, timeout=10, abo
         last = match_image(screen, template, config, deadline=deadline)
         if last["status"] in {"ambiguous", "invalid_template", "unsupported"}:
             raise image_failure(last)
+        if last["status"] in {"matched", "not_found"}:
+            last_complete = last
+            frames_checked += 1
         if last["status"] == "matched":
             saw_match = True
             if previous is not None and stable_match(previous, last) and time.monotonic() < deadline:
@@ -121,8 +137,20 @@ def locate_stable_image(capture, image_path, image_options=None, timeout=10, abo
                 raise RuntimeError(USER_ABORT_MESSAGE)
         else:
             time.sleep(min(0.15, remaining))
+    timeout_reason = last.get("reason", "")
+    if timeout_reason not in {"deadline_exceeded", "screenshot_deadline"}:
+        timeout_reason = "deadline_exceeded"
     if saw_match or last["status"] == "matched":
-        last = {**last, "status": "unstable", "reason": "target_not_stable"}
+        last = {**(last_complete or last), "status": "unstable", "reason": "target_not_stable"}
+    elif last_complete is not None:
+        # A final, incomplete attempt must not overwrite the verified absence
+        # and candidate metrics from earlier frames with a stability error.
+        last = {**last_complete}
+    elif last["status"] == "not_found":
+        last = {**last, "status": "unstable", "reason": "deadline_exceeded"}
     last["point"] = None
+    last["timed_out"] = True
+    last["timeout_reason"] = timeout_reason
+    last["frames_checked"] = frames_checked
     last["timings"]["localization_ms"] = round((time.monotonic() - started) * 1000, 2)
     raise image_failure(last)

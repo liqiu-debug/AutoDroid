@@ -63,9 +63,16 @@ const runStatus = ref('idle') // idle, running, success, failed
 const reportId = ref(null)
 const logContainer = ref(null)
 let ws = null
+let launchTimer = null
+const clearLaunchTimer = () => {
+  if (launchTimer !== null) clearTimeout(launchTimer)
+  launchTimer = null
+}
 
 const statusText = computed(() => {
   switch (runStatus.value) {
+    case 'submitting': return '启动中...'
+    case 'unknown': return '执行状态待确认'
     case 'running': return '执行中...'
     case 'success': return '✓ 完成'
     case 'failed': return '✗ 失败'
@@ -78,12 +85,13 @@ const reportUrl = computed(() => api.getReportAssetUrl(reportId.value))
 
 // 连接 WebSocket
 const connect = (caseId, envId = null, deviceSerial = null) => {
-  if (ws) {
-    ws.close()
-  }
+  clearLaunchTimer()
+  const previous = ws
+  ws = null
+  previous?.close()
   
   logs.value = []
-  runStatus.value = 'running'
+  runStatus.value = 'submitting'
   reportId.value = null
   
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -97,9 +105,21 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
     wsUrl += `?${queryParams.join('&')}`
   }
   
-  ws = new WebSocket(wsUrl)
+  const socket = new WebSocket(wsUrl)
+  ws = socket
+  const isCurrent = () => ws === socket
+  let terminal = false
+  let started = false
+  const markUnknown = () => {
+    if (!isCurrent() || terminal || runStatus.value === 'unknown') return
+    clearLaunchTimer()
+    runStatus.value = 'unknown'
+    emit('runError', { case_id: caseId, outcomeUnknown: true, message: '执行连接已断开，启动结果待确认' })
+  }
+  launchTimer = setTimeout(markUnknown, 60000)
   
-  ws.onopen = () => {
+  socket.onopen = () => {
+    if (!isCurrent()) return
     logs.value.push({
       timestamp: new Date().toISOString(),
       status: 'info',
@@ -107,16 +127,20 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
     })
   }
   
-  ws.onmessage = (event) => {
+  socket.onmessage = (event) => {
+    if (!isCurrent()) return
     const data = JSON.parse(event.data)
     
     if (data.type === 'run_start') {
+      clearLaunchTimer()
+      started = true
+      runStatus.value = 'running'
       logs.value.push({
         timestamp: data.timestamp,
         status: 'info',
         log: `📋 开始执行用例: ${data.case_name} (${data.total_steps} 步)`
       })
-      emit('runStart', data)
+      emit('runStart', { ...data, case_id: caseId })
     }
     
     if (data.type === 'step_update') {
@@ -134,6 +158,8 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
     }
     
     if (data.type === 'run_complete') {
+      clearLaunchTimer()
+      terminal = true
       runStatus.value = data.status === 'ABORTED' ? 'aborted' : (data.success ? 'success' : 'failed')
       reportId.value = data.report_id
       
@@ -143,12 +169,17 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
         log: `${data.status === 'ABORTED' ? '已终止' : (data.success ? '✓' : '✗')} 执行完成: ${data.passed} 通过, ${data.failed} 失败 (${data.total_duration}s)`
       })
       
-      emit('runComplete', data)
+      emit('runComplete', { ...data, case_id: caseId })
     }
     
     if (data.type === 'error') {
-      emit('runError', data)
-      runStatus.value = 'failed'
+      if (started) markUnknown()
+      else {
+        clearLaunchTimer()
+        terminal = true
+        emit('runError', { ...data, case_id: caseId })
+        runStatus.value = 'failed'
+      }
       logs.value.push({
         timestamp: new Date().toISOString(),
         status: 'failed',
@@ -157,22 +188,13 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
     }
   }
   
-  ws.onerror = (err) => {
-    emit('runError', err)
-    runStatus.value = 'failed'
-    logs.value.push({
-      timestamp: new Date().toISOString(),
-      status: 'failed',
-      log: '❌ WebSocket 连接错误'
-    })
+  socket.onerror = () => {
+    if (!isCurrent()) return
+    markUnknown()
+    logs.value.push({ timestamp: new Date().toISOString(), status: 'warning', log: '执行连接异常，请查看执行状态' })
   }
-  
-  ws.onclose = () => {
-    if (runStatus.value === 'running') {
-      runStatus.value = 'idle'
-      emit('runError', { message: '执行连接已断开' })
-    }
-  }
+  socket.onclose = () => markUnknown()
+
 }
 
 const scrollToBottom = () => {
@@ -190,6 +212,10 @@ const formatTime = (isoString) => {
 }
 
 const clear = () => {
+  clearLaunchTimer()
+  const previous = ws
+  ws = null
+  previous?.close()
   logs.value = []
   runStatus.value = 'idle'
   reportId.value = null
@@ -208,6 +234,10 @@ const setReportId = (id) => {
 }
 
 const markAborted = () => {
+  clearLaunchTimer()
+  const previous = ws
+  ws = null
+  previous?.close()
   runStatus.value = 'aborted'
   logs.value.push({
     timestamp: new Date().toISOString(),
@@ -227,9 +257,10 @@ defineExpose({
 })
 
 onUnmounted(() => {
-  if (ws) {
-    ws.close()
-  }
+  clearLaunchTimer()
+  const previous = ws
+  ws = null
+  previous?.close()
 })
 </script>
 

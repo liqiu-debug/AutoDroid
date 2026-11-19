@@ -148,13 +148,31 @@ api.interceptors.response.use(
 )
 
 const IMAGE_MATCHER_UPGRADE_MESSAGE = '请升级桌面客户端以使用高精度图像功能'
+const RUN_START_TIMEOUT_MS = 60000
 let imageClientInfoPromise = null
+let executionSessionRevision = 0
+let capabilitySession = null
+let executionSessionToken = null
+const executionSessionKey = () => {
+    let token = ''
+    try { token = localStorage.getItem('token') || '' } catch { /* test / SSR */ }
+    if (token !== executionSessionToken) {
+        executionSessionToken = token
+        executionSessionRevision += 1
+    }
+    return String(executionSessionRevision)
+}
 const imageMatcherSupported = info => {
     const capability = info?.image_matcher
     return capability?.version === 'strict-v1' && capability.validated === true
         && capability.preview === true && capability.metadata === true
 }
 const imageClientInfo = () => {
+    const session = executionSessionKey()
+    if (session !== capabilitySession) {
+        imageClientInfoPromise = null
+        capabilitySession = session
+    }
     if (!imageClientInfoPromise) {
         imageClientInfoPromise = api.get('/client/info', { silent401: true }).then(response => response?.data || {}).catch(error => {
             if (error.response?.status === 404 && !desktopBridge()) return { clientMode: false }
@@ -163,6 +181,20 @@ const imageClientInfo = () => {
         })
     }
     return imageClientInfoPromise
+}
+const executionCapabilities = async (options = {}) => {
+    if (options.refresh) imageClientInfoPromise = null
+    return imageClientInfo()
+}
+const launchRequestConfig = async launch => {
+    const config = { timeout: RUN_START_TIMEOUT_MS }
+    if (!launch?.requestId) return config
+    const info = await imageClientInfo()
+    if (info.clientMode !== true || info.launch_idempotency !== true || info.engine_instance_id !== launch.engineInstanceId) {
+        throw new Error('桌面引擎已变化，请查看原执行记录后再运行')
+    }
+    config.headers = { 'Idempotency-Key': launch.requestId, 'X-AutoDroid-Engine-Instance': launch.engineInstanceId }
+    return config
 }
 const assertImageMatcher = async () => {
     const info = await imageClientInfo()
@@ -192,6 +224,10 @@ const assertScenarioImageMatcher = async id => {
 
 export default {
     ensureImageMatcher: assertImageMatcher,
+    ensureCaseExecutionAllowed: assertCaseImageMatcher,
+    ensureScenarioExecutionAllowed: assertScenarioImageMatcher,
+    getExecutionCapabilities: executionCapabilities,
+    getExecutionSessionKey: executionSessionKey,
     // Typed, device-independent HTTP automation. Uses the same auth interceptors.
     apiTesting: {
         // 一次性 GET（详情/首载大载荷）：默认全局 30s；真轮询调用处显式传
@@ -207,6 +243,8 @@ export default {
     // options.server: 客户端（桌面引擎）模式下的上游服务器地址，随 X-AutoDroid-Server
     // 头交给本地引擎归一化后反代；纯 Web 模式不传该头，行为不变。
     login(data, options = {}) {
+        executionSessionRevision += 1
+        imageClientInfoPromise = null
         const config = {}
         const server = typeof options?.server === 'string' ? options.server.trim() : ''
         if (server) config.headers = { 'X-AutoDroid-Server': server }
@@ -258,25 +296,25 @@ export default {
     createTestCase(data) {
         return api.post('/cases/', data)
     },
-    async runTestCase(id) {
+    async runTestCase(id, launch) {
         await assertCaseImageMatcher(id)
         // Sync run (deprecated for long runs but kept for simple ones)
-        return api.post(`/cases/${id}/run`, null, { timeout: 300000 })
+        return api.post(`/cases/${id}/run`, null, await launchRequestConfig(launch))
     },
-    async runTestCaseAsync(id, envId, deviceSerial) {
+    async runTestCaseAsync(id, envId, deviceSerial, launch) {
         await assertCaseImageMatcher(id)
         let qs = []
         if (envId) qs.push(`env_id=${envId}`)
         if (deviceSerial) qs.push(`device_serial=${deviceSerial}`)
         const qsStr = qs.length ? `?${qs.join('&')}` : ''
-        return api.post(`/cases/${id}/run${qsStr}`)
+        return api.post(`/cases/${id}/run${qsStr}`, null, await launchRequestConfig(launch))
     },
-    async runTestCaseBatch(id, envId, deviceSerials) {
+    async runTestCaseBatch(id, envId, deviceSerials, launch) {
         await assertCaseImageMatcher(id)
         return api.post(`/cases/${id}/run-batch`, {
             env_id: envId || null,
             device_serials: Array.isArray(deviceSerials) ? deviceSerials : (deviceSerials ? [deviceSerials] : [])
-        })
+        }, await launchRequestConfig(launch))
     },
     async precheckTestCase(id, envId, deviceSerial) {
         await assertCaseImageMatcher(id)
@@ -400,12 +438,12 @@ export default {
     deleteScenario(id) {
         return api.delete(`/scenarios/${id}`)
     },
-    async runScenario(id, envId, deviceSerials) {
+    async runScenario(id, envId, deviceSerials, launch) {
         await assertScenarioImageMatcher(id)
         return api.post(`/scenarios/${id}/run`, {
             env_id: envId || null,
             device_serials: Array.isArray(deviceSerials) ? deviceSerials : (deviceSerials ? [deviceSerials] : [])
-        })
+        }, await launchRequestConfig(launch))
     },
     async precheckScenario(id, envId, deviceSerial) {
         await assertScenarioImageMatcher(id)

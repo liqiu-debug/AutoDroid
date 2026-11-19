@@ -99,6 +99,42 @@ class StrictImageMatchTests(unittest.TestCase):
                 compressed = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
                 self.assertEqual(match_image(frame(compressed), template)["status"], "matched")
 
+    def test_sparse_jpeg_recording_matches_lossless_frames(self):
+        # Recording used full-frame JPEG q90 before cropping the template;
+        # execution reads lossless PNG. Background pixels must not set the
+        # contour threshold or compression ringing becomes foreground.
+        for side in (60, 100, 160):
+            for thickness in (1, 2, 3):
+                with self.subTest(side=side, thickness=thickness):
+                    screen = np.full((side + 80, side + 100, 3), 255, np.uint8)
+                    center = np.array([30 + side // 2, 40 + side // 2])
+                    points = center + np.array([[6, -12], [-6, 0], [6, 12]])
+                    cv2.polylines(screen, [points], False, (20, 20, 20), thickness, cv2.LINE_AA)
+                    _, encoded = cv2.imencode(".jpg", screen, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    recorded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                    template = recorded[40:40 + side, 30:30 + side]
+                    result = match_image(screen, template)
+                    self.assertEqual(result["status"], "matched", result)
+                    self.assertEqual(result["rect"], [30, 40, side, side])
+                    self.assertGreaterEqual(result["candidates"][0]["metrics"]["edge_coverage"], .88)
+
+    def test_sparse_jpeg_template_still_rejects_blank_changed_shape_and_duplicates(self):
+        side = 100
+        template = np.full((side, side, 3), 255, np.uint8)
+        cv2.polylines(template, [np.array([[56, 38], [44, 50], [56, 62]])], False, (20, 20, 20), 1, cv2.LINE_AA)
+        _, encoded = cv2.imencode(".jpg", template, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        compressed = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        blank = np.full((240, 320, 3), 255, np.uint8)
+        self.assertEqual(match_image(blank, compressed)["status"], "not_found")
+        changed = np.flip(template, axis=1).copy()
+        wrong = blank.copy()
+        wrong[40:140, 30:130] = changed
+        self.assertEqual(match_image(wrong, compressed)["status"], "not_found")
+        duplicate = blank.copy()
+        duplicate[20:120, 20:120] = template
+        duplicate[130:230, 190:290] = template
+        self.assertEqual(match_image(duplicate, compressed)["status"], "ambiguous")
+
     def test_size_change_uses_recorded_resolution(self):
         template = icon()
         scaled = cv2.resize(template, (60, 60))
@@ -119,7 +155,7 @@ class StrictImageMatchTests(unittest.TestCase):
                        {"template_sha256": "a" * 64, "search_region": None}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 normalize_image_options(config)
-        for config in ({"ios": None}, {"ios": {}}, {"ios": {"template_sha256": "a" * 64}}):
+        for config in ({"ios": None}, {"ios": {}}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 select_image_options(config, "android")
 

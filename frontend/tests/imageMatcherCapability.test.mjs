@@ -97,3 +97,40 @@ test('partial capability declarations cannot silently enable image matching', as
     await assert.rejects(() => context.api.ensureImageMatcher(), upgradeMessage)
   }
 })
+
+test('execution capabilities share the cached image probe and require explicit preflight support', async () => {
+  const context = setup({ info: { ...upgraded,execution_preflight_v1:true,launch_idempotency:true,engine_instance_id:'engine-a' } })
+  await context.api.ensureCaseExecutionAllowed(1)
+  await context.api.ensureScenarioExecutionAllowed(10)
+  assert.equal((await context.api.getExecutionCapabilities()).execution_preflight_v1,true)
+  assert.equal(context.calls.filter(call => call[1] === '/client/info').length,1)
+  const legacy = setup({info:{...upgraded}})
+  assert.notEqual((await legacy.api.getExecutionCapabilities()).execution_preflight_v1,true)
+})
+
+test('all HTTP launch APIs explicitly set sixty seconds and carry supported idempotency headers', async () => {
+  const context = setup({ info:{...upgraded,launch_idempotency:true,engine_instance_id:'engine-a'} })
+  const posted = []
+  context.instance.post = async (...args) => { posted.push(args); return {data:{}} }
+  const launch = {requestId:'original',engineInstanceId:'engine-a'}
+  await context.api.runTestCase(1,launch)
+  await context.api.runTestCaseAsync(1,2,'usb',launch)
+  await context.api.runTestCaseBatch(1,2,['usb'],launch)
+  await context.api.runScenario(2,2,['usb'],launch)
+  assert.equal(posted.length,4)
+  for (const [,,config] of posted) {
+    assert.equal(config.timeout,60000)
+    assert.deepEqual(config.headers,{'Idempotency-Key':'original','X-AutoDroid-Engine-Instance':'engine-a'})
+  }
+  await context.api.runScenario(2,2,['usb'])
+  assert.equal(posted.at(-1)[2].timeout,60000)
+  assert.equal(posted.at(-1)[2].headers,undefined)
+})
+
+test('new launch credentials cannot silently fall back to a legacy or changed engine', async () => {
+  for (const info of [upgraded,{...upgraded,launch_idempotency:true,engine_instance_id:'engine-b'}]) {
+    const context = setup({info})
+    await assert.rejects(() => context.api.runScenario(1,null,['usb'],{requestId:'old',engineInstanceId:'engine-a'}),/桌面引擎已变化/)
+    assert.equal(context.calls.some(call=>call[0]==='post'),false)
+  }
+})

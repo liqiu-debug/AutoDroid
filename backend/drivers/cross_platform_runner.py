@@ -790,7 +790,11 @@ class TestCaseRunner:
                 )
             try:
                 image_options = step_image_options(step_data, args)
-                config = select_image_options(image_options, self.platform) if image_options is not None else None
+                config = select_image_options(
+                    image_options, self.platform, image_path=path,
+                    platform_overrides=_render_runtime_value(step_data.get("platform_overrides"), self.runtime_variables),
+                    default_image_path=args.get("image_path") or args.get("path") or _render_runtime_value(step_data.get("selector"), self.runtime_variables),
+                ) if image_options is not None else None
             except ValueError as exc:
                 raise ValueError(_with_error_code("P1006_INVALID_ARGS", str(exc))) from exc
             parameters = inspect.signature(self.driver.click_image).parameters
@@ -849,7 +853,11 @@ class TestCaseRunner:
                 )
             try:
                 image_options = step_image_options(step_data, args)
-                config = select_image_options(image_options, self.platform) if image_options is not None else None
+                config = select_image_options(
+                    image_options, self.platform, image_path=path,
+                    platform_overrides=_render_runtime_value(step_data.get("platform_overrides"), self.runtime_variables),
+                    default_image_path=args.get("image_path") or args.get("path") or _render_runtime_value(step_data.get("selector"), self.runtime_variables),
+                ) if image_options is not None else None
             except ValueError as exc:
                 raise ValueError(_with_error_code("P1006_INVALID_ARGS", str(exc))) from exc
             parameters = inspect.signature(self.driver.assert_image).parameters
@@ -1239,6 +1247,7 @@ def _resolve_image_path(
         or step_data.get("selector")
         or _extract_override_selector(step_data, platform)
         or _extract_override_selector(step_data, "android")
+        or _extract_override_selector(step_data, "ios")
         or option_image_path
         or value
     )

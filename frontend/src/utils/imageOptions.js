@@ -11,11 +11,15 @@ export function imageMatchStatusText(result) {
     no_foreground: '选区缺少可区分的轮廓，请缩小背景并包含目标',
     template_hash_mismatch: '模板已更换，请重新截取以更新模板信息',
     aspect_ratio_changed: '当前画面方向或宽高比与录制不一致，请重新截取对应模板',
-    deadline_exceeded: '图像定位超时，请检查当前画面或重新截取模板'
+    deadline_exceeded: '图像定位超时，请检查当前画面或重新截取模板',
+    screenshot_deadline: '获取设备截图超时，请检查设备连接后重试',
+    target_not_stable: '目标未在超时内稳定，请等待画面稳定后重试'
   }
   if (!result) return '请圈选完整的目标图像'
   const reason = String(result.reason || '')
-  const text = reasons[reason] || (/[\u3400-\u9fff]/.test(reason) ? reason : labels[result.status]) || '定位验证失败'
+  const text = (result.status === 'not_found' && result.timed_out
+    ? '在超时内未找到通过验证的目标，请检查当前画面或重新截取模板'
+    : reasons[reason] || (/[\u3400-\u9fff]/.test(reason) ? reason : labels[result.status])) || '定位验证失败'
   const warnings = { low_contrast: '选区对比度较低', sparse_features: '选区可区分特征较少', dense_texture: '选区纹理过密' }
   const warningText = (result.quality?.warnings || []).map(value => warnings[value]).filter(Boolean).join('，')
   return warningText ? `${text}；${warningText}` : text
@@ -51,8 +55,27 @@ export function getImageOptionsMap(step) {
 export function selectImageOptions(step, platform) {
   const options = getImageOptionsMap(step)
   const selected = options[platform] || options.default
-  if (Object.keys(options).length && !selected) throw new Error('此设备平台尚未配置图像模板，请在该平台重新截取')
-  return selected || null
+  if (selected) return selected
+  const other = platform === 'ios' ? 'android' : platform === 'android' ? 'ios' : null
+  if (other && options[other]) {
+    const currentPath = selectImagePath(step, platform)
+    const donorPath = selectImagePath(step, other)
+    // An independently recropped legacy template has no binding. Do not attach
+    // another image's fingerprint or tap anchor to it.
+    if (currentPath && donorPath && currentPath !== donorPath) return null
+    const { template_sha256, tap_anchor = [0.5, 0.5] } = options[other]
+    return { template_sha256, tap_anchor: [...tap_anchor] }
+  }
+  if (Object.keys(options).length) throw new Error('此设备平台尚未配置图像模板，请在该平台重新截取')
+  return null
+}
+
+export function selectImagePath(step, platform) {
+  const override = step?.platform_overrides?.[platform]
+  const platformPath = String(override?.by || '').toLowerCase() === 'image' ? override.selector : null
+  const other = step?.platform_overrides?.[platform === 'ios' ? 'android' : 'ios']
+  const otherPath = String(other?.by || '').toLowerCase() === 'image' ? other.selector : null
+  return String(platformPath || step?.args?.image_path || step?.args?.path || step?.selector || otherPath || '').trim()
 }
 
 export function setImageOptionsMap(step, map) {
@@ -69,9 +92,10 @@ export function bindRecordedImage(step, platform, imagePath, settings) {
   const map = getImageOptionsMap(step)
   const overrides = { ...(step.platform_overrides || {}) }
   const other = platform === 'ios' ? 'android' : 'ios'
-  const oldPath = overrides[other]?.selector || step.args?.image_path || step.selector
+  const oldPath = selectImagePath(step, other)
+  const oldSettings = selectImageOptions(step, other)
   if (oldPath && !overrides[other]) overrides[other] = { selector: oldPath, by: 'image' }
-  if (oldPath && map.default && !map[other]) map[other] = cloneImageOptions(map.default)
+  if (oldPath && oldSettings && !map[other]) map[other] = cloneImageOptions(oldSettings)
   delete map.default
   map[platform] = settings
   overrides[platform] = { selector: imagePath, by: 'image' }
@@ -86,10 +110,11 @@ export function bindRecordedImage(step, platform, imagePath, settings) {
 export function replaceDefaultImagePath(step, imagePath) {
   const map = getImageOptionsMap(step)
   const overrides = { ...(step.platform_overrides || {}) }
-  const iosPath = overrides.ios?.selector || step.args?.image_path
-  if (iosPath && (map.ios || map.default)) {
+  const iosPath = selectImagePath(step, 'ios')
+  const iosSettings = selectImageOptions(step, 'ios')
+  if (iosPath) {
     overrides.ios = { selector: iosPath, by: 'image' }
-    if (!map.ios && map.default) map.ios = cloneImageOptions(map.default)
+    if (!map.ios && iosSettings) map.ios = cloneImageOptions(iosSettings)
   }
   delete map.android
   delete map.default

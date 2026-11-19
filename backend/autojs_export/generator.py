@@ -236,7 +236,10 @@ def build_script_step(
         overrides = step.get("platform_overrides")
         override = overrides.get(platform) if isinstance(overrides, dict) else None
         platform_image = override.get("selector") if isinstance(override, dict) and str(override.get("by") or "").lower() == "image" else None
-        image_path = platform_image or args.get("image_path") or args.get("path") or step.get("selector") or step.get("value")
+        other = "ios" if platform == "android" else "android"
+        other_override = overrides.get(other) if isinstance(overrides, dict) else None
+        other_image = other_override.get("selector") if isinstance(other_override, dict) and str(other_override.get("by") or "").lower() == "image" else None
+        image_path = platform_image or args.get("image_path") or args.get("path") or step.get("selector") or other_image or step.get("value")
         asset = _resolve_image_asset(image_path)
         if asset:
             asset_name, rel_path = asset
@@ -250,7 +253,10 @@ def build_script_step(
             script_step["args"]["match_mode"] = match_mode
         image_options = step_image_options(step, args)
         if image_options is not None:
-            script_step["args"]["image_options"] = select_image_options(image_options, platform)
+            script_step["args"]["image_options"] = select_image_options(
+                image_options, platform, image_path=image_path, platform_overrides=overrides,
+                default_image_path=args.get("image_path") or args.get("path") or step.get("selector"),
+            )
     elif action == "extract_by_ocr":
         region = _parse_region(args.get("region") if args.get("region") is not None else step.get("value"))
         extract_rule = args.get("extract_rule")

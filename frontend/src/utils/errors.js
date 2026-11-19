@@ -3,6 +3,8 @@
 // `err.message` or `err.response.data.detail` get Chinese text without being
 // touched; exported for new code that wants it directly.
 
+import { blockedDeviceReason } from './uiRunPresentation.js'
+
 const STATUS_TEXT = {
   400: '请求无效，请检查输入内容',
   401: '登录状态已失效，请重新登录',
@@ -30,6 +32,10 @@ export function describeDetail(detail) {
   if (isValidationList(detail)) return detail.map(item => item.msg).join('；')
   if (Array.isArray(detail)) return detail.map(item => (item && (item.message || item.msg)) || (typeof item === 'string' ? item : JSON.stringify(item))).join('；')
   if (detail && typeof detail === 'object') {
+    if (['C1001_CASE_PRECHECK_FAILED', 'S1001_SCENARIO_PRECHECK_FAILED'].includes(detail.code)) {
+      const first = detail.items?.[0]
+      return `运行前预检未通过：${first ? `${first.device_serial || '未知设备'} - ${blockedDeviceReason(first)}` : '无可执行设备'}`
+    }
     const related = detail.scenarios || detail.tasks
     const head = detail.message || detail.msg || ''
     return related?.length ? `${head}：${related.join('、')}` : head

@@ -72,17 +72,21 @@ class DeviceRecordingHelperTests(unittest.TestCase):
         self.assertEqual(encoded, base64.b64encode(raw_jpeg).decode("utf-8"))
         self.assertEqual(image_format, "jpeg")
 
-    def test_take_screenshot_payload_encodes_pil_image_as_jpeg(self):
+    def test_take_screenshot_payload_preserves_pil_pixels_in_png(self):
         device = Mock()
-        device.screenshot.return_value = Image.new("RGBA", (32, 64), (255, 0, 0, 255))
+        image = Image.new("RGBA", (32, 64), (255, 255, 255, 255))
+        for x in range(32):
+            image.putpixel((x, x + 16), (x * 7, x * 3, x * 5, 255))
+        device.screenshot.return_value = image
 
         encoded, image_format = _take_screenshot_payload(device)
 
-        self.assertEqual(image_format, "jpeg")
+        self.assertEqual(image_format, "png")
         decoded = Image.open(io.BytesIO(base64.b64decode(encoded)))
-        self.assertEqual(decoded.format, "JPEG")
+        self.assertEqual(decoded.format, "PNG")
         # 原分辨率不缩放：截图是图像模板裁剪素材源
         self.assertEqual(decoded.size, (32, 64))
+        self.assertEqual(decoded.tobytes(), image.convert("RGB").tobytes())
 
     def test_get_device_hierarchy_xml_reads_ios_source(self):
         driver = Mock()

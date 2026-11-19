@@ -177,6 +177,19 @@ def delete_scenario(
 
 # ---- Steps Management ----
 
+@router.get("/{scenario_id}/execution-data")
+def get_scenario_execution_data(
+    scenario_id: int,
+    env_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user_readonly),
+):
+    """Read ordered scenario inputs and deduplicated cases for local execution."""
+    from backend.execution_data import scenario_execution_data
+
+    return scenario_execution_data(session, scenario_id, env_id)
+
+
 @router.get("/{scenario_id}/steps", response_model=List[ScenarioStepRead])
 def get_scenario_steps(
     scenario_id: int,

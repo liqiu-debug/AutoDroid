@@ -21,6 +21,7 @@ from backend.step_contract import (
     normalize_retry_count,
 )
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
+from backend.utils.image_match_options import preserve_image_references
 from backend.wda_port_manager import wda_relay_manager
 
 logger = logging.getLogger(__name__)
@@ -260,7 +261,10 @@ def _parse_json_object(raw_value: Optional[str], setting_key: str) -> Dict[str, 
     return parsed
 
 
-def load_app_key_mapping(session: Session) -> Dict[str, Dict[str, str]]:
+def load_app_key_mapping(
+    session: Session,
+    settings_map: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Dict[str, str]]:
     """
     Load app_key mapping from system settings.
 
@@ -280,8 +284,11 @@ def load_app_key_mapping(session: Session) -> Dict[str, Dict[str, str]]:
     """
     merged: Dict[str, Dict[str, str]] = {}
 
+    def setting_value(key: str) -> Optional[str]:
+        return settings_map.get(key) if settings_map is not None else get_setting_value(session, key)
+
     for setting_key in ("app_key_map", "app_key_mapping"):
-        payload = _parse_json_object(get_setting_value(session, setting_key), setting_key)
+        payload = _parse_json_object(setting_value(setting_key), setting_key)
         if not payload:
             continue
 
@@ -320,7 +327,7 @@ def load_app_key_mapping(session: Session) -> Dict[str, Dict[str, str]]:
                 _merge_app_mapping(merged, app_key, "android", platform_value)
 
     for platform, setting_key in (("android", "android_app_map"), ("ios", "ios_app_map")):
-        payload = _parse_json_object(get_setting_value(session, setting_key), setting_key)
+        payload = _parse_json_object(setting_value(setting_key), setting_key)
         for app_key, app_id in payload.items():
             _merge_app_mapping(merged, app_key, platform, app_id)
 
@@ -405,18 +412,23 @@ def _resolve_image_path(
     first_selector: str,
     value: Any,
 ) -> str:
+    overrides = step_item.get("platform_overrides")
+    current = overrides.get(platform) if isinstance(overrides, dict) else None
+    platform_image = current.get("selector") if isinstance(current, dict) and str(current.get("by") or "").lower() == "image" else None
     options = step_item.get("options")
     option_image_path = ""
     if isinstance(options, dict):
         option_image_path = _clean_text(options.get("image_path") or options.get("path"))
 
     return _clean_text(
-        args.get("image_path")
+        platform_image
+        or args.get("image_path")
         or args.get("path")
         or first_selector
         or step_item.get("selector")
         or _extract_override_selector(step_item, platform)
         or _extract_override_selector(step_item, "android")
+        or _extract_override_selector(step_item, "ios")
         or option_image_path
         or value
     )
@@ -815,6 +827,7 @@ def prepare_steps_for_platform(
         first_selector = _first_locator_selector(locator_candidates)
 
         if platform_lower in execute_on and action in {"click_image", "assert_image"}:
+            step_item = preserve_image_references(step_item, args)
             image_path = _resolve_image_path(
                 step_item=step_item,
                 args=args,

@@ -42,7 +42,53 @@ test('an explicitly cleared template binding cannot resurrect old args metadata'
   assert.deepEqual(uiStepToStandardStep(step, 1).args.image_options, {})
   assert.equal(imageOptions.selectImageOptions(step, 'ios'), null)
   const onlyAndroid = { options: { image_options: { android: config } } }
-  assert.throws(() => imageOptions.selectImageOptions(onlyAndroid, 'ios'), /平台尚未配置/, 'never borrow Android metadata for an iOS template')
+  assert.deepEqual(imageOptions.selectImageOptions(onlyAndroid, 'ios'), { template_sha256: sha, tap_anchor: config.tap_anchor })
+})
+
+test('single-platform image fallback preserves its fingerprint and anchor without screen geometry', () => {
+  for (const [platform, other] of [['android', 'ios'], ['ios', 'android']]) {
+    const step = { action: 'click_image', args: { image_path: 'recorded.png', image_options: { [other]: copy(config) } },
+      platform_overrides: { [other]: { selector: 'recorded.png', by: 'image' } } }
+    assert.equal(imageOptions.selectImagePath(step, platform), 'recorded.png')
+    assert.deepEqual(imageOptions.selectImageOptions(step, platform), { template_sha256: sha, tap_anchor: config.tap_anchor })
+    assert.deepEqual(imageOptions.selectImageOptions(step, other), config)
+    assert.deepEqual(step.args.image_options[other], config)
+  }
+})
+
+test('current platform and default bindings retain their complete configuration', () => {
+  const defaults = { ...config, template_sha256: 'd'.repeat(64) }
+  const step = { args: { image_path: 'shared.png', image_options: { ...copy(maps), default: defaults } } }
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'android'), config)
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'ios'), maps.ios)
+  delete step.args.image_options.ios
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'ios'), defaults)
+})
+
+test('image timeout messages distinguish absence, capture failure and movement', () => {
+  assert.match(imageOptions.imageMatchStatusText({ status: 'not_found', reason: 'no_verified_candidate', timed_out: true }), /在超时内未找到通过验证的目标/)
+  assert.match(imageOptions.imageMatchStatusText({ status: 'unstable', reason: 'screenshot_deadline' }), /获取设备截图超时/)
+  assert.match(imageOptions.imageMatchStatusText({ status: 'unstable', reason: 'target_not_stable' }), /目标未在超时内稳定/)
+  assert.match(imageOptions.imageMatchStatusText({ status: 'not_found', reason: 'no_verified_candidate' }), /当前画面未找到目标/)
+})
+
+test('recropping iOS preserves an unbound legacy Android template without borrowing the iOS fingerprint', () => {
+  const step = { action: 'click_image', selector: 'android-old.png', selector_type: 'image',
+    args: { image_path: 'android-old.png' }, platform_overrides: { android: { by: 'image', selector: 'android-old.png' } } }
+  imageOptions.bindRecordedImage(step, 'ios', 'ios-new.png', copy(config))
+  assert.equal(imageOptions.selectImagePath(step, 'android'), 'android-old.png')
+  assert.equal(imageOptions.selectImageOptions(step, 'android'), null)
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'ios'), config)
+})
+
+test('recropping the only recorded platform preserves the shared template binding on the other platform', () => {
+  const step = { action: 'click_image', selector: 'ios-old.png', args: { image_path: 'ios-old.png', image_options: { ios: copy(config) } },
+    platform_overrides: { ios: { by: 'image', selector: 'ios-old.png' } } }
+  const replacement = { ...config, template_sha256: 'f'.repeat(64) }
+  imageOptions.bindRecordedImage(step, 'ios', 'ios-new.png', replacement)
+  assert.equal(imageOptions.selectImagePath(step, 'android'), 'ios-old.png')
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'android'), { template_sha256: sha, tap_anchor: config.tap_anchor })
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'ios'), replacement)
 })
 
 test('recropping only iOS preserves the Android template and metadata through store conversion', () => {
@@ -66,6 +112,25 @@ test('changing the default path drops its old binding and preserves an independe
   assert.equal(step.options.image_options.android, undefined)
   assert.deepEqual(step.options.image_options.ios, maps.ios)
   assert.equal(step.platform_overrides.ios.selector, 'ios.png')
+})
+
+test('changing an Android path preserves the iOS binding borrowed from the previous template', () => {
+  const step = { action: 'click_image', selector: 'android-new.png', args: { image_path: 'android-old.png', image_options: { android: copy(config) } },
+    platform_overrides: { android: { by: 'image', selector: 'android-old.png' } } }
+  imageOptions.replaceDefaultImagePath(step, 'android-new.png')
+  assert.equal(imageOptions.selectImagePath(step, 'ios'), 'android-old.png')
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'ios'), { template_sha256: sha, tap_anchor: config.tap_anchor })
+  assert.equal(imageOptions.selectImagePath(step, 'android'), 'android-new.png')
+  assert.equal(imageOptions.selectImageOptions(step, 'android'), null)
+})
+
+test('changing an Android path preserves an iOS template referenced only by args.path', () => {
+  const step = { action: 'click_image', selector: 'android-new.png', args: { path: 'ios-old.png', image_options: { ios: copy(config) } } }
+  imageOptions.replaceDefaultImagePath(step, 'android-new.png')
+  assert.equal(imageOptions.selectImagePath(step, 'ios'), 'ios-old.png')
+  assert.deepEqual(imageOptions.selectImageOptions(step, 'ios'), config)
+  assert.equal(imageOptions.selectImagePath(step, 'android'), 'android-new.png')
+  assert.equal(imageOptions.selectImageOptions(step, 'android'), null)
 })
 
 test('screen-edge selection preserves the original tap as a template anchor', () => {

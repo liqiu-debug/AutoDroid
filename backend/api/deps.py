@@ -24,6 +24,8 @@ def _authenticate_api_token(
     token: str,
     session: Session,
     credentials_exception: HTTPException,
+    *,
+    record_usage: bool = True,
 ) -> User:
     """校验 API Token（adk_ 前缀）并返回属主用户。"""
     token_hash = hash_api_token(token)
@@ -47,7 +49,7 @@ def _authenticate_api_token(
         request.state.api_token_id = api_token.id
 
     now = datetime.now()
-    if (
+    if record_usage and (
         api_token.last_used_at is None
         or (now - api_token.last_used_at).total_seconds() > API_TOKEN_LAST_USED_THROTTLE_SECONDS
     ):
@@ -71,11 +73,15 @@ def _authenticate_token(
     token: str,
     session: Session,
     credentials_exception: HTTPException,
+    *,
+    record_usage: bool = True,
 ) -> User:
     """校验 Bearer 令牌（JWT 或 API Token）并返回属主用户。"""
     # API Token（机器凭证）路径：Bearer adk_...
     if is_api_token(token):
-        return _authenticate_api_token(request, token, session, credentials_exception)
+        return _authenticate_api_token(
+            request, token, session, credentials_exception, record_usage=record_usage
+        )
 
     # 原有 JWT 路径（行为不变）
     try:
@@ -99,6 +105,20 @@ async def get_current_user(
     session: Session = Depends(get_session),
 ) -> User:
     return _authenticate_token(request, token, session, _credentials_exception())
+
+
+async def get_current_user_readonly(
+    request: Request = None,
+    token: str = Depends(oauth2_scheme),
+    session: Session = Depends(get_session),
+) -> User:
+    """Authenticate a pure read without writing API Token usage metadata."""
+    user = _authenticate_token(
+        request, token, session, _credentials_exception(), record_usage=False
+    )
+    if not user.is_active:
+        raise _credentials_exception()
+    return user
 
 
 def authenticate_token(token: str, session: Session, request: Optional[Request] = None) -> User:

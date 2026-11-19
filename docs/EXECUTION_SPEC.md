@@ -120,10 +120,10 @@
 - `click_image`
   - 必填 `args.image_path` 或可回退出的 `selector`。
   - 优先使用当前平台明确的 `by=image` override 模板路径，再回退到通用路径。
-  - `args.image_options` 按 `android` / `ios` / `default` 保存独立配置；旧模型对应 `options.image_options`。配置存在但缺少当前平台且无 `default` 时拒绝执行。
+  - `args.image_options` 按 `android` / `ios` / `default` 保存独立配置；旧模型对应 `options.image_options`。优先当前平台及 `default`；仅录过另一平台且共用同一模板时借用其 SHA 和模板内点击锚点，不继承源设备的 `source_size`、`search_region`。已有独立模板但尚无配置的旧平台保留无配置严格匹配，避免借错另一张图的绑定。重截只更新当前平台，并保留另一平台已有模板及配置。
   - 非空平台配置必须含模板原始文件的 `template_sha256`（64 位十六进制）；可配置 `tap_anchor: [u,v]`（模板内 0..1，默认中心）、`source_size: [width,height]`（录制截图像素）、`search_region: [x1,y1,x2,y2]`（屏幕内 0..1）。所有字段均严格校验，模板字节变化后须重新确认配置。
   - `strict-v1` 验证多候选及局部结构，唯一目标连续两帧稳定后点击一次；无匹配、重复目标、模板无效或目标不稳定均拒绝点击，不以 OCR 文本点击替代。定位使用步骤 `timeout`（默认 10 秒），不放宽匹配条件。
-  - 诊断通过 `output.image_match` 保留，含 `status/reason/matcher_version/candidates/point/quality/timings`；失败时同时记录到 `error_context.image_match`。已提交但结果未知的点击不自动重试。
+  - 诊断通过 `output.image_match` 保留，含 `status/reason/matcher_version/candidates/point/quality/timings`；失败时同时记录到 `error_context.image_match`。定位预算耗尽时另记 `timed_out/timeout_reason/frames_checked`，保留最后完成验证的候选和指标；始终未通过验证的目标报告 `not_found`，只对曾识别但未取得两帧稳定结果的目标报告 `target_not_stable`。已提交但结果未知的点击不自动重试。
   - 手机脚本执行端须提供已验收的 `images.matchImageStrict` 及 `strictMatcherCapabilities().validated=true`；缺少能力或尚未验收时报告 unsupported，禁止回退旧匹配算法。
 - `extract_by_ocr`
   - 必填 `args.region` 或可回退出的 `selector`。

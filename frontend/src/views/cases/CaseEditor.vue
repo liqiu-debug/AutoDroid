@@ -12,7 +12,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import api from '@/api'
-import { describeRunSubmission } from '@/utils/uiRunPresentation'
+import { submissionNotice } from '@/utils/uiRunPresentation'
+import { submitExecution, pendingExecution, rememberWebsocketExecution, settlePendingExecution, UNKNOWN_LAUNCH_MESSAGE } from '@/utils/executionLaunch'
+import { getErrorDetail } from '@/utils/errors'
 import { createPollingLoop } from '@/utils/polling'
 
 const route = useRoute()
@@ -26,13 +28,33 @@ const logConsoleRef = ref(null)
 const deviceStageRef = ref(null)
 const isRunning = ref(false)
 const runPhase = ref('')
+const pendingLaunch = ref(null)
+const wsOutcomeUnknown = ref(false)
 const runBusy = computed(() => Boolean(runPhase.value) || saving.value)
-const runLabel = computed(() => ({ saving: '保存中', prechecking: '预检中', submitting: '启动中' }[runPhase.value] || (isRunning.value ? '终止' : (!currentCase.value.id || hasUnsavedChanges.value ? '保存并运行' : '运行'))))
+const runLabel = computed(() => ({ saving: '保存中', prechecking: '预检中', submitting: '启动中' }[runPhase.value] || (pendingLaunch.value || wsOutcomeUnknown.value ? '结果待确认' : isRunning.value ? '终止' : (!currentCase.value.id || hasUnsavedChanges.value ? '保存并运行' : '运行'))))
 const activeRun = ref(null)
 const terminatingRun = ref(false)
 const ACTIVE_RUN_POLL_INTERVAL_MS = 3000
 const envId = ref(null)
 const environments = ref([])
+let executionViewGeneration = 0
+let websocketCaseId = null
+const isCurrentCaseEvent = data => websocketCaseId !== null
+  && String(websocketCaseId) === String(currentCase.value.id)
+  && (data?.case_id == null || String(data.case_id) === String(websocketCaseId))
+
+const detachExecutionView = () => {
+  executionViewGeneration += 1
+  websocketCaseId = null
+  logConsoleRef.value?.clear?.()
+  stopActiveRunPolling()
+  runPhase.value = ''
+  pendingLaunch.value = null
+  wsOutcomeUnknown.value = false
+  activeRun.value = null
+  isRunning.value = false
+  terminatingRun.value = false
+}
 
 // 获取 DeviceStage 的 OCR 框选模式状态
 const ocrCropMode = computed(() => {
@@ -54,6 +76,7 @@ const includeInteractionScreenshot = computed(() => {
 })
 
 const initData = async () => {
+    const generation = executionViewGeneration
     const id = route.params.id
     if (id) {
         await caseStore.loadCase(id)
@@ -61,8 +84,10 @@ const initData = async () => {
         const folderId = route.query.folder_id ? Number(route.query.folder_id) : null
         caseStore.newCase({ folder_id: folderId })
     }
+    if (generation !== executionViewGeneration) return
     try {
         const { data } = await api.getEnvironments()
+        if (generation !== executionViewGeneration) return
         environments.value = data
         if (data && data.length > 0 && !envId.value) {
             envId.value = data[0].id
@@ -70,12 +95,14 @@ const initData = async () => {
     } catch (error) {
         console.error('获取环境列表失败', error)
     }
+    pendingLaunch.value = pendingExecution('case', currentCase.value.id)
     restoreActiveRun()
 }
 
 watch(() => route.params.id, () => {
+    detachExecutionView()
     initData()
-})
+}, { flush: 'sync' })
 
 const goBack = () => {
     router.push('/ui/cases')
@@ -94,30 +121,49 @@ const ensureSaved = async () => {
 }
 
 const handleRun = async () => {
+  if (!runBusy.value && isRunning.value && activeRun.value && !activeRun.value.unknown) return terminateActiveRun()
+  pendingLaunch.value = pendingLaunch.value || pendingExecution('case', currentCase.value.id)
   if (runBusy.value || terminatingRun.value) return
+  if (pendingLaunch.value || wsOutcomeUnknown.value) {
+    await restoreActiveRun()
+    return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+  }
   if (isRunning.value) return terminateActiveRun()
   if (!currentCase.value.steps.length) return ElMessage.warning('用例没有步骤')
   const selectedEnvironment = envId.value
   const currentDevice = recordingDeviceSerial.value
+  const generation = executionViewGeneration
+  let submittedCaseId = currentCase.value.id
+  let connected = false
   runPhase.value = 'saving'
   try {
     if (!await ensureSaved()) return
+    if (generation !== executionViewGeneration) return
     const caseId = currentCase.value.id
-    runPhase.value = 'prechecking'
-    if (currentDevice) {
+    submittedCaseId = caseId
+    await api.ensureCaseExecutionAllowed(caseId)
+    const info = await api.getExecutionCapabilities()
+    if (generation !== executionViewGeneration) return
+    if (!(info.clientMode === true && info.execution_preflight_v1 === true) && currentDevice) {
+      runPhase.value = 'prechecking'
       const check = await precheckCaseOnDevice(caseId, currentDevice, selectedEnvironment)
+      if (generation !== executionViewGeneration) return
       if (!check.ok) return ElMessage.error(`运行前预检失败: ${check.reason}`)
     }
     runPhase.value = 'submitting'
-    activeRun.value = { kind: 'case', target_id: caseId, device_serials: currentDevice ? [currentDevice] : [] }
+    activeRun.value = { kind: 'case', target_id: caseId, unknown: true, device_serials: currentDevice ? [currentDevice] : [] }
+    rememberWebsocketExecution('case', caseId, currentDevice ? [currentDevice] : [])
+    websocketCaseId = caseId
     logConsoleRef.value.connect(caseId, selectedEnvironment, currentDevice)
-    isRunning.value = true
+    connected = true
   } catch (err) {
+    if (generation !== executionViewGeneration) return
+    settlePendingExecution('case', submittedCaseId)
     isRunning.value = false
     activeRun.value = null
-    ElMessage.error('启动失败: ' + err.message)
+    ElMessage.error('启动失败: ' + getErrorDetail(err))
   } finally {
-    runPhase.value = ''
+    if (!connected && generation === executionViewGeneration) runPhase.value = ''
   }
 }
 
@@ -151,59 +197,50 @@ const precheckCaseOnDevice = async (caseId, serial, selectedEnvironment = envId.
 }
 
 const submitMultiRun = async () => {
-  if (runBusy.value || isRunning.value) return
-  if (multiRunForm.value.deviceSerials.length === 0) {
-    ElMessage.warning('请至少选择一台设备')
-    return
-  }
+  pendingLaunch.value = pendingLaunch.value || pendingExecution('case', currentCase.value.id)
+  if (runBusy.value || (isRunning.value && !pendingLaunch.value) || wsOutcomeUnknown.value) return
+  if (pendingLaunch.value && !pendingLaunch.value.retryable) return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+  if (!pendingLaunch.value && !multiRunForm.value.deviceSerials.length) return ElMessage.warning('请至少选择一台设备')
   const selectedEnvironment = envId.value
   const selectedDevices = [...multiRunForm.value.deviceSerials]
+  const generation = executionViewGeneration
   runPhase.value = 'saving'
   try {
-    if (!await ensureSaved()) return
-    const caseId = currentCase.value.id
-    runPhase.value = 'prechecking'
-    const runnable = []
-    const blocked = []
-    for (const serial of selectedDevices) {
-      const check = await precheckCaseOnDevice(caseId, serial, selectedEnvironment)
-      if (check.ok) runnable.push(serial)
-      else blocked.push({ serial, reason: check.reason })
-    }
-
-    if (runnable.length === 0) {
-      const first = blocked[0]
-      ElMessage.error(`运行前预检未通过：${first ? `${first.serial} - ${first.reason}` : '无可执行设备'}`)
-      return
-    }
-
+    if (!pendingLaunch.value && !await ensureSaved()) return
+    if (generation !== executionViewGeneration) return
+    const selection = pendingLaunch.value || { kind: 'case', targetId: currentCase.value.id, envId: selectedEnvironment, devices: selectedDevices }
     runPhase.value = 'submitting'
-    const { data } = await api.runTestCaseBatch(caseId, selectedEnvironment, runnable)
-    const submissionText = describeRunSubmission(data, runnable.length)
-    if (blocked.length > 0) {
-      const first = blocked[0]
-      ElMessage.warning(`${submissionText}；${blocked.length} 台预检失败（示例：${first.serial} - ${first.reason}）`)
-    } else {
-      ElMessage.success(submissionText)
-    }
+    const { data, launch } = await submitExecution(api, selection, pendingLaunch.value)
+    if (generation !== executionViewGeneration) return
+    const notice = submissionNotice(data, launch.devices)
+    ElMessage[notice.warning ? 'warning' : 'success'](notice.text)
     activeRun.value = {
-      kind: 'case',
-      target_id: currentCase.value.id,
-      batch_id: data?.batch_id,
-      run_ids: data?.run_ids || [],
-      device_serials: runnable
+      kind: 'case', target_id: launch.targetId, batch_id: data?.batch_id,
+      run_ids: data?.run_ids || data?.runs?.map(item => item.run_id).filter(Boolean) || [],
+      device_serials: notice.devices,
     }
+    pendingLaunch.value = null
     isRunning.value = true
     startActiveRunPolling()
     runDialogVisible.value = false
   } catch (err) {
-    ElMessage.error('启动批量执行失败: ' + err.message)
+    if (generation !== executionViewGeneration) return
+    if (err.launchPending) {
+      pendingLaunch.value = err.launchPending
+      activeRun.value = { kind: 'case', target_id: err.launchPending.targetId, unknown: true, device_serials: err.launchPending.devices }
+      startActiveRunPolling()
+      ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+    } else {
+      pendingLaunch.value = null
+      ElMessage.error('启动批量执行失败: ' + getErrorDetail(err))
+    }
   } finally {
-    runPhase.value = ''
+    if (generation === executionViewGeneration) runPhase.value = ''
   }
 }
 
 const openMultiRunDialog = async () => {
+  if (pendingLaunch.value || wsOutcomeUnknown.value) return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
   multiRunForm.value.deviceSerials = []
   runDialogVisible.value = true
   runDialogLoading.value = true
@@ -226,6 +263,10 @@ const handleRunCommand = async (command) => {
 }
 
 const handleRunComplete = (data) => {
+  if (!isCurrentCaseEvent(data)) return
+  settlePendingExecution('case', currentCase.value.id)
+  runPhase.value = ''
+  wsOutcomeUnknown.value = false
   isRunning.value = false
   activeRun.value = null
   stopActiveRunPolling()
@@ -239,13 +280,31 @@ const handleRunComplete = (data) => {
 }
 
 const handleRunError = (data) => {
+  if (!isCurrentCaseEvent(data)) return
+  runPhase.value = ''
+  if (data?.outcomeUnknown) {
+    const accepted = Boolean(activeRun.value?.run_ids?.length)
+    wsOutcomeUnknown.value = !accepted
+    if (activeRun.value) activeRun.value.unknown = !accepted
+    startActiveRunPolling()
+    ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+    return
+  }
+  settlePendingExecution('case', currentCase.value.id)
+  wsOutcomeUnknown.value = false
   isRunning.value = false
   activeRun.value = null
   stopActiveRunPolling()
-  ElMessage.error(data?.message || '执行连接失败，请检查日志后重试')
+  ElMessage.error(data?.message || '执行启动被拒绝，请检查日志')
 }
 
 const handleRunStart = (data) => {
+  if (!isCurrentCaseEvent(data)) return
+  runPhase.value = ''
+  isRunning.value = true
+  wsOutcomeUnknown.value = false
+  rememberWebsocketExecution('case', currentCase.value.id, data.device_serial ? [data.device_serial] : [], true)
+  pendingLaunch.value = null
   startActiveRunPolling()
   activeRun.value = {
     kind: 'case',
@@ -258,15 +317,27 @@ const handleRunStart = (data) => {
 
 const terminateActiveRun = async () => {
   if (!activeRun.value || terminatingRun.value) return
+  const targetId = activeRun.value.target_id || currentCase.value.id
+  const record = activeRun.value
+  const generation = executionViewGeneration
   terminatingRun.value = true
   try {
     await api.cancelRun({
       kind: 'case',
-      target_id: currentCase.value.id,
-      batch_id: activeRun.value.batch_id || null,
-      run_ids: activeRun.value.run_ids || [],
-      device_serials: activeRun.value.device_serials || []
+      target_id: targetId,
+      batch_id: record.batch_id || null,
+      run_ids: record.run_ids || [],
+      device_serials: record.device_serials || []
     })
+    const unresolved = pendingExecution('case', targetId)
+    if (!unresolved || unresolved.transport === 'websocket') {
+      settlePendingExecution('case', targetId)
+      if (generation !== executionViewGeneration) return
+      pendingLaunch.value = null
+    } else {
+      if (generation !== executionViewGeneration) return
+      pendingLaunch.value = unresolved
+    }
     ElMessage.warning('已发送终止请求')
     logConsoleRef.value?.markAborted?.()
     isRunning.value = false
@@ -274,18 +345,34 @@ const terminateActiveRun = async () => {
     stopActiveRunPolling()
     await deviceStageRef.value?.refreshDevices?.()
   } catch (err) {
+    if (generation !== executionViewGeneration) return
     ElMessage.error('终止失败: ' + (err.response?.data?.detail || err.message))
   } finally {
-    terminatingRun.value = false
+    if (generation === executionViewGeneration) terminatingRun.value = false
   }
 }
 
 const restoreActiveRun = async () => {
   if (!currentCase.value.id) return
+  const targetId = currentCase.value.id
+  const generation = executionViewGeneration
   try {
-    const { data } = await api.getActiveRuns('case', currentCase.value.id)
+    const { data } = await api.getActiveRuns('case', targetId)
+    if (generation !== executionViewGeneration || targetId !== currentCase.value.id) return
     const items = data?.items || []
-    if (items.length === 0) return
+    if (items.length === 0) {
+      const retained = pendingLaunch.value || pendingExecution('case', currentCase.value.id)
+      if (retained?.transport === 'websocket' && retained.accepted) {
+        settlePendingExecution('case', currentCase.value.id)
+        pendingLaunch.value = null
+        wsOutcomeUnknown.value = false
+        runPhase.value = ''
+        isRunning.value = false
+        activeRun.value = null
+        stopActiveRunPolling()
+      }
+      return
+    }
     activeRun.value = {
       kind: 'case',
       target_id: currentCase.value.id,
@@ -294,18 +381,36 @@ const restoreActiveRun = async () => {
       device_serials: items.map(item => item.device_serial).filter(Boolean)
     }
     isRunning.value = true
+    wsOutcomeUnknown.value = false
+    if (pendingExecution('case', currentCase.value.id)?.transport === 'websocket' || pendingLaunch.value?.transport === 'websocket') {
+      settlePendingExecution('case', currentCase.value.id)
+      pendingLaunch.value = null
+    }
+    runPhase.value = ''
     startActiveRunPolling()
   } catch {}
 }
 
 const pollActiveRun = async () => {
   if (!currentCase.value.id || !activeRun.value) return
+  const targetId = currentCase.value.id
+  const generation = executionViewGeneration
   try {
-    const { data } = await api.getActiveRuns('case', currentCase.value.id)
+    const { data } = await api.getActiveRuns('case', targetId)
+    if (generation !== executionViewGeneration || targetId !== currentCase.value.id) return
     if ((data?.items || []).length === 0) {
+      if (activeRun.value.unknown) return
+      if (pendingExecution('case', currentCase.value.id)?.transport === 'websocket' || pendingLaunch.value?.transport === 'websocket') {
+        settlePendingExecution('case', currentCase.value.id)
+        pendingLaunch.value = null
+      }
+      wsOutcomeUnknown.value = false
+      runPhase.value = ''
       isRunning.value = false
       activeRun.value = null
       stopActiveRunPolling()
+    } else if (activeRun.value.unknown) {
+      await restoreActiveRun()
     }
   } catch {}
 }
@@ -366,7 +471,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  stopActiveRunPolling()
+  detachExecutionView()
 })
 </script>
 
@@ -390,6 +495,10 @@ onUnmounted(() => {
         </el-dropdown>
       </div>
     </header>
+    <el-alert v-if="pendingLaunch || wsOutcomeUnknown" :title="UNKNOWN_LAUNCH_MESSAGE" type="warning" :closable="false" show-icon>
+      <el-button v-if="pendingLaunch?.retryable" :disabled="runBusy" @click="submitMultiRun">确认原启动结果</el-button>
+      <el-button :disabled="runBusy" @click="restoreActiveRun">查看执行状态</el-button>
+    </el-alert>
     <div class="content-container">
       <section class="center-pane">
         <DeviceStage ref="deviceStageRef" :env-id="envId" hide-device-select @update-loading="loading = $event">
