@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlmodel import Session, select
@@ -29,6 +30,7 @@ from backend.step_contract import (
     normalize_execute_on,
     normalize_platform,
     step_image_options,
+    step_image_match,
 )
 from backend.utils.image_match_options import select_image_options
 from backend.utils.pydantic_compat import dump_model
@@ -100,7 +102,7 @@ def _render_text(value: Any, variables: Dict[str, str]) -> Any:
     if isinstance(value, str):
         return render_step_data(value, variables)
     if isinstance(value, dict):
-        return {key: _render_text(item, variables) for key, item in value.items()}
+        return {key: item if key == "image_match" else _render_text(item, variables) for key, item in value.items()}
     if isinstance(value, list):
         return [_render_text(item, variables) for item in value]
     return value
@@ -257,6 +259,16 @@ def build_script_step(
                 image_options, platform, image_path=image_path, platform_overrides=overrides,
                 default_image_path=args.get("image_path") or args.get("path") or step.get("selector"),
             )
+        shared_match = step_image_match(step, args)
+        if asset:
+            from pathlib import Path
+            from backend.utils.adaptive_template import ensure_descriptor
+            from backend.autojs_export.packager import PROJECT_ROOT
+            target = Path(PROJECT_ROOT) / asset[1]
+            if target.is_file():
+                shared_match = ensure_descriptor(target.read_bytes(), shared_match,
+                    anchor=script_step["args"].get("image_options", {}).get("tap_anchor"), deadline=time.monotonic() + 10)
+        script_step["args"]["image_match"] = shared_match
     elif action == "extract_by_ocr":
         region = _parse_region(args.get("region") if args.get("region") is not None else step.get("value"))
         extract_rule = args.get("extract_rule")

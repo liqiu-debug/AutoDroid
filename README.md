@@ -341,7 +341,7 @@ iOS WDA URL、设备映射、启动参数和故障处理见 [iOS WDA 运维手�
 
 ```bash
 source .venv/bin/activate
-python -m unittest discover -s backend/tests -p 'test_*.py'
+python -m pytest backend/tests -q
 ```
 
 运行后端 lint（致命错误级检查）：

@@ -254,6 +254,51 @@ def step_image_options(step: Dict[str, Any], args: Optional[Dict[str, Any]] = No
     return standard if standard is not None else legacy
 
 
+def step_image_match(step: Dict[str, Any], args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Shared template identity/semantics are independent of platform geometry."""
+    from copy import deepcopy
+    arguments = args if isinstance(args, dict) else step.get("args")
+    options = step.get("options")
+    has_standard = isinstance(arguments, dict) and "image_match" in arguments
+    has_legacy = isinstance(options, dict) and "image_match" in options
+    standard = arguments.get("image_match") if isinstance(arguments, dict) else None
+    legacy = options.get("image_match") if isinstance(options, dict) else None
+    if has_standard and has_legacy and standard != legacy:
+        raise ValueError("args.image_match conflicts with options.image_match")
+    if not has_standard and not has_legacy:
+        return {"profile": "adaptive-v2"}
+    config = standard if has_standard else legacy
+    if not isinstance(config, dict) or config.get("profile", "adaptive-v2") not in {"adaptive-v2", "strict-v1"}:
+        raise ValueError("image_match profile must be adaptive-v2 or strict-v1")
+    allowed = {"profile", "template_sha256", "descriptor", "descriptor_canonical", "descriptor_sha256"}
+    if set(config) - allowed:
+        raise ValueError("image_match contains unsupported fields")
+    if "template_sha256" in config:
+        import re
+        if not isinstance(config["template_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", config["template_sha256"]):
+            raise ValueError("image_match requires a valid template_sha256")
+    if "descriptor" in config or "descriptor_canonical" in config:
+        import hashlib
+        import json
+        from backend.utils.adaptive_template import canonical_descriptor, validate_descriptor
+        canonical = config.get("descriptor_canonical")
+        if canonical is not None and not isinstance(canonical, str):
+            raise ValueError("invalid descriptor_canonical")
+        try:
+            descriptor = json.loads(canonical) if canonical is not None else config["descriptor"]
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid descriptor_canonical") from exc
+        if "descriptor" in config and descriptor != config["descriptor"]:
+            raise ValueError("descriptor_mismatch")
+        validate_descriptor(descriptor)
+        canonical = canonical if canonical is not None else canonical_descriptor(descriptor)
+        if config.get("descriptor_sha256") != hashlib.sha256(canonical.encode("utf-8")).hexdigest():
+            raise ValueError("descriptor_hash_mismatch")
+        if "template_sha256" not in config:
+            raise ValueError("descriptor requires template_sha256")
+    return {**deepcopy(config), "profile": config.get("profile", "adaptive-v2")}
+
+
 def _safe_timeout(value: Any, default: int = 10) -> int:
     try:
         timeout = int(value)
@@ -358,6 +403,8 @@ def legacy_step_to_standard(step: Any, case_id: int, order: int) -> Dict[str, An
         image_options = step_image_options(raw)
         if image_options is not None:
             args["image_options"] = image_options
+    if action in {"click_image", "assert_image"}:
+        args["image_match"] = step_image_match(raw)
 
     return {
         "case_id": case_id,
@@ -434,6 +481,8 @@ def standard_step_to_legacy(step: Any) -> Dict[str, Any]:
         image_options = step_image_options(raw)
         if image_options is not None:
             options["image_options"] = image_options
+    if action in {"click_image", "assert_image"}:
+        options["image_match"] = step_image_match(raw)
 
     return {
         "action": action,

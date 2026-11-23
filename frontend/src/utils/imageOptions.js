@@ -88,12 +88,45 @@ export function clearImageOptions(step) {
   setImageOptionsMap(step, {})
 }
 
-export function bindRecordedImage(step, platform, imagePath, settings) {
+export function getSharedImageMatch(step) {
+  const hasArgs = Boolean(step?.args && Object.hasOwn(step.args, 'image_match'))
+  const hasOptions = Boolean(step?.options && Object.hasOwn(step.options, 'image_match'))
+  if (!hasArgs && !hasOptions) return { profile: 'adaptive-v2' }
+  const validate = value => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('图像匹配配置必须是对象')
+    const profile = Object.hasOwn(value, 'profile') ? value.profile : 'adaptive-v2'
+    if (!['adaptive-v2', 'strict-v1'].includes(profile)) throw new Error('图像匹配配置版本无效')
+    // Match settings are JSON data and may contain nested Vue proxies.
+    return { ...cloneImageOptions(value), profile }
+  }
+  const args = hasArgs ? validate(step.args.image_match) : null
+  const options = hasOptions ? validate(step.options.image_match) : null
+  const stable = value => Array.isArray(value) ? value.map(stable)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value
+  if (args && options && JSON.stringify(stable(args)) !== JSON.stringify(stable(options))) {
+    throw new Error('图像匹配配置冲突，请重新载入步骤')
+  }
+  return args || options
+}
+
+export function setSharedImageMatch(step, config) {
+  const value = getSharedImageMatch(config === undefined ? {} : { args: { image_match: config } })
+  step.args = { ...(step.args || {}), image_match: value }
+  step.options = { ...(step.options || {}), image_match: cloneImageOptions(value) }
+}
+
+export function bindRecordedImage(step, platform, imagePath, settings, sharedMatch) {
+  const previousShared = getSharedImageMatch(step)
   const map = getImageOptionsMap(step)
   const overrides = { ...(step.platform_overrides || {}) }
   const other = platform === 'ios' ? 'android' : 'ios'
   const oldPath = selectImagePath(step, other)
   const oldSettings = selectImageOptions(step, other)
+  const independentOther = oldPath && oldPath !== imagePath
+  const next = previousShared.profile === 'strict-v1' || independentOther
+    ? { profile: previousShared.profile }
+    : sharedMatch === undefined ? { profile: previousShared.profile } : sharedMatch
+  const nextShared = getSharedImageMatch({ args: { image_match: next } })
   if (oldPath && !overrides[other]) overrides[other] = { selector: oldPath, by: 'image' }
   if (oldPath && oldSettings && !map[other]) map[other] = cloneImageOptions(oldSettings)
   delete map.default
@@ -105,9 +138,14 @@ export function bindRecordedImage(step, platform, imagePath, settings) {
   step.selector_type = 'image'
   step.args = { ...(step.args || {}), image_path: step.selector }
   setImageOptionsMap(step, map)
+  // Historical independent pictures retain their own bound platform metadata.
+  // Shared semantics are prepared from the chosen original, never attached to
+  // a different picture's digest after one platform is recaptured.
+  setSharedImageMatch(step, nextShared)
 }
 
 export function replaceDefaultImagePath(step, imagePath) {
+  const previousShared = getSharedImageMatch(step)
   const map = getImageOptionsMap(step)
   const overrides = { ...(step.platform_overrides || {}) }
   const iosPath = selectImagePath(step, 'ios')
@@ -122,6 +160,7 @@ export function replaceDefaultImagePath(step, imagePath) {
   step.args = { ...(step.args || {}), image_path: imagePath }
   step.platform_overrides = { ...overrides, android: { selector: imagePath, by: 'image' } }
   setImageOptionsMap(step, map)
+  setSharedImageMatch(step, { profile: previousShared.profile })
 }
 
 export function anchorFromSelection(selection, point) {

@@ -435,7 +435,10 @@ class DeviceFlowTests(_Base):
         with tempfile.TemporaryDirectory() as tmp_root:
             images_dir = Path(tmp_root) / "static" / "images"
             images_dir.mkdir(parents=True)
-            (images_dir / "element_ab12cd34.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+            from PIL import Image, ImageDraw
+            image = Image.new("RGB", (40, 40), "white")
+            ImageDraw.Draw(image).rectangle((5, 5, 30, 30), outline="black", width=3)
+            image.save(images_dir / "element_ab12cd34.png")
             self._add_step(
                 case.id, 3, "click_image",
                 args={"image_path": "static/images/element_ab12cd34.png"},

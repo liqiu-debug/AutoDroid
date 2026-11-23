@@ -90,6 +90,21 @@ def precheck_case_script(
             except ValueError as exc:
                 issues.append(_issue(order, "error", "P1006_INVALID_ARGS", str(exc)))
 
+        if action in {"click_image", "assert_image"}:
+            try:
+                from backend.step_contract import step_image_match
+                from backend.utils.adaptive_template import ensure_descriptor
+                shared = step_image_match({"args": args})
+                if project_root is not None:
+                    ref = next((rel for name, rel in case_script.get("template_refs") or [] if name == args.get("image")), None)
+                    target = Path(project_root) / ref if ref else None
+                    if target is not None and target.is_file():
+                        if shared["profile"] == "adaptive-v2" and "descriptor_canonical" not in shared:
+                            raise ValueError("导出的图像步骤缺少共享模板描述，请重新生成脚本包")
+                        ensure_descriptor(target.read_bytes(), shared)
+            except (ValueError, RuntimeError) as exc:
+                issues.append(_issue(order, "error", "P1006_INVALID_ARGS", str(exc)))
+
         if action in ("start_app", "stop_app"):
             app_identifier = (args.get("bundle_id") or args.get("app_id")) if str(platform).lower() == "ios" else (args.get("package") or args.get("app_id"))
             if not app_identifier:

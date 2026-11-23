@@ -27,13 +27,13 @@ class ImageDriver(FakeDriver):
         self.image_calls = []
         self.image_error = None
 
-    def click_image(self, path, image_options=None, timeout=10):
+    def click_image(self, path, image_options=None, timeout=10, image_match=None):
         self.image_calls.append((path, image_options, timeout))
         if self.image_error:
             raise self.image_error
         return {"image_match": {"status": "matched", "point": [10, 20], "matcher_version": "strict-v1"}}
 
-    def assert_image(self, path, match_mode="exists", image_options=None, timeout=10, abort_event=None):
+    def assert_image(self, path, match_mode="exists", image_options=None, timeout=10, abort_event=None, image_match=None):
         self.assert_image_calls.append((path, match_mode, image_options, timeout, abort_event))
         return {"image_match": {"status": "ambiguous", "candidates": [{"accepted": True}], "assertion_mode": match_mode}}
 
@@ -160,9 +160,12 @@ class ImageClickContractTests(unittest.TestCase):
                         self.assertEqual(call[1] if action == "click_image" else call[2],
                                          {"template_sha256": CONFIG["template_sha256"], "tap_anchor": CONFIG["tap_anchor"]})
 
-    def test_legacy_single_argument_driver_remains_supported(self):
-        runner = self.runner(driver=FakeDriver("offline"))
-        self.assertEqual(runner.run_step({"action": "click_image", "args": {"image_path": "old.png"}})["status"], "PASS")
+    def test_legacy_driver_requires_upgrade_for_default_adaptive_but_supports_explicit_strict(self):
+        driver = FakeDriver("offline")
+        driver.click_image = lambda path: None
+        runner = self.runner(driver=driver)
+        self.assertEqual(runner.run_step({"action": "click_image", "args": {"image_path": "old.png"}})["status"], "FAIL")
+        self.assertEqual(runner.run_step({"action": "click_image", "args": {"image_path": "old.png", "image_match": {"profile": "strict-v1"}}})["status"], "PASS")
 
     def test_diagnostics_survive_failure_and_submitted_tap_is_never_retried(self):
         runner = self.runner()
@@ -179,7 +182,7 @@ class ImageClickContractTests(unittest.TestCase):
     def test_image_attempts_share_one_timeout_budget(self):
         clock = [0.0]
         runner = self.runner()
-        def fail_image(path, image_options=None, timeout=10):
+        def fail_image(path, image_options=None, timeout=10, image_match=None):
             runner.driver.image_calls.append(timeout)
             clock[0] += min(0.8, timeout)
             raise ExecutionStepRuntimeError("E2005_IMAGE_NOT_MATCHED", "not found")

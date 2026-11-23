@@ -556,13 +556,13 @@ ACTIONS.assert_image = function (ctx, step) {
             strictImageFailure({status: "unsupported", reason: "strict_matcher_unavailable"});
         }
         var capabilities = images.strictMatcherCapabilities();
-        if (!capabilities || capabilities.matcher_version !== "strict-v1" || capabilities.validated !== true) {
+        if (!capabilities || capabilities.validated !== true) {
             strictImageFailure({status: "unsupported", reason: "strict_matcher_not_validated"});
         }
         if (step.args.hasOwnProperty("image_options") && isNullish(step.args.image_options)) {
             strictImageFailure({status: "invalid_options", reason: "image_options_must_be_object"});
         }
-        var options = strictImageOptions(step.args.hasOwnProperty("image_options") ? step.args.image_options : {});
+        var options = sharedImageOptions(step, strictImageOptions(step.args.hasOwnProperty("image_options") ? step.args.image_options : {}), capabilities);
         template = loadTemplateAsset(ctx, step.args.image, options.template_sha256);
         var readFrame = function () {
             if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
@@ -580,7 +580,7 @@ ACTIONS.assert_image = function (ctx, step) {
             });
             if (stopRequested(ctx)) strictImageFailure({status: "unstable", reason: "execution_stopped"});
             if (Date.now() >= deadline) strictImageFailure({status: "unstable", reason: "deadline_exceeded"});
-            if (!found || found.matcher_version !== "strict-v1" || !(found.candidates instanceof Array) ||
+            if (!found || found.matcher_version !== options.image_match.profile || !(found.candidates instanceof Array) ||
                 ["matched", "not_found", "ambiguous", "invalid_template", "invalid_options", "unstable", "unsupported"].indexOf(found.status) < 0) {
                 strictImageFailure({status: "unsupported", reason: "invalid_matcher_contract"});
             }
@@ -670,6 +670,46 @@ function strictImageOptions(raw) {
     return options;
 }
 
+// A single frozen descriptor accompanies the original PNG on every execution
+// surface. Missing capabilities or a damaged binding are never downgraded.
+function sharedImageOptions(step, options, capabilities) {
+    var raw = step.args.hasOwnProperty("image_match") ? step.args.image_match : {profile: "adaptive-v2"};
+    if (!raw || typeof raw !== "object" || raw instanceof Array) {
+        strictImageFailure({status: "invalid_options", reason: "image_match_must_be_object"});
+    }
+    var config = JSON.parse(JSON.stringify(raw));
+    config.profile = config.hasOwnProperty("profile") ? config.profile : "adaptive-v2";
+    if (["strict-v1", "adaptive-v2"].indexOf(config.profile) < 0) {
+        strictImageFailure({status: "unsupported", reason: "unknown_matcher_profile"});
+    }
+    if (config.hasOwnProperty("template_sha256")) {
+        if (!/^[a-f0-9]{64}$/i.test(String(config.template_sha256 || ""))) {
+            strictImageFailure({status: "invalid_options", reason: "template_hash_required"});
+        }
+        var digest = config.template_sha256.toLowerCase();
+        if (options.template_sha256 && options.template_sha256 !== digest) {
+            strictImageFailure({status: "invalid_options", reason: "template_hash_mismatch"});
+        }
+        options.template_sha256 = digest;
+    }
+    if (config.profile === "adaptive-v2") {
+        if (!capabilities.profiles || Array.prototype.indexOf.call(capabilities.profiles, "adaptive-v2") < 0 ||
+            !capabilities.descriptor_versions || Array.prototype.indexOf.call(capabilities.descriptor_versions, 1) < 0) {
+            strictImageFailure({status: "unsupported", reason: "adaptive_matcher_upgrade_required"});
+        }
+        if (!/^[a-f0-9]{64}$/i.test(String(config.template_sha256 || "")) ||
+            typeof config.descriptor_canonical !== "string" || !/^[a-f0-9]{64}$/i.test(String(config.descriptor_sha256 || ""))) {
+            strictImageFailure({status: "invalid_options", reason: "prepared_descriptor_required"});
+        }
+        if (options.template_sha256 && options.template_sha256 !== config.template_sha256.toLowerCase()) {
+            strictImageFailure({status: "invalid_options", reason: "template_hash_mismatch"});
+        }
+        options.template_sha256 = config.template_sha256.toLowerCase();
+    }
+    options.image_match = config;
+    return options;
+}
+
 function strictImageStable(first, second) {
     if (!first || first.status !== "matched" || second.status !== "matched") return false;
     var a = first.rect, b = second.rect;
@@ -703,14 +743,14 @@ ACTIONS.click_image = function (ctx, step) {
     var capabilities;
     try { capabilities = images.strictMatcherCapabilities(); }
     catch (capabilityError) { strictImageFailure({status: "unsupported", reason: "strict_matcher_unavailable"}); }
-    if (!capabilities || capabilities.matcher_version !== "strict-v1" || capabilities.validated !== true) {
+    if (!capabilities || capabilities.validated !== true) {
         strictImageFailure({status: "unsupported", reason: "strict_matcher_not_validated"});
     }
     var raw = step.args.hasOwnProperty("image_options") ? step.args.image_options : {};
     if (step.args.hasOwnProperty("image_options") && isNullish(raw)) {
         strictImageFailure({status: "invalid_options", reason: "image_options_must_be_object"});
     }
-    var options = strictImageOptions(raw);
+    var options = sharedImageOptions(step, strictImageOptions(raw), capabilities);
     var timeout = Number(step.timeout || 10);
     if (!isFinite(timeout) || timeout <= 0) strictImageFailure({status: "invalid_options", reason: "invalid_timeout"});
     var startedAt = Date.now(), deadline = startedAt + timeout * 1000;
@@ -730,7 +770,7 @@ ACTIONS.click_image = function (ctx, step) {
                     var found = images.matchImageStrict(shot, template, callOptions);
                     // Normalize bridge-owned arrays/objects to this JS engine's realm.
                     if (found && typeof found === "object") found = JSON.parse(JSON.stringify(found));
-                    if (!found || ["matched", "not_found", "ambiguous", "invalid_template", "invalid_options", "unstable", "unsupported"].indexOf(found.status) < 0 || found.matcher_version !== "strict-v1") {
+                    if (!found || ["matched", "not_found", "ambiguous", "invalid_template", "invalid_options", "unstable", "unsupported"].indexOf(found.status) < 0 || found.matcher_version !== options.image_match.profile) {
                         strictImageFailure({status: "unsupported", reason: "invalid_matcher_contract"});
                     }
                     if (found.status === "matched") {
@@ -982,7 +1022,7 @@ function renderRuntimeValue(ctx, value) {
         }
         var obj = {};
         for (var k in value) {
-            obj[k] = renderRuntimeValue(ctx, value[k]);
+            obj[k] = k === "image_match" ? value[k] : renderRuntimeValue(ctx, value[k]);
         }
         return obj;
     }

@@ -19,6 +19,8 @@ from backend.step_contract import (
     normalize_action,
     normalize_execute_on,
     normalize_retry_count,
+    step_image_match,
+    step_image_options,
 )
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
 from backend.utils.image_match_options import preserve_image_references
@@ -156,7 +158,7 @@ def render_with_variables(raw: Any, variables: Dict[str, str]) -> Any:
     if isinstance(raw, list):
         return [render_with_variables(item, variables) for item in raw]
     if isinstance(raw, dict):
-        return {k: render_with_variables(v, variables) for k, v in raw.items()}
+        return {k: v if k == "image_match" else render_with_variables(v, variables) for k, v in raw.items()}
     return raw
 
 
@@ -837,6 +839,21 @@ def prepare_steps_for_platform(
             )
             if image_path:
                 args["image_path"] = image_path
+                from pathlib import Path
+                from backend.utils.adaptive_template import ensure_descriptor
+                from backend.utils.image_match_options import select_image_options
+                target = Path(str(image_path))
+                if not target.is_absolute():
+                    target = Path(__file__).resolve().parents[1] / target
+                shared = step_image_match(step_item, args)
+                if target.is_file():
+                    settings = select_image_options(step_image_options(step_item, args), platform_lower,
+                        image_path=image_path, platform_overrides=step_item.get("platform_overrides"),
+                        default_image_path=image_path)
+                    shared = ensure_descriptor(target.read_bytes(), shared, anchor=settings.get("tap_anchor"), deadline=time.monotonic() + 10)
+                args["image_match"] = shared
+                if isinstance(step_item.get("options"), dict) and "image_match" in step_item["options"]:
+                    step_item["options"] = {**step_item["options"], "image_match": shared}
 
         if platform_lower in execute_on and action == "extract_by_ocr":
             region = _resolve_extract_region(

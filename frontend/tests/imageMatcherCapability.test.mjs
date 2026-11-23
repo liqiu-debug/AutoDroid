@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 
 const read = file => readFileSync(new URL(file, import.meta.url), 'utf8')
 const stripImports = source => source.replace(/^import [\s\S]*? from ['"][^'"]+['"]\s*\n/gm, '')
-const capability = { version: 'strict-v1', validated: true, preview: true, metadata: true }
+const capability = { version: 'strict-v1', validated: true, preview: true, metadata: true, profiles: ['strict-v1', 'adaptive-v2'], descriptor_versions: [1] }
 const upgraded = { clientMode: true, image_matcher: capability }
 const upgradeMessage = /请升级桌面客户端以使用高精度图像功能/
 

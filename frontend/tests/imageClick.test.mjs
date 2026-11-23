@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { ref, computed, nextTick, watch, reactive } from 'vue'
+import { ref, computed, nextTick, watch, reactive, effectScope, isProxy } from 'vue'
 import * as imageOptions from '../src/utils/imageOptions.js'
 import * as actionConstants from '../src/utils/actionConstants.js'
 
@@ -33,6 +33,50 @@ test('saved image settings survive load, edit, save and legacy export for both p
   assert.deepEqual(uiStepToLegacyStep(ui).options.image_options, edited)
   assert.deepEqual(standardStepToUiStep(standard).options.image_options, edited)
   assert.deepEqual(saved.args.image_options, maps, 'editing must not mutate the fetched source object')
+})
+
+test('shared descriptors survive assertion and click legacy round trips without null defaults', () => {
+  const { standardStepToUiStep, uiStepToStandardStep, uiStepToLegacyStep } = storeFunctions()
+  const shared = { profile: 'adaptive-v2', template_sha256: sha, descriptor_canonical: '{"text":"云闪付"}', descriptor_sha256: 'c'.repeat(64) }
+  for (const action of ['click_image', 'assert_image']) {
+    const saved = { action, args: { image_path: 'shared.png', image_options: { ios: config }, image_match: shared } }
+    const ui = standardStepToUiStep(saved)
+    assert.deepEqual(uiStepToStandardStep(ui, 1).args.image_match, shared)
+    assert.deepEqual(uiStepToLegacyStep(ui).options.image_match, shared)
+    assert.deepEqual(uiStepToLegacyStep(ui).options.image_options, { ios: config })
+    for (const invalid of [null, false, '', [], { profile: null }, { profile: 'unknown' }]) {
+      assert.throws(() => standardStepToUiStep({ action, args: { image_match: invalid } }), /配置/)
+      assert.throws(() => uiStepToStandardStep({ action, args: { image_match: invalid }, options: {} }, 1), /配置/)
+    }
+  }
+  assert.throws(() => imageOptions.getSharedImageMatch({ args: { image_match: shared }, options: { image_match: { profile: 'strict-v1' } } }), /冲突/)
+  assert.deepEqual(imageOptions.getSharedImageMatch({ args: { image_match: { profile: 'strict-v1' } } }), { profile: 'strict-v1' })
+  const newStep = { action: 'assert_image', selector: '', options: {} }
+  const before = copy(newStep)
+  assert.throws(() => imageOptions.bindRecordedImage(newStep, 'ios', 'new.png', config, null), /配置/)
+  assert.deepEqual(newStep, before, 'invalid metadata must not partially replace the template')
+})
+
+test('recrop retains explicit strict semantics and independent template hashes', () => {
+  const step = { action: 'click_image', selector: 'old.png', args: { image_path: 'old.png', image_match: { profile: 'strict-v1' } },
+    options: { image_match: { profile: 'strict-v1' }, image_options: { android: config } } }
+  imageOptions.bindRecordedImage(step, 'ios', 'new.png', maps.ios, { profile: 'adaptive-v2', template_sha256: 'b'.repeat(64) })
+  assert.deepEqual(step.args.image_match, { profile: 'strict-v1' })
+  assert.equal(step.platform_overrides.android.selector, 'old.png')
+  assert.equal(step.options.image_options.android.template_sha256, sha)
+  assert.equal(step.options.image_options.ios.template_sha256, 'b'.repeat(64))
+  imageOptions.replaceDefaultImagePath(step, 'third.png')
+  assert.deepEqual(step.args.image_match, { profile: 'strict-v1' })
+})
+
+test('independent legacy pictures freeze only after selecting their original template', () => {
+  const shared = { profile: 'adaptive-v2', template_sha256: sha, descriptor_canonical: '{}', descriptor_sha256: 'c'.repeat(64) }
+  const step = { action: 'click_image', selector: 'old.png', args: { image_path: 'old.png', image_match: shared },
+    options: { image_match: copy(shared), image_options: { android: config } } }
+  imageOptions.bindRecordedImage(step, 'ios', 'new.png', maps.ios, { ...shared, template_sha256: 'b'.repeat(64) })
+  assert.deepEqual(step.args.image_match, { profile: 'adaptive-v2' })
+  assert.equal(imageOptions.selectImagePath(step, 'android'), 'old.png')
+  assert.equal(imageOptions.selectImagePath(step, 'ios'), 'new.png')
 })
 
 test('an explicitly cleared template binding cannot resurrect old args metadata', () => {
@@ -338,8 +382,198 @@ function editorSetup(api = {}, props = { deviceSerial: 'ios-device' }) {
     useCaseStore: () => ({}), storeToRefs: () => ({ currentCase: ref({ steps: [] }), lastAddedStepUuid: ref(null) }),
     api, apiClient: api, ElMessage: notices, createUuid: () => 'generated', ...actionConstants, ...imageOptions
   }
-  return new Function(...Object.keys(deps), source + '\nreturn {buildExecutableStep,previewImageMatch,imagePreviewResult}')(...Object.values(deps))
+  const scope = effectScope()
+  const editor = scope.run(() => new Function(...Object.keys(deps), source + '\nreturn {buildExecutableStep,previewImageMatch,imagePreviewResult,imagePreviewBusy,imagePreviewVisible}')(...Object.values(deps)))
+  return { ...editor, dispose: () => scope.stop() }
 }
+
+// Recorded case 48 steps use one iOS template on Android, with an explicit
+// adaptive profile. The store adds options.image_match before Pinia proxies it.
+function recordedImageSteps() {
+  return [
+    { order: 6, action: 'assert_image', image: 'ddcefbc8a6fbc8e6',
+      sha: 'ddcefbc8a6fbc8e6cd6ecc382757c505ef721c756e951bca974ea9e40e75dbb5', anchor: [0.5, 0.5] },
+    { order: 8, action: 'click_image', image: '9873a10dbe180617',
+      sha: '9873a10dbe18061710badde2ffde31d19ac0a91e536c63f13d2d9aa6a7d471a9', anchor: [0.48598130841121495, 0.5135135135135135] }
+  ].map(({ order, action, image, sha, anchor }) => {
+    const imagePath = `static/images/element_${image}.png`
+    return { order, action,
+      args: { image_path: imagePath, image_options: { ios: { template_sha256: sha, tap_anchor: anchor, source_size: [1178, 2556] } },
+        image_match: { profile: 'adaptive-v2' }, ...(action === 'assert_image' ? { match_mode: 'exists' } : {}) },
+      value: '', execute_on: ['android', 'ios'],
+      platform_overrides: { android: { selector: imagePath, by: 'image' }, ios: { selector: imagePath, by: 'image' } },
+      timeout: 10, error_strategy: 'ABORT', retry_count: 0, description: '' }
+  })
+}
+
+function previewApi(result = { status: 'matched', candidates: [{ accepted: true }] }) {
+  const requests = []
+  return { requests, api: {
+    ensureImageMatcher: async () => { requests.push({ stage: 'capability' }) },
+    getDeviceDump: async serial => {
+      requests.push({ stage: 'screenshot', serial })
+      return { data: { screenshot: 'SCREEN', device_info: { platform: 'android' } } }
+    },
+    matchImage: async payload => { requests.push({ stage: 'match', payload }); return { data: result } },
+    executeStep: () => assert.fail('preview must not execute a device step'),
+    interactDevice: () => assert.fail('preview must not tap a device')
+  } }
+}
+
+test('shared image descriptors deeply clone Vue proxies while preserving canonical metadata and conflict checks', () => {
+  const descriptor = { schema_version: 1, template_size: [277, 122],
+    regions: [{ id: 'visual-1', kind: 'visual', rect: [0, 0, 0.3, 1], required: true },
+      { id: 'text-1', kind: 'text', rect: [0.4, 0, 1, 1], text: '云闪付', required: true }],
+    relations: [{ visual: 'visual-1', text: 'text-1', direction: 'right' }], tap: { region_id: 'visual-1', anchor: [0.2, 0.7] } }
+  const shared = { profile: 'adaptive-v2', template_sha256: sha, descriptor,
+    descriptor_canonical: JSON.stringify(descriptor), descriptor_sha256: 'c'.repeat(64) }
+  const step = reactive({ args: { image_match: copy(shared) }, options: { image_match: copy(shared) } })
+  assert.equal(isProxy(step.args.image_match.descriptor.regions), true)
+  const cloned = imageOptions.getSharedImageMatch(step)
+  assert.deepEqual(cloned, shared)
+  assert.doesNotThrow(() => structuredClone(cloned))
+  cloned.descriptor.regions[1].text = 'changed'
+  cloned.descriptor.tap.anchor[0] = 0.9
+  assert.equal(step.args.image_match.descriptor.regions[1].text, '云闪付')
+  assert.equal(step.options.image_match.descriptor.tap.anchor[0], 0.2)
+  assert.equal(step.args.image_match.descriptor_canonical, JSON.stringify(descriptor))
+  const mixed = { args: { image_match: { ...shared, descriptor: reactive(copy(descriptor)) } } }
+  assert.deepEqual(imageOptions.getSharedImageMatch(mixed), shared, 'nested proxies inside a plain config are cloned too')
+  step.options.image_match.descriptor.regions[1].text = 'different'
+  assert.throws(() => imageOptions.getSharedImageMatch(step), /图像匹配配置冲突/)
+})
+
+test('reactive shared settings survive save and recapture without aliasing their descriptor', () => {
+  const { standardStepToUiStep, uiStepToStandardStep } = storeFunctions()
+  const step = reactive(standardStepToUiStep(recordedImageSteps()[0]))
+  const descriptor = { schema_version: 1, template_size: [303, 294],
+    regions: [{ id: 'whole', kind: 'visual', rect: [0, 0, 1, 1], required: true }],
+    relations: [], tap: { region_id: 'whole', anchor: [0.5, 0.5] } }
+  const shared = { profile: 'adaptive-v2', template_sha256: config.template_sha256,
+    descriptor, descriptor_canonical: JSON.stringify(descriptor), descriptor_sha256: 'c'.repeat(64) }
+  const incoming = reactive(copy(shared))
+  imageOptions.setSharedImageMatch(step, incoming)
+  incoming.descriptor.regions[0].rect[0] = 0.2
+  assert.deepEqual(step.args.image_match, shared)
+  assert.deepEqual(step.options.image_match, shared)
+  const saved = uiStepToStandardStep(step, 6)
+  assert.deepEqual(saved.args.image_match, shared)
+  saved.args.image_match.descriptor.tap.anchor[0] = 0.1
+  assert.equal(step.options.image_match.descriptor.tap.anchor[0], 0.5)
+
+  // Re-capture a template shared by both platforms, retaining its bound
+  // descriptor and canonical digest through the same reactive draft.
+  imageOptions.bindRecordedImage(step, 'ios', step.selector, copy(config), reactive(copy(shared)))
+  const recaptured = uiStepToStandardStep(step, 6)
+  assert.deepEqual(recaptured.args.image_match, shared)
+  assert.deepEqual(recaptured.args.image_options.ios, config)
+  assert.deepEqual(imageOptions.getSharedImageMatch(step), shared)
+})
+
+test('loaded recorded image assertions and clicks preview through real Vue reactive watchers', async t => {
+  const { standardStepToUiStep } = storeFunctions()
+  for (const standard of recordedImageSteps()) {
+    const step = reactive(standardStepToUiStep(copy(standard)))
+    assert.equal(isProxy(step.options.image_match), true)
+    const { api, requests } = previewApi()
+    const editor = editorSetup(api, reactive({ deviceSerial: 'android-device' }))
+    t.after(editor.dispose)
+    await editor.previewImageMatch(step)
+    assert.equal(editor.imagePreviewBusy.value, false)
+    assert.equal(editor.imagePreviewResult.value.status, 'matched')
+    assert.deepEqual(requests.map(request => request.stage), ['capability', 'screenshot', 'match'])
+    const payload = requests[2].payload
+    assert.equal(payload.image_path, standard.args.image_path)
+    assert.deepEqual(payload.image_match, { profile: 'adaptive-v2' })
+    assert.deepEqual(payload.image_options, { template_sha256: standard.args.image_options.ios.template_sha256,
+      tap_anchor: standard.args.image_options.ios.tap_anchor })
+    assert.deepEqual(step.args, standard.args, 'preview must not mutate saved settings')
+  }
+  const legacy = copy(recordedImageSteps()[0])
+  delete legacy.args.image_match
+  const step = reactive(standardStepToUiStep(legacy))
+  assert.deepEqual(step.options.image_match, { profile: 'adaptive-v2' })
+  const { api } = previewApi()
+  const editor = editorSetup(api, { deviceSerial: 'android-device' })
+  t.after(editor.dispose)
+  await editor.previewImageMatch(step)
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'matched')
+})
+
+test('invalid preview configuration reports an error, releases loading, and permits a corrected retry', async t => {
+  const step = reactive({ action: 'assert_image', selector: 'target.png', options: { image_match: { profile: 'invalid-profile' } } })
+  const { api, requests } = previewApi()
+  const editor = editorSetup(api, { deviceSerial: 'android-device' })
+  t.after(editor.dispose)
+  await assert.doesNotReject(editor.previewImageMatch(step))
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.match(editor.imagePreviewResult.value.reason, /图像匹配配置版本无效/)
+  assert.equal(requests.length, 0)
+  assert.doesNotThrow(() => { step.options.image_match.profile = 'adaptive-v2' })
+  await editor.previewImageMatch(step)
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'matched')
+})
+
+test('an initial preview key exception is handled before loading can become stuck', async t => {
+  const step = reactive({ action: 'click_image', selector: 'target.png', options: {}, platform_overrides: {} })
+  step.platform_overrides.cycle = step.platform_overrides
+  const { api } = previewApi()
+  const editor = editorSetup(api, { deviceSerial: 'android-device' })
+  t.after(editor.dispose)
+  await assert.doesNotReject(editor.previewImageMatch(step))
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'unsupported')
+  assert.ok(editor.imagePreviewResult.value.reason)
+  delete step.platform_overrides.cycle
+  await editor.previewImageMatch(step)
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'matched')
+})
+
+test('a rejected matching request releases preview loading and allows another request', async t => {
+  const step = reactive(storeFunctions().standardStepToUiStep(recordedImageSteps()[0]))
+  const { api } = previewApi()
+  let attempts = 0
+  api.matchImage = async () => {
+    if (++attempts === 1) throw new Error('定位验证请求超时')
+    return { data: { status: 'matched', candidates: [{ accepted: true }] } }
+  }
+  const editor = editorSetup(api, { deviceSerial: 'android-device' })
+  t.after(editor.dispose)
+  await editor.previewImageMatch(step)
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.match(editor.imagePreviewResult.value.reason, /定位验证请求超时/)
+  await editor.previewImageMatch(step)
+  assert.equal(attempts, 2)
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'matched')
+})
+
+test('configuration changes while a preview is pending do not throw from its synchronous watcher', async t => {
+  const step = reactive(storeFunctions().standardStepToUiStep(recordedImageSteps()[1]))
+  const { api } = previewApi()
+  let finishMatch
+  api.matchImage = () => new Promise(resolve => { finishMatch = resolve })
+  const editor = editorSetup(api, { deviceSerial: 'android-device' })
+  t.after(editor.dispose)
+  const pending = editor.previewImageMatch(step)
+  pending.catch(() => {})
+  for (let i = 0; i < 10 && !finishMatch; i++) await Promise.resolve()
+  assert.equal(typeof finishMatch, 'function')
+  assert.doesNotThrow(() => { step.options.image_match.profile = 'invalid-profile' })
+  finishMatch({ data: { status: 'matched', candidates: [{ accepted: true }] } })
+  await pending
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'unstable')
+  assert.deepEqual(editor.imagePreviewResult.value.candidates, [])
+  assert.doesNotThrow(() => { step.options.image_match.profile = 'adaptive-v2' })
+  api.matchImage = async () => ({ data: { status: 'matched', candidates: [{ accepted: true }] } })
+  await editor.previewImageMatch(step)
+  assert.equal(editor.imagePreviewBusy.value, false)
+  assert.equal(editor.imagePreviewResult.value.status, 'matched')
+})
 
 test('step editor preserves both image actions and their metadata without preview requests', () => {
   const editor = editorSetup()
@@ -373,7 +607,7 @@ test('optional preview uses the current platform template for both image actions
     const step = { action, selector: 'android.png', options: { image_options: copy(maps) },
       platform_overrides: { android: { by: 'image', selector: 'android.png' }, ios: { by: 'image', selector: 'ios.png' } } }
     await editor.previewImageMatch(step)
-    assert.deepEqual(requests, [{ screenshot_base64: 'SCREEN', image_path: 'ios.png', image_options: maps.ios }])
+    assert.deepEqual(requests, [{ screenshot_base64: 'SCREEN', image_path: 'ios.png', image_options: maps.ios, image_match: { profile: 'adaptive-v2' } }])
     assert.deepEqual(editor.imagePreviewResult.value, result)
   }
 })

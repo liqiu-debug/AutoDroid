@@ -11,6 +11,8 @@ from backend.execution_errors import E2005_IMAGE_NOT_MATCHED, E2201_INVALID_ARGS
 from .image_match import MATCHER_VERSION, match_image, stable_match
 from .image_match_options import normalize_image_options
 from .template_match import image_to_bgr
+from .adaptive_template import ensure_descriptor
+from .adaptive_match import match_adaptive
 
 STATUS_CODES = {
     "not_found": E2005_IMAGE_NOT_MATCHED,
@@ -73,7 +75,7 @@ def _bounded_capture(capture, deadline):
     return image_to_bgr(bounded_image_read(capture, deadline), source="screenshot")
 
 
-def locate_stable_image(capture, image_path, image_options=None, timeout=10, abort_event=None):
+def locate_stable_image(capture, image_path, image_options=None, timeout=10, abort_event=None, image_match=None):
     """Returns evidence immediately before one caller-owned tap, or raises.
 
     Only not-found and unstable observations are retried; ambiguity/invalid input
@@ -97,6 +99,16 @@ def locate_stable_image(capture, image_path, image_options=None, timeout=10, abo
     except RuntimeError as exc:
         raise image_failure({"status": "invalid_template", "reason": str(exc), "matcher_version": MATCHER_VERSION,
                              "point": None, "candidates": [], "timings": {}}) from exc
+    try:
+        match_config = ensure_descriptor(raw, image_match, config.get("tap_anchor"), deadline=deadline)
+    except TimeoutError as exc:
+        raise image_failure({"status": "unstable", "reason": "deadline_exceeded", "matcher_version": "adaptive-v2",
+                             "point": None, "candidates": [], "timings": {}}) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise image_failure({"status": "invalid_template" if isinstance(exc, ValueError) else "unsupported",
+                             "reason": str(exc), "matcher_version": "adaptive-v2",
+                             "point": None, "candidates": [], "timings": {}}) from exc
+    adaptive = match_config["profile"] != "strict-v1"
     previous = None
     saw_match = False
     last_complete = None
@@ -111,7 +123,8 @@ def locate_stable_image(capture, image_path, image_options=None, timeout=10, abo
         except TimeoutError:
             last = {**last, "status": "unstable", "reason": "screenshot_deadline"}
             break
-        last = match_image(screen, template, config, deadline=deadline)
+        last = (match_adaptive(screen, template, config, deadline=deadline, image_match=match_config)
+                if adaptive else match_image(screen, template, config, deadline=deadline))
         if last["status"] in {"ambiguous", "invalid_template", "unsupported"}:
             raise image_failure(last)
         if last["status"] in {"matched", "not_found"}:

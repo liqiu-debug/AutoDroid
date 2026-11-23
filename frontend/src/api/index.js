@@ -164,7 +164,7 @@ const executionSessionKey = () => {
 }
 const imageMatcherSupported = info => {
     const capability = info?.image_matcher
-    return capability?.version === 'strict-v1' && capability.validated === true
+    return capability?.version === 'strict-v1' && capability.profiles?.includes('adaptive-v2') && capability.descriptor_versions?.includes(1) && capability.validated === true
         && capability.preview === true && capability.metadata === true
 }
 const imageClientInfo = () => {

@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +37,21 @@ GENERATOR_NAME = "autodroid/1"
 
 # 打包根目录（与 backend/api/cases.py 的 PROJECT_ROOT 一致）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _freeze_image_descriptors(case_script: Dict[str, Any]) -> None:
+    """Resolve against the same asset root used to build and validate the bundle."""
+    from backend.step_contract import step_image_match
+    from backend.utils.adaptive_template import ensure_descriptor
+    refs = dict(case_script.get("template_refs") or [])
+    for step in case_script.get("steps") or []:
+        if step.get("action") not in {"click_image", "assert_image"}:
+            continue
+        args = step.get("args") or {}
+        target = PROJECT_ROOT / refs[args["image"]] if args.get("image") in refs else None
+        if target is not None and target.is_file():
+            args["image_match"] = ensure_descriptor(target.read_bytes(), step_image_match({"args": args}),
+                anchor=(args.get("image_options") or {}).get("tap_anchor"), deadline=time.monotonic() + 10)
 
 
 def _load_runtime_source() -> str:
@@ -203,6 +219,7 @@ def collect_scenario_parts(
             missing.append(scenario_step.case_id)
             continue
         case_script = build_case_script(session, case, env_id=env_id, platform=platform)
+        _freeze_image_descriptors(case_script)
         module_file = f"cases/case_{case.id}.js"
         case_scripts.append((case_script, module_file))
         case_entries.append({
@@ -292,6 +309,7 @@ def build_case_bundle(
 ) -> Dict[str, Any]:
     """单用例的 JSON 脚本包（App 直跑）。"""
     case_script = build_case_script(session, case, env_id=env_id, platform=platform)
+    _freeze_image_descriptors(case_script)
     module_file = f"cases/case_{case.id}.js"
     precheck = precheck_case_package(
         [case_script], project_root=PROJECT_ROOT, platform=platform

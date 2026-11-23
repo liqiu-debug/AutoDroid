@@ -77,6 +77,9 @@ class Step(BaseModel):
         if isinstance(value, dict) and "image_options" in value:
             from backend.step_contract import normalize_image_options_map
             value = {**value, "image_options": normalize_image_options_map(value["image_options"])}
+        if isinstance(value, dict) and "image_match" in value:
+            from backend.step_contract import step_image_match
+            value = {**value, "image_match": step_image_match({"options": value})}
         return value
 
 class Variable(BaseModel):
@@ -1051,6 +1054,9 @@ class TestCaseStepWrite(BaseModel):
         if "image_options" in value:
             from backend.step_contract import normalize_image_options_map
             value = {**value, "image_options": normalize_image_options_map(value["image_options"])}
+        if isinstance(value, dict) and "image_match" in value:
+            from backend.step_contract import step_image_match
+            value = {**value, "image_match": step_image_match({"args": value})}
         return value
 
 class TestCaseStepCreate(TestCaseStepWrite):
@@ -1080,6 +1086,9 @@ class TestCaseStepUpdate(BaseModel):
         if isinstance(value, dict) and "image_options" in value:
             from backend.step_contract import normalize_image_options_map
             value = {**value, "image_options": normalize_image_options_map(value["image_options"])}
+        if isinstance(value, dict) and "image_match" in value:
+            from backend.step_contract import step_image_match
+            value = {**value, "image_match": step_image_match({"args": value})}
         return value
 
 class TestCaseStepRead(TestCaseStepWrite):

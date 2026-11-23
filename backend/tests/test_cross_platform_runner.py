@@ -100,11 +100,11 @@ class FakeDriver(BaseDriver):
         if app_id == "":
             raise ValueError("empty app")
 
-    def click_image(self, image_path: str) -> None:
+    def click_image(self, image_path: str, image_match=None) -> None:
         if image_path == "missing.png":
             raise RuntimeError("image not found")
 
-    def assert_image(self, image_path: str, match_mode: str = "exists") -> None:
+    def assert_image(self, image_path: str, match_mode: str = "exists", image_match=None) -> None:
         self.assert_image_calls.append(
             {
                 "image_path": image_path,

@@ -21,7 +21,7 @@ def normalize_variable_placeholders(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(normalize_variable_placeholders(item) for item in value)
     if isinstance(value, dict):
-        return {key: normalize_variable_placeholders(item) for key, item in value.items()}
+        return {key: item if key == "image_match" else normalize_variable_placeholders(item) for key, item in value.items()}
     return value
 
 

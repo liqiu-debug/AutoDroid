@@ -556,7 +556,7 @@ class IOSDriver(
             self._log_action_failure("swipe", started_at, exc, direction=direction)
             raise
 
-    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
+    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None, image_match=None) -> Dict[str, Any]:
         started_at = time.time()
         step_deadline = time.monotonic() + timeout
         target = ""
@@ -568,7 +568,7 @@ class IOSDriver(
             # Resolve the read-only session before capturing the target, so a
             # session discovery round-trip cannot stale a verified coordinate.
             session_id = bounded_image_read(lambda: self.client.session().session_id, step_deadline)
-            diagnostic = locate_stable_image(self.screenshot, target, image_options, max(0.001, step_deadline - time.monotonic()), abort_event=abort_event)
+            diagnostic = locate_stable_image(self.screenshot, target, image_options, max(0.001, step_deadline - time.monotonic()), abort_event=abort_event, image_match=image_match)
             x, y = diagnostic["point"]
             deadline = diagnostic.pop("_deadline", time.monotonic() + timeout)
             if abort_event is not None and abort_event.is_set():
@@ -582,7 +582,7 @@ class IOSDriver(
                     context={"image_match": diagnostic, "tap_submitted": True},
                 ) from tap_exc
             self._log_action_success(
-                "click_image", started_at, image_path=target, strategy="strict-v1",
+                "click_image", started_at, image_path=target, strategy=diagnostic.get("matcher_version", "adaptive-v2"),
                 x=round(x, 2), y=round(y, 2), stable_frames=2,
             )
             logger.info("iOS.click_image evidence: %s", diagnostic)
@@ -591,13 +591,13 @@ class IOSDriver(
             self._log_action_failure("click_image", started_at, exc, image_path=target)
             raise
 
-    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
+    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None, image_match=None) -> Dict[str, Any]:
         started_at = time.time()
         target = ""
         try:
             target = self._resolve_template_image_path(image_path, action_name="assert_image")
-            result = assert_image_presence(self.screenshot, target, match_mode, image_options, timeout, abort_event)
-            self._log_action_success("assert_image", started_at, image_path=target, match_mode=match_mode, strategy="strict-v1")
+            result = assert_image_presence(self.screenshot, target, match_mode, image_options, timeout, abort_event, image_match=image_match)
+            self._log_action_success("assert_image", started_at, image_path=target, match_mode=match_mode, strategy=result["image_match"].get("matcher_version", "adaptive-v2"))
             return result
         except Exception as exc:
             self._log_action_failure("assert_image", started_at, exc, image_path=target or image_path, match_mode=match_mode)

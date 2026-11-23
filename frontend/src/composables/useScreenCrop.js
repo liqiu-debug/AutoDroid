@@ -210,7 +210,7 @@ export function useScreenCrop({
     }
   }
 
-  const addQuickImageStep = (imagePath, imageOptions) => {
+  const addQuickImageStep = (imagePath, imageOptions, imageMatch) => {
     const step = {
       action: 'click_image',
       selector: imagePath,
@@ -218,8 +218,8 @@ export function useScreenCrop({
       value: '',
       description: '',
       error_strategy: 'ABORT',
-      options: { image_options: imageOptions },
-      args: { image_path: imagePath, image_options: imageOptions },
+      options: { image_options: imageOptions, image_match: imageMatch || { profile: 'adaptive-v2' } },
+      args: { image_path: imagePath, image_options: imageOptions, image_match: imageMatch || { profile: 'adaptive-v2' } },
       platform_overrides: { [currentImagePlatform()]: { selector: imagePath, by: 'image' } }
     }
     caseStore.addStep(step)
@@ -259,9 +259,9 @@ export function useScreenCrop({
       if (!isCurrent()) return false
       const options = makeRecordedImageOptions(metadata, anchor)
       if (step) {
-        bindRecordedImage(step, platform, metadata.image_path, options)
+        bindRecordedImage(step, platform, metadata.image_path, options, metadata.image_match)
       } else {
-        addQuickImageStep(metadata.image_path, { [platform]: options })
+        addQuickImageStep(metadata.image_path, { [platform]: options }, metadata.image_match)
       }
       const executeTap = Boolean(capture?.executeTap)
       let tapError = ''

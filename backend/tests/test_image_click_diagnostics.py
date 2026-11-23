@@ -18,11 +18,11 @@ def test_final_incomplete_frame_preserves_failed_verification(tmp_path, interrup
                "candidates": [], "timings": {}}
     captures = [object(), TimeoutError("screenshot_deadline")] if interrupted_by == "screenshot_deadline" else [object(), object()]
     ticks = [0, 0, .1, .2, 1.2] if interrupted_by == "screenshot_deadline" else [0, 0, .1, .2, 1.1, 1.2]
-    with patch.object(image_click, "image_to_bgr"), patch.object(image_click, "_bounded_capture", side_effect=captures), \
+    with patch.object(image_click, "ensure_descriptor", return_value={"profile": "strict-v1"}), patch.object(image_click, "image_to_bgr"), patch.object(image_click, "_bounded_capture", side_effect=captures), \
             patch.object(image_click, "match_image", side_effect=[absent, expired]), \
             patch.object(image_click.time, "monotonic", side_effect=ticks), patch.object(image_click.time, "sleep"), \
             pytest.raises(ExecutionStepRuntimeError) as failure:
-        image_click.locate_stable_image(lambda: None, template, timeout=1)
+        image_click.locate_stable_image(lambda: None, template, timeout=1, image_match={"profile": "strict-v1"})
     assert failure.value.code == "E2005_IMAGE_NOT_MATCHED"
     diagnostic = failure.value.context["image_match"]
     assert diagnostic["reason"] == "no_verified_candidate"
@@ -50,10 +50,10 @@ def test_timeout_messages_explain_which_operation_failed(reason, label):
 def test_budget_exhausted_before_first_frame_never_claims_verified_absence(tmp_path):
     template = tmp_path / "template.png"
     template.write_bytes(b"template")
-    with patch.object(image_click, "image_to_bgr"), patch.object(image_click, "_bounded_capture") as capture, \
+    with patch.object(image_click, "ensure_descriptor", return_value={"profile": "strict-v1"}), patch.object(image_click, "image_to_bgr"), patch.object(image_click, "_bounded_capture") as capture, \
             patch.object(image_click.time, "monotonic", side_effect=[0, 1.1, 1.2]), \
             pytest.raises(ExecutionStepRuntimeError) as failure:
-        image_click.locate_stable_image(lambda: None, template, timeout=1)
+        image_click.locate_stable_image(lambda: None, template, timeout=1, image_match={"profile": "strict-v1"})
     capture.assert_not_called()
     diagnostic = failure.value.context["image_match"]
     assert diagnostic["status"] == "unstable"
@@ -67,11 +67,11 @@ def test_only_verified_but_moving_target_reports_instability(tmp_path):
     template.write_bytes(b"template")
     matches = [{"status": "matched", "reason": "unique_verified_target", "point": [x, 20],
                 "rect": [x, 10, 40, 40], "candidates": [], "timings": {}} for x in (10, 30)]
-    with patch.object(image_click, "image_to_bgr"), patch.object(image_click, "_bounded_capture"), \
+    with patch.object(image_click, "ensure_descriptor", return_value={"profile": "strict-v1"}), patch.object(image_click, "image_to_bgr"), patch.object(image_click, "_bounded_capture"), \
             patch.object(image_click, "match_image", side_effect=matches), \
             patch.object(image_click.time, "monotonic", side_effect=[0, 0, .1, .2, 1.1, 1.2]), \
             patch.object(image_click.time, "sleep"), pytest.raises(ExecutionStepRuntimeError) as failure:
-        image_click.locate_stable_image(lambda: None, template, timeout=1)
+        image_click.locate_stable_image(lambda: None, template, timeout=1, image_match={"profile": "strict-v1"})
     assert failure.value.code == "E2012_IMAGE_UNSTABLE"
     diagnostic = failure.value.context["image_match"]
     assert diagnostic["reason"] == "target_not_stable"

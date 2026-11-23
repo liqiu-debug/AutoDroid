@@ -111,10 +111,10 @@ class BaseDriver(ABC):
     def stop_app(self, app_id: str) -> None:
         raise NotImplementedError(f"{self.__class__.__name__} 不支持 stop_app")
 
-    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event: Any = None) -> Optional[Dict[str, Any]]:
+    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event: Any = None, image_match: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         raise NotImplementedError(f"{self.__class__.__name__} 不支持 click_image")
 
-    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event: Any = None) -> Optional[Dict[str, Any]]:
+    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event: Any = None, image_match: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         raise NotImplementedError(f"{self.__class__.__name__} 不支持 assert_image")
 
     def extract_by_ocr(self, region: str, extract_rule: Optional[Dict[str, Any]] = None) -> str:

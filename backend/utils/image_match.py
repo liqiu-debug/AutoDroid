@@ -28,8 +28,10 @@ def matcher_capabilities() -> Dict[str, Any]:
     try:
         _load_cv_stack()
     except RuntimeError:
-        return {"version": MATCHER_VERSION, "validated": False, "preview": False, "metadata": True}
-    return {"version": MATCHER_VERSION, "validated": True, "preview": True, "metadata": True}
+        return {"version": MATCHER_VERSION, "validated": False, "preview": False, "metadata": True,
+                "profiles": ["strict-v1"], "descriptor_versions": []}
+    return {"version": MATCHER_VERSION, "validated": True, "preview": True, "metadata": True,
+            "profiles": ["strict-v1", "adaptive-v2"], "descriptor_versions": [1]}
 
 
 def _result(status: str, reason: str, quality=None, candidates=None, started=None) -> Dict[str, Any]:

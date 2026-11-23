@@ -36,6 +36,7 @@ from backend.utils.template_match import find_template_match, image_to_bgr, load
 from backend.utils.image_click import locate_stable_image
 from backend.utils.image_assert import assert_image_presence
 from backend.utils.image_tap import android_tap_once
+from backend.utils.android_png import capture_android_png
 
 logger = logging.getLogger(__name__)
 
@@ -884,10 +885,7 @@ class AndroidDriver(BaseDriver):
         """截取当前屏幕，返回 PNG 字节流。"""
         started_at = time.time()
         try:
-            image = self._device.screenshot(format="pillow")
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            raw = buf.getvalue()
+            raw = capture_android_png(self._device)
             self._log_action_success(
                 "screenshot",
                 started_at,
@@ -1070,7 +1068,7 @@ class AndroidDriver(BaseDriver):
             self._log_action_failure("stop_app", started_at, exc, app_id=app_id)
             raise
 
-    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
+    def click_image(self, image_path: str, image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None, image_match=None) -> Dict[str, Any]:
         started_at = time.time()
         target = ""
         try:
@@ -1078,7 +1076,7 @@ class AndroidDriver(BaseDriver):
             if abort_event is not None and abort_event.is_set():
                 from backend.execution_errors import USER_ABORT_MESSAGE
                 raise RuntimeError(USER_ABORT_MESSAGE)
-            diagnostic = locate_stable_image(lambda: self._device.screenshot(format="opencv"), target, image_options, timeout, abort_event=abort_event)
+            diagnostic = locate_stable_image(lambda: capture_android_png(self._device), target, image_options, timeout, abort_event=abort_event, image_match=image_match)
             x, y = diagnostic["point"]
             deadline = diagnostic.pop("_deadline", time.monotonic() + timeout)
             if abort_event is not None and abort_event.is_set():
@@ -1092,7 +1090,7 @@ class AndroidDriver(BaseDriver):
                     context={"image_match": diagnostic, "tap_submitted": True},
                 ) from tap_exc
             self._log_action_success(
-                "click_image", started_at, image_path=target, strategy="strict-v1",
+                "click_image", started_at, image_path=target, strategy=diagnostic.get("matcher_version", "adaptive-v2"),
                 x=round(x, 2), y=round(y, 2), stable_frames=2,
             )
             logger.info("Android.click_image evidence: %s", diagnostic)
@@ -1101,13 +1099,13 @@ class AndroidDriver(BaseDriver):
             self._log_action_failure("click_image", started_at, exc, image_path=target)
             raise
 
-    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None) -> Dict[str, Any]:
+    def assert_image(self, image_path: str, match_mode: str = "exists", image_options: Optional[Dict[str, Any]] = None, timeout: float = 10, abort_event=None, image_match=None) -> Dict[str, Any]:
         started_at = time.time()
         target = ""
         try:
             target = self._resolve_template_image_path(image_path, action_name="assert_image")
-            result = assert_image_presence(lambda: self._device.screenshot(format="opencv"), target, match_mode, image_options, timeout, abort_event)
-            self._log_action_success("assert_image", started_at, image_path=target, match_mode=match_mode, strategy="strict-v1")
+            result = assert_image_presence(lambda: capture_android_png(self._device), target, match_mode, image_options, timeout, abort_event, image_match=image_match)
+            self._log_action_success("assert_image", started_at, image_path=target, match_mode=match_mode, strategy=result["image_match"].get("matcher_version", "adaptive-v2"))
             return result
         except Exception as exc:
             self._log_action_failure("assert_image", started_at, exc, image_path=target or image_path, match_mode=match_mode)

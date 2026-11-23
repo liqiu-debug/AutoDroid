@@ -1,9 +1,12 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { imageMatchPreviewText } from '@/utils/imageOptions'
 
 const props = defineProps({ screenshot: { type: String, default: '' }, result: { type: Object, default: null }, action: { type: String, default: 'click_image' } })
 const dimensions = ref([1, 1])
+const accepted = computed(() => (props.result?.candidates || []).filter(item => item.accepted))
+const matchedText = computed(() => [...new Set(accepted.value.flatMap(item =>
+  Object.values(item.region_matches || {}).filter(region => region.text).map(region => region.text)))])
 const onLoad = event => { dimensions.value = [event.target.naturalWidth, event.target.naturalHeight] }
 const rectStyle = rect => ({
   left: `${100 * rect[0] / dimensions.value[0]}%`, top: `${100 * rect[1] / dimensions.value[1]}%`,
@@ -13,11 +16,14 @@ const rectStyle = rect => ({
 
 <template>
   <div class="image-preview-message" role="status">{{ imageMatchPreviewText(props.result, props.action) }}</div>
+  <p v-if="props.result?.matcher_version === 'adaptive-v2'" class="image-preview-help">
+    同一模板多设备适配<span v-if="matchedText.length"> · 已验证必要文字：{{ matchedText.join('、') }}</span>
+  </p>
   <div v-if="props.screenshot" class="image-preview-frame">
     <img :src="props.screenshot" alt="当前截图的图像定位验证" @load="onLoad" />
     <template v-for="(candidate, index) in props.result?.candidates || []" :key="index">
       <div v-if="Array.isArray(candidate.rect)" class="image-preview-candidate" :class="{ accepted: candidate.accepted }" :style="rectStyle(candidate.rect)">
-        <span>{{ index + 1 }} · {{ Number(candidate.similarity || 0).toFixed(3) }}</span>
+        <span>{{ index + 1 }} · {{ Number(candidate.similarity || 0).toFixed(3) }}<template v-if="candidate.scale"> · {{ Number(candidate.scale).toFixed(3) }}倍</template></span>
       </div>
     </template>
   </div>

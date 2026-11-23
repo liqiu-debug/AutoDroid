@@ -50,6 +50,7 @@ from backend.step_contract import (
 )
 from backend.utils import calculate_element_from_coordinates
 from backend.utils.image_match_preview import crop_metadata, preview_image_match
+from backend.utils.android_png import capture_android_png
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +308,8 @@ def _take_screenshot_payload(device, serial: Optional[str] = None) -> Tuple[str,
     """
     started_at = time.monotonic()
     try:
-        image = device.screenshot()
+        # Real Android Device instances expose adb_device. iOS uses WDA bytes.
+        image = capture_android_png(device) if getattr(type(device), "adb_device", None) is not None else device.screenshot()
         if isinstance(image, (bytes, bytearray)):
             raw = bytes(image)
             device_transport_metrics.record(
@@ -735,6 +737,7 @@ class MatchImageRequest(BaseModel):
     screenshot_base64: str
     image_path: str
     image_options: Optional[Dict[str, Any]] = None
+    image_match: Optional[Dict[str, Any]] = None
 
 
 @router.post("/api/device/match_image")
@@ -749,7 +752,7 @@ def preview_match_image(req: MatchImageRequest):
     if not target.is_relative_to(image_root) or not target.is_file():
         raise HTTPException(status_code=400, detail="模板图不存在或路径无效，请重新截取")
     try:
-        return preview_image_match(req.screenshot_base64, target.read_bytes(), req.image_options)
+        return preview_image_match(req.screenshot_base64, target.read_bytes(), req.image_options, req.image_match)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

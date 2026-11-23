@@ -9,7 +9,7 @@ import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
-import { getImageOptionsMap, selectImageOptions, selectImagePath, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
+import { getImageOptionsMap, getSharedImageMatch, selectImageOptions, selectImagePath, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
 import ImageMatchPreview from './ImageMatchPreview.vue'
 
 const caseStore = useCaseStore()
@@ -199,7 +199,7 @@ const buildExecutableStep = (step) => {
     }
   }
   if (['click_image', 'assert_image'].includes(step.action)) {
-    payloadStep.args = { ...(step.args || {}), image_path: String(step.selector || ''), image_options: getImageOptionsMap(step) }
+    payloadStep.args = { ...(step.args || {}), image_path: String(step.selector || ''), image_options: getImageOptionsMap(step), image_match: getSharedImageMatch(step) }
   }
 
   const selectorType = String(payloadStep.selector_type || '').trim()
@@ -267,9 +267,12 @@ const imagePreviewBusy = ref(false)
 const imagePreviewScreenshot = ref('')
 const imagePreviewResult = ref(null)
 const imagePreviewStep = ref(null)
-const imagePreviewKey = step => JSON.stringify([props.deviceSerial, step?.action, step?.selector, step?.platform_overrides, getImageOptionsMap(step)])
+const imagePreviewKey = step => JSON.stringify([props.deviceSerial, step?.action, step?.selector, step?.platform_overrides, getImageOptionsMap(step), getSharedImageMatch(step)])
+const safeImagePreviewKey = step => {
+  try { return imagePreviewKey(step) } catch { return null }
+}
 const staleImagePreview = () => ({ status: 'unstable', reason: '设备或模板已变化，请重新验证定位', candidates: [] })
-watch(() => imagePreviewStep.value && imagePreviewKey(imagePreviewStep.value), (key, oldKey) => {
+watch(() => imagePreviewStep.value && safeImagePreviewKey(imagePreviewStep.value), (key, oldKey) => {
   if (key !== oldKey && imagePreviewResult.value) imagePreviewResult.value = staleImagePreview()
 }, { flush: 'sync' })
 
@@ -277,14 +280,16 @@ const previewImageMatch = async step => {
   if (imagePreviewBusy.value) return
   if (!props.deviceSerial) { ElMessage.warning('请先选择一台调试设备'); return }
   imagePreviewBusy.value = true
-  imagePreviewVisible.value = true
-  imagePreviewResult.value = null
-  imagePreviewScreenshot.value = ''
-  imagePreviewStep.value = step
-  const requestedKey = imagePreviewKey(step)
+  let requestedKey = null
   const serial = props.deviceSerial
-  const isCurrent = () => imagePreviewVisible.value && requestedKey === imagePreviewKey(step)
+  const isCurrent = () => imagePreviewVisible.value && serial === props.deviceSerial
+    && (requestedKey === null || requestedKey === safeImagePreviewKey(step))
   try {
+    imagePreviewVisible.value = true
+    imagePreviewResult.value = null
+    imagePreviewScreenshot.value = ''
+    imagePreviewStep.value = step
+    requestedKey = imagePreviewKey(step)
     await api.ensureImageMatcher()
     if (!isCurrent()) { imagePreviewResult.value = staleImagePreview(); return }
     const { data: dump } = await api.getDeviceDump(serial, {
@@ -296,7 +301,7 @@ const previewImageMatch = async step => {
     const platform = dump.device_info?.platform === 'ios' ? 'ios' : 'android'
     const imagePath = selectImagePath(step, platform)
     const config = selectImageOptions(step, platform)
-    const { data } = await api.matchImage({ screenshot_base64: dump.screenshot, image_path: imagePath, ...(config ? { image_options: config } : {}) })
+    const { data } = await api.matchImage({ screenshot_base64: dump.screenshot, image_path: imagePath, image_match: getSharedImageMatch(step), ...(config ? { image_options: config } : {}) })
     if (imagePreviewVisible.value) imagePreviewResult.value = isCurrent() ? data : staleImagePreview()
   } catch (err) {
     if (imagePreviewVisible.value) imagePreviewResult.value = isCurrent()

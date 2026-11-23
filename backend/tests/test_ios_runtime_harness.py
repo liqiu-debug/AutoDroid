@@ -38,6 +38,8 @@ class IOSRuntimeHarnessTests(unittest.TestCase):
             "start_app": {"bundle_id": "com.apple.Preferences"},
             "stop_app": {"bundle_id": "com.apple.Preferences"},
         }.get(action, {})
+        if action in {"click_image", "assert_image"}:
+            args["image_match"] = {"profile": "strict-v1"}
         if image_options is not None:
             args["image_options"] = image_options
         if match_mode is not None:

@@ -338,6 +338,13 @@
     };
 
     global.ocr = {
+        detect: function (image, options) {
+            options = options || {};
+            if (typeof ADT.ocrItems !== "function") throw new Error("native_structured_ocr_unavailable");
+            var result = ADT.ocrItems(image.__h, Number(options.deadline_ms || (Date.now() + 10000)));
+            if (!result || String(result.status) !== "ok") throw new Error("native_structured_ocr_failed");
+            return JSON.parse(JSON.stringify(result.items || []));
+        },
         recognizeText: function (image) {
             var texts = ADT.ocr(image.__h) || [];
             var out = [];

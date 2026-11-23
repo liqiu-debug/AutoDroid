@@ -4,7 +4,7 @@ import api from '@/api'
 import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { fetchAllPages } from '@/utils/paginate'
-import { cloneImageOptions, getImageOptionsMap } from '@/utils/imageOptions'
+import { cloneImageOptions, getImageOptionsMap, getSharedImageMatch } from '@/utils/imageOptions'
 import {
     VERSION_CONFLICT_MESSAGE,
     extractVersionState,
@@ -73,7 +73,7 @@ function normalizeVariablePlaceholders(value) {
     }
     if (value && typeof value === 'object') {
         return Object.fromEntries(
-            Object.entries(value).map(([key, item]) => [key, normalizeVariablePlaceholders(item)])
+            Object.entries(value).map(([key, item]) => [key, key === 'image_match' ? item : normalizeVariablePlaceholders(item)])
         )
     }
     return value
@@ -210,6 +210,7 @@ function standardStepToUiStep(step) {
         }
         selectorType = 'image'
         if (args.image_options) options.image_options = cloneImageOptions(args.image_options)
+        options.image_match = getSharedImageMatch(step)
     }
     if ((value === undefined || value === null || value === '') && action === 'sleep' && args.seconds !== undefined) {
         value = String(args.seconds)
@@ -308,9 +309,13 @@ function uiStepToLegacyStep(step) {
             }
             : action === 'assert_image'
                 ? {
+                    image_options: getImageOptionsMap(normalized),
+                    image_match: getSharedImageMatch(normalized),
                     match_mode: normalized.options?.match_mode === 'not_exists' ? 'not_exists' : 'exists'
                 }
-                : (normalized.options && typeof normalized.options === 'object' ? normalized.options : {}),
+                : action === 'click_image'
+                    ? { ...(normalized.options || {}), image_options: getImageOptionsMap(normalized), image_match: getSharedImageMatch(normalized) }
+                    : (normalized.options && typeof normalized.options === 'object' ? normalized.options : {}),
         description: normalized.description || '',
         timeout: normalized.timeout,
         error_strategy: normalized.error_strategy || 'ABORT',
@@ -375,6 +380,9 @@ function uiStepToStandardStep(step, order) {
         args.extract_rule = normalized.options && typeof normalized.options === 'object' ? normalized.options : {}
     }
 
+    if (['click_image', 'assert_image'].includes(action)) {
+        args.image_match = getSharedImageMatch(normalized)
+    }
     return {
         order,
         action,
