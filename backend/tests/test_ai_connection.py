@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from backend.api.ai import TestConnectionRequest, test_ai_connection
+from backend.api.ai import TestConnectionRequest, test_ai_connection as call_test_ai_connection
 from backend.api.log_analysis import call_llm_service
 from backend.api_testing.ai_service import call_model
 
@@ -66,7 +66,7 @@ class TestConnectionApiTests(unittest.IsolatedAsyncioTestCase):
             "backend.api.ai._get_setting",
             side_effect=AssertionError("表单已给全值，不应读库"),
         ) as get_mock, patch("httpx.AsyncClient", _FakeAsyncClient):
-            resp = await test_ai_connection(
+            resp = await call_test_ai_connection(
                 TestConnectionRequest(
                     api_key="form-key",
                     api_base="https://llm.example/v1/",
@@ -92,7 +92,7 @@ class TestConnectionApiTests(unittest.IsolatedAsyncioTestCase):
             "backend.api.ai._get_setting",
             side_effect=["saved-key", "https://api.openai.com/v1", "gpt-4o-mini"],
         ) as get_mock, patch("httpx.AsyncClient", _FakeAsyncClient):
-            resp = await test_ai_connection(None, session=object())
+            resp = await call_test_ai_connection(None, session=object())
 
         self.assertTrue(resp.success)
         self.assertEqual(resp.model, "gpt-4o-mini")
@@ -105,7 +105,7 @@ class TestConnectionApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_api_key_returns_400(self):
         with patch("backend.api.ai._get_setting", return_value=""):
             with self.assertRaises(HTTPException) as ctx:
-                await test_ai_connection(None, session=object())
+                await call_test_ai_connection(None, session=object())
         self.assertEqual(ctx.exception.status_code, 400)
 
     async def test_upstream_http_error_maps_to_502(self):
@@ -118,7 +118,7 @@ class TestConnectionApiTests(unittest.IsolatedAsyncioTestCase):
             side_effect=["k", "https://x/v1", "m"],
         ), patch("httpx.AsyncClient", _FakeAsyncClient):
             with self.assertRaises(HTTPException) as ctx:
-                await test_ai_connection(None, session=object())
+                await call_test_ai_connection(None, session=object())
 
         self.assertEqual(ctx.exception.status_code, 502)
         self.assertIn("401", ctx.exception.detail)
@@ -131,7 +131,7 @@ class TestConnectionApiTests(unittest.IsolatedAsyncioTestCase):
             "httpx.AsyncClient", _SlowAsyncClient
         ):
             with self.assertRaises(HTTPException) as ctx:
-                await test_ai_connection(None, session=object())
+                await call_test_ai_connection(None, session=object())
 
         self.assertEqual(ctx.exception.status_code, 504)
 
