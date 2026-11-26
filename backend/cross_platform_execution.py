@@ -1080,6 +1080,24 @@ def check_wda_health(wda_url: str) -> None:
         ) from exc
 
 
+def mark_device_busy_for_execution(session: Session, device_serial: str) -> None:
+    """CAS protects queued startup reservations from legacy execution paths."""
+    from sqlalchemy import func, or_, update
+    device = session.exec(select(Device).where(Device.serial == device_serial)).first()
+    if device is None:
+        return
+    result = session.exec(update(Device).where(
+        Device.serial == device_serial,
+        or_(Device.lease_task_id.is_(None), Device.lease_task_id == ""),
+        # Existing case/scenario callers own the process limiter and may have
+        # already set BUSY. Preserve that compatibility while fencing leases.
+        func.upper(Device.status).in_(["IDLE", "BUSY"]),
+    ).values(status="BUSY", updated_at=datetime.now()))
+    if result.rowcount != 1:
+        session.rollback()
+        raise RuntimeError(f"设备已被其他执行任务占用: {device_serial}")
+
+
 def restore_device_status_after_execution(
     session: Session,
     device_serial: str,
@@ -1091,6 +1109,9 @@ def restore_device_status_after_execution(
     if not device:
         logger.warning("restore device status skipped: device not found serial=%s", device_serial)
         return None
+    if device.lease_task_id:
+        logger.info("restore skipped: device has an owner lease: serial=%s owner=%s", device_serial, device.lease_task_id)
+        return str(device.status or "").upper()
 
     if only_if_busy and str(device.status or "").strip().upper() != "BUSY":
         logger.info(

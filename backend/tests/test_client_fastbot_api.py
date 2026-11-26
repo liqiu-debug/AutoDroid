@@ -156,7 +156,7 @@ class ClientFastbotApiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         task_id = resp.json()["id"]
 
-        startup = self.client.get("/api/fastbot/startup/tasks").json()
+        startup = self.client.get("/api/fastbot/startup/tasks", headers=self._headers()).json()
         self.assertEqual([item["id"] for item in startup["items"]], [task_id])
 
         explore = self.client.get("/api/fastbot/tasks").json()

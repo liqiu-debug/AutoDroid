@@ -63,7 +63,7 @@ test('stability report detail survives slow links and missing devices', () => {
 test('fluency and startup history rows also resolve iOS device names', () => {
   for (const view of ['views/special/Fluency.vue', 'views/special/Startup.vue']) {
     const source = src(view)
-    assert.match(source, /getFastbotDevices\(\{ include_ios: true \}\)/, view)
+    assert.match(source, view.includes('Startup') ? /getStartupDevices\(/ : /getFastbotDevices\(\{ include_ios: true \}\)/, view)
     assert.doesNotMatch(source, /return serial \|\| '未知设备'/, view)
   }
 })

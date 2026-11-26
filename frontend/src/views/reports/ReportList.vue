@@ -7,10 +7,11 @@ import api from '@/api'
 import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
-import { runStatusTagType, runSourceLabel } from '@/utils/statusMeta'
+import { runStatusTagType, runStatusLabel, runSourceLabel } from '@/utils/statusMeta'
 import FlakyAnalysisDrawer from './FlakyAnalysisDrawer.vue'
 import ApiRunList from '../api-testing/RunList.vue'
 import { createPollingLoop } from '@/utils/polling'
+import { startupModeLabel, startupPlatformLabel, startupExecutorLabel, startupCounts, startupProgressText, startupCanViewReport, startupPercentileText, startupThresholdMetric, startupMetricLabel, isStartupActive } from '@/utils/startup'
 
 const router = useRouter()
 const route = useRoute()
@@ -382,19 +383,30 @@ const getFbDuration = (task) => {
     return `${m}m ${s}s`
 }
 
-const formatMs = (value) => {
-    const num = Number(value)
-    return Number.isFinite(num) ? `${num} ms` : '-'
-}
-
-const getStartupAggregateValue = (task, mode, key) => task.summary?.startup_aggregate?.[mode]?.[key]
 const getStartupSlowCount = (task) => Number(task.summary?.slow_count || 0)
 const getStartupModes = (task) => {
     const modes = task.summary?.startup_config?.startup_modes || []
     if (!Array.isArray(modes) || modes.length === 0) return '-'
-    return modes.map(mode => mode === 'cold' ? '冷启动' : '热启动').join(' / ')
+    return modes.map(startupModeLabel).join(' / ')
 }
 const getStartupIterations = (task) => task.summary?.startup_config?.iterations || task.duration || '-'
+const splitStartupPercentile = (task, mode) => {
+    const text = startupPercentileText(task, mode, startupThresholdMetric(task))
+    const [value, note] = text.split(' · ')
+    return { value, note: note || '' }
+}
+const formatStartupShortDate = (value) => value ? dayjs(value).format('MM-DD HH:mm') : '-'
+const startupStopping = ref([])
+const stopStartupTask = async task => {
+    if (!isStartupActive(task) || task.cancel_requested || startupStopping.value.includes(task.id)) return
+    startupStopping.value = [...startupStopping.value, task.id]
+    try {
+        const res = await api.stopStartupTask(task.id)
+        Object.assign(task, res.data || {}, { cancel_requested: true })
+        await fetchStartupTasks()
+    } catch (err) { ElMessage.error(err.response?.data?.detail || err.message || '取消失败，请重试') }
+    finally { startupStopping.value = startupStopping.value.filter(id => id !== task.id) }
+}
 
 const handleTabChange = (tab) => {
     if (tab === 'api') return
@@ -796,50 +808,72 @@ onUnmounted(() => {
                     <div class="list-scroll-area" v-loading="startupLoading">
                     <el-table
                         :data="startupTasksWithDevice"
+                        class="startup-report-table"
                         style="width: 100%"
                     >
-                        <el-table-column label="目标包名" min-width="190">
+                        <el-table-column label="目标包名" min-width="156">
                             <template #default="{ row }">
-                                <button type="button" class="ad-name-button pkg-name" @click="handleFbView(row.id)">{{ row.package_name }}</button>
+                                <button type="button" class="ad-name-button pkg-name" :disabled="!startupCanViewReport(row)" :title="row.package_name" @click="handleFbView(row.id)">{{ row.package_name }}</button>
+                                <div class="startup-meta">{{ startupPlatformLabel(row.platform || row.summary?.platform) }} · {{ startupExecutorLabel(row) }}</div>
                             </template>
                         </el-table-column>
-                        <el-table-column label="运行设备" width="170">
+                        <el-table-column label="运行设备" min-width="112" show-overflow-tooltip>
                             <template #default="{ row }">{{ row._resolved_device }}</template>
                         </el-table-column>
-                        <el-table-column label="冷启动就绪 P90" width="116" align="center">
-                            <template #default="{ row }">{{ formatMs(getStartupAggregateValue(row, 'cold', 'ready_p90_ms')) }}</template>
-                        </el-table-column>
-                        <el-table-column label="热启动就绪 P90" width="116" align="center">
-                            <template #default="{ row }">{{ formatMs(getStartupAggregateValue(row, 'hot', 'ready_p90_ms')) }}</template>
-                        </el-table-column>
-                        <el-table-column label="慢启动" width="90" align="center">
+                        <el-table-column label="冷启动 P90" min-width="118" align="center">
                             <template #default="{ row }">
-                                <span :class="{ 'text-danger': getStartupSlowCount(row) > 0 }">{{ getStartupSlowCount(row) }}</span>
+                                <div class="startup-metric-line">
+                                    <span class="startup-num">{{ splitStartupPercentile(row, 'cold').value }}</span>
+                                    <span v-if="splitStartupPercentile(row, 'cold').note" class="startup-sample-warn">{{ splitStartupPercentile(row, 'cold').note }}</span>
+                                </div>
+                                <div class="startup-meta startup-ellipsis" :title="startupMetricLabel(startupThresholdMetric(row), row.platform || row.summary?.platform)">{{ startupMetricLabel(startupThresholdMetric(row), row.platform || row.summary?.platform) }}</div>
                             </template>
                         </el-table-column>
-                        <el-table-column label="开始时间" width="140" align="center">
-                            <template #default="{ row }">{{ formatDate(row.started_at || row.created_at) }}</template>
-                        </el-table-column>
-                        <el-table-column label="状态" width="100" align="center">
+                        <el-table-column label="后台恢复 P90" min-width="96" align="center">
                             <template #default="{ row }">
-                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">{{ row.status }}</el-tag>
+                                <div class="startup-num">{{ splitStartupPercentile(row, 'hot').value }}</div>
+                                <div v-if="splitStartupPercentile(row, 'hot').note" class="startup-sample-warn">{{ splitStartupPercentile(row, 'hot').note }}</div>
                             </template>
                         </el-table-column>
-                        <el-table-column label="信息" width="56" align="center"><template #default="{ row }">
+                        <el-table-column label="进度 / 有效" width="106" align="center">
+                            <template #default="{ row }">
+                                <div class="startup-num">{{ startupProgressText(row) }}</div>
+                                <div class="startup-meta">有效 {{ startupCounts(row).valid ?? '未校验' }} · 无效 {{ startupCounts(row).invalid ?? '未校验' }}</div>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="超阈值" width="58" align="center">
+                            <template #default="{ row }">
+                                <span class="startup-num" :class="{ 'text-danger': getStartupSlowCount(row) > 0 }">{{ getStartupSlowCount(row) }}</span>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="开始时间" width="102" align="center">
+                            <template #default="{ row }">
+                                <span class="startup-num" :title="formatDate(row.started_at || row.created_at)">{{ formatStartupShortDate(row.started_at || row.created_at) }}</span>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="84" align="center">
+                            <template #default="{ row }">
+                                <el-tag :type="runStatusTagType(row.status)" size="small" effect="plain">{{ row.cancel_requested && isStartupActive(row) ? '取消中' : runStatusLabel(row.status) }}</el-tag>
+                            </template>
+                        </el-table-column>
+                        <el-table-column label="信息" width="52" align="center"><template #default="{ row }">
                             <el-popover trigger="click" width="300" placement="left">
                                 <template #reference><el-button link aria-label="报告完整信息">详情</el-button></template>
-                                <dl class="report-metadata"><dt>报告 ID</dt><dd>{{ row.id }}</dd><dt>执行人</dt><dd>{{ row.executor_name || '—' }}</dd><dt>完整时间</dt><dd>{{ dayjs(row.started_at || row.created_at).format('YYYY-MM-DD HH:mm:ss') }}</dd><dt>启动模式 / 次数</dt><dd>{{ getStartupModes(row) }} / {{ getStartupIterations(row) }}</dd><dt>冷 / 热 Total P90</dt><dd>{{ formatMs(getStartupAggregateValue(row, 'cold', 'p90_ms')) }} / {{ formatMs(getStartupAggregateValue(row, 'hot', 'p90_ms')) }}</dd></dl>
+                                <dl class="report-metadata"><dt>报告 ID</dt><dd>{{ row.id }}</dd><dt>执行人</dt><dd>{{ row.executor_name || '—' }}</dd><dt>完整时间</dt><dd>{{ dayjs(row.started_at || row.created_at).format('YYYY-MM-DD HH:mm:ss') }}</dd><dt>启动模式 / 次数</dt><dd>{{ getStartupModes(row) }} / {{ getStartupIterations(row) }}</dd><dt>冷 / 热阈值指标 P90</dt><dd>{{ startupPercentileText(row, 'cold', startupThresholdMetric(row)) }} / {{ startupPercentileText(row, 'hot', startupThresholdMetric(row)) }}</dd><dt>失败轮次</dt><dd>{{ startupCounts(row).failed }}</dd><dt>测量版本</dt><dd>{{ row.summary?.measurement_version || '历史版本' }}</dd></dl>
                             </el-popover>
                         </template></el-table-column>
-                        <el-table-column label="操作" width="88" align="center" fixed="right">
+                        <el-table-column label="操作" width="106" align="center" fixed="right">
                             <template #default="{ row }">
-                                <el-tooltip v-if="row.status === 'COMPLETED' || row.report_ready" content="查看报告" placement="top">
-                                    <el-button :icon="View" link type="primary" @click="handleFbView(row.id)" />
-                                </el-tooltip>
-                                <el-dropdown trigger="click" @command="handleFbDelete(row)">
-                                    <el-button :icon="MoreFilled" link aria-label="更多报告操作" />
-                                    <template #dropdown><el-dropdown-menu><el-dropdown-item command="delete" :disabled="['RUNNING', 'PENDING'].includes(row.status)">删除报告</el-dropdown-item></el-dropdown-menu></template>
-                                </el-dropdown>
+                                <div class="startup-row-actions">
+                                    <el-tooltip v-if="startupCanViewReport(row)" :content="isStartupActive(row) ? '查看部分报告' : '查看报告'" placement="top">
+                                        <el-button :icon="View" link type="primary" @click="handleFbView(row.id)" />
+                                    </el-tooltip>
+                                    <el-button v-if="isStartupActive(row)" link type="danger" :loading="startupStopping.includes(row.id)" :disabled="row.cancel_requested" @click="stopStartupTask(row)">取消</el-button>
+                                    <el-dropdown trigger="click" @command="handleFbDelete(row)">
+                                        <el-button :icon="MoreFilled" link aria-label="更多报告操作" />
+                                        <template #dropdown><el-dropdown-menu><el-dropdown-item command="delete" :disabled="isStartupActive(row)">删除报告</el-dropdown-item></el-dropdown-menu></template>
+                                    </el-dropdown>
+                                </div>
                             </template>
                         </el-table-column>
                     </el-table>
@@ -991,6 +1025,15 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.startup-meta { font-size: 12px; color: var(--ad-muted); margin-top: 2px; line-height: 1.4; }
+.startup-ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.startup-metric-line { display: inline-flex; align-items: baseline; justify-content: center; gap: 4px; flex-wrap: wrap; }
+.startup-num { font-variant-numeric: tabular-nums; font-weight: 500; }
+.startup-sample-warn { font-size: 11px; color: var(--ad-warning); white-space: nowrap; }
+.startup-row-actions { display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; }
+.startup-row-actions :deep(.el-button + .el-button) { margin-left: 0; }
+.startup-report-table :deep(.el-table__cell) { padding: 7px 0; height: auto; }
+.startup-report-table :deep(.cell) { line-height: 1.45; }
 .report-page-heading { display: flex; align-items: baseline; gap: 12px; padding: 16px 16px 0; }
 .report-page-heading h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--ad-text); }
 .report-page-heading span, .batch-summary { color: var(--ad-muted); font-size: 12px; }

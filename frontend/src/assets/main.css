@@ -98,7 +98,9 @@ h1, h2, h3 { color: var(--ad-text); }
 .autodroid-update-notes-label { display: block; font-size: 12px; color: var(--ad-muted); margin-bottom: 4px; }
 .autodroid-update-notes { display: block; max-height: min(45vh, 320px); overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; color: var(--ad-text); background: var(--ad-bg); border: 1px solid var(--ad-border); border-radius: 6px; padding: 8px 10px; text-align: left; }
 .el-dropdown-menu__item, .el-select-dropdown__item { font-size: 13px; }
-.el-tooltip__popper, .el-popper { max-width: min(560px, calc(100vw - 24px)); overflow-wrap: anywhere; }
+.el-tooltip__popper, .el-popper:not(.el-select__popper) { max-width: min(560px, calc(100vw - 24px)); overflow-wrap: anywhere; }
+.el-select__popper { max-width: calc(100vw - 24px); }
+.startup-device-popper .el-select-dropdown__item { height: auto; min-height: 36px; padding-top: 6px; padding-bottom: 6px; line-height: 1.4; }
 .el-empty { padding: 24px 12px; }
 .el-empty__description { margin-top: 12px; }
 .el-empty__description p { color: var(--ad-muted); font-size: 13px; }

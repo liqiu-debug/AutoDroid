@@ -37,7 +37,7 @@ from sqlmodel import Session, select
 from backend.api import deps
 from backend.database import get_session
 from backend.fastbot.reporting import FASTBOT_REPORTS_DIR
-from backend.models import FastbotReport, FastbotTask, User
+from backend.models import FastbotReport, FastbotTask, User, Device
 from backend.schemas import FastbotTaskRead
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ REPORTS_DIR = FASTBOT_REPORTS_DIR
 
 CLIENT_FASTBOT_KINDS = {"fastbot", "fluency", "startup"}
 SESSION_TYPE_BY_KIND = {"fluency": "fluency_manual", "startup": "startup"}
-FINISH_STATUSES = {"COMPLETED", "FAILED"}
+FINISH_STATUSES = {"COMPLETED", "FAILED", "ABORTED"}
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 _ARTIFACT_CHUNK_BYTES = 1024 * 1024
 
@@ -65,6 +65,9 @@ class ClientFastbotTaskCreate(BaseModel):
     capture_log: bool = True
     started_at: Optional[datetime] = None
     executor_name: Optional[str] = None
+    client_instance_id: Optional[str] = None
+    startup_config: Optional[Dict[str, Any]] = None
+    startup_capabilities: Optional[Dict[str, Any]] = None
 
 
 class ClientFastbotReportPayload(BaseModel):
@@ -82,6 +85,28 @@ class ClientFastbotFinish(BaseModel):
     total_anrs: Optional[int] = None
     finished_at: Optional[datetime] = None
     report: ClientFastbotReportPayload = Field(default_factory=ClientFastbotReportPayload)
+    client_instance_id: Optional[str] = None
+    attempt: int = 0
+    claim_token: str = ""
+
+
+class StartupClaim(BaseModel):
+    client_instance_id: str
+    capabilities: Optional[Dict[str, Any]] = None
+    active_run_ids: List[str] = Field(default_factory=list, max_length=100)
+
+
+class StartupGuard(BaseModel):
+    client_instance_id: str
+    attempt: int
+    claim_token: str = ""
+    run_id: Optional[str] = None
+    local_status: Optional[str] = None
+
+
+class StartupProgress(StartupGuard):
+    progress: Dict[str, Any] = Field(default_factory=dict)
+    partial_report: Optional[ClientFastbotReportPayload] = None
 
 
 def _normalize_kind(raw: Any) -> str:
@@ -111,8 +136,8 @@ def _safe_artifact_rel_path(raw: Any) -> str:
     return "/".join(parts)
 
 
-@router.post("", response_model=FastbotTaskRead)
-@router.post("/", response_model=FastbotTaskRead)
+@router.post("")
+@router.post("/")
 def create_client_fastbot_task(
     payload: ClientFastbotTaskCreate,
     session: Session = Depends(get_session),
@@ -130,6 +155,31 @@ def create_client_fastbot_task(
     device_serial = str(payload.device_serial or "").strip()
     if not package_name or not device_serial:
         raise HTTPException(status_code=400, detail="package_name / device_serial 不能为空")
+
+    if kind == "startup" and payload.startup_config is not None:
+        from backend import startup_dispatch as dispatch
+        from backend.startup.contract import StartupConfig
+        from pydantic import ValidationError
+        if not payload.client_instance_id:
+            raise HTTPException(422, "冷热启动需要 client_instance_id")
+        dispatch.register_instance(session, current_user, payload.client_instance_id, payload.startup_capabilities)
+        session.commit()
+        device = session.exec(select(Device).where(Device.serial == device_serial)).first()
+        if not device or device.owner_id != current_user.id or device.client_instance_id != payload.client_instance_id:
+            raise HTTPException(403, "设备不属于当前客户端实例，请重新连接设备")
+        try:
+            config = StartupConfig.model_validate({**payload.startup_config,
+                "package_name": package_name, "device_serials": [device_serial], "request_id": run_id}).model_dump()
+        except ValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        commands = dispatch.submit_commands(session, current_user, config, [device], local_run_id=run_id)
+        claimed = dispatch.claim_command(session, current_user, payload.client_instance_id,
+            task_id=commands[0].task_id, capabilities=payload.startup_capabilities)
+        if claimed is None:
+            command = commands[0]
+            claimed = dispatch.command_read(command, session.get(FastbotTask, command.task_id), include_guard=True)
+        task = session.get(FastbotTask, claimed["task_id"])
+        return {**FastbotTaskRead.model_validate(task).model_dump(), **claimed}
 
     existing = session.exec(select(FastbotTask).where(FastbotTask.run_id == run_id)).first()
     if existing is not None:
@@ -168,6 +218,58 @@ def create_client_fastbot_task(
     return task
 
 
+@router.post("/startup/claim")
+def claim_startup_task(payload: StartupClaim, session: Session = Depends(get_session),
+                       current_user: User = Depends(deps.get_current_user)):
+    from backend.startup_dispatch import claim_command
+    return {"command": claim_command(session, current_user, payload.client_instance_id,
+                                     capabilities=payload.capabilities, active_run_ids=payload.active_run_ids)}
+
+
+@router.post("/startup/{task_id}/progress")
+def progress_startup_task(task_id: int, payload: StartupProgress,
+                          session: Session = Depends(get_session),
+                          current_user: User = Depends(deps.get_current_user)):
+    from backend import startup_dispatch as dispatch
+    command = dispatch.guard_command(session, current_user, task_id, payload.client_instance_id,
+        payload.attempt, payload.claim_token)
+    return dispatch.record_progress(session, command, payload.progress,
+        payload.partial_report.model_dump() if payload.partial_report else None)
+
+
+@router.post("/startup/{task_id}/recover")
+def recover_startup_task(task_id: int, payload: StartupGuard,
+                         session: Session = Depends(get_session),
+                         current_user: User = Depends(deps.get_current_user)):
+    from backend import startup_dispatch as dispatch
+    dispatch.reap_commands(session)
+    command = dispatch.execution_for_task(session, task_id)
+    if not command:
+        raise HTTPException(404, "冷热启动命令不存在")
+    if command.node_owner_id != current_user.id or command.client_instance_id != payload.client_instance_id:
+        raise HTTPException(403, "执行节点或账号不一致")
+    if command.run_id != payload.run_id or command.attempt != payload.attempt or command.attempt < 1:
+        raise HTTPException(409, "旧执行结果无法对应当前任务，请保留本地结果")
+    # Restore only upload credentials. A restarted client never resumes samples.
+    local_status = str(payload.local_status or "ABORTED").upper()
+    if command.status not in dispatch.TERMINAL and local_status not in {"COMPLETED", "FAILED"}:
+        dispatch.close_command(session, command, "ABORTED", reason="客户端重启，采集中断；仅恢复结果补传")
+    elif command.status in dispatch.TERMINAL:
+        dispatch._release_reservation(session, command)
+    session.commit()
+    return dispatch.command_read(command, session.get(FastbotTask, task_id), include_guard=True)
+
+
+@router.post("/startup/{task_id}/finish")
+def finish_startup_task(task_id: int, payload: ClientFastbotFinish,
+                        session: Session = Depends(get_session),
+                        current_user: User = Depends(deps.get_current_user)):
+    from backend import startup_dispatch as dispatch
+    command = dispatch.guard_command(session, current_user, task_id, payload.client_instance_id or "",
+        payload.attempt, payload.claim_token, allow_terminal=True)
+    return dispatch.finish_command(session, command, payload.status.strip().upper(), payload.report.model_dump())
+
+
 @router.post("/{task_id}/finish")
 def finish_client_fastbot_task(
     task_id: int,
@@ -177,6 +279,9 @@ def finish_client_fastbot_task(
 ):
     """收尾：写/更新 FastbotReport 并落任务状态（COMPLETED/FAILED）。"""
     task = _get_task_or_404(session, task_id)
+    from backend import startup_dispatch as dispatch
+    if dispatch.execution_for_task(session, task_id):
+        return finish_startup_task(task_id, payload, session, current_user)
     deps.ensure_owner_or_admin(task.executor_id, current_user)
 
     status = str(payload.status or "COMPLETED").strip().upper()
@@ -227,14 +332,25 @@ async def upload_client_fastbot_artifact(
     task_id: int,
     file: UploadFile = File(...),
     path: Optional[str] = Form(None),
+    client_instance_id: Optional[str] = Form(None),
+    attempt: Optional[int] = Form(None),
+    claim_token: Optional[str] = Form(None),
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
     """产物上传：写入 reports/fastbot/{task_id}/<path>（replays/…、traces/… 等）。"""
     task = _get_task_or_404(session, task_id)
-    deps.ensure_owner_or_admin(task.executor_id, current_user)
 
     rel = _safe_artifact_rel_path(path)
+    from backend import startup_dispatch as dispatch
+    command = dispatch.execution_for_task(session, task_id)
+    if command:
+        dispatch.guard_command(session, current_user, task_id, client_instance_id or "",
+            attempt or 0, claim_token or "", allow_terminal=True)
+        if not rel.startswith(f"attempts/{command.attempt}/"):
+            rel = f"attempts/{command.attempt}/{rel}"
+    else:
+        deps.ensure_owner_or_admin(task.executor_id, current_user)
     task_dir = os.path.abspath(os.path.join(REPORTS_DIR, str(task_id)))
     target = os.path.abspath(os.path.join(task_dir, rel))
     if not target.startswith(task_dir + os.sep):

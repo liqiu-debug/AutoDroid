@@ -13,11 +13,12 @@ export const formatMetric = (value, digits = 1) => {
 }
 
 export const formatMs = (value) => {
+    if (value === null || value === undefined || value === '' || typeof value === 'boolean') return '未采集'
     const num = Number(value)
-    return Number.isFinite(num) ? `${num} ms` : '-'
+    return Number.isFinite(num) ? `${num} ms` : '未采集'
 }
 
-export const formatStartupMode = (value) => value === 'cold' ? '冷启动' : (value === 'hot' ? '热启动' : value || '-')
+export const formatStartupMode = (value) => ({ cold: '冷启动', hot: '热启动（后台恢复）', warm: '温启动（Activity 重建）', unknown: '未验证' })[value] || value || '-'
 
 export const formatReadyStatus = (value) => {
     const map = {
@@ -26,6 +27,7 @@ export const formatReadyStatus = (value) => {
         FOUND: '已就绪',
         TIMEOUT: '超时',
         ERROR: '异常',
+        NOT_CHECKED: '未检查',
     }
     return map[value] || value || '-'
 }
@@ -47,6 +49,7 @@ export const formatDiagnosisStatus = (value) => {
         PENDING: '待分析',
         EXPORT_IN_PROGRESS: '录制中',
         ANALYZED: '已分析',
+        PARTIAL: '部分分析',
         EXPORT_FAILED: '导出失败',
         EXPORT_LIMIT_REACHED: '达到上限',
         EXPORT_COOLDOWN: '冷却中',
@@ -85,6 +88,9 @@ export const formatJankSource = (value) => {
 export const formatTraceAnalysisStatus = (value) => {
     const labelMap = {
         ANALYZED: '已分析',
+        PARTIAL: '部分分析',
+        PENDING: '等待分析',
+        UNAVAILABLE: '暂不可用',
         FAILED: '分析失败',
         TOOL_MISSING: '缺少工具',
         TRACE_MISSING: '文件缺失',
@@ -114,6 +120,7 @@ export const getTraceAnalysisLevel = (artifact) => {
     if (level === 'full') return '完整'
     if (level === 'frame_timeline_only') return '帧级分析'
     if (level === 'partial') return '部分'
+    if (level === 'startup_evidence') return '启动区间证据'
     return '-'
 }
 
@@ -125,6 +132,7 @@ export const getTraceCaptureModeLabel = (artifact) => {
     const mode = getTraceCaptureMode(artifact)
     if (mode === 'continuous') return '全程采样'
     if (mode === 'diagnostic') return '异常诊断'
+    if (mode === 'original_sample') return '原轮次取证'
     return mode || '-'
 }
 

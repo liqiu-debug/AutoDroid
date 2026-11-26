@@ -47,6 +47,8 @@ frontend/.npm/
 /reports/
 /asset_store/
 /static/images/*
+# Pinned native tool prepared by scripts/fetch-trace-processor.py at build time
+/assets/trace_processor/
 
 # Mobile packages
 *.apk

@@ -53,6 +53,20 @@ class JsonGzipResponseTests(unittest.TestCase):
 
 
 class DeviceRecordingHelperTests(unittest.TestCase):
+    def test_startup_drain_never_releases_active_recording_lock(self):
+        pool = _RecordingIOSSessionPool()
+        driver = Mock()
+        with patch("backend.api.recording.check_wda_health"), patch("backend.api.recording.IOSDriver", return_value=driver):
+            acquired = pool.acquire("ios-startup", "http://127.0.0.1:8200")
+            with self.assertRaisesRegex(RuntimeError, "录制请求尚未结束"):
+                pool.drain_for_exclusive_execution("ios-startup", timeout=0.001)
+            self.assertTrue(pool._entries["ios-startup"].lock.locked())
+            driver.disconnect.assert_not_called()
+            pool.release("ios-startup", acquired)
+            pool.drain_for_exclusive_execution("ios-startup")
+        self.assertNotIn("ios-startup", pool._entries)
+        driver.disconnect.assert_called_once()
+
     def test_take_screenshot_base64_accepts_png_bytes(self):
         raw_png = b"\x89PNG\r\n\x1a\nfake-payload"
         device = Mock()

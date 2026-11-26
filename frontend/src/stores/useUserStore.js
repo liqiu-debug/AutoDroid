@@ -82,6 +82,15 @@ export const useUserStore = defineStore('user', () => {
     // 直到重新手动登录并勾选自动登录）。401/取用户信息失败等被动登出保持默认
     // manual=false，不置标记。标记失败静默，绝不影响登出本身。
     function logout(manual = false) {
+        // Capture before cleanup: Axios may run its interceptor after the token
+        // is cleared, or after a later login has installed another account.
+        const sessionToken = token.value || localStorage.getItem('token') || ''
+        if (typeof window !== 'undefined' && window.desktop && typeof api.logoutClientSession === 'function') {
+            try {
+                const pending = api.logoutClientSession(sessionToken)
+                if (pending && typeof pending.catch === 'function') pending.catch(() => {})
+            } catch { /* Local state cleanup still completes if the engine has exited. */ }
+        }
         token.value = ''
         userInfo.value = null
         featureFlags.value = { ...defaultFeatureFlags }

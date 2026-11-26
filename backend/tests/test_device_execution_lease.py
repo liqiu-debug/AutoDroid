@@ -110,6 +110,18 @@ class DeviceExecutionLeaseTests(unittest.TestCase):
         self.assertEqual(self._device().status, "IDLE")
         self.assertEqual(get_execution_limiter().get_stats()["active_tasks"], 0)
 
+    def test_ios_startup_can_adopt_only_its_pre_reserved_owner(self):
+        with Session(self.engine) as session:
+            session.add(Device(serial="ios-startup", platform="ios", status="BUSY",
+                lease_task_id="startup:42", lease_kind="startup"))
+            session.commit()
+        lease = DeviceExecutionLease.acquire(user_id=1, serial="ios-startup", task_id="startup:42",
+            kind="startup", platform="ios", reserved_owner=True, check_legacy_fastbot=False,
+            timeout=0.1, db_engine=self.engine)
+        self.assertTrue(lease.release())
+        with Session(self.engine) as session:
+            self.assertEqual(session.exec(select(Device).where(Device.serial == "ios-startup")).one().status, "IDLE")
+
     def test_release_never_clears_a_different_owner(self):
         lease = DeviceExecutionLease.acquire(
             user_id=3,

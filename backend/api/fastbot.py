@@ -19,12 +19,13 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from backend.database import get_session, engine
 from backend.device_execution_lease import DeviceExecutionLease
 from backend.device_sorting import sort_devices_for_display
-from backend.models import FastbotTask, FastbotReport, User, Device
+from backend.models import FastbotTask, FastbotReport, User, Device, StartupExecution
 from backend.schemas import (
     FastbotTaskCreate,
     FastbotTaskRead,
@@ -123,10 +124,15 @@ def _ensure_fastbot_android_device(device: Device) -> None:
 def _artifact_needs_trace_analysis(artifact: Dict) -> bool:
     if not artifact.get("path"):
         return False
+    analysis = artifact.get("analysis") or {}
+    if (artifact.get("analysis_level") in {"startup", "startup_evidence"}
+            or analysis.get("analysis_level") == "startup_evidence"):
+        # Original-sample startup evidence has its own bounded SQL queries and
+        # metric contract. Legacy jank repair must never replace this payload.
+        return False
     if not artifact.get("analysis_status"):
         return True
 
-    analysis = artifact.get("analysis") or {}
     frame_stats = analysis.get("frame_stats") or {}
     frame_timeline_series = analysis.get("frame_timeline_series") or []
     return (
@@ -144,9 +150,16 @@ def _ensure_report_trace_analysis(
     report: FastbotReport,
     session: Session,
 ):
+    from backend.startup_dispatch import execution_for_task, TERMINAL
     jank_events = json.loads(report.jank_events) if report.jank_events else []
     trace_artifacts = json.loads(report.trace_artifacts) if report.trace_artifacts else []
     summary = json.loads(report.summary) if report.summary else {}
+    startup_command = execution_for_task(session, task_id) if summary.get("session_type") == "startup" else None
+    # Live startup snapshots belong to the running executor. Read-side analysis
+    # must not replace a newer heartbeat report while trace processing blocks.
+    if startup_command and startup_command.status not in TERMINAL:
+        return jank_events, trace_artifacts, summary
+    original_traces, original_jank = report.trace_artifacts, report.jank_events
 
     needs_trace_analysis = any(_artifact_needs_trace_analysis(artifact) for artifact in trace_artifacts)
     if needs_trace_analysis:
@@ -156,6 +169,32 @@ def _ensure_report_trace_analysis(
                 from backend.fastbot.perfetto import _analyze_exported_traces
 
                 _analyze_exported_traces(task.package_name, trace_artifacts, jank_events)
+                if startup_command:
+                    # A terminal interrupted run may still recover local
+                    # evidence. Merge into its newest summary and use a CAS so
+                    # slow analysis never overwrites that recovered snapshot.
+                    session.refresh(report)
+                    latest_summary = report.summary
+                    if report.trace_artifacts != original_traces or report.jank_events != original_jank:
+                        return (json.loads(report.jank_events or "[]"),
+                                json.loads(report.trace_artifacts or "[]"),
+                                json.loads(report.summary or "{}"))
+                    summary = json.loads(latest_summary or "{}")
+                    summary["analyzed_trace_count"] = sum(
+                        1 for artifact in trace_artifacts if artifact.get("analysis_status") == "ANALYZED"
+                    )
+                    session.exec(update(FastbotReport).where(
+                        FastbotReport.id == report.id,
+                        FastbotReport.trace_artifacts == original_traces,
+                        FastbotReport.jank_events == original_jank,
+                        FastbotReport.summary == latest_summary,
+                    ).values(jank_events=json.dumps(jank_events), trace_artifacts=json.dumps(trace_artifacts),
+                             summary=json.dumps(summary)).execution_options(synchronize_session=False))
+                    session.commit()
+                    session.refresh(report)
+                    return (json.loads(report.jank_events or "[]"),
+                            json.loads(report.trace_artifacts or "[]"),
+                            json.loads(report.summary or "{}"))
                 summary["analyzed_trace_count"] = sum(
                     1 for artifact in trace_artifacts if artifact.get("analysis_status") == "ANALYZED"
                 )
@@ -475,6 +514,12 @@ def get_task(task_id: int, session: Session = Depends(get_session)):
     task = session.get(FastbotTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    from backend import startup_dispatch as dispatch
+    command = dispatch.execution_for_task(session, task_id)
+    if command:
+        return {**FastbotTaskRead.model_validate(task).model_dump(),
+                **dispatch.command_read(command, task),
+                "summary": dispatch._summary(session, task_id)}
     return task
 
 
@@ -487,7 +532,14 @@ def delete_task(
     task = session.get(FastbotTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task.status == "RUNNING":
+    from backend.startup_dispatch import execution_for_task
+    startup_command = execution_for_task(session, task_id)
+    if startup_command:
+        deps.ensure_owner_or_admin(startup_command.owner_id, current_user)
+        reserved = session.exec(select(Device).where(Device.lease_task_id == f"startup:{task_id}")).first()
+        if reserved:
+            raise HTTPException(409, "执行节点尚未确认停止，请恢复客户端同步后再删除")
+    if task.status in {"RUNNING", "QUEUED", "PENDING"}:
         raise HTTPException(status_code=400, detail="运行中的任务无法删除")
 
     report = session.exec(
@@ -495,6 +547,9 @@ def delete_task(
     ).first()
     if report:
         session.delete(report)
+    if startup_command:
+        session.delete(startup_command)
+        session.flush()
 
     session.delete(task)
     session.commit()
@@ -511,7 +566,10 @@ def get_report(task_id: int, session: Session = Depends(get_session)):
     if not report:
         raise HTTPException(status_code=404, detail="报告不存在")
 
-    _ensure_report_trace_analysis(task_id, report, session)
+    from backend.startup_dispatch import execution_for_task, TERMINAL
+    startup_command = execution_for_task(session, task_id) if _is_startup_report(report) else None
+    if not startup_command or startup_command.status in TERMINAL:
+        _ensure_report_trace_analysis(task_id, report, session)
 
     crash_events = json.loads(report.crash_events) if report.crash_events else []
     if _normalize_report_replays(task_id, crash_events):
@@ -687,6 +745,10 @@ async def analyze_trace_ai_summary(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
+    from backend.startup_dispatch import execution_for_task, TERMINAL
+    startup_command = execution_for_task(session, task_id) if _is_startup_report(report) else None
+    if startup_command and startup_command.status not in TERMINAL:
+        raise HTTPException(status_code=409, detail="启动测试仍在采集，请在任务结束后分析 trace")
     _ensure_report_trace_analysis(task_id, report, session)
 
     trace_artifacts = json.loads(report.trace_artifacts) if report.trace_artifacts else []
@@ -697,6 +759,9 @@ async def analyze_trace_ai_summary(
 
     if not artifact.get("analysis"):
         raise HTTPException(status_code=400, detail="当前 trace 还没有可用的结构化分析结果。")
+    if (artifact.get("analysis_level") == "startup_evidence"
+            or artifact["analysis"].get("analysis_level") == "startup_evidence"):
+        raise HTTPException(status_code=400, detail="启动 Trace 已提供原轮次主线程与调度证据；当前 AI 分析仅支持流畅度 Trace")
 
     result = await summarize_jank_analysis(
         artifact=artifact,
@@ -706,11 +771,29 @@ async def analyze_trace_ai_summary(
         force_refresh=req.force_refresh,
     )
 
-    artifact["ai_summary"] = result["analysis_result"]
-    artifact["ai_summary_cached"] = bool(result.get("cached"))
-    report.trace_artifacts = json.dumps(trace_artifacts)
-    session.add(report)
-    session.commit()
+    if startup_command:
+        # LLM work can take minutes. Preserve artifacts recovered during that
+        # wait and never write the old report array back over them.
+        session.refresh(report)
+        current_traces = report.trace_artifacts
+        trace_artifacts = json.loads(current_traces or "[]")
+        artifact = next((item for item in trace_artifacts if str(item.get("path") or "") == trace_path), None)
+        if artifact is None:
+            raise HTTPException(status_code=409, detail="trace 产物已更新，请刷新后重试")
+        artifact["ai_summary"] = result["analysis_result"]
+        artifact["ai_summary_cached"] = bool(result.get("cached"))
+        updated = session.exec(update(FastbotReport).where(
+            FastbotReport.id == report.id, FastbotReport.trace_artifacts == current_traces,
+        ).values(trace_artifacts=json.dumps(trace_artifacts)).execution_options(synchronize_session=False))
+        session.commit()
+        if updated.rowcount != 1:
+            raise HTTPException(status_code=409, detail="trace 产物已更新，请刷新后重试")
+    else:
+        artifact["ai_summary"] = result["analysis_result"]
+        artifact["ai_summary_cached"] = bool(result.get("cached"))
+        report.trace_artifacts = json.dumps(trace_artifacts)
+        session.add(report)
+        session.commit()
 
     return JankAiSummaryResponse(
         success=True,
@@ -814,13 +897,18 @@ def list_startup_tasks(
     limit: int = 20,
     keyword: Optional[str] = None,
     session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
 ):
     """分页获取冷热启动任务，keyword 匹配包名或设备序列号"""
+    from backend import startup_dispatch as dispatch
+    dispatch.reap_commands(session)
     tasks = session.exec(select(FastbotTask).order_by(FastbotTask.id.desc())).all()
     summary_by_task = _load_report_summary_map(session)
 
     matched: List[FastbotTask] = []
     for task in tasks:
+        if isinstance(current_user, User) and current_user.role != "admin" and task.executor_id != current_user.id:
+            continue
         is_startup = task.id in _startup_task_ids or _is_startup_summary_text(
             summary_by_task.get(task.id)
         )
@@ -838,7 +926,49 @@ def list_startup_tasks(
         )
         for task in matched[skip:skip + limit]
     ]
+    for item in items:
+        command = dispatch.execution_for_task(session, item["id"])
+        if command:
+            item.update(dispatch.command_read(command, session.get(FastbotTask, item["id"])))
     return PaginatedStartupTaskRead(total=len(matched), items=items)
+
+
+@router.get("/startup/devices")
+async def list_startup_devices(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
+    from backend import startup_dispatch as dispatch
+    from backend.api.devices import _build_device_reads
+    dispatch.reap_commands(session)
+    devices = session.exec(select(Device)).all()
+    devices = [device for device in devices if dispatch.can_control(device, current_user)]
+    reads = {item.serial: dump_model(item) for item in _build_device_reads(session, devices)}
+    result = []
+    server_android = [device for device in devices if not device.client_instance_id and device.last_seen_at is None and device.platform == "android"]
+    online_android = await _get_online_devices() if server_android else set()
+    for device in devices:
+        kind, node, reason = dispatch.node_for_device(session, device)
+        caps = node.startup_capabilities if node else dispatch.default_capabilities(device.platform)
+        if device.platform not in {"android", "ios"} or str(device.serial).startswith(("ios:", "autojs6:")):
+            reason = "请选择通过 ADB 或 WDA 连接的物理设备"
+        elif not reason and (device.status != "IDLE" or device.lease_task_id or _is_device_busy(device.serial)):
+            reason = "设备正忙" if device.status != "OFFLINE" else "设备已离线"
+        elif not reason and kind == "server":
+            if device.platform == "android" and device.serial not in online_android:
+                reason = "服务端 ADB 未连接此设备或尚未授权"
+            elif device.platform == "ios":
+                from backend.cross_platform_execution import check_wda_health, resolve_ios_wda_url
+                try:
+                    await asyncio.to_thread(check_wda_health, resolve_ios_wda_url(session, device.serial))
+                except Exception as exc:
+                    reason = f"WDA 不可用: {exc}"
+        result.append({**reads.get(device.serial, {}), "serial": device.serial,
+            "platform": device.platform, "executor_kind": kind,
+            "client_instance_id": device.client_instance_id,
+            "available": not bool(reason), "unavailable_reason": reason,
+            "capabilities": caps})
+    return {"items": sort_devices_for_display(result)}
 
 
 @router.post("/startup/run", response_model=List[StartupTaskRead])
@@ -848,55 +978,61 @@ async def run_startup_test(
     session: Session = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ):
-    devices_by_serial = {
-        device.serial: device
-        for device in session.exec(select(Device).where(Device.serial.in_(data.device_serials))).all()
-    }
+    from backend import startup_dispatch as dispatch
+    dispatch.reap_commands(session)
+    config = dump_model(data)
+    devices_by_serial = {device.serial: device for device in session.exec(
+        select(Device).where(Device.serial.in_(data.device_serials))).all()}
     missing = [serial for serial in data.device_serials if serial not in devices_by_serial]
     if missing:
         raise HTTPException(status_code=404, detail=f"设备不存在: {', '.join(missing)}")
+    devices = [devices_by_serial[serial] for serial in data.device_serials]
+    platforms = {device.platform for device in devices}
+    if len(platforms) != 1:
+        raise HTTPException(400, "一次启动测试只能选择同一平台设备")
+    # Idempotent retry must return an already running task before busy preflight.
+    request_key = f"{current_user.id}:{config.get('request_id')}"
+    previous = session.exec(select(StartupExecution).where(StartupExecution.request_key == request_key)).all() if config.get("request_id") else []
+    if not previous:
+        for device in devices:
+            if not dispatch.can_control(device, current_user):
+                raise HTTPException(403, f"无权控制设备 {device.serial}")
+            kind, node, reason = dispatch.node_for_device(session, device)
+            if reason:
+                raise HTTPException(400, reason)
+            dispatch.validate_device_config(device, config, node.startup_capabilities if node else dispatch.default_capabilities(device.platform))
+            if device.status != "IDLE" or device.lease_task_id or _is_device_busy(device.serial):
+                raise HTTPException(409, f"设备正忙，请稍后再试: {device.serial}")
+    commands = dispatch.submit_commands(session, current_user, config, devices)
+    server_ids = [item.task_id for item in commands if item.executor_kind == "server" and item.status == "QUEUED"]
+    if server_ids:
+        # A daemon owns the async loop; the HTTP request returns without waiting
+        # for measurement and server restarts are recovered from durable rows.
+        background_tasks.add_task(_start_startup_worker, server_ids)
+    return [_startup_command_read(session, item) for item in commands]
 
-    for serial in data.device_serials:
-        _ensure_fastbot_android_device(devices_by_serial[serial])
-        if _is_device_busy(serial) or _has_external_device_lease(
-            devices_by_serial[serial]
-        ):
-            raise HTTPException(status_code=400, detail=f"设备正忙，请稍后再试: {serial}")
 
-    online_serials = await _get_online_devices()
-    offline = [serial for serial in data.device_serials if serial not in online_serials]
-    if offline:
-        raise HTTPException(status_code=400, detail=f"设备不在线或未就绪: {', '.join(offline)}")
+def _start_startup_worker(task_ids):
+    from backend.startup_dispatch import execute_server_batch
+    threading.Thread(target=execute_server_batch, args=(task_ids,), daemon=True).start()
 
-    task_reads: List[Dict[str, Any]] = []
-    task_ids: List[int] = []
-    for serial in data.device_serials:
-        task = FastbotTask(
-            package_name=data.package_name,
-            duration=len(data.startup_modes) * data.iterations,
-            throttle=data.cooldown_sec * 1000,
-            ignore_crashes=True,
-            capture_log=data.capture_log,
-            device_serial=serial,
-            status="PENDING",
-            executor_id=current_user.id,
-            executor_name=current_user.full_name or current_user.username,
-        )
-        session.add(task)
-        session.commit()
-        session.refresh(task)
 
-        _startup_task_ids.add(task.id)
-        _lock_device(serial, task.id)
-        task_ids.append(task.id)
-        task_reads.append(_build_startup_task_read(task))
+def _startup_command_read(session, command):
+    from backend import startup_dispatch as dispatch
+    task = session.get(FastbotTask, command.task_id)
+    return {**_build_startup_task_read(task, dispatch._summary(session, task.id), True),
+            **dispatch.command_read(command, task)}
 
-    background_tasks.add_task(
-        _execute_startup_batch_background,
-        task_ids,
-        dump_model(data),
-    )
-    return task_reads
+
+@router.post("/startup/tasks/{task_id}/stop", response_model=StartupTaskRead)
+def stop_startup_task(task_id: int, session: Session = Depends(get_session),
+                      current_user: User = Depends(deps.get_current_user)):
+    from backend import startup_dispatch as dispatch
+    command = dispatch.execution_for_task(session, task_id)
+    if not command:
+        raise HTTPException(404, "冷热启动任务不存在或为不支持取消的历史记录")
+    dispatch.cancel_command(session, command, current_user)
+    return _startup_command_read(session, command)
 
 
 @router.post("/run", response_model=FastbotTaskRead)
@@ -1076,140 +1212,13 @@ async def _execute_fastbot_async(
 
 
 def _execute_startup_batch_background(task_ids: List[int], config: Dict[str, Any]):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_execute_startup_batch_async(task_ids, config))
-    finally:
-        loop.close()
+    from backend.startup_dispatch import execute_server_batch
+    execute_server_batch(task_ids)
 
 
-async def _execute_startup_batch_async(task_ids: List[int], config: Dict[str, Any]):
-    await asyncio.gather(*[
-        _execute_startup_task_async(task_id, config)
-        for task_id in task_ids
-    ])
-
-
-async def _execute_startup_task_async(
-    task_id: int,
-    config: Dict[str, Any],
-):
-    from backend.fastbot.startup import run_startup_task
-    from sqlmodel import Session as SQLSession
-
-    serial = ""
-    lease: Optional[DeviceExecutionLease] = None
-    try:
-        with SQLSession(engine) as session:
-            task = session.get(FastbotTask, task_id)
-            if not task:
-                return
-
-            serial = task.device_serial
-            executor_id = int(task.executor_id or 0)
-            if not task.started_at:
-                task.started_at = datetime.now()
-            task.status = "RUNNING"
-            session.add(task)
-            session.commit()
-
-        lease = await asyncio.to_thread(
-            DeviceExecutionLease.acquire,
-            user_id=executor_id,
-            serial=serial,
-            task_id=f"fastbot-startup:{task_id}",
-            kind="fastbot",
-            check_legacy_fastbot=False,
-        )
-        result = await run_startup_task(
-            device_serial=serial,
-            package_name=str(config.get("package_name") or ""),
-            activity_name=config.get("activity_name") or None,
-            startup_modes=list(config.get("startup_modes") or ["cold", "hot"]),
-            iterations=int(config.get("iterations") or 3),
-            cooldown_sec=int(config.get("cooldown_sec") or 3),
-            capture_log=bool(config.get("capture_log", True)),
-            ready_check=dict(config.get("ready_check") or {}),
-            perfetto_slow_trace=dict(config.get("perfetto_slow_trace") or {}),
-            task_id=task_id,
-        )
-
-        with SQLSession(engine) as session:
-            task = session.get(FastbotTask, task_id)
-            if not task:
-                return
-
-            summary = result.get("summary", {})
-            task.status = "COMPLETED"
-            task.finished_at = datetime.now()
-            task.total_crashes = summary.get("total_crashes", 0)
-            task.total_anrs = summary.get("total_anrs", 0)
-            session.add(task)
-
-            report = FastbotReport(
-                task_id=task_id,
-                performance_data=json.dumps(result.get("performance_data", [])),
-                jank_data=json.dumps(result.get("jank_data", [])),
-                jank_events=json.dumps(result.get("jank_events", [])),
-                trace_artifacts=json.dumps(result.get("trace_artifacts", [])),
-                crash_events=json.dumps(result.get("crash_events", [])),
-                summary=json.dumps(summary),
-            )
-            session.add(report)
-            session.commit()
-
-        logger.info("冷热启动任务 #%s 执行完成", task_id)
-
-    except Exception as exc:
-        logger.error("冷热启动任务 #%s 执行失败: %s", task_id, exc)
-        failure_summary = {
-            "session_type": "startup",
-            "session_label": "冷热启动测试",
-            "performance_monitor_enabled": False,
-            "jank_frame_monitor_enabled": False,
-            "startup_config": config,
-            "startup_runs": [],
-            "startup_aggregate": {},
-            "slow_events": [],
-            "success_count": 0,
-            "fail_count": 1,
-            "success_rate": 0,
-            "slow_count": 0,
-            "total_crashes": 0,
-            "total_anrs": 0,
-            "error": str(exc),
-        }
-        with SQLSession(engine) as session:
-            task = session.get(FastbotTask, task_id)
-            if task:
-                serial = task.device_serial
-                task.status = "FAILED"
-                task.finished_at = datetime.now()
-                session.add(task)
-                existing_report = session.exec(
-                    select(FastbotReport).where(FastbotReport.task_id == task_id)
-                ).first()
-                if not existing_report:
-                    session.add(FastbotReport(
-                        task_id=task_id,
-                        performance_data=json.dumps([]),
-                        jank_data=json.dumps([]),
-                        jank_events=json.dumps([]),
-                        trace_artifacts=json.dumps([]),
-                        crash_events=json.dumps([]),
-                        summary=json.dumps(failure_summary),
-                    ))
-                session.commit()
-    finally:
-        if lease:
-            try:
-                await asyncio.to_thread(lease.release)
-            except Exception:
-                logger.exception("冷热启动设备租约释放失败: %s", serial)
-        if serial:
-            _unlock_device(serial)
-        _startup_task_ids.discard(task_id)
+async def _execute_startup_task_async(task_id: int, config: Dict[str, Any]):
+    from backend.startup_dispatch import execute_server_command
+    await execute_server_command(task_id)
 
 
 def _execute_fluency_background(task_id: int):

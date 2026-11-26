@@ -63,6 +63,8 @@ test('fastbot / fluency / startup api face matches the platform router paths', a
   await api.getFluencySessions({ limit: 20 })
   await api.runStartupTest({ package_name: 'a.b' })
   await api.getStartupTasks({ limit: 20 })
+  await api.getStartupDevices()
+  await api.stopStartupTask(9)
   assert.deepEqual(calls.map(c => [c[0], c[1]]), [
     ['post', '/fastbot/run'],
     ['get', '/fastbot/tasks'],
@@ -77,6 +79,8 @@ test('fastbot / fluency / startup api face matches the platform router paths', a
     ['get', '/fastbot/fluency/sessions'],
     ['post', '/fastbot/startup/run'],
     ['get', '/fastbot/startup/tasks'],
+    ['get', '/fastbot/startup/devices'],
+    ['post', '/fastbot/startup/tasks/9/stop'],
   ])
 })
 

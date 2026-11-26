@@ -94,9 +94,10 @@ export const resetSessionExpired = () => {
 // 预登录端点（登录/注册/客户端模式探测）：无 token 也照常放行。
 const PRE_LOGIN_PATHS = ['/auth/token', '/auth/register', '/auth/registration-status', '/client/info']
 
+const requestPath = (url) => String(url || '').split('?')[0].replace(/\/+$/, '') || '/'
+
 const isPreLoginRequest = (url) => {
-    const path = String(url || '').split('?')[0].replace(/\/+$/, '') || '/'
-    return PRE_LOGIN_PATHS.some(p => path === p)
+    return PRE_LOGIN_PATHS.includes(requestPath(url))
 }
 
 // 无 token 时的本地快速拒绝：会话已结束（401 处理/手动登出），轮询/后台请求
@@ -112,8 +113,15 @@ const createSessionExpiredAbort = (config) => {
 // Request interceptor
 api.interceptors.request.use(
     (config) => {
+        // Axios runs request interceptors asynchronously. The store has already
+        // cleared localStorage by then, so this local revocation request keeps
+        // the token captured at logout and can also revoke an expired session.
+        if (config.localSessionLogout === true
+            && String(config.method).toLowerCase() === 'post'
+            && requestPath(config.url) === '/client/session/logout') return config
         const token = localStorage.getItem('token')
         if (token) {
+            config.headers ||= {}
             config.headers.Authorization = `Bearer ${token}`
         } else if (!isPreLoginRequest(config.url)) {
             // 401/登出后 token 已清：发起前本地拒绝，轮询自动静默停止
@@ -586,8 +594,8 @@ export default {
     getFastbotTasks(params, config = {}) {
         return api.get('/fastbot/tasks', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
-    getFastbotTask(id) {
-        return api.get(`/fastbot/tasks/${id}`)
+    getFastbotTask(id, config = {}) {
+        return api.get(`/fastbot/tasks/${id}`, { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
     },
     deleteFastbotTask(id) {
         return api.delete(`/fastbot/tasks/${id}`)
@@ -595,8 +603,8 @@ export default {
     runFastbot(data) {
         return api.post('/fastbot/run', data)
     },
-    getFastbotReport(taskId) {
-        return api.get(`/fastbot/reports/${taskId}`)
+    getFastbotReport(taskId, config = {}) {
+        return api.get(`/fastbot/reports/${taskId}`, { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
     },
     getFastbotReplay(taskId, filename) {
         return api.get(`/fastbot/replays/${taskId}/${encodeURIComponent(filename)}`, {
@@ -610,8 +618,26 @@ export default {
     getStartupTasks(params, config = {}) {
         return api.get('/fastbot/startup/tasks', { timeout: POLL_GET_TIMEOUT_MS, params, ...config })
     },
+    getStartupDevices(config = {}) {
+        return api.get('/fastbot/startup/devices', { timeout: DETAIL_GET_TIMEOUT_MS, ...config })
+    },
+    getStartupLocalResults(config = {}) {
+        return api.get('/fastbot/startup/local-results', { timeout: POLL_GET_TIMEOUT_MS, ...config })
+    },
     runStartupTest(data) {
         return api.post('/fastbot/startup/run', data)
+    },
+    logoutClientSession(token) {
+        const sessionToken = token ?? localStorage.getItem('token')
+        return api.post('/client/session/logout', {}, {
+            timeout: 5000,
+            silent401: true,
+            localSessionLogout: true,
+            headers: sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {},
+        })
+    },
+    stopStartupTask(taskId) {
+        return api.post(`/fastbot/startup/tasks/${taskId}/stop`)
     },
     startFluencySession(data) {
         return api.post('/fastbot/fluency/start', data)

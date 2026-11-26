@@ -13,6 +13,7 @@ from sqlmodel import Session, select
 
 from backend.api import deps
 from backend.cross_platform_execution import (
+    mark_device_busy_for_execution,
     precheck_case_execution,
     restore_device_status_after_execution,
     run_case_with_standard_runner,
@@ -1114,11 +1115,7 @@ def _run_case_background_cross_platform(
                     abort_event = register_device_abort(device_serial)
 
                 try:
-                    device = session.exec(select(Device).where(Device.serial == device_serial)).first()
-                    if device:
-                        device.status = "BUSY"
-                        device.updated_at = datetime.now()
-                        session.add(device)
+                    mark_device_busy_for_execution(session, device_serial)
                     session.commit()
 
                     result = run_case_with_standard_runner(

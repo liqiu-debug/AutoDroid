@@ -266,6 +266,43 @@ class FastbotReport(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
+class ClientInstance(SQLModel, table=True):
+    """Authenticated desktop execution node and its advertised startup protocol."""
+    id: str = Field(primary_key=True)
+    owner_id: int = Field(foreign_key="user.id", index=True)
+    startup_capabilities: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    last_seen_at: datetime = Field(default_factory=datetime.now)
+    logged_out_at: Optional[datetime] = None
+
+
+class StartupExecution(SQLModel, table=True):
+    """Persistent per-device command; results remain in FastbotTask/FastbotReport."""
+    __table_args__ = (UniqueConstraint("request_key", "device_serial"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    task_id: int = Field(foreign_key="fastbottask.id", unique=True, index=True)
+    run_id: str = Field(unique=True, index=True)
+    request_key: str = Field(index=True)
+    owner_id: int = Field(foreign_key="user.id", index=True)
+    node_owner_id: int = Field(foreign_key="user.id")
+    device_serial: str = Field(index=True)
+    platform: str
+    executor_kind: str = "server"
+    client_instance_id: Optional[str] = Field(default=None, index=True)
+    config: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    config_digest: str
+    status: str = Field(default="QUEUED", index=True)
+    attempt: int = 0
+    claim_token: Optional[str] = None
+    lease_expires_at: Optional[datetime] = None
+    reservation_release_at: Optional[datetime] = None
+    queue_expires_at: datetime
+    cancel_requested: bool = False
+    progress: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
+    terminal_reason: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
 class Device(SQLModel, table=True):
     """设备管理表 - 记录由 ADB / tidevice 同步的物理设备"""
     id: Optional[int] = Field(default=None, primary_key=True)

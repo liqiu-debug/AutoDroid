@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from sqlmodel import SQLModel, Session, create_engine, select
 
-from backend.cross_platform_execution import restore_device_status_after_execution
+from backend.cross_platform_execution import restore_device_status_after_execution, mark_device_busy_for_execution
 from backend.models import Device
 
 
@@ -34,6 +34,19 @@ class DeviceStatusRestoreTests(unittest.TestCase):
         self.assertIsNotNone(device)
         self.assertEqual(device.status, "IDLE")
         check_mock.assert_not_called()
+
+    def test_legacy_execution_cannot_claim_or_restore_startup_reservation(self):
+        device = self._add_device("startup-reserved", "ios", status="BUSY")
+        device.lease_task_id = "startup:23"
+        device.lease_kind = "startup"
+        self.session.add(device)
+        self.session.commit()
+        with self.assertRaisesRegex(RuntimeError, "其他执行任务"):
+            mark_device_busy_for_execution(self.session, device.serial)
+        with patch("backend.cross_platform_execution.check_wda_health") as health:
+            self.assertEqual(restore_device_status_after_execution(self.session, device.serial), "BUSY")
+        health.assert_not_called()
+        self.assertEqual(self.session.get(Device, device.id).lease_task_id, "startup:23")
 
     def test_restore_ios_device_status_to_idle_when_wda_healthy(self):
         self._add_device("ios-1", "ios", status="BUSY")

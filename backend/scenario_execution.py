@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from sqlmodel import Session, select
 
 from backend.cross_platform_execution import (
+    mark_device_busy_for_execution,
     restore_device_status_after_execution,
     run_case_with_standard_runner,
 )
@@ -211,11 +212,7 @@ def _prepare_cross_platform_device_execution(
     if resolved_meta.get("device_info"):
         execution.device_info = resolved_meta.get("device_info")
 
-    dev = session.exec(select(Device).where(Device.serial == device_serial)).first()
-    if dev:
-        dev.status = "BUSY"
-        dev.updated_at = datetime.now()
-        session.add(dev)
+    mark_device_busy_for_execution(session, device_serial)
 
     session.add(execution)
     session.commit()

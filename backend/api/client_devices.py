@@ -19,7 +19,7 @@ app_owner_id（App 形态登记）与 owner_id（桌面客户端物理持有）�
 """
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -49,10 +49,13 @@ class ClientDeviceRegisterRequest(BaseModel):
     market_name: Optional[str] = None
     connection_type: Optional[str] = None
     client_instance_id: Optional[str] = None
+    startup_capabilities: Optional[Dict[str, Any]] = None
 
 
 class ClientDeviceHeartbeatRequest(BaseModel):
     serials: List[str]
+    client_instance_id: Optional[str] = None
+    startup_capabilities: Optional[Dict[str, Any]] = None
 
 
 class ClientDeviceLogoutRequest(BaseModel):
@@ -86,6 +89,9 @@ def register_client_device(
     platform = str(payload.platform or "").strip().lower() or "android"
 
     now = datetime.now()
+    if payload.client_instance_id:
+        from backend.startup_dispatch import register_instance
+        register_instance(session, current_user, payload.client_instance_id, payload.startup_capabilities, allow_rebind=True)
     device = session.exec(select(Device).where(Device.serial == serial)).first()
     takeover = bool(device and device.owner_id is not None and device.owner_id != current_user.id)
 
@@ -129,7 +135,7 @@ def register_client_device(
     device.updated_at = now
     # 注册即存活：把超时/登出的 OFFLINE 拉回 IDLE（客户端重启重新上报场景）
     if str(device.status or "").strip().upper() == "OFFLINE":
-        device.status = "IDLE"
+        device.status = "BUSY" if device.lease_task_id else "IDLE"
 
     session.add(device)
     session.commit()
@@ -146,10 +152,13 @@ def heartbeat_client_devices(
 ):
     """仅更新本人设备的 last_seen_at，返回 {updated: n}。"""
     serials = [str(s).strip() for s in (payload.serials or []) if str(s).strip()]
+    now = datetime.now()
+    if payload.client_instance_id:
+        from backend.startup_dispatch import register_instance
+        register_instance(session, current_user, payload.client_instance_id, payload.startup_capabilities)
+        session.commit()
     if not serials:
         return {"updated": 0}
-
-    now = datetime.now()
     rows = session.exec(
         select(Device).where(
             col(Device.serial).in_(serials), Device.owner_id == current_user.id
@@ -158,11 +167,13 @@ def heartbeat_client_devices(
 
     updated = 0
     for device in rows:
+        if payload.client_instance_id and device.client_instance_id != payload.client_instance_id:
+            continue
         device.last_seen_at = now
         device.updated_at = now
         # 心跳即存活：插拔回来/超时恢复后由心跳拉回 IDLE
         if str(device.status or "").strip().upper() == "OFFLINE":
-            device.status = "IDLE"
+            device.status = "BUSY" if device.lease_task_id else "IDLE"
         session.add(device)
         updated += 1
 
@@ -195,10 +206,16 @@ def logout_client_devices(
     if client_instance_id is not None:
         statement = statement.where(Device.client_instance_id == client_instance_id)
     devices = session.exec(statement).all()
+    if client_instance_id:
+        from backend.models import ClientInstance
+        node = session.get(ClientInstance, client_instance_id)
+        if node and node.owner_id == current_user.id:
+            node.logged_out_at = now
+            session.add(node)
     for device in devices:
         device.status = "OFFLINE"
         device.updated_at = now
         session.add(device)
-    if devices:
+    if devices or client_instance_id:
         session.commit()
     return {"updated": len(devices)}

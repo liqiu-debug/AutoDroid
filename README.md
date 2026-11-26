@@ -2,7 +2,7 @@
 
 AutoDroid 是一个面向 Android/iOS 的低代码 UI 自动化测试平台，覆盖设备管理、可视化录制、用例与场景编排、跨端执行、定时调度、稳定性探索、报告分析和通知闭环。
 
-当前产品边界是：**Android 支持 Scrcpy 实时交互或静态截图录制，iOS 支持 WDA MJPEG 近实时预览，并以静态截图和页面层级完成元素审查、交互录制；Android/iOS 均支持标准用例执行**。Fastbot、冷热启动和兼容性测试目前是 Android 专项能力。同一套标准步骤可以按平台分发，并通过预检提前发现动作、定位器、变量、应用映射和 WDA 状态问题。
+当前产品边界是：**Android 支持 Scrcpy 实时交互或静态截图录制，iOS 支持 WDA MJPEG 近实时预览，并以静态截图和页面层级完成元素审查、交互录制；Android/iOS 均支持标准用例执行与冷热启动测试**。冷热启动支持桌面本机、服务端及 Web 派发至在线桌面设备；Fastbot 和视觉兼容性仍按各自的平台能力开放。同一套标准步骤可以按平台分发，并通过预检提前发现动作、定位器、变量、应用映射和 WDA 状态问题。
 
 ## 核心能力
 
@@ -17,7 +17,7 @@ AutoDroid 是一个面向 Android/iOS 的低代码 UI 自动化测试平台，�
 | 跨端执行 | Android 使用 uiautomator2，iOS 使用 facebook-wda；支持统一动作与平台定位覆盖 |
 | 调度中心 | 单次、每天、每周、循环任务；支持 UI 场景和 Fastbot 任务 |
 | 智能稳定性 | Fastbot 探索、Crash/ANR、CPU/内存、framestats 卡顿检测、回放与 Trace 分析 |
-| 冷热启动专项 | ADB 启动计时、uiautomator2 首页就绪检查、慢启动 Perfetto 取证 |
+| 冷热启动专项 | Android/iOS 冷启动与后台恢复、桌面本地/服务端/Web 派发、就绪检查、原轮次 Perfetto 与离线分析、取消及结果补传；见 [使用指南](docs/STARTUP_TESTING.md) |
 | 兼容性测试 | Android APK 版本/机型对比，按手动配置的页面合集采集截图和 UI XML |
 | 报告与大盘 | 用例、Fastbot 与兼容性报告；内容寻址证据资产、失败截图、趋势与设备状态概览 |
 | AI 辅助 | 自然语言生成测试步骤、Fastbot 日志根因分析、接口校验建议与失败解释、OpenAI 兼容接口 |
@@ -71,7 +71,7 @@ flowchart TD
 | 图像/OCR 步骤 | 支持 | 支持 | 具体动作与参数见执行规范 |
 | 实时 Scrcpy 画面 | 支持 | 不支持 | 用于 Android 预览和触控 |
 | Fastbot 探索 | 支持 | 不支持 | Android 专项能力 |
-| 冷热启动专项 | 支持 | 不支持 | Android 专项能力，首页就绪 P90 为主指标 |
+| 冷热启动专项 | 支持 | 支持 | 按执行节点能力开放；区分平台原生、自动化控制与业务就绪指标，WDA 耗时不充当系统首帧 |
 | 视觉兼容性测试 | 支持 | 不支持 | Android 生产 APK 专项能力，按页面集合采集截图和 UI XML |
 
 ## 移动端适配
@@ -234,7 +234,7 @@ npm run dev -- --host
 5. 将多个用例编排为场景，通过场景上下文传递运行时变量。
 6. 选择一台或多台设备执行场景；不满足条件的设备会被预检过滤。
 7. 在定时任务中创建单次、每日、每周或循环任务。
-8. 在“专项测试 -> 冷热启动”中配置包名、启动模式、启动次数和首页就绪 locator，查看首页就绪 P90 与慢启动 Trace。
+8. 在“专项测试 -> 冷热启动”中按平台选择设备，配置包名/Bundle ID、启动模式、轮次、阈值和可选就绪 locator；查看各指标 P50/P90/P95、有效样本及原轮次证据。桌面设备也可由 Web 派发，取消和断线后保留已有结果。
 9. 在“专项测试 -> 兼容性测试 -> 页面合集”中维护预设页面，每个页面引用已有用例作为进入脚本。
 10. 在“专项测试 -> 兼容性测试 -> 测试配置”中选择旧版 APK、新版 APK、Android 设备和页面合集，发起升级兼容或干净安装对比。
 11. 在报告中心和运行大盘查看结果、失败截图、趋势和设备告警。
@@ -326,7 +326,7 @@ iOS WDA URL、设备映射、启动参数和故障处理见 [iOS WDA 运维手�
 
 - OpenAPI：`GET /docs`
 - 主要业务 API：`/api/auth`、`/api/cases`、`/api/scenarios`、`/api/devices`、`/api/tasks`、`/api/reports`、`/api/fastbot`
-- 冷热启动专项 API：`POST /api/fastbot/startup/run`、`GET /api/fastbot/startup/tasks`
+- 冷热启动专项 API：`GET /api/fastbot/startup/devices`、`POST /api/fastbot/startup/run`、`GET /api/fastbot/startup/tasks`、`POST /api/fastbot/startup/tasks/{id}/stop`；认领、进度和恢复见 [启动派发协议](docs/STARTUP_DISPATCH_PROTOCOL.md)
 - 兼容性测试 API：`/api/compatibility/page-sets`、`/api/compatibility/runs`
 - 鉴权证据资产：`GET /api/assets/status`、`GET /api/assets/{asset_id}`
 - CI 集成（API Token 机器凭证、上传包 → 触发回归 → 轮询结果）：见 [CI 集成指南](docs/CI_INTEGRATION.md)

@@ -20,6 +20,7 @@ from sqlmodel import Session, select
 
 from backend.api.recording import _disconnect_runner_if_supported
 from backend.cross_platform_execution import (
+    mark_device_busy_for_execution,
     check_wda_health,
     prepare_case_steps_for_platform,
     resolve_device_platform,
@@ -159,12 +160,8 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 device_serial=device_serial,
             )
 
-            device = session.exec(select(Device).where(Device.serial == device_serial)).first()
-            if device:
-                device.status = "BUSY"
-                device.updated_at = datetime.now()
-                session.add(device)
-                session.commit()
+            mark_device_busy_for_execution(session, device_serial)
+            session.commit()
 
             runner = await _run_in_blocking_executor(
                 blocking_executor,

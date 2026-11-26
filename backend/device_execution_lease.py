@@ -57,6 +57,8 @@ class DeviceExecutionLease:
         abort_event: Optional[threading.Event] = None,
         timeout: float = 1800.0,
         check_legacy_fastbot: bool = True,
+        platform: str = "android",
+        reserved_owner: bool = False,
         db_engine=None,
     ) -> "DeviceExecutionLease":
         """Acquire limiter capacity, then atomically transition IDLE -> BUSY."""
@@ -77,13 +79,23 @@ class DeviceExecutionLease:
 
             target_engine = db_engine or engine
             with Session(target_engine) as session:
+                platform = str(platform or "android").strip().lower()
+                owner_condition = (
+                    Device.lease_task_id == task_id
+                    if reserved_owner
+                    else or_(Device.lease_task_id.is_(None), Device.lease_task_id == "")
+                )
+                status_condition = (
+                    func.upper(Device.status) == "BUSY"
+                    if reserved_owner else func.upper(Device.status) == "IDLE"
+                )
                 statement = (
                     update(Device)
                     .where(
                         Device.serial == serial,
-                        func.lower(Device.platform) == "android",
-                        func.upper(Device.status) == "IDLE",
-                        or_(Device.lease_task_id.is_(None), Device.lease_task_id == ""),
+                        func.lower(Device.platform) == platform,
+                        status_condition,
+                        owner_condition,
                     )
                     .values(
                         status="BUSY",
@@ -101,9 +113,9 @@ class DeviceExecutionLease:
                     ).first()
                     if device is None:
                         raise DeviceLeaseUnavailable(f"设备不存在: {serial}")
-                    if str(device.platform or "").lower() != "android":
+                    if str(device.platform or "").lower() != platform:
                         raise DeviceLeaseUnavailable(
-                            f"设备 {serial} 非 Android 设备，暂不支持执行租用"
+                            f"设备 {serial} 平台与请求的 {platform} 不一致"
                         )
                     raise DeviceLeaseUnavailable(
                         f"设备 {serial} 非空闲或已被其他任务租用 "

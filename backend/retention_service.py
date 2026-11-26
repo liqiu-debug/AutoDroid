@@ -79,6 +79,7 @@ def _cleanup_expired_executions(session: Session, cutoff: datetime) -> int:
 
 def _cleanup_expired_fastbot_tasks(session: Session, cutoff: datetime) -> int:
     from backend.api.fastbot import _delete_fastbot_artifacts_dir
+    from backend.models import Device, StartupExecution
 
     expired = session.exec(
         select(FastbotTask).where(FastbotTask.created_at < cutoff)
@@ -88,6 +89,13 @@ def _cleanup_expired_fastbot_tasks(session: Session, cutoff: datetime) -> int:
         if str(task.status or "").upper() in _ACTIVE_STATUSES:
             continue
         try:
+            command = session.exec(select(StartupExecution).where(StartupExecution.task_id == task.id)).first()
+            if command:
+                reserved = session.exec(select(Device).where(Device.lease_task_id == f"startup:{task.id}")).first()
+                if reserved:
+                    continue
+                session.delete(command)
+                session.flush()
             reports = session.exec(
                 select(FastbotReport).where(FastbotReport.task_id == task.id)
             ).all()

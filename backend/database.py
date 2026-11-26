@@ -841,6 +841,32 @@ def _migrate_steps_version_columns(cursor) -> None:
             logger.info("Migration: ALTER TABLE %s ADD COLUMN version", table)
 
 
+def _migrate_startup_execution(cursor) -> None:
+    """Create durable execution nodes/commands even for migration-only upgrades."""
+    cursor.execute("""CREATE TABLE IF NOT EXISTS clientinstance (
+        id VARCHAR PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES user(id),
+        startup_capabilities JSON NOT NULL DEFAULT '{}', last_seen_at TIMESTAMP NOT NULL,
+        logged_out_at TIMESTAMP)""")
+    cursor.execute("""CREATE TABLE IF NOT EXISTS startupexecution (
+        id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL UNIQUE REFERENCES fastbottask(id),
+        run_id VARCHAR NOT NULL UNIQUE, request_key VARCHAR NOT NULL,
+        owner_id INTEGER NOT NULL REFERENCES user(id), node_owner_id INTEGER NOT NULL REFERENCES user(id),
+        device_serial VARCHAR NOT NULL, platform VARCHAR NOT NULL,
+        executor_kind VARCHAR NOT NULL DEFAULT 'server', client_instance_id VARCHAR,
+        config JSON NOT NULL DEFAULT '{}', config_digest VARCHAR NOT NULL,
+        status VARCHAR NOT NULL DEFAULT 'QUEUED', attempt INTEGER NOT NULL DEFAULT 0,
+        claim_token VARCHAR, lease_expires_at TIMESTAMP, reservation_release_at TIMESTAMP, queue_expires_at TIMESTAMP NOT NULL,
+        cancel_requested BOOLEAN NOT NULL DEFAULT 0, progress JSON NOT NULL DEFAULT '{}',
+        terminal_reason VARCHAR, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL,
+        UNIQUE(request_key, device_serial))""")
+    for table, names in (
+        ("clientinstance", ("owner_id",)),
+        ("startupexecution", ("task_id", "run_id", "request_key", "owner_id", "device_serial", "client_instance_id", "status")),
+    ):
+        for name in names:
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS ix_{table}_{name} ON {table}({name})")
+
+
 def _run_migrations_with_conn(conn) -> None:
     cursor = conn.cursor()
     cursor.execute("PRAGMA foreign_keys")
@@ -916,6 +942,7 @@ def _run_migrations_with_conn(conn) -> None:
             # iOS 设备展示名纠正：model 里的机型标识（iPhone18,2）译成市场名；market_name 里
             # 服务端同步曾写入的手机名（DeviceName，如「刘鸿的iPhone」）清掉，让型号显示出来
             ("20261108_041_device_display_names", _migrate_device_display_names),
+            ("20261125_042_startup_execution", _migrate_startup_execution),
         ]
 
         for version, migration_func in migration_plan:

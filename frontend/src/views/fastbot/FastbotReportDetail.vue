@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
@@ -17,6 +17,9 @@ import LogAnalysisDialog from './components/LogAnalysisDialog.vue'
 import ReplayDialog from './components/ReplayDialog.vue'
 import TraceAiDialog from './components/TraceAiDialog.vue'
 import { requestTraceAiSummary } from './components/traceAi'
+import { createPollingLoop, pollRequestConfig } from '@/utils/polling'
+import { isStartupActive } from '@/utils/startup'
+import { useClientApp } from '@/composables/useClientApp'
 import {
     clockTimeToTimestamp,
     formatDurationSeconds,
@@ -37,6 +40,7 @@ const router = useRouter()
 const taskId = Number(route.params.id)
 const chartGroup = `fastbot-report-${taskId}`
 const task = ref(null)
+const { isClientApp, detectClientApp } = useClientApp()
 const report = ref(null)
 const loadError = ref('')
 const loading = ref(true)
@@ -55,15 +59,16 @@ const bindCharts = async () => {
     connect(chartGroup)
 }
 
-const fetchData = async () => {
-    loading.value = true
-    loadError.value = ''
+const fetchData = async (quiet = false) => {
+    if (!quiet) loading.value = true
+    if (!quiet) loadError.value = ''
   try {
+        const config = quiet ? pollRequestConfig() : undefined
         const [taskRes, reportRes, deviceRes] = await Promise.all([
-            api.getFastbotTask(taskId),
-            api.getFastbotReport(taskId),
+            api.getFastbotTask(taskId, config),
+            api.getFastbotReport(taskId, config),
             // 8s 轮询超时在慢链路上会被吞掉（map 为空 → 设备栏显示设备编号），给足超时
-            api.getDeviceList({ timeout: 30000 }).catch(() => ({ data: [] }))
+            quiet ? Promise.resolve({ data: Object.values(devicesMap.value) }) : api.getDeviceList({ timeout: 30000 }).catch(() => ({ data: [] }))
         ])
         task.value = taskRes.data
         report.value = reportRes.data
@@ -75,12 +80,32 @@ const fetchData = async () => {
             })
         }
         devicesMap.value = map
+        await loadLocalStartupResult(false)
     } catch (err) {
-    loadError.value = '获取报告数据失败，请重试'
-        ElMessage.error('获取报告数据失败')
+        const recovered = await loadLocalStartupResult(true)
+        if (!quiet && !recovered) {
+            loadError.value = '获取报告数据失败，请重试'
+            ElMessage.error('获取报告数据失败')
+        }
     } finally {
         loading.value = false
     }
+}
+const loadLocalStartupResult = async force => {
+    try {
+        if (!force && report.value?.summary?.session_type !== 'startup') return false
+        await detectClientApp()
+        if (!isClientApp.value) return false
+        const response = await api.getStartupLocalResults()
+        const local = response.data?.items?.find(item => String(item.id) === String(taskId))
+        if (!local?.report) return false
+        if (force || local.sync_state === 'pending' || !report.value) {
+            task.value = { ...task.value, ...local }
+            report.value = local.report
+            loadError.value = ''
+        }
+        return true
+    } catch { return false }
 }
 
 const formatDeviceName = (identifier) => {
@@ -91,7 +116,7 @@ const jankData = computed(() => report.value?.jank_data || [])
 const jankEvents = computed(() => report.value?.jank_events || [])
 const traceArtifacts = computed(() => report.value?.trace_artifacts || [])
 const crashEvents = computed(() => report.value?.crash_events || [])
-const summary = computed(() => report.value?.summary || {})
+const summary = computed(() => report.value?.summary || task.value?.summary || {})
 const isStartupSession = computed(() => summary.value?.session_type === 'startup')
 const isManualFluencySession = computed(() => summary.value?.session_type === 'fluency_manual')
 const manualMarkers = computed(() => Array.isArray(summary.value?.manual_markers) ? summary.value.manual_markers : [])
@@ -210,7 +235,8 @@ const hydrateTraceSummaries = async (options = {}) => {
 
     if (batchTraceAiLoading.value) return
 
-    const targets = analyzedTraceArtifacts.value.filter(artifact => !artifact.ai_summary)
+    const targets = analyzedTraceArtifacts.value.filter(artifact => !artifact.ai_summary
+        && artifact.analysis_level !== 'startup_evidence' && artifact.analysis?.analysis_level !== 'startup_evidence')
     if (targets.length === 0) {
         if (!silent) {
             ElMessage.success('当前已分析 Trace 都已有 AI 总结')
@@ -282,11 +308,24 @@ const goBack = () => {
     router.push({ path: '/execution/reports', query: { tab: isStartupSession.value ? 'startup' : 'fastbot' } })
 }
 
-onMounted(() => {
-    fetchData()
+const reportPollLoop = createPollingLoop({
+    intervalMs: 8000,
+    tick: async () => {
+        if (isStartupSession.value && (isStartupActive(task.value) || task.value?.sync_state === 'pending')) await fetchData(true)
+        else reportPollLoop.stop()
+    },
 })
+onMounted(async () => {
+    await fetchData()
+    if (isStartupSession.value && (isStartupActive(task.value) || task.value?.sync_state === 'pending')) reportPollLoop.start()
+})
+onActivated(() => {
+    if (isStartupSession.value && (isStartupActive(task.value) || task.value?.sync_state === 'pending')) reportPollLoop.start()
+})
+onDeactivated(() => reportPollLoop.stop())
 
 onUnmounted(() => {
+    reportPollLoop.stop()
     disconnect(chartGroup)
 })
 

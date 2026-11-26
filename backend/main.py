@@ -194,6 +194,9 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+    from backend.startup_dispatch import recover_startup_runs, register_startup_reaper
+    recover_startup_runs()
+    register_startup_reaper()
     from backend.api_testing.service import recover_runs
     recover_runs()
     # 启动 Scrcpy 设备监听（独立守护线程，不阻塞主线程）
@@ -232,6 +235,8 @@ def on_startup():
 
 @app.on_event("shutdown")
 def on_shutdown():
+    from backend.startup_dispatch import shutdown_startup_runs
+    shutdown_startup_runs()
     from backend.api_testing.service import shutdown as shutdown_api_testing
     shutdown_api_testing()
     try:

@@ -31,7 +31,7 @@ function apiSetup({ desktop } = {}) {
   return { ...exposed, calls, instance }
 }
 
-function userStoreSetup() {
+function userStoreSetup({ desktop = false, logoutFailure = false } = {}) {
   const calls = []
   const stored = []
   const api = {
@@ -42,6 +42,10 @@ function userStoreSetup() {
     getUserInfo: async () => ({ data: { id: 7, role: 'user' } }),
     getFeatureFlags: async () => ({ data: {} }),
     markLoggedLogout: (...args) => { calls.push(['markLoggedLogout', ...args]); return Promise.resolve() },
+    logoutClientSession: sessionToken => {
+      calls.push(['logoutClientSession', sessionToken, localStorage.getItem('token')])
+      return logoutFailure ? Promise.reject(new Error('engine unavailable')) : Promise.resolve()
+    },
   }
   const localStorage = {
     getItem: key => (key === 'token' ? (stored.includes('token') ? 'token-1' : null) : null),
@@ -50,7 +54,7 @@ function userStoreSetup() {
   }
   const source = stripImports(readFileSync(new URL('../src/stores/useUserStore.js', import.meta.url), 'utf8'))
     .replace('export const useUserStore', 'const useUserStore')
-  const deps = { defineStore: (_name, factory) => factory, ref, computed, api, localStorage, console: { error: () => {} } }
+  const deps = { defineStore: (_name, factory) => factory, ref, computed, api, localStorage, window: desktop ? { desktop: {} } : {}, console: { error: () => {} } }
   const store = new Function(...Object.keys(deps), source + '\nreturn useUserStore()')(...Object.values(deps))
   return { store, calls, stored }
 }
@@ -408,6 +412,20 @@ test('manual logout(true) calls markLoggedLogout with true; plain logout never d
   assert.deepEqual(calls, [['markLoggedLogout', true]])
   assert.equal(store.token.value, '')
   assert.equal(stored.includes('token'), false)
+})
+
+test('desktop passive and manual logout capture their session before cleanup without waiting for the engine', async () => {
+  for (const manual of [false, true]) {
+    const { store, calls, stored } = userStoreSetup({ desktop: true, logoutFailure: true })
+    await store.login('alice', 'secret')
+    calls.length = 0
+    store.logout(manual)
+    assert.deepEqual(calls[0], ['logoutClientSession', 'token-1', 'token-1'])
+    assert.equal(calls.filter(call => call[0] === 'markLoggedLogout').length, manual ? 1 : 0)
+    assert.equal(store.token.value, '')
+    assert.equal(stored.includes('token'), false)
+    await Promise.resolve() // rejected engine notification is already handled
+  }
 })
 
 test('markLoggedLogout only fires for manual sign-out and is swallowed on bridge failure', async () => {

@@ -175,6 +175,29 @@ class _RecordingIOSSessionPool:
                 pass
         self._close_entry(removed)
 
+    def drain_for_exclusive_execution(self, serial: str, timeout: float = 20.0) -> None:
+        """Retire the old recording session before startup owns WDA settings.
+
+        The persistent startup reservation rejects new recording calls. Wait
+        for the one already inside the pool before closing its session; never
+        release another caller's mutex or let TTL cleanup close the new session.
+        """
+        device_id = str(serial or "").strip()
+        with self._lock:
+            entry = self._entries.get(device_id)
+        if entry is None:
+            return
+        if not entry.lock.acquire(timeout=timeout):
+            raise RuntimeError("录制请求尚未结束，请稍后重试冷热启动测试")
+        try:
+            with self._lock:
+                if self._entries.get(device_id) is entry:
+                    self._entries.pop(device_id)
+            self._close_entry(entry)
+        finally:
+            if entry.lock.locked():
+                entry.lock.release()
+
     def close_all(self) -> None:
         with self._lock:
             entries = list(self._entries.values())
@@ -348,6 +371,7 @@ def _connect_recording_device(
     session: Session,
     serial: Optional[str],
 ) -> Tuple[str, Any, Optional[Any]]:
+    _ensure_not_startup_reserved(session, serial)
     platform = _resolve_recording_platform(session, serial)
     if platform == "ios":
         if not serial:
@@ -363,6 +387,14 @@ def _connect_recording_device(
 
     device = _recording_android_device_pool.acquire(serial)
     return platform, device, None
+
+
+def _ensure_not_startup_reserved(session: Session, serial: Optional[str]) -> None:
+    if not serial:
+        return
+    device = session.exec(select(Device).where(Device.serial == serial)).first()
+    if device and device.lease_kind == "startup" and device.lease_task_id:
+        raise HTTPException(409, "设备正在进行冷热启动测量，请等待结束后再录制或交互")
 
 
 def _cleanup_recording_device(cleanup) -> None:
@@ -995,6 +1027,7 @@ def execute_single_step(request: Request, payload: SingleStepPayload, session: S
     """
     if not payload.device_serial:
         raise HTTPException(status_code=400, detail="请选择执行设备")
+    _ensure_not_startup_reserved(session, payload.device_serial)
 
     platform = _resolve_recording_platform(session, payload.device_serial)
     variables_map = _merge_execution_variables(session, payload.env_id, payload.variables)

@@ -166,13 +166,14 @@ test('处理完成后重新登录再过期：可再次处理（门闩会复位�
 function apiSetup({ token = 'tok-1' } = {}) {
   const storage = fakeStorage(token)
   const hooks = { request: null, responseFail: null }
+  const calls = []
   const instance = {
     interceptors: {
       request: { use: ok => { hooks.request = ok } },
       response: { use: (ok, fail) => { hooks.responseFail = fail } },
     },
     get: async () => ({ data: {} }),
-    post: async () => ({ data: {} }),
+    post: async (...args) => { calls.push(['post', ...args]); return { data: {} } },
     put: async () => ({ data: {} }),
     patch: async () => ({ data: {} }),
     delete: async () => ({ data: {} }),
@@ -197,7 +198,7 @@ function apiSetup({ token = 'tok-1' } = {}) {
     ...Object.keys(deps),
     source + '\nreturn { api: __default, setSessionExpiredHandler, resetSessionExpired }',
   )(...Object.values(deps))
-  return { ...exposed, hooks, storage, windowObj, source }
+  return { ...exposed, hooks, storage, windowObj, source, calls }
 }
 
 const error401 = () => ({ response: { status: 401, data: {} }, message: 'unauthorized' })
@@ -256,6 +257,41 @@ test('请求门闩：预登录端点无 token 放行；有 token 照常带 Beare
   const authed = apiSetup({ token: 'tok-9' })
   const config = authed.hooks.request({ headers: {}, url: '/reports/executions' })
   assert.equal(config.headers.Authorization, 'Bearer tok-9')
+})
+
+test('desktop logout preserves the captured token after async local cleanup or a new login', async () => {
+  const context = apiSetup()
+  await context.api.logoutClientSession()
+  const [, url, body, config] = context.calls[0]
+  assert.equal(url, '/client/session/logout')
+  assert.deepEqual(body, {})
+  assert.equal(config.headers.Authorization, 'Bearer tok-1')
+  assert.equal(config.silent401, true)
+  context.storage.removeItem('token')
+  assert.equal(context.hooks.request({ ...config, method: 'post', url }).headers.Authorization, 'Bearer tok-1')
+  context.storage.setItem('token', 'another-account')
+  assert.equal(context.hooks.request({ ...config, method: 'post', url }).headers.Authorization, 'Bearer tok-1', 'must not revoke a later account')
+
+  await context.api.logoutClientSession('explicit-session')
+  assert.equal(context.calls[1][3].headers.Authorization, 'Bearer explicit-session')
+})
+
+test('passive logout may revoke a local session without stored credentials and only that POST bypasses the gate', async () => {
+  const context = apiSetup({ token: null })
+  await context.api.logoutClientSession('')
+  const config = context.calls[0][3]
+  assert.equal(context.hooks.request({ ...config, method: 'post', url: '/client/session/logout' }).headers.Authorization, undefined)
+  for (const [method, url] of [['get', '/client/session/logout'], ['post', '/client/session/logout-extra'], ['post', '/devices/']]) {
+    assert.throws(() => context.hooks.request({ ...config, method, url }), { code: 'ERR_SESSION_EXPIRED' })
+  }
+  assert.throws(() => context.hooks.request({ headers: {}, method: 'post', url: '/client/session/logout' }), { code: 'ERR_SESSION_EXPIRED' })
+  const seen = []
+  context.storage.setItem('token', 'later-session')
+  context.setSessionExpiredHandler(() => seen.push('expired'))
+  await assert.rejects(context.hooks.responseFail({ ...error401(), config }))
+  await flush()
+  assert.deepEqual(seen, [], 'logout failure does not recursively expire a later login')
+  assert.equal(context.storage.getItem('token'), 'later-session')
 })
 
 test('api 层清理统一走 useUserStore.logout()，401 呈现可注入且导出 reset 钩子', () => {
