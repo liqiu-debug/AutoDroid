@@ -531,6 +531,21 @@ async def _capture_activity(serial: str) -> str:
         return ""
 
 
+COMPAT_CAPTURE_TIMEOUT_SECONDS = 45.0
+
+
+def _capture_u2_snapshot_sync(serial: str) -> Tuple[bytes, str]:
+    import uiautomator2 as u2
+
+    device = u2.connect(serial)
+    screenshot = device.screenshot(format="pillow")
+    buffer = io.BytesIO()
+    screenshot.save(buffer, format="PNG")
+    image_bytes = buffer.getvalue()
+    xml_text = str(device.dump_hierarchy() or "")
+    return image_bytes, xml_text
+
+
 async def _capture_snapshot(
     *,
     serial: str,
@@ -540,16 +555,12 @@ async def _capture_snapshot(
     phase: str,
     page: Dict[str, Any],
 ) -> Dict[str, Any]:
-    import uiautomator2 as u2
-
     page_key = str(page.get("key") or "page")
     base_dir = project_path("reports", "compatibility", str(run_id), str(cell_id), phase, page_key)
-    device = u2.connect(serial)
-    screenshot = device.screenshot(format="pillow")
-    buffer = io.BytesIO()
-    screenshot.save(buffer, format="PNG")
-    image_bytes = buffer.getvalue()
-    xml_text = str(device.dump_hierarchy() or "")
+    image_bytes, xml_text = await asyncio.wait_for(
+        asyncio.to_thread(_capture_u2_snapshot_sync, serial),
+        timeout=COMPAT_CAPTURE_TIMEOUT_SECONDS,
+    )
     activity = await _capture_activity(serial)
     logcat_errors = await _capture_logcat_errors(serial, package_name)
 

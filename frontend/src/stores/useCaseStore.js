@@ -17,6 +17,8 @@ const SELECTOR_TYPE_TO_BY = {
     text: 'text',
     xpath: 'xpath',
     description: 'description',
+    className: 'class_name',
+    composite: 'composite',
     image: 'image'
 }
 
@@ -28,6 +30,11 @@ const BY_TO_SELECTOR_TYPE = {
     xpath: 'xpath',
     description: 'description',
     desc: 'description',
+    class_name: 'className',
+    classname: 'className',
+    class: 'className',
+    type: 'className',
+    composite: 'composite',
     image: 'image',
     label: 'text',
     name: 'text'
@@ -146,7 +153,7 @@ function ensureCrossPlatformFields(step) {
         normalized.selector_type = 'image'
     } else if (
         ['click', 'input', 'wait_until_exists'].includes(normalized.action)
-        && !['text', 'description', 'xpath', 'resourceId'].includes(String(normalized.selector_type || '').trim())
+        && !['text', 'description', 'xpath', 'resourceId', 'className', 'composite'].includes(String(normalized.selector_type || '').trim())
     ) {
         normalized.selector_type = 'text'
     }
@@ -180,6 +187,13 @@ function ensureCrossPlatformFields(step) {
         normalized.options.match_mode = normalized.options.match_mode === 'not_exists'
             ? 'not_exists'
             : 'exists'
+    }
+
+    const isDisabled = Boolean(normalized.disabled || normalized.args?.disabled || normalized.options?.disabled)
+    if (isDisabled) {
+        normalized.disabled = true
+    } else {
+        delete normalized.disabled
     }
 
     return normalized
@@ -244,6 +258,8 @@ function standardStepToUiStep(step) {
         }
     }
 
+    const isDisabled = Boolean(step?.disabled || args?.disabled || step?.options?.disabled)
+
     return ensureCrossPlatformFields({
         uuid: step?.uuid,
         action,
@@ -257,7 +273,8 @@ function standardStepToUiStep(step) {
         error_strategy: step?.error_strategy || 'ABORT',
         retry_count: normalizeRetryCount(step?.retry_count),
         execute_on: step?.execute_on,
-        platform_overrides: action === 'assert_text' ? {} : (step?.platform_overrides || {})
+        platform_overrides: action === 'assert_text' ? {} : (step?.platform_overrides || {}),
+        ...(isDisabled ? { disabled: true } : {})
     })
 }
 
@@ -297,7 +314,7 @@ function uiStepToLegacyStep(step) {
         selectorType = null
     }
 
-    return {
+    const legacy = {
         uuid: normalized.uuid,
         action: normalized.action,
         selector,
@@ -321,6 +338,10 @@ function uiStepToLegacyStep(step) {
         error_strategy: normalized.error_strategy || 'ABORT',
         retry_count: normalizeRetryCount(normalized.retry_count)
     }
+    if (normalized.disabled) {
+        legacy.disabled = true
+    }
+    return legacy
 }
 
 function uiStepToStandardStep(step, order) {
@@ -382,6 +403,11 @@ function uiStepToStandardStep(step, order) {
 
     if (['click_image', 'assert_image'].includes(action)) {
         args.image_match = getSharedImageMatch(normalized)
+    }
+    if (normalized.disabled) {
+        args.disabled = true
+    } else {
+        delete args.disabled
     }
     return {
         order,

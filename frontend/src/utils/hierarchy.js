@@ -89,7 +89,13 @@ export const parseHierarchy = (xml, deviceInfoPayload = null) => {
     : null
   const screenArea = iosScreen ? (iosScreen.x2 - iosScreen.x1) * (iosScreen.y2 - iosScreen.y1) : undefined
 
+  let visitSeq = 0
+
   const traverse = (node, depth = 0) => {
+    visitSeq += 1
+    const enter = visitSeq
+    let pushedEntry = null
+
     if (node.nodeType === 1) {
       const bounds = parseNodeBounds(node, coordinateScale)
       if (bounds) {
@@ -101,7 +107,7 @@ export const parseHierarchy = (xml, deviceInfoPayload = null) => {
         const hasElementChildren = Array.from(node.childNodes || []).some(child => child.nodeType === 1)
         const className = node.getAttribute('class') || node.getAttribute('type') || node.nodeName || ''
         if (!shouldSkipCanvasNode(className, depth)) {
-          result.push({
+          pushedEntry = {
             x1,
             y1,
             x2,
@@ -110,17 +116,25 @@ export const parseHierarchy = (xml, deviceInfoPayload = null) => {
             resourceId: node.getAttribute('resource-id') || node.getAttribute('resourceId') || node.getAttribute('id') || '',
             className,
             contentDesc: node.getAttribute('content-desc') || node.getAttribute('name') || '',
+            clickable: String(node.getAttribute('clickable') || '').trim().toLowerCase() === 'true',
             depth,
             childCount: Array.from(node.childNodes || []).filter(child => child.nodeType === 1).length,
             isLeaf: !hasElementChildren,
             area,
+            enter,
+            exit: enter,
             ...(screenArea ? { screenArea } : {})
-          })
+          }
+          result.push(pushedEntry)
         }
       }
     }
     for (const child of node.childNodes) {
       traverse(child, depth + 1)
+    }
+    visitSeq += 1
+    if (pushedEntry) {
+      pushedEntry.exit = visitSeq
     }
   }
   traverse(doc.documentElement)

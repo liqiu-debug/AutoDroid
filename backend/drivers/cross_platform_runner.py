@@ -30,10 +30,12 @@ from backend.execution_errors import (
     suggestion_for,
 )
 from backend.locator_resolution import resolve_locator_candidates
+from backend.utils.composite_locator import render_composite_selector
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
 from backend.utils.image_match_options import select_image_options
 from backend.step_contract import (
     MAX_RETRY_COUNT,
+    is_step_disabled,
     normalize_action,
     normalize_error_strategy,
     normalize_execute_on,
@@ -238,6 +240,19 @@ class TestCaseRunner:
                     _with_error_code("P1002_ACTION_NOT_SUPPORTED", str(exc))
                 ) from exc
             strategy = normalize_error_strategy(raw_strategy)
+            if is_step_disabled(step_data):
+                return self._result(
+                    step_data=step_data,
+                    action=action,
+                    status="SKIP",
+                    error_strategy=strategy,
+                    error="步骤已禁用",
+                    output=None,
+                    artifacts=None,
+                    duration=time.time() - started_at,
+                    error_code="STEP_DISABLED",
+                    skip_reason="步骤已禁用",
+                )
             execute_on = normalize_execute_on(step_data.get("execute_on"))
 
             if self.platform not in execute_on:
@@ -273,13 +288,26 @@ class TestCaseRunner:
             value = step_data.get("value")
             args = _render_runtime_value(args, self.runtime_variables)
             value = _render_runtime_value(value, self.runtime_variables)
-            locator_candidates = [
-                {
-                    "selector": _render_runtime_value(item.get("selector"), self.runtime_variables),
-                    "by": _render_runtime_value(item.get("by"), self.runtime_variables),
-                }
-                for item in resolve_locator_candidates(step_data, platform=self.platform)
-            ]
+            locator_candidates = []
+            for item in resolve_locator_candidates(step_data, platform=self.platform):
+                rendered_by = _render_runtime_value(item.get("by"), self.runtime_variables)
+                raw_selector = item.get("selector")
+                if (
+                    self.runtime_variables
+                    and str(rendered_by or "").strip().lower() == "composite"
+                ):
+                    rendered_selector = render_composite_selector(
+                        raw_selector,
+                        lambda v: render_step_data(v, self.runtime_variables),
+                    )
+                else:
+                    rendered_selector = _render_runtime_value(raw_selector, self.runtime_variables)
+                locator_candidates.append(
+                    {
+                        "selector": rendered_selector,
+                        "by": rendered_by,
+                    }
+                )
             # 供失败时构建 error_context 使用（纯错误路径辅助信息）。
             step_context["locator_candidates"] = locator_candidates
             unresolved = _collect_unresolved_templates(

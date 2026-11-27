@@ -120,15 +120,16 @@ const ensureSaved = async () => {
   return true
 }
 
-const handleRun = async () => {
-  if (!runBusy.value && isRunning.value && activeRun.value && !activeRun.value.unknown) return terminateActiveRun()
+const handleRun = async (options = {}) => {
+  const startStepIndex = Number.isInteger(options?.startStepIndex) && options.startStepIndex > 0 ? options.startStepIndex : 0
+  if (startStepIndex === 0 && !runBusy.value && isRunning.value && activeRun.value && !activeRun.value.unknown) return terminateActiveRun()
   pendingLaunch.value = pendingLaunch.value || pendingExecution('case', currentCase.value.id)
   if (runBusy.value || terminatingRun.value) return
   if (pendingLaunch.value || wsOutcomeUnknown.value) {
     await restoreActiveRun()
     return ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
   }
-  if (isRunning.value) return terminateActiveRun()
+  if (isRunning.value) return startStepIndex > 0 ? undefined : terminateActiveRun()
   if (!currentCase.value.steps.length) return ElMessage.warning('用例没有步骤')
   const selectedEnvironment = envId.value
   const currentDevice = recordingDeviceSerial.value
@@ -154,7 +155,11 @@ const handleRun = async () => {
     activeRun.value = { kind: 'case', target_id: caseId, unknown: true, device_serials: currentDevice ? [currentDevice] : [] }
     rememberWebsocketExecution('case', caseId, currentDevice ? [currentDevice] : [])
     websocketCaseId = caseId
-    logConsoleRef.value.connect(caseId, selectedEnvironment, currentDevice)
+    if (startStepIndex > 0) {
+      logConsoleRef.value.connect(caseId, selectedEnvironment, currentDevice, { startStepIndex })
+    } else {
+      logConsoleRef.value.connect(caseId, selectedEnvironment, currentDevice)
+    }
     connected = true
   } catch (err) {
     if (generation !== executionViewGeneration) return
@@ -509,7 +514,7 @@ onUnmounted(() => {
         <GeneralStepsPanel :loading="loading" :device-serial="recordingDeviceSerial" :ocr-crop-mode="ocrCropMode" :record-mode="recordMode" :include-screenshot="includeInteractionScreenshot" @action-start="loading = true" @action-end="loading = false" @refresh-needed="handleRefreshNeeded" />
       </section>
       <section class="right-pane">
-        <StepBuilder :env-id="envId" :device-serial="recordingDeviceSerial" :active-image-crop-step-uuid="activeImageCropStepUuid" :include-screenshot="includeInteractionScreenshot" @refresh-needed="handleRefreshNeeded" @request-ocr-crop="handleRequestOcrCrop" @request-image-crop="handleRequestImageCrop" />
+        <StepBuilder :env-id="envId" :device-serial="recordingDeviceSerial" :active-image-crop-step-uuid="activeImageCropStepUuid" :include-screenshot="includeInteractionScreenshot" :is-running="isRunning || runBusy" @refresh-needed="handleRefreshNeeded" @request-ocr-crop="handleRequestOcrCrop" @request-image-crop="handleRequestImageCrop" @run-from-step="index => handleRun({ startStepIndex: index })" />
       </section>
     </div>
     <LogConsole ref="logConsoleRef" :case-id="currentCase.id" @run-start="handleRunStart" @run-complete="handleRunComplete" @run-error="handleRunError" />

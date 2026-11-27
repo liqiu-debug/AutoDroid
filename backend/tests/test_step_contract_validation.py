@@ -57,6 +57,52 @@ class StepContractValidationTests(unittest.TestCase):
         self.assertEqual(step.platform_overrides.android.selector, "登录")
         self.assertEqual(step.platform_overrides.android.by, "text")
 
+    def test_step_write_normalizes_and_validates_composite_and_class_name(self):
+        comp_step = TestCaseStepWrite(
+            action="click",
+            platform_overrides={
+                "android": {
+                    "selector": '{"text":"确定","resourceId":"com.demo:id/ok"}',
+                    "by": "composite",
+                }
+            },
+        )
+        self.assertEqual(comp_step.platform_overrides.android.by, "composite")
+        self.assertEqual(
+            comp_step.platform_overrides.android.selector,
+            '{"id":"com.demo:id/ok","text":"确定"}',
+        )
+
+        from backend.step_contract import normalize_platform_overrides
+
+        cls_step = TestCaseStepWrite(
+            action="input",
+            args={"text": "hello"},
+            platform_overrides={
+                "android": {"selector": "android.widget.EditText", "by": "className"}
+            },
+        )
+        normalized_overrides = normalize_platform_overrides(cls_step.model_dump()["platform_overrides"])
+        self.assertEqual(normalized_overrides["android"]["by"], "classname")
+
+        legacy_cls = legacy_step_to_standard(
+            {
+                "action": "input",
+                "selector": "android.widget.EditText",
+                "selector_type": "className",
+                "value": "hello",
+            },
+            case_id=1,
+            order=1,
+        )
+        self.assertEqual(legacy_cls["platform_overrides"]["android"]["by"], "class_name")
+
+        with self.assertRaises(ValidationError):
+            TestCaseStepWrite(
+                action="click",
+                platform_overrides={"android": {"selector": "{bad-json", "by": "composite"}},
+            )
+
 
 class RetryCountContractTests(unittest.TestCase):
     def test_normalize_retry_count_accepts_valid_values(self):

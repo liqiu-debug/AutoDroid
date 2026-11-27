@@ -263,6 +263,47 @@ class PrecheckTests(_Base):
         self.assertTrue(result["ok"])  # warning 不拦截导出
         self.assertIn("EXPORT_UNRESOLVED_VARIABLE", [i["code"] for i in result["issues"]])
 
+    def test_composite_and_class_name_export_and_precheck(self):
+        case = self._create_case()
+        self._add_step(
+            case.id,
+            1,
+            "click",
+            platform_overrides={
+                "android": {
+                    "selector": '{"id":"com.x:id/btn","text":"{{BTN_TEXT}}"}',
+                    "by": "composite",
+                }
+            },
+        )
+        self._add_step(
+            case.id,
+            2,
+            "input",
+            args={"text": "123"},
+            platform_overrides={
+                "android": {"selector": "android.widget.EditText", "by": "class_name"}
+            },
+        )
+        script = build_case_script(self.session, case)
+        result = precheck_case_script(script, project_root=packager.PROJECT_ROOT)
+        self.assertTrue(result["ok"], result)
+        step1_rendered = script["steps"][0]["locators"][0]["selector"]
+        self.assertEqual(step1_rendered, '{"id":"com.x:id/btn","text":"{{BTN_TEXT}}"}')
+        self.assertEqual(script["steps"][1]["locators"][0]["by"], "class_name")
+
+        bad_case = self._create_case()
+        self._add_step(
+            bad_case.id,
+            1,
+            "click",
+            platform_overrides={"android": {"selector": "{bad-json", "by": "composite"}},
+        )
+        bad_script = build_case_script(self.session, bad_case)
+        bad_res = precheck_case_script(bad_script, project_root=packager.PROJECT_ROOT)
+        self.assertFalse(bad_res["ok"])
+        self.assertIn("P1006_INVALID_ARGS", [i["code"] for i in bad_res["issues"]])
+
 
 class DeviceFlowTests(_Base):
     def setUp(self) -> None:

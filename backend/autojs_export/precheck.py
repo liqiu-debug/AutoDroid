@@ -13,9 +13,24 @@ from backend.autojs_export.generator import (
     LOCATOR_ACTIONS,
     find_unresolved_placeholders,
 )
+from backend.utils.composite_locator import parse_composite_selector
 from backend.utils.image_match_options import normalize_image_options
 
-SUPPORTED_BY = {"id", "resourceid", "resource_id", "text", "label", "name", "description", "desc", "content-desc"}
+SUPPORTED_BY = {
+    "id",
+    "resourceid",
+    "resource_id",
+    "text",
+    "label",
+    "name",
+    "description",
+    "desc",
+    "content-desc",
+    "class_name",
+    "classname",
+    "class",
+    "composite",
+}
 
 
 def _issue(
@@ -70,6 +85,13 @@ def precheck_case_script(
                 issues.append(
                     _issue(order, "error", "P1002_ACTION_NOT_SUPPORTED", f"{action} 步骤定位方式不支持: {by}")
                 )
+            elif by == "composite":
+                try:
+                    parse_composite_selector(locator.get("selector"))
+                except ValueError as exc:
+                    issues.append(
+                        _issue(order, "error", "P1006_INVALID_ARGS", f"{action} 步骤组合定位格式无效: {exc}")
+                    )
 
         if action in ("click_image", "assert_image"):
             if not args.get("image"):

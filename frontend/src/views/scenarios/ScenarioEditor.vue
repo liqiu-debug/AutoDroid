@@ -15,6 +15,7 @@ import LogConsole from '@/components/LogConsole.vue'
 import { createUuid } from '@/utils/uuid'
 import { fetchAllPages } from '@/utils/paginate'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
+import { formatLocatorTitle } from '@/utils/compositeLocator'
 import { deviceStatusLabel as statusLabel, deviceStatusTagType as statusTagType } from '@/utils/statusMeta'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import {
@@ -729,7 +730,10 @@ const actionOptions = Object.entries(ACTION_LABELS)
 
 const getStepTitle = (step) => {
   const actionLabel = getActionLabel(step.action)
-  let target = step.selector ? (step.selector.length > 25 ? step.selector.slice(0, 25) + '...' : step.selector) : '?'
+  const rawSelector = step.selector || step.platform_overrides?.android?.selector || ''
+  const rawBy = step.selector_type || step.platform_overrides?.android?.by || ''
+  const formatted = formatLocatorTitle(rawBy, rawSelector)
+  let target = formatted !== '?' ? (formatted.length > 32 ? formatted.slice(0, 32) + '...' : formatted) : '?'
   if (step.action === 'sleep') {
     target = step.value ? `${step.value}s` : '5s'
   } else if (step.action === 'assert_text') {
@@ -849,7 +853,7 @@ const getStepTitle = (step) => {
                         </div>
                         </div>
                     </VueDraggable>
-                    <el-empty v-if="scenarioSteps.length === 0" description="拖拽左侧的用例至此" :image-size="80" />
+                    <el-empty v-if="scenarioSteps.length === 0" class="step-empty-overlay" description="拖拽左侧的用例至此" :image-size="80" />
             </div>
         </div>
 
@@ -905,7 +909,7 @@ const getStepTitle = (step) => {
                             </div>
                             <div class="form-row" v-if="!['swipe', 'sleep', 'extract_by_ocr'].includes(step.action)">
                                 <label>选择器:</label>
-                                <span class="break-text">{{ step.selector || '-' }}</span>
+                                <span class="break-text">{{ (step.selector_type === 'composite' || step.platform_overrides?.android?.by === 'composite') ? formatLocatorTitle('composite', step.selector || step.platform_overrides?.android?.selector) : (step.selector || '-') }}</span>
                             </div>
                             <div class="form-row" v-if="step.action === 'swipe'">
                                 <label>方向:</label>
@@ -1195,7 +1199,10 @@ const getStepTitle = (step) => {
 }
 
 .step-content {
-    padding: 0 10px; /* Add horizontal padding to container */
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
 }
 
 .step-item {
@@ -1225,7 +1232,18 @@ const getStepTitle = (step) => {
 .col-alias { flex: 1; padding-right: 10px; }
 .col-action { width: 40px; text-align: center; }
 
-.step-draggable { min-height: 100px; }
+.step-draggable {
+    flex: 1 0 auto;
+    min-height: 100%;
+    padding: 8px 10px 48px;
+    box-sizing: border-box;
+}
+
+.step-empty-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
 
 
 

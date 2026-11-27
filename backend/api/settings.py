@@ -14,10 +14,16 @@ from backend.api import deps
 from backend.notification_service import NotificationService
 from backend.feature_flags import (
     FLAG_CONTENT_ADDRESSED_ASSETS,
+    FLAG_DRIVER_POOL,
     FLAG_IOS_EXECUTION,
     FLAG_NEW_STEP_MODEL,
+    FLAG_RECORDING_ENABLE_CLASS_NAME,
+    FLAG_RECORDING_ENABLE_RESOURCE_ID,
     FLAG_TIERED_ASSET_RETENTION,
     FLAG_WS_DISCONNECT_ABORT,
+    SETTING_RECORDING_LOCATOR_PRIORITY,
+    VALID_RECORDING_LOCATOR_PRIORITIES,
+    get_recording_locator_config,
     is_flag_enabled,
     parse_bool_setting,
 )
@@ -52,11 +58,23 @@ def get_feature_flags(
         FLAG_WS_DISCONNECT_ABORT,
         FLAG_CONTENT_ADDRESSED_ASSETS,
         FLAG_TIERED_ASSET_RETENTION,
+        FLAG_DRIVER_POOL,
+        FLAG_RECORDING_ENABLE_RESOURCE_ID,
+        FLAG_RECORDING_ENABLE_CLASS_NAME,
     )
     values = {key: is_flag_enabled(session, key) for key in keys}
     if not values[FLAG_CONTENT_ADDRESSED_ASSETS]:
         values[FLAG_TIERED_ASSET_RETENTION] = False
     return values
+
+
+@router.get("/recording-locator")
+def get_recording_locator_settings(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """获取录制定位策略配置（Resource ID / ClassName 开关与优先级）"""
+    return get_recording_locator_config(session)
 
 
 @router.get("/", response_model=List[SettingResponse])
@@ -84,6 +102,23 @@ def save_settings(
 ):
     """批量保存系统配置 (Upsert)"""
     items_by_key = {item.key: item for item in items}
+    if SETTING_RECORDING_LOCATOR_PRIORITY in items_by_key:
+        priority_item = items_by_key[SETTING_RECORDING_LOCATOR_PRIORITY]
+        normalized_priority = str(priority_item.value or "").strip().lower() or VALID_RECORDING_LOCATOR_PRIORITIES[0]
+        if normalized_priority not in VALID_RECORDING_LOCATOR_PRIORITIES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{SETTING_RECORDING_LOCATOR_PRIORITY} 仅支持 "
+                    + ", ".join(VALID_RECORDING_LOCATOR_PRIORITIES)
+                ),
+            )
+        items_by_key[SETTING_RECORDING_LOCATOR_PRIORITY] = SettingItem(
+            key=SETTING_RECORDING_LOCATOR_PRIORITY,
+            value=normalized_priority,
+            description=priority_item.description,
+        )
+
     dependencies = {
         FLAG_CONTENT_ADDRESSED_ASSETS: (FLAG_TIERED_ASSET_RETENTION,),
     }

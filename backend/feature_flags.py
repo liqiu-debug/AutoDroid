@@ -1,7 +1,7 @@
 """Feature flag helpers for staged rollout."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from sqlmodel import Session, select
 
@@ -13,6 +13,16 @@ FLAG_IOS_EXECUTION = "ios_execution"
 FLAG_WS_DISCONNECT_ABORT = "ws_disconnect_abort"
 FLAG_CONTENT_ADDRESSED_ASSETS = "content_addressed_assets"
 FLAG_TIERED_ASSET_RETENTION = "tiered_asset_retention"
+FLAG_DRIVER_POOL = "driver_pool_enabled"
+FLAG_RECORDING_ENABLE_RESOURCE_ID = "recording_enable_resource_id"
+FLAG_RECORDING_ENABLE_CLASS_NAME = "recording_enable_class_name"
+SETTING_RECORDING_LOCATOR_PRIORITY = "recording_locator_priority"
+RECORDING_PRIORITY_SEMANTIC_FIRST = "semantic_first"
+RECORDING_PRIORITY_ID_FIRST = "id_first"
+VALID_RECORDING_LOCATOR_PRIORITIES = (
+    RECORDING_PRIORITY_SEMANTIC_FIRST,
+    RECORDING_PRIORITY_ID_FIRST,
+)
 
 # 各开关的默认值表：调用点不再各自硬编码 default。
 # 标准步骤模型已默认启用；在 SystemSetting 中显式写入 false 仍可关闭。
@@ -23,6 +33,9 @@ _FLAG_DEFAULTS = {
     FLAG_WS_DISCONNECT_ABORT: False,
     FLAG_CONTENT_ADDRESSED_ASSETS: False,
     FLAG_TIERED_ASSET_RETENTION: False,
+    FLAG_DRIVER_POOL: False,
+    FLAG_RECORDING_ENABLE_RESOURCE_ID: False,
+    FLAG_RECORDING_ENABLE_CLASS_NAME: False,
 }
 
 _UNSET = object()
@@ -86,3 +99,54 @@ def is_flag_enabled(session: Session, key: str, default=_UNSET) -> bool:
     if default is _UNSET:
         default = _FLAG_DEFAULTS.get(key, False)
     return parse_bool_setting(get_setting_value(session, key), default=bool(default))
+
+
+def _coerce_bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return parse_bool_setting(str(value), default=default)
+
+
+def normalize_recording_locator_priority(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text == RECORDING_PRIORITY_ID_FIRST:
+        return RECORDING_PRIORITY_ID_FIRST
+    return RECORDING_PRIORITY_SEMANTIC_FIRST
+
+
+def parse_recording_locator_config(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize recording locator policy from SystemSetting dict or request payload."""
+    source = raw if isinstance(raw, dict) else {}
+    enable_id_raw = (
+        source.get("enable_resource_id")
+        if "enable_resource_id" in source
+        else source.get(FLAG_RECORDING_ENABLE_RESOURCE_ID)
+    )
+    enable_class_raw = (
+        source.get("enable_class_name")
+        if "enable_class_name" in source
+        else source.get(FLAG_RECORDING_ENABLE_CLASS_NAME)
+    )
+    priority_raw = (
+        source.get("priority")
+        if "priority" in source
+        else source.get(SETTING_RECORDING_LOCATOR_PRIORITY)
+    )
+    return {
+        "enable_resource_id": _coerce_bool_value(enable_id_raw, default=False),
+        "enable_class_name": _coerce_bool_value(enable_class_raw, default=False),
+        "priority": normalize_recording_locator_priority(priority_raw),
+    }
+
+
+def get_recording_locator_config(session: Session) -> Dict[str, Any]:
+    """Read recording locator policy from SystemSetting."""
+    return {
+        "enable_resource_id": is_flag_enabled(session, FLAG_RECORDING_ENABLE_RESOURCE_ID),
+        "enable_class_name": is_flag_enabled(session, FLAG_RECORDING_ENABLE_CLASS_NAME),
+        "priority": normalize_recording_locator_priority(
+            get_setting_value(session, SETTING_RECORDING_LOCATOR_PRIORITY)
+        ),
+    }

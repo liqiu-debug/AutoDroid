@@ -52,6 +52,54 @@ class RecordingClickGuardTests(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 400)
         self.assertEqual(context.exception.detail, CLICK_TARGET_NOT_FOUND_DETAIL)
 
+    def test_ambiguous_click_target_raises_400_with_dedicated_detail(self):
+        from backend.api.recording import CLICK_AMBIGUOUS_LOCATOR_DETAIL
+
+        with self.assertRaises(HTTPException) as context:
+            _build_click_step_from_inspect_result(
+                {"strategy": "ambiguous", "selector": "", "element": {"bounds": "[0,0][100,100]"}}
+            )
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertEqual(context.exception.detail, CLICK_AMBIGUOUS_LOCATOR_DETAIL)
+
+    def test_resource_id_class_name_and_composite_allowed_only_when_configured(self):
+        id_result = {"strategy": "resourceId", "selector": "com.demo:id/icon", "element": {}}
+        comp_result = {
+            "strategy": "composite",
+            "selector": '{"id":"com.demo:id/btn","text":"确认"}',
+            "element": {},
+        }
+        cls_result = {"strategy": "className", "selector": "android.widget.EditText", "element": {}}
+
+        with self.assertRaises(HTTPException):
+            _build_click_step_from_inspect_result(id_result)
+        with self.assertRaises(HTTPException):
+            _build_click_step_from_inspect_result(cls_result)
+        with self.assertRaises(HTTPException):
+            _build_click_step_from_inspect_result(comp_result)
+
+        id_step = _build_click_step_from_inspect_result(
+            id_result,
+            locator_config={"enable_resource_id": True},
+        )
+        self.assertEqual(id_step["selector_type"], "resourceId")
+        self.assertEqual(id_step["selector"], "com.demo:id/icon")
+
+        cls_step = _build_click_step_from_inspect_result(
+            cls_result,
+            locator_config={"enable_class_name": True},
+        )
+        self.assertEqual(cls_step["selector_type"], "className")
+        self.assertEqual(cls_step["selector"], "android.widget.EditText")
+
+        comp_step = _build_click_step_from_inspect_result(
+            comp_result,
+            locator_config={"enable_resource_id": True},
+        )
+        self.assertEqual(comp_step["selector_type"], "composite")
+        self.assertEqual(comp_step["selector"], '{"id":"com.demo:id/btn","text":"确认"}')
+
 
 if __name__ == "__main__":
     unittest.main()

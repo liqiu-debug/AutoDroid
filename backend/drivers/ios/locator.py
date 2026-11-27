@@ -18,6 +18,10 @@ from backend.execution_errors import (
     E2009_CLICK_NO_EFFECT,
     ExecutionStepRuntimeError,
 )
+from backend.utils.composite_locator import (
+    build_ios_predicate_from_composite,
+    parse_composite_selector,
+)
 
 # 保持与拆分前一致的 logger 名称（backend.drivers.ios_driver），日志过滤与测试 assertLogs 兼容。
 logger = logging.getLogger("backend.drivers.ios_driver")
@@ -204,10 +208,13 @@ class IOSLocatorMixin:
             return session(label=selector)
         if by_lower == "xpath":
             return session(xpath=selector)
-        if by_lower in ("class_name", "classname", "type"):
+        if by_lower in ("class_name", "classname", "type", "class"):
             return session(className=selector)
         if by_lower == "predicate":
             return session(predicate=selector)
+        if by_lower == "composite":
+            conditions = parse_composite_selector(selector)
+            return session(predicate=build_ios_predicate_from_composite(conditions))
 
         raise ValueError(f"iOS 不支持的定位策略: by={by!r}")
 
@@ -218,7 +225,7 @@ class IOSLocatorMixin:
             return "label"
         if by_lower in ("accessibilityid", "accessibility_id", "description", "desc"):
             return "id"
-        if by_lower in ("classname", "type"):
+        if by_lower in ("classname", "type", "class"):
             return "class_name"
         return by_lower
 
@@ -252,6 +259,15 @@ class IOSLocatorMixin:
                 ("name", selector),
                 ("predicate", self._build_contains_predicate(selector)),
             ]
+        if by_lower == "composite":
+            try:
+                conditions = parse_composite_selector(selector)
+            except ValueError:
+                return []
+            if "text" in conditions:
+                return [
+                    ("predicate", build_ios_predicate_from_composite(conditions, text_contains=True)),
+                ]
         return []
 
     def _build_click_locator_attempts(self, locator_candidates: List[Dict[str, Any]]) -> List[Dict[str, str]]:

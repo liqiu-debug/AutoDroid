@@ -38,7 +38,11 @@ from backend.database import get_session
 from backend.device_transport_metrics import device_transport_metrics
 from backend.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner
 from backend.drivers.ios_driver import IOSDriver
-from backend.feature_flags import FLAG_IOS_EXECUTION, is_flag_enabled
+from backend.feature_flags import (
+    FLAG_IOS_EXECUTION,
+    get_recording_locator_config,
+    is_flag_enabled,
+)
 from backend.models import Device, GlobalVariable
 from backend.schemas import InteractionRequest
 from backend.step_contract import (
@@ -57,6 +61,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 CLICK_IMAGE_REQUIRED_DETAIL = "添加步骤失败：当前点击区域无 Desc/Text，请使用图像点击步骤。"
+CLICK_AMBIGUOUS_LOCATOR_DETAIL = "添加步骤失败：当前元素定位属性在页面存在重复，无法唯一识别，请使用图像点击步骤。"
 CLICK_TARGET_NOT_FOUND_DETAIL = "添加步骤失败：当前点击区域未识别到可录制元素，请重试或使用图像点击步骤。"
 
 RECORDING_IOS_IDLE_TTL_SECONDS = 45.0
@@ -682,7 +687,12 @@ def _ensure_android_recording_device(session: Session, serial: Optional[str]) ->
         )
 
 
-def _build_step_from_inspect(inspect_res: dict, operation: str = "click") -> dict:
+def _build_step_from_inspect(
+    inspect_res: dict,
+    operation: str = "click",
+    *,
+    locator_config: Optional[Dict[str, Any]] = None,
+) -> dict:
     """
     工具函数：根据元素检查结果构建步骤数据。
 
@@ -691,14 +701,31 @@ def _build_step_from_inspect(inspect_res: dict, operation: str = "click") -> dic
     """
     element = inspect_res.get("element", {})
     strategy = inspect_res["strategy"]
+    selector_value = str(inspect_res.get("selector") or "").strip()
 
     if operation == "click":
-        has_semantic_locator = bool(
-            str(element.get("text") or "").strip()
-            or str(element.get("description") or "").strip()
-        )
-        if strategy not in {"text", "description"} or not has_semantic_locator:
+        if strategy == "ambiguous":
+            raise HTTPException(status_code=400, detail=CLICK_AMBIGUOUS_LOCATOR_DETAIL)
+
+        cfg = locator_config if isinstance(locator_config, dict) else {}
+        enable_id = bool(cfg.get("enable_resource_id", False))
+        enable_class = bool(cfg.get("enable_class_name", False))
+        allowed_strategies = {"text", "description"}
+        if enable_id:
+            allowed_strategies.update({"resourceId", "composite"})
+        if enable_class:
+            allowed_strategies.update({"className", "composite"})
+
+        if strategy not in allowed_strategies or not selector_value:
             raise HTTPException(status_code=400, detail=CLICK_IMAGE_REQUIRED_DETAIL)
+
+        if strategy in {"text", "description"}:
+            has_semantic_locator = bool(
+                str(element.get("text") or "").strip()
+                or str(element.get("description") or "").strip()
+            )
+            if not has_semantic_locator:
+                raise HTTPException(status_code=400, detail=CLICK_IMAGE_REQUIRED_DETAIL)
 
     return {
         "action": "click" if operation == "click" else operation,
@@ -710,10 +737,18 @@ def _build_step_from_inspect(inspect_res: dict, operation: str = "click") -> dic
     }
 
 
-def _build_click_step_from_inspect_result(inspect_res: dict) -> dict:
+def _build_click_step_from_inspect_result(
+    inspect_res: dict,
+    *,
+    locator_config: Optional[Dict[str, Any]] = None,
+) -> dict:
     if "error" in inspect_res:
         raise HTTPException(status_code=400, detail=CLICK_TARGET_NOT_FOUND_DETAIL)
-    return _build_step_from_inspect(inspect_res, operation="click")
+    return _build_step_from_inspect(
+        inspect_res,
+        operation="click",
+        locator_config=locator_config,
+    )
 
 
 class CropTemplateRequest(BaseModel):
@@ -807,14 +842,21 @@ def inspect_device(
     try:
         platform, device, cleanup = _connect_recording_device(session, serial)
         xml_dump = _get_device_hierarchy_xml(device, platform=platform)
+        locator_cfg = get_recording_locator_config(session)
         inspect_res = calculate_element_from_coordinates(
             xml_dump,
             x,
             y,
             coordinate_scale=_get_recording_coordinate_scale(device, platform),
+            enable_resource_id=locator_cfg["enable_resource_id"],
+            enable_class_name=locator_cfg["enable_class_name"],
+            locator_priority=locator_cfg["priority"],
         )
 
-        step = _build_click_step_from_inspect_result(inspect_res)
+        step = _build_click_step_from_inspect_result(
+            inspect_res,
+            locator_config=locator_cfg,
+        )
 
         return {
             "step": step,
@@ -848,6 +890,7 @@ def interact_with_device(request: Request, req: InteractionRequest, session: Ses
         # 2. 如果是坐标点击，分析点击坐标处的元素
         inspect_res = {}
         step_info = None
+        locator_cfg = get_recording_locator_config(session) if (req.operation == "click" and req.record_step) else None
         if req.operation == "click" and req.record_step:
             # 1. 获取当前 UI 层级 (仅点击时需要)
             xml_dump = req.xml_dump or _get_device_hierarchy_xml(device, platform=platform)
@@ -857,6 +900,9 @@ def interact_with_device(request: Request, req: InteractionRequest, session: Ses
                 req.x,
                 req.y,
                 coordinate_scale=coordinate_scale,
+                enable_resource_id=locator_cfg["enable_resource_id"],
+                enable_class_name=locator_cfg["enable_class_name"],
+                locator_priority=locator_cfg["priority"],
             )
 
             # 如果前端传入的 XML 过期，用新的重试
@@ -868,11 +914,17 @@ def interact_with_device(request: Request, req: InteractionRequest, session: Ses
                     req.x,
                     req.y,
                     coordinate_scale=coordinate_scale,
+                    enable_resource_id=locator_cfg["enable_resource_id"],
+                    enable_class_name=locator_cfg["enable_class_name"],
+                    locator_priority=locator_cfg["priority"],
                 )
 
         # 3. 构建步骤
         if req.operation == "click" and req.record_step:
-            step_info = _build_click_step_from_inspect_result(inspect_res)
+            step_info = _build_click_step_from_inspect_result(
+                inspect_res,
+                locator_config=locator_cfg,
+            )
         elif req.operation != "click":
             # 全局动作/通用步骤
             step_info = {

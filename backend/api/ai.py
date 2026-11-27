@@ -264,6 +264,10 @@ def _normalize_locator_by(raw_by: Any, action: str) -> Optional[str]:
         "content-desc": "description",
         "resourceid": "id",
         "resource_id": "id",
+        "class_name": "class_name",
+        "classname": "class_name",
+        "class": "class_name",
+        "composite": "composite",
     }
     return alias_map.get(normalized, normalized)
 

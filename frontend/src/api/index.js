@@ -408,8 +408,12 @@ export default {
         const query = serial ? `&serial=${serial}` : ''
         return api.post(`/device/inspect?x=${x}&y=${y}${query}`)
     },
-    interactDevice(x, y, operation, xml_dump, action_data, serial, record_step = true, include_screenshot = true) {
-        return api.post('/device/interact', { x, y, operation, xml_dump, action_data, device_serial: serial, record_step, include_screenshot })
+    interactDevice(x, y, operation, xml_dump, action_data, serial, record_step = true, include_screenshot = true, locator_config = null) {
+        const payload = { x, y, operation, xml_dump, action_data, device_serial: serial, record_step, include_screenshot }
+        if (locator_config && typeof locator_config === 'object') {
+            payload.locator_config = locator_config
+        }
+        return api.post('/device/interact', payload)
     },
     async executeStep(step) {
         if (requiresImageMatcher(step?.step?.action)) await assertImageMatcher()
@@ -517,6 +521,9 @@ export default {
     deleteBatch(batchId) {
         return api.delete(`/reports/batch/${batchId}`)
     },
+    batchDeleteReports(payload) {
+        return api.post('/reports/batch-delete', payload)
+    },
     cancelRun(data) {
         return api.post('/runs/cancel', data)
     },
@@ -551,6 +558,9 @@ export default {
     },
     getFeatureFlags() {
         return api.get('/settings/feature-flags')
+    },
+    getRecordingLocatorConfig() {
+        return api.get('/settings/recording-locator')
     },
     getAssetStorageStatus() {
         return api.get('/assets/status')

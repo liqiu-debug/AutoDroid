@@ -1,13 +1,14 @@
 <script setup>
 import { ref, onActivated, onDeactivated, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { Search, Refresh, Timer, Download, Delete, View, CircleClose, TrendCharts, MoreFilled } from '@element-plus/icons-vue'
+import { Search, Refresh, Timer, Download, Delete, View, CircleClose, TrendCharts, MoreFilled, VideoPlay } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import dayjs from 'dayjs'
 import { useClientMode } from '@/composables/useClientMode'
 import { runStatusTagType, runStatusLabel, runSourceLabel } from '@/utils/statusMeta'
+import { submitExecution, UNKNOWN_LAUNCH_MESSAGE } from '@/utils/executionLaunch'
 import FlakyAnalysisDrawer from './FlakyAnalysisDrawer.vue'
 import ApiRunList from '../api-testing/RunList.vue'
 import { createPollingLoop } from '@/utils/polling'
@@ -39,6 +40,10 @@ const stoppingDeviceSerial = ref('')
 const showFlakyDrawer = ref(false)
 const selectedBatch = ref(null)
 const batchDrawerVisible = ref(false)
+const uiReportTableRef = ref(null)
+const selectedBatchRows = ref([])
+const batchDeleting = ref(false)
+const rerunningFailed = ref(false)
 const handleBatchView = row => {
     if (row.executions.length === 1) return handleView(row.executions[0].id)
     selectedBatch.value = row
@@ -93,7 +98,9 @@ const fetchData = async () => {
                 batchMap[bId] = {
                     batch_id: bId,
                     batch_name: item.batch_name || item.scenario_name,
+                    scenario_id: Number(item.scenario_id || 0),
                     scenario_name: item.scenario_name,
+                    env_id: item.env_id ?? null,
                     start_time: item.start_time,
                     executor_name: item.executor_name,
                     status: 'RUNNING', 
@@ -101,6 +108,13 @@ const fetchData = async () => {
                     executions: []
                 }
                 grouped.push(batchMap[bId])
+            } else {
+                if (!batchMap[bId].scenario_id && Number(item.scenario_id || 0) > 0) {
+                    batchMap[bId].scenario_id = Number(item.scenario_id)
+                }
+                if (batchMap[bId].env_id == null && item.env_id != null) {
+                    batchMap[bId].env_id = item.env_id
+                }
             }
             batchMap[bId].executions.push(item)
         })
@@ -132,6 +146,8 @@ const fetchData = async () => {
         })
         
         executions.value = grouped
+        selectedBatchRows.value = []
+        uiReportTableRef.value?.clearSelection?.()
         if (selectedBatch.value) {
             selectedBatch.value = grouped.find(group => group.batch_id === selectedBatch.value.batch_id) || selectedBatch.value
         }
@@ -208,6 +224,95 @@ const handleDeleteBatch = async (row) => {
         fetchData()
     } catch (err) {
         if (err !== 'cancel') ElMessage.error('删除失败')
+    }
+}
+
+const isFailedExecutionStatus = (status) => ['FAIL', 'ERROR', 'ABORTED'].includes(String(status || '').toUpperCase())
+
+const selectedBatchFailedExecutions = computed(() =>
+    (selectedBatch.value?.executions || []).filter(item => isFailedExecutionStatus(item.status) && item.device_serial)
+)
+
+const buildBatchDeletePayload = (rows) => {
+    const batchIds = []
+    const executionIds = []
+    for (const row of rows || []) {
+        const bId = String(row?.batch_id || '')
+        if (!bId) continue
+        if (bId.startsWith('single_')) {
+            const firstId = row.executions?.[0]?.id
+            if (firstId) executionIds.push(firstId)
+        } else {
+            batchIds.push(bId)
+        }
+    }
+    return { batch_ids: batchIds, execution_ids: executionIds }
+}
+
+const handleBatchDeleteSelected = async () => {
+    if (!selectedBatchRows.value.length || batchDeleting.value) return
+    const totalExecs = selectedBatchRows.value.reduce((acc, g) => acc + (g.executions?.length || 0), 0)
+    try {
+        await ElMessageBox.confirm(
+            `确定批量删除已选的 ${selectedBatchRows.value.length} 个批次（共 ${totalExecs} 条执行记录）？相关截图和报告文件也将被删除。`,
+            '批量删除确认',
+            { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
+        )
+    } catch {
+        return
+    }
+    batchDeleting.value = true
+    try {
+        const payload = buildBatchDeletePayload(selectedBatchRows.value)
+        const { data } = await api.batchDeleteReports(payload)
+        const deletedCount = Number(data?.deleted_count || 0)
+        const skippedCount = Number(data?.skipped_running_count || 0)
+        if (skippedCount > 0) {
+            ElMessage.warning(`已删除 ${deletedCount} 条记录，跳过 ${skippedCount} 条运行中记录`)
+        } else {
+            ElMessage.success(`已删除 ${deletedCount} 条记录`)
+        }
+        await fetchData()
+    } catch (err) {
+        ElMessage.error('批量删除失败：' + (err.response?.data?.detail || err.message || '未知错误'))
+    } finally {
+        batchDeleting.value = false
+    }
+}
+
+const handleRerunFailedDevices = async () => {
+    const batch = selectedBatch.value
+    const scenarioId = Number(batch?.scenario_id || 0)
+    const devices = [...new Set(selectedBatchFailedExecutions.value.map(item => item.device_serial).filter(Boolean))]
+    if (!scenarioId || !devices.length || rerunningFailed.value) return
+    try {
+        await ElMessageBox.confirm(
+            `确定使用场景「${batch.scenario_name || batch.batch_name}」重跑以下 ${devices.length} 台失败设备？`,
+            '重跑失败设备',
+            { type: 'info', confirmButtonText: '立即重跑', cancelButtonText: '取消' }
+        )
+    } catch {
+        return
+    }
+    rerunningFailed.value = true
+    try {
+        await submitExecution(api, {
+            kind: 'scenario',
+            targetId: scenarioId,
+            envId: batch.env_id ?? null,
+            devices,
+        })
+        ElMessage.success(`已重新提交 ${devices.length} 台失败设备的执行任务`)
+        batchDrawerVisible.value = false
+        await fetchData()
+    } catch (err) {
+        if (err?.launchPending) {
+            ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+        } else {
+            ElMessage.error('重跑失败：' + (err.response?.data?.detail || err.message || '未知错误'))
+        }
+    } finally {
+        rerunningFailed.value = false
     }
 }
 
@@ -621,6 +726,16 @@ onUnmounted(() => {
                             </el-radio-group>
                         </div>
                         <div class="right-actions">
+                            <el-button
+                                v-if="selectedBatchRows.length > 0"
+                                type="danger"
+                                plain
+                                :icon="Delete"
+                                :loading="batchDeleting"
+                                @click="handleBatchDeleteSelected"
+                            >
+                                批量删除 ({{ selectedBatchRows.length }})
+                            </el-button>
                             <el-button type="primary" plain :icon="TrendCharts" @click="showFlakyDrawer = true">
                                 稳定性分析
                             </el-button>
@@ -630,7 +745,16 @@ onUnmounted(() => {
 
                     <!-- UI 报告列表 -->
                     <div class="list-scroll-area" v-loading="loading">
-                        <el-table v-if="executions.length > 0" :data="executions" style="width: 100%" row-key="batch_id" size="default">
+                        <el-table
+                            v-if="executions.length > 0"
+                            ref="uiReportTableRef"
+                            :data="executions"
+                            style="width: 100%"
+                            row-key="batch_id"
+                            size="default"
+                            @selection-change="val => { selectedBatchRows = val }"
+                        >
+                            <el-table-column type="selection" width="46" :selectable="row => !isExecutionRunning(row.status)" />
                             <el-table-column label="运行批次 / 场景" min-width="200">
                                 <template #default="{ row }">
                                     <div class="batch-name-cell">
@@ -999,7 +1123,19 @@ onUnmounted(() => {
     </div>
         <el-drawer v-model="batchDrawerVisible" :title="selectedBatch?.batch_name || '设备执行结果'" size="min(760px, 100vw)">
             <template v-if="selectedBatch">
-                <p class="batch-summary">{{ selectedBatch.executions.length }} 台设备 · {{ formatDate(selectedBatch.start_time) }} · {{ selectedBatch.executor_name || '—' }} · {{ runSourceLabel(selectedBatch.executions[0] || selectedBatch) }}</p>
+                <div class="batch-drawer-toolbar">
+                    <p class="batch-summary">{{ selectedBatch.executions.length }} 台设备 · {{ formatDate(selectedBatch.start_time) }} · {{ selectedBatch.executor_name || '—' }} · {{ runSourceLabel(selectedBatch.executions[0] || selectedBatch) }}</p>
+                    <el-button
+                        v-if="Number(selectedBatch.scenario_id) > 0 && selectedBatchFailedExecutions.length > 0"
+                        type="primary"
+                        size="small"
+                        :icon="VideoPlay"
+                        :loading="rerunningFailed"
+                        @click="handleRerunFailedDevices"
+                    >
+                        重跑失败设备 ({{ selectedBatchFailedExecutions.length }})
+                    </el-button>
+                </div>
                 <el-table :data="selectedBatch.executions" class="ad-table" row-key="id">
                     <el-table-column label="设备" min-width="160">
                         <template #default="{ row }"><button type="button" class="ad-name-button" @click="handleView(row.id)">{{ formatDeviceName(row.device_serial, row.device_info) }}</button></template>
@@ -1037,6 +1173,8 @@ onUnmounted(() => {
 .report-page-heading { display: flex; align-items: baseline; gap: 12px; padding: 16px 16px 0; }
 .report-page-heading h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--ad-text); }
 .report-page-heading span, .batch-summary { color: var(--ad-muted); font-size: 12px; }
+.batch-drawer-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.batch-drawer-toolbar .batch-summary { margin: 0; }
 .batch-name-cell { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .batch-name-cell .ad-name-button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .batch-name-cell .ad-metadata { white-space: nowrap; }

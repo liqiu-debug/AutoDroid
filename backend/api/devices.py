@@ -189,6 +189,7 @@ def _find_tidevice_pids_for_udid(udid: str) -> List[int]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         )
     except Exception as exc:
         logger.warning("列出 tidevice 进程失败: udid=%s error=%s", device_id, exc)
@@ -307,6 +308,7 @@ def _discover_ios_wda_bundle_id(udid: str) -> Optional[str]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=15,
         )
     except Exception as exc:
         logger.warning("自动发现 WDA bundle id 失败: udid=%s error=%s", device_id, exc)
@@ -603,6 +605,7 @@ def _is_process_alive(pid: Optional[int]) -> bool:
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         )
         state = str(proc.stdout or "").strip().upper()
         if state.startswith("Z"):
@@ -1247,6 +1250,20 @@ def client_presence_expired(device: Device, now: Optional[datetime] = None) -> b
     return (current - seen_at).total_seconds() > CLIENT_HEARTBEAT_TIMEOUT_SECONDS
 
 
+def _reclaim_stale_client_device_for_server(
+    device: Device, now: Optional[datetime] = None
+) -> bool:
+    """心跳过期的桌面客户端设备若已被服务端直连发现，清空过期客户端绑定交回服务端。
+
+    绝不抢占心跳仍新鲜的客户端托管设备；保留原 owner_id 不变。
+    """
+    if not is_client_managed_device(device) or not client_presence_expired(device, now):
+        return False
+    device.client_instance_id = None
+    device.last_seen_at = None
+    return True
+
+
 def apply_client_presence_status(device: Device, now: Optional[datetime] = None) -> bool:
     """客户端设备超时判定：心跳过期 -> OFFLINE（不在此复活，复活由 register/heartbeat 负责）。
 
@@ -1418,11 +1435,17 @@ async def list_devices(
         # 更新设备状态（仅 Android）
         status_updated = False
         for device in devices:
-            if is_client_managed_device(device):
-                # 客户端注册设备不归服务端 adb 管：仅按心跳超时判定（已在上方独立处理）
-                continue
             if getattr(device, "platform", "android") == "ios" or is_app_device(device):
                 continue  # iOS 设备跳过 ADB 检测
+            if is_client_managed_device(device):
+                # 客户端注册设备默认不归服务端 adb 管；若心跳过期且服务端 adb 已直连发现，则交回服务端
+                if device.serial in online_serials and _reclaim_stale_client_device_for_server(device):
+                    if device.status == "OFFLINE":
+                        device.status = "IDLE"
+                    device.updated_at = datetime.now()
+                    session.add(device)
+                    status_updated = True
+                continue
             if device.serial in online_serials:
                 if device.status == "OFFLINE":
                     device.status = "IDLE"
@@ -1838,6 +1861,7 @@ async def sync_devices(
             # （register 的「物理持有即接管」不适用于服务端同步：服务器看到 ≠ 某人持有）
             if existing.owner_id is None and getattr(current_user, "id", None) is not None:
                 existing.owner_id = current_user.id
+            _reclaim_stale_client_device_for_server(existing)
             existing.platform = info.get("platform", "android")
             existing.model = info["model"]
             existing.brand = info["brand"]
@@ -1879,6 +1903,7 @@ async def sync_devices(
             if existing:
                 if existing.owner_id is None and getattr(current_user, "id", None) is not None:
                     existing.owner_id = current_user.id
+                _reclaim_stale_client_device_for_server(existing)
                 existing.platform = "ios"
                 existing.model = ios_dev["model"]
                 existing.brand = "APPLE"

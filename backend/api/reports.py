@@ -52,6 +52,7 @@ class TestExecutionRead(BaseModel):
     batch_id: Optional[str] = None
     batch_name: Optional[str] = None
     run_source: Optional[str] = None # app | platform
+    env_id: Optional[int] = None
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -64,6 +65,11 @@ class TestExecutionDetail(TestExecutionRead):
 class PaginatedTestExecutionRead(BaseModel):
     total: int
     items: List[TestExecutionRead]
+
+
+class BatchDeleteReportsRequest(BaseModel):
+    execution_ids: List[int] = []
+    batch_ids: List[str] = []
 
 
 from sqlalchemy import case
@@ -1070,3 +1076,56 @@ def delete_batch(batch_id: str, session: Session = Depends(get_session)):
 
     session.commit()
     return {"success": True}
+
+
+@router.post("/batch-delete")
+def batch_delete_reports(
+    payload: BatchDeleteReportsRequest,
+    session: Session = Depends(get_session),
+):
+    execution_ids = [int(eid) for eid in (payload.execution_ids or []) if eid]
+    batch_ids = [str(bid).strip() for bid in (payload.batch_ids or []) if str(bid or "").strip()]
+    if not execution_ids and not batch_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一条报告记录")
+
+    matched: Dict[int, TestExecution] = {}
+    if execution_ids:
+        for execution in session.exec(
+            select(TestExecution).where(col(TestExecution.id).in_(execution_ids))
+        ).all():
+            matched[execution.id] = execution
+    if batch_ids:
+        for execution in session.exec(
+            select(TestExecution).where(col(TestExecution.batch_id).in_(batch_ids))
+        ).all():
+            matched[execution.id] = execution
+
+    if not matched:
+        raise HTTPException(status_code=404, detail="未找到可删除的报告记录")
+
+    active_states = {"RUNNING", "PENDING"}
+    running = [e for e in matched.values() if str(e.status or "").upper() in active_states]
+    deletable = [e for e in matched.values() if str(e.status or "").upper() not in active_states]
+    if not deletable:
+        raise HTTPException(status_code=400, detail="所选报告均在运行中，无法删除")
+
+    deletable_ids = [e.id for e in deletable]
+    results_by_exec: Dict[int, List[TestResult]] = {eid: [] for eid in deletable_ids}
+    for result in session.exec(
+        select(TestResult).where(col(TestResult.execution_id).in_(deletable_ids))
+    ).all():
+        results_by_exec.setdefault(result.execution_id, []).append(result)
+
+    for execution in deletable:
+        exec_results = results_by_exec.get(execution.id, [])
+        _delete_execution_artifacts(execution, exec_results)
+        for result in exec_results:
+            session.delete(result)
+        session.delete(execution)
+
+    session.commit()
+    return {
+        "success": True,
+        "deleted_count": len(deletable),
+        "skipped_running_count": len(running),
+    }

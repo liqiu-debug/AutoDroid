@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, watch, nextTick } from 'vue'
-import { Plus, Delete, Rank, ArrowDown, VideoPlay, MagicStick, Crop, QuestionFilled } from '@element-plus/icons-vue'
+import { Plus, Delete, Rank, ArrowDown, VideoPlay, MagicStick, Crop, QuestionFilled, CopyDocument, DArrowRight, View, Hide } from '@element-plus/icons-vue'
 import { useCaseStore } from '@/stores/useCaseStore'
 import { storeToRefs } from 'pinia'
 import { VueDraggable } from 'vue-draggable-plus'
@@ -10,6 +10,7 @@ import { ElMessage } from 'element-plus'
 import { createUuid } from '@/utils/uuid'
 import { ACTION_LABELS, getActionLabel, getActionColor } from '@/utils/actionConstants'
 import { getImageOptionsMap, getSharedImageMatch, selectImageOptions, selectImagePath, replaceDefaultImagePath, imageExecutionFailure } from '@/utils/imageOptions'
+import { COMPOSITE_FIELD_OPTIONS, parseCompositeConditions, serializeCompositeConditions, formatLocatorTitle } from '@/utils/compositeLocator'
 import ImageMatchPreview from './ImageMatchPreview.vue'
 
 const caseStore = useCaseStore()
@@ -32,13 +33,21 @@ const props = defineProps({
   includeScreenshot: {
     type: Boolean,
     default: true
+  },
+  isRunning: {
+    type: Boolean,
+    default: false
   }
 })
 
 const logicalLocatorActions = ['click', 'input', 'wait_until_exists']
 const byOptions = [
   { value: 'text', label: 'Text' },
-  { value: 'description', label: 'Description' }
+  { value: 'description', label: 'Description' },
+  { value: 'id', label: 'Resource ID' },
+  { value: 'class_name', label: 'Class Name' },
+  { value: 'composite', label: '组合定位' },
+  { value: 'xpath', label: 'XPath' }
 ]
 const assertTextMatchOptions = [
   { value: 'contains', label: '包含' },
@@ -58,12 +67,25 @@ const errorStrategyOptions = [
 const selectorTypeToBy = {
   text: 'text',
   description: 'description',
+  resourceId: 'id',
+  className: 'class_name',
+  composite: 'composite',
+  xpath: 'xpath',
   image: 'image'
 }
 const byToSelectorType = {
   text: 'text',
   description: 'description',
-  desc: 'description'
+  desc: 'description',
+  id: 'resourceId',
+  resourceid: 'resourceId',
+  resource_id: 'resourceId',
+  class_name: 'className',
+  classname: 'className',
+  class: 'className',
+  type: 'className',
+  composite: 'composite',
+  xpath: 'xpath'
 }
 
 const isLogicalLocatorAction = (action) => logicalLocatorActions.includes(String(action || '').toLowerCase())
@@ -176,7 +198,7 @@ const ensureCrossPlatformConfig = (step) => {
     step.selector_type = 'image'
   } else if (isLogicalLocatorAction(step.action)) {
     const selectorType = String(step.selector_type || '').trim()
-    if (!['text', 'description'].includes(selectorType)) {
+    if (!['text', 'description', 'resourceId', 'className', 'composite', 'xpath'].includes(selectorType)) {
       step.selector_type = 'text'
     }
   }
@@ -238,6 +260,106 @@ const syncLegacyFromAndroidOverride = (step) => {
   if (mappedSelectorType) {
     step.selector_type = mappedSelectorType
   }
+}
+
+const compositeRowsCache = ref({})
+
+const getCompositeRows = (step) => {
+  const uuid = ensureStepUuid(step)
+  const android = getPlatformOverride(step, 'android')
+  const rawSelector = String(android.selector || '').trim()
+  const cached = compositeRowsCache.value[uuid]
+  if (cached && serializeCompositeConditions(cached) === rawSelector) {
+    return cached
+  }
+  const parsed = parseCompositeConditions(rawSelector)
+  const rows = parsed.length ? parsed : [{ key: 'id', value: '' }]
+  compositeRowsCache.value[uuid] = rows
+  return rows
+}
+
+const syncCompositeDraftToStep = (step, rows) => {
+  const uuid = ensureStepUuid(step)
+  compositeRowsCache.value[uuid] = rows
+  const android = getPlatformOverride(step, 'android')
+  android.selector = serializeCompositeConditions(rows)
+  syncLegacyFromAndroidOverride(step)
+}
+
+const isCompositeKeyDisabled = (rows, currentIndex, candidateKey) => {
+  return rows.some((row, idx) => idx !== currentIndex && row.key === candidateKey)
+}
+
+const updateCompositeRowKey = (step, index, newKey) => {
+  const rows = [...getCompositeRows(step)]
+  rows[index] = { ...rows[index], key: newKey }
+  syncCompositeDraftToStep(step, rows)
+}
+
+const updateCompositeRowValue = (step, index, newValue) => {
+  const rows = [...getCompositeRows(step)]
+  rows[index] = { ...rows[index], value: newValue }
+  syncCompositeDraftToStep(step, rows)
+}
+
+const appendCompositeVariable = (step, index, varKey) => {
+  const rows = [...getCompositeRows(step)]
+  const placeholder = `{{${varKey}}}`
+  rows[index] = { ...rows[index], value: (rows[index]?.value || '') + placeholder }
+  syncCompositeDraftToStep(step, rows)
+}
+
+const addCompositeConditionRow = (step) => {
+  const rows = [...getCompositeRows(step)]
+  const used = new Set(rows.map((r) => r.key))
+  const nextOption = COMPOSITE_FIELD_OPTIONS.find((opt) => !used.has(opt.value))
+  if (!nextOption) return
+  rows.push({ key: nextOption.value, value: '' })
+  syncCompositeDraftToStep(step, rows)
+}
+
+const removeCompositeConditionRow = (step, index) => {
+  const rows = [...getCompositeRows(step)]
+  if (rows.length <= 1) return
+  rows.splice(index, 1)
+  syncCompositeDraftToStep(step, rows)
+}
+
+const onLocatorByChange = (step, nextBy) => {
+  const android = getPlatformOverride(step, 'android')
+  const prevBy = selectorTypeToBy[String(step.selector_type || '').trim()] || ''
+  const prevSelector = String(step.selector || '').trim()
+
+  if (nextBy === 'composite') {
+    const parsed = parseCompositeConditions(prevSelector)
+    if (parsed.length) {
+      syncCompositeDraftToStep(step, parsed)
+    } else if (prevSelector && ['id', 'text', 'description', 'class_name'].includes(prevBy)) {
+      syncCompositeDraftToStep(step, [{ key: prevBy, value: prevSelector }])
+    } else {
+      syncCompositeDraftToStep(step, [{ key: 'id', value: '' }])
+    }
+    return
+  }
+
+  if (prevBy === 'composite') {
+    const parsed = parseCompositeConditions(prevSelector)
+    const matched = parsed.find((item) => item.key === nextBy)
+    android.selector = matched ? matched.value : ''
+  }
+  syncLegacyFromAndroidOverride(step)
+}
+
+const getLocatorPlaceholder = (step) => {
+  const by = String(getPlatformOverride(step, 'android').by || '').toLowerCase()
+  if (step.action === 'input') {
+    return '可留空：留空时向当前焦点输入框输入'
+  }
+  if (by === 'id') return '例如: com.demo:id/login_btn'
+  if (by === 'class_name') return '例如: android.widget.EditText'
+  if (by === 'xpath') return '例如: //*[@text="登录"]'
+  if (by === 'description') return '输入 content-desc / name'
+  return '输入定位值'
 }
 
 const syncNonLogicalSelectorToAndroidOverride = (step) => {
@@ -580,7 +702,13 @@ const getStepTitle = (step) => {
   const targetSelector = isLogicalLocatorAction(action)
     ? (step?.platform_overrides?.android?.selector || step.selector)
     : (step?.selector || step?.platform_overrides?.android?.selector)
-  const target = targetSelector ? (targetSelector.length > 25 ? targetSelector.slice(0, 25) + '...' : targetSelector) : '?'
+  const targetBy = isLogicalLocatorAction(action)
+    ? (step?.platform_overrides?.android?.by || selectorTypeToBy[step?.selector_type] || step?.selector_type)
+    : (step?.selector_type || step?.platform_overrides?.android?.by)
+  const formattedTarget = isLogicalLocatorAction(action)
+    ? formatLocatorTitle(targetBy, targetSelector)
+    : (targetSelector || '?')
+  const target = formattedTarget.length > 32 ? formattedTarget.slice(0, 32) + '...' : formattedTarget
   return `${actionLabel} → ${target}`
 }
 
@@ -607,7 +735,35 @@ const addCustomStep = () => {
 }
 
 const executingStepId = ref(null)
-const emit = defineEmits(['refresh-needed', 'request-ocr-crop', 'request-image-crop'])
+const emit = defineEmits(['refresh-needed', 'request-ocr-crop', 'request-image-crop', 'run-from-step'])
+
+const isStepDisabled = (step) => Boolean(step?.disabled || step?.args?.disabled || step?.options?.disabled)
+
+const toggleStepDisabled = (step) => {
+  if (!step || typeof step !== 'object') return
+  if (isStepDisabled(step)) {
+    delete step.disabled
+    if (step.args && typeof step.args === 'object') delete step.args.disabled
+    if (step.options && typeof step.options === 'object') delete step.options.disabled
+  } else {
+    step.disabled = true
+  }
+}
+
+const duplicateStep = (index) => {
+  const steps = currentCase.value.steps || []
+  const source = steps[index]
+  if (!source) return
+  const cloned = JSON.parse(JSON.stringify(source))
+  cloned.uuid = createUuid()
+  steps.splice(index + 1, 0, cloned)
+  expandedSteps.value.add(cloned.uuid)
+  lastAddedStepUuid.value = cloned.uuid
+}
+
+const handleRunFromStep = (index) => {
+  emit('run-from-step', index)
+}
 
 const requestOcrCrop = (step) => {
   emit('request-ocr-crop', step)
@@ -754,6 +910,7 @@ const handleExecuteStep = async (step) => {
           v-for="(step, index) in currentCase.steps"
           :key="step.uuid || index"
           class="step-card"
+          :class="{ 'is-disabled': isStepDisabled(step) }"
           :data-step-index="index"
           :style="{ '--action-color': getActionColor(step.action) }"
         >
@@ -762,21 +919,65 @@ const handleExecuteStep = async (step) => {
               <el-icon><Rank /></el-icon>
             </div>
             <div class="step-index">{{ index + 1 }}</div>
-            <div class="step-title">{{ getStepTitle(step) }}</div>
-            <div class="step-actions">
-              <el-button 
-                :icon="VideoPlay" 
-                size="small" 
-                text
-                class="step-run-action"
-                @click.stop="handleExecuteStep(step)"
-                :loading="executingStepId === step" 
-                title="执行步骤"
-              />
-              <el-button :icon="Delete" size="small" text class="step-remove-action" @click.stop="removeStep(index)" title="删除步骤" />
-              <el-icon class="expand-icon" :class="{ expanded: isExpanded(step) }">
-                <ArrowDown />
-              </el-icon>
+            <div class="step-header-content">
+              <div class="step-header-top">
+                <div class="step-title" :title="getStepTitle(step)">{{ getStepTitle(step) }}</div>
+                <span v-if="isStepDisabled(step)" class="step-disabled-badge">已禁用</span>
+                <el-icon class="expand-icon" :class="{ expanded: isExpanded(step) }">
+                  <ArrowDown />
+                </el-icon>
+              </div>
+              <div class="step-actions" @click.stop>
+                <el-button
+                  :icon="VideoPlay"
+                  size="small"
+                  text
+                  class="step-run-action"
+                  @click.stop="handleExecuteStep(step)"
+                  :loading="executingStepId === step"
+                  title="单步调试执行当前步骤"
+                >
+                  单步
+                </el-button>
+                <el-button
+                  :icon="DArrowRight"
+                  size="small"
+                  text
+                  class="step-run-from-action"
+                  :disabled="isRunning"
+                  @click.stop="handleRunFromStep(index)"
+                  title="从此步开始继续运行"
+                >
+                  续跑
+                </el-button>
+                <div class="step-actions-edit">
+                  <el-button
+                    :icon="CopyDocument"
+                    size="small"
+                    text
+                    class="step-copy-action"
+                    @click.stop="duplicateStep(index)"
+                    title="复制步骤"
+                  />
+                  <el-button
+                    :icon="isStepDisabled(step) ? Hide : View"
+                    size="small"
+                    text
+                    class="step-toggle-action"
+                    :class="{ 'is-off': isStepDisabled(step) }"
+                    @click.stop="toggleStepDisabled(step)"
+                    :title="isStepDisabled(step) ? '启用步骤' : '禁用步骤'"
+                  />
+                  <el-button
+                    :icon="Delete"
+                    size="small"
+                    text
+                    class="step-remove-action"
+                    @click.stop="removeStep(index)"
+                    title="删除步骤"
+                  />
+                </div>
+              </div>
             </div>
           </div>
           
@@ -829,7 +1030,7 @@ const handleExecuteStep = async (step) => {
                   <el-select
                     v-model="getPlatformOverride(step, 'android').by"
                     size="small"
-                    @change="syncLegacyFromAndroidOverride(step)"
+                    @change="(val) => onLocatorByChange(step, val)"
                   >
                     <el-option
                       v-for="opt in byOptions"
@@ -840,12 +1041,70 @@ const handleExecuteStep = async (step) => {
                   </el-select>
                 </div>
 
-                <div class="form-row">
+                <div class="form-row" v-if="getPlatformOverride(step, 'android').by === 'composite'">
+                  <label>{{ step.action === 'input' ? '组合条件（可选）' : '组合条件' }}</label>
+                  <div class="composite-editor">
+                    <div
+                      v-for="(cond, condIdx) in getCompositeRows(step)"
+                      :key="condIdx"
+                      class="composite-row"
+                    >
+                      <el-select
+                        :model-value="cond.key"
+                        size="small"
+                        class="composite-key-select"
+                        @update:model-value="(val) => updateCompositeRowKey(step, condIdx, val)"
+                      >
+                        <el-option
+                          v-for="opt in COMPOSITE_FIELD_OPTIONS"
+                          :key="opt.value"
+                          :label="opt.label"
+                          :value="opt.value"
+                          :disabled="isCompositeKeyDisabled(getCompositeRows(step), condIdx, opt.value)"
+                        />
+                      </el-select>
+                      <el-input
+                        :model-value="cond.value"
+                        size="small"
+                        class="composite-value-input"
+                        placeholder="输入属性值"
+                        @update:model-value="(val) => updateCompositeRowValue(step, condIdx, val)"
+                      >
+                        <template #append v-if="globalVarKeys.length">
+                          <el-dropdown trigger="click" @command="(key) => appendCompositeVariable(step, condIdx, key)">
+                            <el-button size="small" class="var-dropdown-btn">{{ '{ }' }}</el-button>
+                            <template #dropdown>
+                              <el-dropdown-menu>
+                                <el-dropdown-item v-for="k in globalVarKeys" :key="k" :command="k">
+                                  {{ varPlaceholder(k) }}
+                                </el-dropdown-item>
+                              </el-dropdown-menu>
+                            </template>
+                          </el-dropdown>
+                        </template>
+                      </el-input>
+                      <el-button
+                        :icon="Delete"
+                        size="small"
+                        text
+                        :disabled="getCompositeRows(step).length <= 1"
+                        @click.stop="removeCompositeConditionRow(step, condIdx)"
+                      />
+                    </div>
+                    <div v-if="getCompositeRows(step).length < COMPOSITE_FIELD_OPTIONS.length" class="composite-actions">
+                      <el-button size="small" link type="primary" :icon="Plus" @click.stop="addCompositeConditionRow(step)">
+                        添加条件
+                      </el-button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="form-row" v-else>
                   <label>{{ step.action === 'input' ? '定位值（可选）' : '定位值' }}</label>
                   <el-input
                     v-model="getPlatformOverride(step, 'android').selector"
                     size="small"
-                    :placeholder="step.action === 'input' ? '可留空：留空时向当前焦点输入框输入' : '输入定位值'"
+                    :placeholder="getLocatorPlaceholder(step)"
                     @input="syncLegacyFromAndroidOverride(step)"
                   >
                     <template #append v-if="globalVarKeys.length">
@@ -1069,7 +1328,7 @@ const handleExecuteStep = async (step) => {
         </div>
       </VueDraggable>
       
-      <el-empty v-if="currentCase.steps.length === 0" description="暂无步骤，点击设备画布开始录制" :image-size="60" />
+      <el-empty v-if="currentCase.steps.length === 0" class="step-list-empty" description="暂无步骤，点击设备画布开始录制" :image-size="60" />
     </div>
     
     <div class="builder-footer">
@@ -1198,14 +1457,27 @@ const handleExecuteStep = async (step) => {
 
 .step-list {
   flex: 1;
+  position: relative;
+  display: flex;
+  flex-direction: column;
   overflow-y: auto;
-  padding: 12px;
+  padding: 0;
 }
 
 .draggable-container {
+  flex: 1 0 auto;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  padding: 12px 12px 48px;
+  box-sizing: border-box;
+}
+
+.step-list-empty {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
 }
 
 .step-card {
@@ -1225,10 +1497,10 @@ const handleExecuteStep = async (step) => {
 
 .step-header {
   display: flex;
-  align-items: center;
-  padding: 12px;
+  align-items: flex-start;
+  padding: 10px 10px 8px;
   cursor: pointer;
-  gap: 10px;
+  gap: 8px;
 }
 
 .drag-handle {
@@ -1236,6 +1508,8 @@ const handleExecuteStep = async (step) => {
   color: var(--ad-muted);
   display: flex;
   align-items: center;
+  height: 24px;
+  flex-shrink: 0;
 }
 
 .drag-handle:active {
@@ -1243,8 +1517,8 @@ const handleExecuteStep = async (step) => {
 }
 
 .step-index {
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   background: var(--action-color);
   border-radius: 6px;
   display: flex;
@@ -1256,26 +1530,53 @@ const handleExecuteStep = async (step) => {
   flex-shrink: 0;
 }
 
+.step-header-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.step-header-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  min-width: 0;
+}
+
 .step-title {
   flex: 1;
+  min-width: 0;
   font-size: 13px;
+  line-height: 1.4;
   color: var(--ad-text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-right: 8px;
 }
 
 .step-actions {
   display: flex;
   align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
+  gap: 2px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--ad-border);
+  cursor: default;
+}
+
+.step-actions-edit {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .expand-icon {
   transition: transform 0.2s ease;
   color: var(--ad-muted);
+  flex-shrink: 0;
 }
 
 .expand-icon.expanded {
@@ -1393,8 +1694,37 @@ const handleExecuteStep = async (step) => {
 .expand-enter-active,
 .expand-leave-active {
   transition: all 0.2s ease;
-  max-height: 300px;
+  max-height: 600px;
   opacity: 1;
+}
+
+.composite-editor {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.composite-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.composite-key-select {
+  width: 112px;
+  flex: 0 0 112px !important;
+}
+
+.composite-value-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.composite-actions {
+  display: flex;
+  justify-content: flex-start;
 }
 
 .expand-enter-from,
@@ -1404,8 +1734,14 @@ const handleExecuteStep = async (step) => {
   padding-top: 0;
   padding-bottom: 0;
 }
-.step-actions :deep(.el-button) { color: var(--ad-muted); }
+.step-actions :deep(.el-button) { height: 22px; padding: 0 5px; font-size: 12px; color: var(--ad-muted); margin-left: 0; }
+.step-actions :deep(.step-toggle-action:hover),
+.step-actions :deep(.step-copy-action:hover),
+.step-actions :deep(.step-run-from-action:hover),
 .step-actions :deep(.step-run-action:hover) { color: var(--ad-primary); }
+.step-actions :deep(.step-toggle-action.is-off) { color: var(--ad-warning); }
 .step-actions :deep(.step-remove-action:hover) { color: var(--ad-danger); }
+.step-card.is-disabled { opacity: 0.58; border-style: dashed; }
+.step-disabled-badge { display: inline-block; flex-shrink: 0; padding: 0 5px; border-radius: 4px; font-size: 11px; line-height: 1.5; color: var(--ad-warning); background: var(--ad-surface); border: 1px solid var(--ad-border); }
 .image-preview-loading { padding: 36px 0; text-align: center; color: var(--ad-muted); }
 </style>

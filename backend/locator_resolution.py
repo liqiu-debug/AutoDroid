@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from backend.step_contract import SELECTOR_TYPE_TO_BY
+from backend.utils.composite_locator import extract_semantic_fallback
 
 
 def _clean_text(value: Any) -> str:
@@ -81,8 +82,22 @@ def _infer_ios_candidates_from_android(android_override: Optional[Dict[str, str]
             {"selector": selector, "by": "name"},
             {"selector": selector, "by": "label"},
         ]
+    if android_by == "composite":
+        semantic = extract_semantic_fallback(selector)
+        if not semantic:
+            return []
+        semantic_by, semantic_value = semantic
+        if semantic_by == "text":
+            return [
+                {"selector": semantic_value, "by": "label"},
+                {"selector": semantic_value, "by": "name"},
+            ]
+        return [
+            {"selector": semantic_value, "by": "name"},
+            {"selector": semantic_value, "by": "label"},
+        ]
 
-    # 当前阶段不自动从 id/xpath 推导 iOS 定位，避免误匹配。
+    # 当前阶段不自动从 id/xpath/class_name 推导 iOS 定位，避免误匹配。
     return []
 
 

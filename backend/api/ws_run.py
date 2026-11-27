@@ -88,7 +88,13 @@ async def _watch_ws_disconnect(
 
 
 @router.websocket("/ws/run/{case_id}")
-async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optional[int] = None, device_serial: Optional[str] = None):
+async def websocket_run_case(
+    websocket: WebSocket,
+    case_id: int,
+    env_id: Optional[int] = None,
+    device_serial: Optional[str] = None,
+    start_step_index: int = 0,
+):
     """WebSocket 端点：实时执行测试用例并推送步骤状态"""
     await manager.connect(websocket, case_id)
 
@@ -151,6 +157,11 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                 env_id=env_id,
             )
 
+            effective_start_step = max(0, int(start_step_index or 0))
+            if steps and effective_start_step >= len(steps):
+                await websocket.send_json({"type": "error", "message": "起始步骤序号超出范围"})
+                return
+
             await manager.broadcast_run_start(
                 case_id,
                 case.name,
@@ -186,6 +197,38 @@ async def websocket_run_case(websocket: WebSocket, case_id: int, env_id: Optiona
                         "执行已被用户终止",
                     )
                     break
+                if i < effective_start_step:
+                    try:
+                        legacy_step = standard_step_to_legacy(step)
+                    except Exception:
+                        legacy_step = {
+                            "action": step.get("action"),
+                            "selector": None,
+                            "selector_type": None,
+                            "value": step.get("value"),
+                            "options": {},
+                            "description": step.get("description"),
+                            "timeout": step.get("timeout", 10),
+                            "error_strategy": step.get("error_strategy", "ABORT"),
+                        }
+                    skip_msg = f"从第 {effective_start_step + 1} 步开始执行，跳过前置步骤"
+                    steps_results.append(
+                        {
+                            **legacy_step,
+                            "status": "skipped",
+                            "duration": 0,
+                            "log": f"↷ [{i+1}/{len(steps)}] 已跳过（从第 {effective_start_step + 1} 步开始）",
+                            "error": skip_msg,
+                        }
+                    )
+                    await manager.broadcast_step_update(
+                        case_id,
+                        i,
+                        "skipped",
+                        f"↷ [{i+1}/{len(steps)}] 已跳过（从第 {effective_start_step + 1} 步开始）",
+                        0,
+                    )
+                    continue
                 desc = step.get("description", "") if isinstance(step, dict) else ""
                 action = step.get("action") if isinstance(step, dict) else ""
                 await manager.broadcast_step_update(

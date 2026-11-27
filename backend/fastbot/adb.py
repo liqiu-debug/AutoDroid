@@ -3,6 +3,7 @@ import asyncio
 from typing import Dict, Optional
 
 ADB_MONITOR_COMMAND_TIMEOUT_SECONDS = 8
+ADB_FILE_TRANSFER_TIMEOUT_SECONDS = 120.0
 
 
 async def _adb_shell(device_serial: str, cmd: str, timeout: Optional[float] = None) -> str:
@@ -56,22 +57,46 @@ async def _adb_shell_result(
     }
 
 
-async def _adb_push(device_serial: str, local: str, remote: str):
+async def _adb_push(
+    device_serial: str,
+    local: str,
+    remote: str,
+    timeout: Optional[float] = ADB_FILE_TRANSFER_TIMEOUT_SECONDS,
+):
     proc = await asyncio.create_subprocess_shell(
         f"adb -s {device_serial} push \"{local}\" \"{remote}\"",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate()
+    try:
+        if timeout is None:
+            await proc.communicate()
+        else:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        await _terminate_subprocess(proc)
+        raise TimeoutError(f"adb push timeout after {timeout}s: {local} -> {remote}") from exc
 
 
-async def _adb_pull(device_serial: str, remote: str, local: str):
+async def _adb_pull(
+    device_serial: str,
+    remote: str,
+    local: str,
+    timeout: Optional[float] = ADB_FILE_TRANSFER_TIMEOUT_SECONDS,
+):
     proc = await asyncio.create_subprocess_shell(
         f"adb -s {device_serial} pull \"{remote}\" \"{local}\"",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        if timeout is None:
+            stdout, stderr = await proc.communicate()
+        else:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        await _terminate_subprocess(proc)
+        raise TimeoutError(f"adb pull timeout after {timeout}s: {remote}") from exc
     if proc.returncode != 0:
         message = stderr.decode(errors="ignore").strip() or stdout.decode(errors="ignore").strip()
         raise RuntimeError(message or f"adb pull failed: {remote}")

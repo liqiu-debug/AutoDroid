@@ -9,6 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional
 
+from backend.utils.composite_locator import normalize_composite_selector
 from backend.utils.pydantic_compat import dump_model
 from backend.utils.image_match_options import normalize_image_options
 
@@ -70,6 +71,8 @@ SELECTOR_TYPE_TO_BY = {
     "text": "text",
     "xpath": "xpath",
     "description": "description",
+    "className": "class_name",
+    "composite": "composite",
     "image": "image",
 }
 SELECTOR_TYPE_TO_BY_LOWER = {k.lower(): v for k, v in SELECTOR_TYPE_TO_BY.items()}
@@ -82,6 +85,11 @@ BY_TO_SELECTOR_TYPE = {
     "xpath": "xpath",
     "description": "description",
     "desc": "description",
+    "class_name": "className",
+    "classname": "className",
+    "class": "className",
+    "type": "className",
+    "composite": "composite",
     "image": "image",
     "label": "text",  # UI fallback for iOS selectors in Android-only recorder
     "name": "text",   # UI fallback for iOS selectors in Android-only recorder
@@ -151,6 +159,28 @@ def normalize_retry_count(value: Any) -> int:
     return retry_count
 
 
+def is_step_disabled(step: Any) -> bool:
+    """判断步骤是否被禁用；支持标准 args.disabled、legacy 顶层 disabled 与 options.disabled。"""
+    if step is None:
+        return False
+    if isinstance(step, dict):
+        raw = step
+    else:
+        try:
+            raw = _to_dict(step)
+        except Exception:
+            return False
+    if bool(raw.get("disabled")):
+        return True
+    args = raw.get("args")
+    if isinstance(args, dict) and bool(args.get("disabled")):
+        return True
+    options = raw.get("options")
+    if isinstance(options, dict) and bool(options.get("disabled")):
+        return True
+    return False
+
+
 def normalize_execute_on(execute_on: Optional[Iterable[Any]]) -> List[str]:
     values = list(execute_on or ["android", "ios"])
     normalized: List[str] = []
@@ -194,6 +224,9 @@ def _normalize_platform_selector(platform: str, selector: Any) -> Optional[Dict[
         return None
     if not selector_text or not by_text:
         raise ValueError(f"platform_overrides.{platform} requires both selector and by")
+
+    if by_text == "composite":
+        selector_text = normalize_composite_selector(selector_text)
 
     return {"selector": selector_text, "by": by_text}
 
@@ -405,6 +438,8 @@ def legacy_step_to_standard(step: Any, case_id: int, order: int) -> Dict[str, An
             args["image_options"] = image_options
     if action in {"click_image", "assert_image"}:
         args["image_match"] = step_image_match(raw)
+    if is_step_disabled(raw):
+        args["disabled"] = True
 
     return {
         "case_id": case_id,
@@ -484,7 +519,7 @@ def standard_step_to_legacy(step: Any) -> Dict[str, Any]:
     if action in {"click_image", "assert_image"}:
         options["image_match"] = step_image_match(raw)
 
-    return {
+    legacy = {
         "action": action,
         "selector": selector,
         "selector_type": selector_type,
@@ -495,6 +530,9 @@ def standard_step_to_legacy(step: Any) -> Dict[str, Any]:
         "error_strategy": normalize_error_strategy(raw.get("error_strategy", "ABORT")),
         "retry_count": _safe_retry_count(raw.get("retry_count"), default=0),
     }
+    if is_step_disabled(raw):
+        legacy["disabled"] = True
+    return legacy
 
 
 def build_standard_from_legacy_steps(steps: Iterable[Any], case_id: int) -> List[Dict[str, Any]]:

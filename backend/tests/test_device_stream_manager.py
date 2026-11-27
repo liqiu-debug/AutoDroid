@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import unittest
 from queue import Empty
 from types import SimpleNamespace
@@ -39,6 +41,9 @@ from backend.device_stream.manager import (
     _build_touch_control_packet,
     _collect_h264_nal_types,
     _get_h264_init_packets,
+    _read_process_stderr_tail,
+    _start_process_output_drainer,
+    _terminate_scrcpy_process,
     _update_h264_init_cache,
     default_stream_profile,
     get_scrcpy_stream_params,
@@ -619,6 +624,54 @@ class DeviceStreamManagerInitializationTests(unittest.TestCase):
             manager.send_touch_event("serial-1", ANDROID_MOTION_EVENT_ACTION_DOWN, 150, -20, method="adb")
 
         self.assertEqual(adb_device.shell_calls, ["input tap 99 0"])
+
+
+class ScrcpyProcessDrainerTests(unittest.TestCase):
+    def test_drainer_prevents_pipe_deadlock_on_large_output_and_keeps_stderr_tail(self):
+        script = (
+            "import sys; "
+            "sys.stdout.buffer.write(b'O' * 300000); sys.stdout.buffer.flush(); "
+            "sys.stderr.buffer.write(b'E' * 300000 + b'TAIL_MARKER\\n'); sys.stderr.buffer.flush(); "
+            "sys.exit(2)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stderr_tail = _start_process_output_drainer(proc, "serial-drain")
+            rc = proc.wait(timeout=5)
+            self.assertEqual(rc, 2)
+            tail_text = _read_process_stderr_tail(proc, stderr_tail)
+            self.assertIn("TAIL_MARKER", tail_text)
+            self.assertLessEqual(len(tail_text.encode("utf-8")), 8192)
+        finally:
+            _terminate_scrcpy_process(proc)
+
+    def test_terminate_scrcpy_process_escalates_to_kill_when_sigterm_ignored(self):
+        script = (
+            "import signal, sys, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "sys.stdout.write('ready\\n'); sys.stdout.flush(); "
+            "time.sleep(30)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            ready = proc.stdout.readline()
+            self.assertIn(b"ready", ready)
+            _terminate_scrcpy_process(proc)
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(proc.stdout.closed)
+            self.assertTrue(proc.stderr.closed)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
 
 
 if __name__ == "__main__":

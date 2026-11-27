@@ -30,6 +30,10 @@ const form = ref({
   api_testing_ai_enabled: false,
   content_addressed_assets: false,
   tiered_asset_retention: false,
+  driver_pool_enabled: false,
+  recording_enable_resource_id: false,
+  recording_enable_class_name: false,
+  recording_locator_priority: 'semantic_first',
 })
 
 const loadAssetStatus = async () => {
@@ -63,6 +67,7 @@ const loadSettings = async () => {
       api.getFeatureFlags(),
     ])
     const settings = res.data || []
+    let hasPrioritySetting = false
     for (const s of settings) {
       if (s.key === 'feishu_webhook') form.value.feishu_webhook = s.value
       if (s.key === 'api_testing_webhook') form.value.api_testing_webhook = s.value
@@ -72,10 +77,23 @@ const loadSettings = async () => {
       if (s.key === 'ai_api_base') form.value.ai_api_base = s.value
       if (s.key === 'ai_model') form.value.ai_model = s.value
       if (s.key === 'api_testing_ai_enabled') form.value.api_testing_ai_enabled = s.value === 'true'
+      if (s.key === 'recording_locator_priority') {
+        hasPrioritySetting = true
+        form.value.recording_locator_priority = s.value === 'id_first' ? 'id_first' : 'semantic_first'
+      }
+    }
+    if (!hasPrioritySetting) {
+      form.value.recording_locator_priority = 'semantic_first'
     }
     form.value.content_addressed_assets = flagRes.data?.content_addressed_assets === true
     form.value.tiered_asset_retention = flagRes.data?.tiered_asset_retention === true
+    form.value.driver_pool_enabled = flagRes.data?.driver_pool_enabled === true
+    form.value.recording_enable_resource_id = flagRes.data?.recording_enable_resource_id === true
+    form.value.recording_enable_class_name = flagRes.data?.recording_enable_class_name === true
     if (!form.value.content_addressed_assets) form.value.tiered_asset_retention = false
+    if (!form.value.recording_enable_resource_id && form.value.recording_locator_priority === 'id_first') {
+      form.value.recording_locator_priority = 'semantic_first'
+    }
     savedSnapshot.value = JSON.stringify(form.value)
   } catch (err) {
     console.error('加载配置失败', err)
@@ -93,6 +111,9 @@ const handleSave = async () => {
     return
   }
   if (!form.value.content_addressed_assets) form.value.tiered_asset_retention = false
+  if (!form.value.recording_enable_resource_id && form.value.recording_locator_priority === 'id_first') {
+    form.value.recording_locator_priority = 'semantic_first'
+  }
   const submittedSnapshot = JSON.stringify(form.value)
   saving.value = true
   try {
@@ -107,6 +128,10 @@ const handleSave = async () => {
       { key: 'api_testing_ai_enabled', value: form.value.api_testing_ai_enabled ? 'true' : 'false', description: '接口自动化 AI 校验建议和失败解释（可选）' },
       { key: 'content_addressed_assets', value: form.value.content_addressed_assets ? 'true' : 'false', description: '内容寻址报告资产双写' },
       { key: 'tiered_asset_retention', value: form.value.tiered_asset_retention ? 'true' : 'false', description: '报告资产分层保留和清理' },
+      { key: 'driver_pool_enabled', value: form.value.driver_pool_enabled ? 'true' : 'false', description: '设备执行驱动连接池复用（团队服务器推荐）' },
+      { key: 'recording_enable_resource_id', value: form.value.recording_enable_resource_id ? 'true' : 'false', description: '录制时启用 Resource ID 定位' },
+      { key: 'recording_enable_class_name', value: form.value.recording_enable_class_name ? 'true' : 'false', description: '录制时启用 ClassName 定位' },
+      { key: 'recording_locator_priority', value: form.value.recording_locator_priority, description: '录制定位优先级（semantic_first / id_first）' },
     ])
     await userStore.fetchFeatureFlags()
     if (activeTab.value === 'features' && activeStorageGroups.value.includes('capacity')) {
@@ -124,6 +149,13 @@ const handleSave = async () => {
 watch(() => form.value.content_addressed_assets, enabled => {
   if (enabled) return
   form.value.tiered_asset_retention = false
+})
+
+watch(() => form.value.recording_enable_resource_id, enabled => {
+  if (enabled) return
+  if (form.value.recording_locator_priority === 'id_first') {
+    form.value.recording_locator_priority = 'semantic_first'
+  }
 })
 
 watch([activeTab, activeStorageGroups], ([tab, groups]) => {
@@ -448,6 +480,21 @@ onMounted(loadSettings)
                 </div>
               </div>
             </el-collapse-item>
+            <el-collapse-item name="execution">
+              <template #title>
+                <div class="feature-group-title">
+                  <strong>执行加速</strong>
+                  <span>按设备复用驱动连接，降低连续执行建连耗时</span>
+                </div>
+              </template>
+              <div class="feature-setting-row">
+                <div>
+                  <div class="feature-name">设备驱动连接池</div>
+                  <div class="feature-desc">在连续执行 UI 测试时复用已健康的设备连接（环境变量 AUTODROID_DRIVER_POOL 可覆盖此项）。</div>
+                </div>
+                <el-switch v-model="form.driver_pool_enabled" />
+              </div>
+            </el-collapse-item>
           </el-collapse>
         </el-card>
 
@@ -489,6 +536,53 @@ onMounted(loadSettings)
             />
           </el-collapse-item>
         </el-collapse>
+      </el-tab-pane>
+
+      <el-tab-pane label="录制定位" name="recording">
+        <el-card shadow="never" class="feature-card">
+          <div class="feature-setting-row">
+            <div>
+              <div class="feature-name">启用 Resource ID 定位</div>
+              <div class="feature-desc">录制点击时允许识别元素 Resource ID。全页唯一时直接生成 ID 定位；若同 ID 存在多个元素，将自动组合 Text/Desc 消歧。</div>
+            </div>
+            <el-switch v-model="form.recording_enable_resource_id" />
+          </div>
+          <div class="feature-setting-row">
+            <div>
+              <div class="feature-name">启用 ClassName 定位</div>
+              <div class="feature-desc">录制点击时允许使用控件类名（如 EditText、Button）参与消歧或作为页面唯一控件的定位器，通用布局容器不会单独作为定位。</div>
+            </div>
+            <el-switch v-model="form.recording_enable_class_name" />
+          </div>
+          <div class="feature-setting-row">
+            <div>
+              <div class="feature-name">录制定位优先级</div>
+              <div class="feature-desc">语义优先更适合跨端复用与无 ID 壳应用；ID 优先适合原生 Android 或多语言/动态文案应用。</div>
+            </div>
+            <div class="feature-control">
+              <el-radio-group v-model="form.recording_locator_priority" size="small" :disabled="!form.recording_enable_resource_id">
+                <el-radio-button value="semantic_first">语义优先</el-radio-button>
+                <el-radio-button value="id_first">ID 优先</el-radio-button>
+              </el-radio-group>
+              <span v-if="!form.recording_enable_resource_id" class="dependency-reason">需先启用 Resource ID 定位</span>
+            </div>
+          </div>
+        </el-card>
+
+        <details class="settings-guidance"><summary>查看定位策略说明</summary><el-card shadow="never" class="tips-card">
+          <template #header>
+            <div class="card-header"><span>录制定位策略说明</span></div>
+          </template>
+          <div class="tips-content">
+            <ol>
+              <li>关闭 Resource ID 与 ClassName（默认）：保持纯语义录制（Text → Description），无合适属性时提示转为图像点击。</li>
+              <li>开启任一开关后：系统会对整页 XML 进行唯一性校验，确保不会把多个同 ID 图标误录成同一位置。</li>
+              <li>若同 ID 在页面中出现多次但文案不同，将自动生成 <code>组合定位（ID + Text）</code>，PC 端与设备端脚本均原生支持执行。</li>
+              <li>若所有属性组合在页面中均不唯一，仍会安全拦截并引导使用「图像点击」，避免回放点偏。</li>
+              <li>已有用例中的 ID / ClassName / 组合定位步骤在执行与步骤编辑器中始终可用，不受录制开关限制。</li>
+            </ol>
+          </div>
+        </el-card></details>
       </el-tab-pane>
       </el-tabs>
 

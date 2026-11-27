@@ -121,7 +121,8 @@ class DriverPoolTests(unittest.TestCase):
 
 class DriverPoolEnvFlagTests(unittest.TestCase):
     def test_disabled_by_default(self):
-        with patch.dict("os.environ", {}, clear=False):
+        with patch.dict("os.environ", {}, clear=False), \
+             patch("backend.drivers.driver_pool._is_driver_pool_enabled_from_db", return_value=False):
             import os
 
             os.environ.pop(pool_module.DRIVER_POOL_ENV, None)
@@ -133,6 +134,27 @@ class DriverPoolEnvFlagTests(unittest.TestCase):
                 self.assertTrue(is_driver_pool_enabled(), raw)
         with patch.dict("os.environ", {pool_module.DRIVER_POOL_ENV: "0"}):
             self.assertFalse(is_driver_pool_enabled())
+
+    def test_falls_back_to_db_flag_when_env_unset(self):
+        import os
+        from sqlmodel import SQLModel, Session, create_engine
+        from backend.feature_flags import FLAG_DRIVER_POOL
+        from backend.models import SystemSetting
+
+        mem_engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+        SQLModel.metadata.create_all(mem_engine)
+        with patch("backend.database.engine", mem_engine), patch.dict("os.environ", {}, clear=False):
+            os.environ.pop(pool_module.DRIVER_POOL_ENV, None)
+            self.assertFalse(is_driver_pool_enabled())
+
+            with Session(mem_engine) as session:
+                session.add(SystemSetting(key=FLAG_DRIVER_POOL, value="true"))
+                session.commit()
+            self.assertTrue(is_driver_pool_enabled())
+
+            # 环境变量显式设置时优先于数据库配置
+            with patch.dict("os.environ", {pool_module.DRIVER_POOL_ENV: "0"}):
+                self.assertFalse(is_driver_pool_enabled())
 
 
 class RunnerPoolIntegrationTests(unittest.TestCase):

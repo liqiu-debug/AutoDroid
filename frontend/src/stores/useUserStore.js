@@ -8,8 +8,17 @@ export const useUserStore = defineStore('user', () => {
     const defaultFeatureFlags = {
         content_addressed_assets: false,
         tiered_asset_retention: false,
+        driver_pool_enabled: false,
+        recording_enable_resource_id: false,
+        recording_enable_class_name: false,
+    }
+    const defaultRecordingLocatorConfig = {
+        enable_resource_id: false,
+        enable_class_name: false,
+        priority: 'semantic_first',
     }
     const featureFlags = ref({ ...defaultFeatureFlags })
+    const recordingLocatorConfig = ref({ ...defaultRecordingLocatorConfig })
 
     const isLoggedIn = computed(() => !!token.value)
     const isAdmin = computed(() => userInfo.value?.role === 'admin')
@@ -70,11 +79,31 @@ export const useUserStore = defineStore('user', () => {
     }
 
     async function fetchFeatureFlags() {
+        let locatorData = null
         try {
-            const response = await api.getFeatureFlags()
+            const [response, locatorResponse] = await Promise.all([
+                api.getFeatureFlags(),
+                typeof api.getRecordingLocatorConfig === 'function'
+                    ? api.getRecordingLocatorConfig().catch(() => ({ data: null }))
+                    : Promise.resolve({ data: null }),
+            ])
             featureFlags.value = { ...defaultFeatureFlags, ...(response.data || {}) }
+            locatorData = locatorResponse?.data || null
         } catch {
             featureFlags.value = { ...defaultFeatureFlags }
+        }
+        if (locatorData) {
+            recordingLocatorConfig.value = {
+                enable_resource_id: Boolean(locatorData.enable_resource_id),
+                enable_class_name: Boolean(locatorData.enable_class_name),
+                priority: locatorData.priority === 'id_first' ? 'id_first' : 'semantic_first',
+            }
+        } else {
+            recordingLocatorConfig.value = {
+                enable_resource_id: Boolean(featureFlags.value.recording_enable_resource_id),
+                enable_class_name: Boolean(featureFlags.value.recording_enable_class_name),
+                priority: 'semantic_first',
+            }
         }
     }
 
@@ -94,6 +123,7 @@ export const useUserStore = defineStore('user', () => {
         token.value = ''
         userInfo.value = null
         featureFlags.value = { ...defaultFeatureFlags }
+        recordingLocatorConfig.value = { ...defaultRecordingLocatorConfig }
         localStorage.removeItem('token')
         if (manual === true) {
             try {
@@ -113,6 +143,7 @@ export const useUserStore = defineStore('user', () => {
         token,
         userInfo,
         featureFlags,
+        recordingLocatorConfig,
         isLoggedIn,
         isAdmin,
         login,

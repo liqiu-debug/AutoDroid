@@ -28,9 +28,25 @@ DRIVER_POOL_LOCK_TIMEOUT_SECONDS = 5.0
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
 
 
+def _is_driver_pool_enabled_from_db() -> bool:
+    """从 SystemSetting 读取连接池开关（隔离连接异常，失败时安全降级为关闭）。"""
+    try:
+        from sqlmodel import Session
+
+        from backend.database import engine
+        from backend.feature_flags import FLAG_DRIVER_POOL, is_flag_enabled
+
+        with Session(engine) as session:
+            return is_flag_enabled(session, FLAG_DRIVER_POOL)
+    except Exception:
+        return False
+
+
 def is_driver_pool_enabled() -> bool:
-    raw = (os.environ.get(DRIVER_POOL_ENV) or "").strip().lower()
-    return raw in _TRUE_VALUES
+    raw = os.environ.get(DRIVER_POOL_ENV)
+    if raw is not None and raw.strip() != "":
+        return raw.strip().lower() in _TRUE_VALUES
+    return _is_driver_pool_enabled_from_db()
 
 
 class _PoolEntry:

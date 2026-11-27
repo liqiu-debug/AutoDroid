@@ -1,5 +1,5 @@
-import { ref } from 'vue'
-import { findBestNodeAtPoint, findBestRecordableNode } from '@/utils/recordableNode'
+import { ref, unref } from 'vue'
+import { evaluateRecordableNode, findBestNodeAtPoint } from '@/utils/recordableNode'
 
 /**
  * 静态截图画布：坐标换算与元素悬停高亮。
@@ -7,10 +7,11 @@ import { findBestNodeAtPoint, findBestRecordableNode } from '@/utils/recordableN
  * - 根据坐标命中可录制节点 / 任意节点
  * - 悬停高亮框样式
  */
-export function useStageCanvas({ liveMode, nodes, liveNodes }) {
+export function useStageCanvas({ liveMode, nodes, liveNodes, locatorConfig = null }) {
   const canvasRef = ref(null)
   const imgRef = ref(null)
   const hoveredNode = ref(null)
+  const hoveredLocatorPreview = ref('')
 
   const getCurrentNodeList = () => (liveMode.value ? liveNodes.value : nodes.value)
 
@@ -43,7 +44,9 @@ export function useStageCanvas({ liveMode, nodes, liveNodes }) {
 
   // Find node at coordinates
   const findNodeAt = (realX, realY) => {
-    return findBestRecordableNode(getCurrentNodeList(), realX, realY)
+    const evaluated = evaluateRecordableNode(getCurrentNodeList(), realX, realY, unref(locatorConfig))
+    hoveredLocatorPreview.value = evaluated?.previewLabel || ''
+    return evaluated?.node || null
   }
 
   const getFallbackNodeAt = (nodeList, realX, realY) => {
@@ -52,6 +55,7 @@ export function useStageCanvas({ liveMode, nodes, liveNodes }) {
 
   const onCanvasMouseLeave = () => {
     hoveredNode.value = null
+    hoveredLocatorPreview.value = ''
   }
 
   // Get overlay style for hovered node
@@ -87,6 +91,7 @@ export function useStageCanvas({ liveMode, nodes, liveNodes }) {
     canvasRef,
     imgRef,
     hoveredNode,
+    hoveredLocatorPreview,
     getCurrentNodeList,
     getMappedCoordinates,
     findNodeAt,

@@ -29,6 +29,7 @@ from backend.execution_errors import (
     ExecutionStepRuntimeError,
 )
 from backend.utils import evaluate_page_text_assertion
+from backend.utils.composite_locator import parse_composite_selector
 from backend.utils.ocr_compat import extract_ocr_text, run_paddle_ocr
 from backend.ocr_service import get_ocr_engine
 from backend.utils.template_match import find_template_match, image_to_bgr, load_image_bgr
@@ -315,7 +316,7 @@ class AndroidDriver(BaseDriver):
     #  内部：根据 by 策略定位元素
     # ------------------------------------------------------------------ #
 
-    def _find_element(self, selector: str, by: str) -> Any:
+    def _find_element(self, selector: str, by: str, *, text_probe_timeout: float = 2.0) -> Any:
         """
         根据 by 策略查找 UI 元素。
 
@@ -336,7 +337,7 @@ class AndroidDriver(BaseDriver):
 
         if by_lower == "text":
             el = self._device(text=selector)
-            if not el.exists(timeout=2):
+            if not el.exists(timeout=text_probe_timeout):
                 # 降级：模糊匹配
                 el = self._device(textContains=selector)
             return el
@@ -344,7 +345,7 @@ class AndroidDriver(BaseDriver):
         if by_lower in ("label", "name"):
             # 兼容跨端步骤在 Android 上的回退语义
             el = self._device(text=selector)
-            if not el.exists(timeout=2):
+            if not el.exists(timeout=text_probe_timeout):
                 el = self._device(textContains=selector)
             return el
 
@@ -353,6 +354,41 @@ class AndroidDriver(BaseDriver):
 
         if by_lower in ("description", "desc", "content-desc"):
             return self._device(description=selector)
+
+        if by_lower in ("class_name", "classname", "class"):
+            return self._device(className=selector)
+
+        if by_lower == "composite":
+            conditions = parse_composite_selector(selector)
+            kwargs: Dict[str, Any] = {}
+            if "id" in conditions:
+                kwargs["resourceId"] = conditions["id"]
+            if "text" in conditions:
+                kwargs["text"] = conditions["text"]
+            if "description" in conditions:
+                kwargs["description"] = conditions["description"]
+            if "class_name" in conditions:
+                kwargs["className"] = conditions["class_name"]
+
+            el = self._device(**kwargs)
+            if "text" in conditions and text_probe_timeout > 0:
+                probe_ok = False
+                try:
+                    probe_ok = bool(
+                        _call_bounded(
+                            lambda: el.exists(timeout=text_probe_timeout),
+                            max(text_probe_timeout + 3.0, self._RPC_TIMEOUT_EXISTS),
+                            label="element.exists.composite",
+                        )
+                    )
+                except Exception:
+                    probe_ok = False
+                if not probe_ok:
+                    fallback_kwargs = dict(kwargs)
+                    text_val = fallback_kwargs.pop("text")
+                    fallback_kwargs["textContains"] = text_val
+                    return self._device(**fallback_kwargs)
+            return el
 
         raise ValueError(f"Android 不支持的定位策略: by={by!r}")
 
@@ -925,7 +961,8 @@ class AndroidDriver(BaseDriver):
             selector, by, timeout,
         )
         try:
-            el = self._find_element(selector, by)
+            probe_timeout = min(2.0, max(0.2, float(timeout or 2)))
+            el = self._find_element(selector, by, text_probe_timeout=probe_timeout)
             if not el.exists(timeout=timeout):
                 raise ExecutionStepRuntimeError(
                     E2002_WAIT_TIMEOUT,

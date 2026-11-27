@@ -25,6 +25,7 @@ from backend.locator_resolution import resolve_locator_candidates
 from backend.models import GlobalVariable, TestCase, TestCaseStep
 from backend.step_contract import (
     build_standard_from_legacy_steps,
+    is_step_disabled,
     normalize_action,
     normalize_error_strategy,
     normalize_execute_on,
@@ -32,6 +33,7 @@ from backend.step_contract import (
     step_image_options,
     step_image_match,
 )
+from backend.utils.composite_locator import render_composite_selector
 from backend.utils.image_match_options import select_image_options
 from backend.utils.pydantic_compat import dump_model
 from backend.utils.variable_render import render_step_data
@@ -102,6 +104,22 @@ def _render_text(value: Any, variables: Dict[str, str]) -> Any:
     if isinstance(value, str):
         return render_step_data(value, variables)
     if isinstance(value, dict):
+        if (
+            str(value.get("by") or "").strip().lower() == "composite"
+            and isinstance(value.get("selector"), str)
+        ):
+            return {
+                key: (
+                    item
+                    if key == "image_match"
+                    else (
+                        render_composite_selector(item, lambda s: render_step_data(s, variables))
+                        if key == "selector"
+                        else _render_text(item, variables)
+                    )
+                )
+                for key, item in value.items()
+            }
         return {key: item if key == "image_match" else _render_text(item, variables) for key, item in value.items()}
     if isinstance(value, list):
         return [_render_text(item, variables) for item in value]
@@ -213,6 +231,10 @@ def build_script_step(
         "locators": [],
         "args": {},
     }
+    if is_step_disabled(step):
+        script_step["disabled"] = True
+        script_step["args"]["disabled"] = True
+        return script_step, template_refs
 
     if action in LOCATOR_ACTIONS:
         candidates = resolve_locator_candidates(step, platform)

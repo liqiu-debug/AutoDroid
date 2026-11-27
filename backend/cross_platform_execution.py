@@ -16,12 +16,14 @@ from backend.locator_resolution import resolve_locator_candidates
 from backend.models import Device, GlobalVariable, TestCase, TestCaseStep
 from backend.step_contract import (
     build_standard_from_legacy_steps,
+    is_step_disabled,
     normalize_action,
     normalize_execute_on,
     normalize_retry_count,
     step_image_match,
     step_image_options,
 )
+from backend.utils.composite_locator import parse_composite_selector, render_composite_selector
 from backend.utils.variable_render import format_variable_placeholder, render_step_data
 from backend.utils.image_match_options import preserve_image_references
 from backend.wda_port_manager import wda_relay_manager
@@ -158,6 +160,22 @@ def render_with_variables(raw: Any, variables: Dict[str, str]) -> Any:
     if isinstance(raw, list):
         return [render_with_variables(item, variables) for item in raw]
     if isinstance(raw, dict):
+        if (
+            str(raw.get("by") or "").strip().lower() == "composite"
+            and isinstance(raw.get("selector"), str)
+        ):
+            rendered: Dict[str, Any] = {}
+            for k, v in raw.items():
+                if k == "image_match":
+                    rendered[k] = v
+                elif k == "selector":
+                    rendered[k] = render_composite_selector(
+                        v,
+                        lambda s: render_step_data(s, variables),
+                    )
+                else:
+                    rendered[k] = render_with_variables(v, variables)
+            return rendered
         return {k: v if k == "image_match" else render_with_variables(v, variables) for k, v in raw.items()}
     return raw
 
@@ -513,6 +531,18 @@ def precheck_steps_for_platform(
             )
             continue
 
+        if is_step_disabled(step_item):
+            results.append(
+                _build_step_precheck_result(
+                    order=index,
+                    action=action,
+                    status="SKIP",
+                    code="STEP_DISABLED",
+                    message="步骤已禁用，执行时将跳过",
+                )
+            )
+            continue
+
         try:
             execute_on = _normalize_step_execute_on(action, step_item.get("execute_on"))
         except Exception as exc:
@@ -630,6 +660,26 @@ def precheck_steps_for_platform(
                     status="FAIL",
                     code=_extract_error_code(msg),
                     message=msg,
+                )
+            )
+            continue
+
+        invalid_composite_msg = None
+        for candidate in locator_candidates:
+            if str(candidate.get("by") or "").strip().lower() == "composite":
+                try:
+                    parse_composite_selector(candidate.get("selector"))
+                except ValueError as exc:
+                    invalid_composite_msg = f"P1006_INVALID_ARGS: 组合定位格式无效: {exc}"
+                    break
+        if invalid_composite_msg:
+            results.append(
+                _build_step_precheck_result(
+                    order=index,
+                    action=action,
+                    status="FAIL",
+                    code=_extract_error_code(invalid_composite_msg),
+                    message=invalid_composite_msg,
                 )
             )
             continue
@@ -828,7 +878,9 @@ def prepare_steps_for_platform(
         locator_candidates = resolve_locator_candidates(step_item, platform=platform_lower)
         first_selector = _first_locator_selector(locator_candidates)
 
-        if platform_lower in execute_on and action in {"click_image", "assert_image"}:
+        disabled_step = is_step_disabled(step_item)
+
+        if not disabled_step and platform_lower in execute_on and action in {"click_image", "assert_image"}:
             step_item = preserve_image_references(step_item, args)
             image_path = _resolve_image_path(
                 step_item=step_item,
@@ -855,7 +907,7 @@ def prepare_steps_for_platform(
                 if isinstance(step_item.get("options"), dict) and "image_match" in step_item["options"]:
                     step_item["options"] = {**step_item["options"], "image_match": shared}
 
-        if platform_lower in execute_on and action == "extract_by_ocr":
+        if not disabled_step and platform_lower in execute_on and action == "extract_by_ocr":
             region = _resolve_extract_region(
                 step_item=step_item,
                 args=args,
@@ -865,7 +917,7 @@ def prepare_steps_for_platform(
             if region:
                 args["region"] = region
 
-        if platform_lower in execute_on and action in ("start_app", "stop_app"):
+        if not disabled_step and platform_lower in execute_on and action in ("start_app", "stop_app"):
             app_key = _extract_step_app_key(step_item)
             if not app_key:
                 raise RuntimeError(

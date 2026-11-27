@@ -84,7 +84,7 @@ const statusText = computed(() => {
 const reportUrl = computed(() => api.getReportAssetUrl(reportId.value))
 
 // 连接 WebSocket
-const connect = (caseId, envId = null, deviceSerial = null) => {
+const connect = (caseId, envId = null, deviceSerial = null, options = {}) => {
   clearLaunchTimer()
   const previous = ws
   ws = null
@@ -100,6 +100,9 @@ const connect = (caseId, envId = null, deviceSerial = null) => {
   const queryParams = []
   if (envId) queryParams.push(`env_id=${encodeURIComponent(envId)}`)
   if (deviceSerial) queryParams.push(`device_serial=${encodeURIComponent(deviceSerial)}`)
+  if (Number.isInteger(options?.startStepIndex) && options.startStepIndex > 0) {
+    queryParams.push(`start_step_index=${encodeURIComponent(options.startStepIndex)}`)
+  }
   
   if (queryParams.length > 0) {
     wsUrl += `?${queryParams.join('&')}`

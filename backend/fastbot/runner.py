@@ -11,7 +11,11 @@ import logging
 import os
 from typing import Dict, List, Optional
 
-from backend.fastbot.adb import ADB_MONITOR_COMMAND_TIMEOUT_SECONDS, _adb_shell
+from backend.fastbot.adb import (
+    ADB_MONITOR_COMMAND_TIMEOUT_SECONDS,
+    _adb_shell,
+    _terminate_subprocess,
+)
 from backend.fastbot.framestats import _monitor_jank
 from backend.fastbot.logcat import _monitor_logcat
 from backend.fastbot.monkey import _build_monkey_command, push_fastbot_assets
@@ -218,11 +222,7 @@ async def run_fastbot_task(
                 monkey_proc.kill()
             monkey_comm.cancel()
         elif monkey_comm not in done:
-            monkey_proc.terminate()
-            try:
-                await monkey_proc.wait()
-            except Exception:
-                pass
+            await _terminate_subprocess(monkey_proc)
             logger.warning("Monkey 进程超时，已强制终止")
             monkey_comm.cancel()
 

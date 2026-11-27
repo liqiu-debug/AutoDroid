@@ -156,8 +156,53 @@
     Element.prototype.exists = function () { return true; };
 
     function Selector(spec) {
-        this.__spec = spec;      // {kind, value, all}
+        this.__spec = spec;      // {kind, value, all, clauses}
     }
+
+    function selectorToPredicateClause(spec) {
+        if (!spec) return "";
+        if (spec.kind === "predicate") return String(spec.value || "");
+        if (spec.kind === "accessibility id") {
+            return "name == '" + escapePredicateLiteral(spec.value) + "'";
+        }
+        if (spec.kind === "class name") {
+            return "type == '" + escapePredicateLiteral(spec.value) + "'";
+        }
+        return "";
+    }
+
+    function combineSelector(leftSelector, rightClause) {
+        var clauses = [];
+        if (leftSelector && leftSelector.__spec) {
+            if (leftSelector.__spec.clauses && leftSelector.__spec.clauses.length) {
+                clauses = leftSelector.__spec.clauses.slice();
+            } else {
+                var baseClause = selectorToPredicateClause(leftSelector.__spec);
+                if (baseClause) clauses.push(baseClause);
+            }
+        }
+        if (rightClause) clauses.push(rightClause);
+        return new Selector({ kind: "predicate", value: clauses.join(" AND "), clauses: clauses });
+    }
+
+    Selector.prototype.id = function (value) {
+        return combineSelector(this, "name == '" + escapePredicateLiteral(value) + "'");
+    };
+    Selector.prototype.text = function (value) {
+        return combineSelector(this, textPredicate(true, value));
+    };
+    Selector.prototype.textContains = function (value) {
+        return combineSelector(this, textPredicate(false, value));
+    };
+    Selector.prototype.desc = function (value) {
+        return combineSelector(this, textPredicate(true, value));
+    };
+    Selector.prototype.descContains = function (value) {
+        return combineSelector(this, textPredicate(false, value));
+    };
+    Selector.prototype.className = function (value) {
+        return combineSelector(this, "type == '" + escapePredicateLiteral(value) + "'");
+    };
 
     Selector.prototype.findOne = function (timeoutMs) {
         var timeout = Math.max(0, Number(timeoutMs) || 0);

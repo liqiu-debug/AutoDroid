@@ -532,6 +532,80 @@ class ClientDeviceStatusRefreshTests(unittest.TestCase):
         statuses = {row["serial"]: row["status"] for row in resp.json()["devices"]}
         self.assertEqual(statuses, {"emulator-5554": "IDLE", "emulator-5556": "OFFLINE"})
 
+    def test_list_and_sync_reclaim_stale_client_device_when_seen_by_server_adb(self):
+        async def _adb_both(*args, **kwargs):
+            return b"List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n"
+
+        async def _props(serial: str):
+            return {
+                "ro.product.model": "Pixel 7",
+                "ro.product.brand": "google",
+                "ro.build.version.release": "14",
+                "resolution": "1080x2400",
+            }
+
+        stale_time = datetime.now() - timedelta(
+            seconds=devices_api.CLIENT_HEARTBEAT_TIMEOUT_SECONDS + 30
+        )
+        # 1) GET /api/devices/ 路径：过期客户端设备直连服务端 adb 时应交回服务端并恢复 IDLE
+        d1 = self._add_device(
+            "emulator-5554",
+            owner_id=self.alice.id,
+            status="OFFLINE",
+            client_instance_id="desk-old-1",
+            last_seen_at=stale_time,
+        )
+        # 2) POST /api/devices/sync 路径：另一台同样过期的客户端设备应在 sync 后保持 IDLE
+        d2 = self._add_device(
+            "emulator-5556",
+            owner_id=self.alice.id,
+            status="OFFLINE",
+            client_instance_id="desk-old-2",
+            last_seen_at=stale_time,
+        )
+
+        with patch("backend.api.devices._run_adb_command", new=_adb_both), patch(
+            "backend.api.devices._get_device_props_batch", side_effect=_props
+        ):
+            list_resp = self.client.get("/api/devices/")
+            self.assertEqual(list_resp.status_code, 200, list_resp.text)
+            list_statuses = {row["serial"]: row["status"] for row in list_resp.json()}
+            self.assertEqual(list_statuses, {"emulator-5554": "IDLE", "emulator-5556": "IDLE"})
+
+            # 重新模拟仅通过 POST /sync 收回的场景
+            d2.client_instance_id = "desk-old-3"
+            d2.last_seen_at = stale_time
+            d2.status = "OFFLINE"
+            self.session.add(d2)
+            self.session.commit()
+
+            sync_resp = self.client.post("/api/devices/sync")
+            self.assertEqual(sync_resp.status_code, 200, sync_resp.text)
+            sync_statuses = {row["serial"]: row["status"] for row in sync_resp.json()["devices"]}
+            self.assertEqual(sync_statuses, {"emulator-5554": "IDLE", "emulator-5556": "IDLE"})
+
+        self.session.refresh(d1)
+        self.session.refresh(d2)
+        self.assertIsNone(d1.client_instance_id)
+        self.assertIsNone(d1.last_seen_at)
+        self.assertIsNone(d2.client_instance_id)
+        self.assertIsNone(d2.last_seen_at)
+        self.assertEqual(d1.owner_id, self.alice.id)
+        self.assertEqual(d2.owner_id, self.alice.id)
+
+    def test_list_does_not_reclaim_fresh_client_device_even_if_adb_sees_it(self):
+        async def _adb_one(*args, **kwargs):
+            return b"List of devices attached\nemulator-5554\tdevice\n"
+
+        self._register(serial="emulator-5554", client_instance_id="desk-active")
+        with patch("backend.api.devices._run_adb_command", new=_adb_one):
+            resp = self.client.get("/api/devices/")
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        row = resp.json()[0]
+        self.assertEqual(row["status"], "IDLE")
+        self.assertEqual(row["client_instance_id"], "desk-active")
+
     def test_server_sync_does_not_steal_device_owned_by_other_member(self):
         """G7 回归：register 的「物理持有即接管」不得改变服务端 sync 认领语义。
 

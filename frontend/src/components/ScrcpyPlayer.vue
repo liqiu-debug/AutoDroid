@@ -15,7 +15,7 @@ import JMuxer from 'jmuxer'
 import { ElMessage } from 'element-plus'
 import { VideoPlay, VideoPause, Refresh, Loading } from '@element-plus/icons-vue'
 import api from '@/api'
-import { findBestRecordableNode } from '@/utils/recordableNode'
+import { evaluateRecordableNode } from '@/utils/recordableNode'
 import { useWebCodecsDecoder, isWebCodecsSupported } from '@/composables/useWebCodecsDecoder'
 import { shouldRestoreStoredStreamProfile } from '@/utils/streamProfile'
 import { buildScrcpyWsUrl, withCurrentStreamToken } from '@/utils/streamAuth'
@@ -70,6 +70,11 @@ const props = defineProps({
   nodes: {
     type: Array,
     default: () => []
+  },
+  /** 录制定位策略配置（决定悬停高亮与策略预览） */
+  locatorConfig: {
+    type: Object,
+    default: () => ({ enable_resource_id: false, enable_class_name: false, priority: 'semantic_first' })
   }
 })
 
@@ -84,6 +89,7 @@ const status = ref('disconnected')
 const errorMsg = ref('')
 const fps = ref(0)
 const hoveredNode = ref(null)
+const hoveredLocatorPreview = ref('')
 const layoutRevision = ref(0)
 const LIVE_EDGE_CHECK_INTERVAL_MS = 1000
 const LIVE_EDGE_MAX_LAG_SECONDS = 0.8
@@ -359,17 +365,21 @@ function mapToDeviceCoords(clientX, clientY) {
 // ==================== 元素高亮 ====================
 
 function findNodeAt(realX, realY) {
-  return findBestRecordableNode(props.nodes, realX, realY)
+  const evaluated = evaluateRecordableNode(props.nodes, realX, realY, props.locatorConfig)
+  hoveredLocatorPreview.value = evaluated?.previewLabel || ''
+  return evaluated?.node || null
 }
 
 function onMouseMove(event) {
   if (props.nodes.length === 0) {
     hoveredNode.value = null
+    hoveredLocatorPreview.value = ''
     return
   }
   const coords = mapToDeviceCoords(event.clientX, event.clientY)
   if (!coords) {
     hoveredNode.value = null
+    hoveredLocatorPreview.value = ''
     return
   }
   hoveredNode.value = findNodeAt(coords.x, coords.y)
@@ -377,6 +387,7 @@ function onMouseMove(event) {
 
 function onMouseLeave() {
   hoveredNode.value = null
+  hoveredLocatorPreview.value = ''
 }
 
 const overlayStyle = computed(() => {
@@ -835,6 +846,7 @@ defineExpose({ connect, disconnect, reconnect })
 
       <!-- 元素信息提示 -->
       <div v-if="hoveredNode" class="element-tooltip">
+        <div v-if="hoveredLocatorPreview && (locatorConfig?.enable_resource_id || locatorConfig?.enable_class_name)" class="tip-row"><b>定位预览:</b> {{ hoveredLocatorPreview }}</div>
         <div v-if="hoveredNode.text" class="tip-row"><b>Text:</b> {{ hoveredNode.text }}</div>
         <div v-if="hoveredNode.resourceId" class="tip-row"><b>ID:</b> {{ hoveredNode.resourceId }}</div>
         <div v-if="hoveredNode.contentDesc" class="tip-row"><b>Desc:</b> {{ hoveredNode.contentDesc }}</div>

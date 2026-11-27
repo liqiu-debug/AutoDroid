@@ -88,6 +88,26 @@ class LocatorResolutionTests(unittest.TestCase):
             ],
         )
 
+    def test_composite_android_locator_extracts_ios_semantic_fallback(self):
+        candidates = resolve_locator_candidates(
+            {
+                "platform_overrides": {
+                    "android": {
+                        "selector": '{"id":"com.demo:id/pay_btn","text":"立即支付"}',
+                        "by": "composite",
+                    }
+                }
+            },
+            "ios",
+        )
+        self.assertEqual(
+            candidates,
+            [
+                {"selector": "立即支付", "by": "label"},
+                {"selector": "立即支付", "by": "name"},
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

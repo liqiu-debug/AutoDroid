@@ -2,6 +2,8 @@
 import { ref, computed, onMounted, onUnmounted, onBeforeUnmount, onDeactivated, onActivated, watch } from 'vue'
 import { DataLine, Refresh } from '@element-plus/icons-vue'
 import { useCaseStore } from '@/stores/useCaseStore'
+import { useUserStore } from '@/stores/useUserStore'
+import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import api from '@/api'
 import { findBestRecordableNode } from '@/utils/recordableNode'
@@ -17,6 +19,8 @@ import IosMjpegPlayer from './IosMjpegPlayer.vue'
 
 defineProps({ hideDeviceSelect: { type: Boolean, default: false } })
 const caseStore = useCaseStore()
+const userStore = useUserStore()
+const { recordingLocatorConfig } = storeToRefs(userStore)
 
 const syncMode = ref(false)
 const liveMode = ref(false)
@@ -189,13 +193,14 @@ const {
   canvasRef,
   imgRef,
   hoveredNode,
+  hoveredLocatorPreview,
   getCurrentNodeList,
   getMappedCoordinates,
   findNodeAt,
   getFallbackNodeAt,
   onCanvasMouseLeave,
   getOverlayStyle
-} = useStageCanvas({ liveMode, nodes, liveNodes })
+} = useStageCanvas({ liveMode, nodes, liveNodes, locatorConfig: recordingLocatorConfig })
 
 const executeRawTapAndRefresh = async (x, y) => {
   // 投屏模式下响应无需整图截图（画面由视频流承担），为远程弱链路省一张整图
@@ -350,7 +355,8 @@ const onCanvasClick = async (event) => {
   }
 
   const currentNodes = getCurrentNodeList()
-  const recordableNode = findBestRecordableNode(currentNodes, coords.realX, coords.realY)
+  const locatorCfg = recordingLocatorConfig.value
+  const recordableNode = findBestRecordableNode(currentNodes, coords.realX, coords.realY, locatorCfg)
   const fallbackNode = getFallbackNodeAt(currentNodes, coords.realX, coords.realY)
 
   if (!recordableNode && !fallbackNode) {
@@ -371,7 +377,7 @@ const onCanvasClick = async (event) => {
 
   loading.value = true
   try {
-    const res = await api.interactDevice(coords.realX, coords.realY, 'click', hierarchyXml.value, null, selectedSerial.value, true, !liveMode.value)
+    const res = await api.interactDevice(coords.realX, coords.realY, 'click', hierarchyXml.value, null, selectedSerial.value, true, !liveMode.value, locatorCfg)
 
     // Update Device State
     updateStateFromDump(res.data.dump)
@@ -421,7 +427,8 @@ const onScrcpyTouch = async ({ x, y, relX, relY }) => {
     return
   }
 
-  const recordableNode = findBestRecordableNode(liveNodes.value, x, y)
+  const locatorCfg = recordingLocatorConfig.value
+  const recordableNode = findBestRecordableNode(liveNodes.value, x, y, locatorCfg)
   const fallbackNode = getFallbackNodeAt(liveNodes.value, x, y)
   if (!recordableNode && !fallbackNode) {
     return
@@ -440,7 +447,7 @@ const onScrcpyTouch = async ({ x, y, relX, relY }) => {
   loading.value = true
 
   try {
-    const res = await api.interactDevice(x, y, 'click', hierarchyXml.value, null, selectedSerial.value, true, !liveMode.value)
+    const res = await api.interactDevice(x, y, 'click', hierarchyXml.value, null, selectedSerial.value, true, !liveMode.value, locatorCfg)
     if (res.data.step) {
       caseStore.addStep(res.data.step)
       ElMessage.success('操作成功并添加步骤')
@@ -689,6 +696,7 @@ defineExpose({
         :device-width="selectedDeviceScreenSize.width"
         :device-height="selectedDeviceScreenSize.height"
         :nodes="liveNodes"
+        :locator-config="recordingLocatorConfig"
         @touch="onScrcpyTouch"
       />
       <div
@@ -699,7 +707,7 @@ defineExpose({
         @mouseup.stop
         @click.stop
       >
-        <div class="quick-image-title">当前区域无 Desc/Text</div>
+        <div class="quick-image-title">{{ (recordingLocatorConfig.enable_resource_id || recordingLocatorConfig.enable_class_name) ? '当前区域无法唯一识别元素' : '当前区域无 Desc/Text' }}</div>
         <div class="quick-image-desc">可直接转为图像点击录制</div>
         <div class="quick-image-actions">
           <el-button size="small" type="primary" @click.stop="beginQuickImageCapture()">
@@ -777,7 +785,7 @@ defineExpose({
         @mouseup.stop
         @click.stop
       >
-        <div class="quick-image-title">当前区域无 Desc/Text</div>
+        <div class="quick-image-title">{{ (recordingLocatorConfig.enable_resource_id || recordingLocatorConfig.enable_class_name) ? '当前区域无法唯一识别元素' : '当前区域无 Desc/Text' }}</div>
         <div class="quick-image-desc">可直接转为图像点击录制</div>
         <div class="quick-image-actions">
           <el-button size="small" type="primary" @click.stop="beginQuickImageCapture()">
@@ -791,6 +799,7 @@ defineExpose({
 
       <!-- Element Tooltip -->
       <div v-if="hoveredNode && !isAnyCropMode" class="element-tooltip">
+        <div v-if="hoveredLocatorPreview && (recordingLocatorConfig.enable_resource_id || recordingLocatorConfig.enable_class_name)" class="tip-row"><b>定位预览:</b> {{ hoveredLocatorPreview }}</div>
         <div v-if="hoveredNode.text" class="tip-row"><b>Text:</b> {{ hoveredNode.text }}</div>
         <div v-if="hoveredNode.resourceId" class="tip-row"><b>ID:</b> {{ hoveredNode.resourceId }}</div>
         <div v-if="hoveredNode.contentDesc" class="tip-row"><b>Desc:</b> {{ hoveredNode.contentDesc }}</div>

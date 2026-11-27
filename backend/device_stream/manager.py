@@ -15,6 +15,7 @@ import threading
 import time
 import logging
 import queue
+from collections import deque
 from typing import Any, Dict, Optional, Generator, List, Set
 
 import adbutils
@@ -255,6 +256,100 @@ def _build_scrcpy_server_command(serial: str, params: Optional[Dict[str, int]] =
         f"max_fps={effective['max_fps']} "
         f"i_frame_interval={effective['i_frame_interval']}"
     )
+
+
+_SCRCPY_STDERR_TAIL_CHUNKS = 8
+_SCRCPY_DRAIN_CHUNK_SIZE = 512
+
+
+def _read_process_stderr_tail(proc: Any, stderr_tail: deque) -> str:
+    """读取 stderr 排空缓冲区的尾部文本（早退时等待排空线程刷新完成）。"""
+    threads = getattr(proc, "_drainer_threads", ()) if proc is not None else ()
+    if proc is not None and proc.poll() is not None:
+        for thread in threads:
+            try:
+                thread.join(timeout=0.3)
+            except Exception:
+                pass
+    chunks = list(stderr_tail)
+    raw = b"".join(
+        chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8", errors="ignore")
+        for chunk in chunks
+    )
+    return raw.decode(errors="ignore")
+
+
+def _start_process_output_drainer(proc: Any, serial: str) -> deque:
+    """启动守护线程持续排空 scrcpy stdout/stderr，防止 OS 管道写满阻塞进程。"""
+    stderr_tail: deque = deque(maxlen=_SCRCPY_STDERR_TAIL_CHUNKS)
+    if proc is None:
+        return stderr_tail
+
+    def _drain_stream(stream: Any, capture_tail: bool) -> None:
+        if stream is None:
+            return
+        read_fn = getattr(stream, "read1", None) or getattr(stream, "read", None)
+        if not callable(read_fn):
+            return
+        try:
+            while True:
+                chunk = read_fn(_SCRCPY_DRAIN_CHUNK_SIZE)
+                if not chunk:
+                    break
+                if capture_tail:
+                    stderr_tail.append(chunk)
+        except (OSError, ValueError):
+            pass
+        except Exception:
+            logger.debug("排空 scrcpy 输出异常（忽略）: serial=%s", serial, exc_info=True)
+
+    threads: List[threading.Thread] = []
+    for label, stream, capture in (
+        ("stdout", getattr(proc, "stdout", None), False),
+        ("stderr", getattr(proc, "stderr", None), True),
+    ):
+        if stream is None:
+            continue
+        thread = threading.Thread(
+            target=_drain_stream,
+            args=(stream, capture),
+            name=f"scrcpy-{label}-{serial}",
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+
+    try:
+        setattr(proc, "_drainer_threads", tuple(threads))
+    except Exception:
+        pass
+    return stderr_tail
+
+
+def _terminate_scrcpy_process(proc: Any) -> None:
+    """温和终止 scrcpy 子进程，超时升级强杀，并关闭输出管道。"""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug("终止 scrcpy 进程失败（忽略）: error=%s", e)
+    finally:
+        for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 
 def _collect_h264_nal_types(data: bytes) -> Set[int]:
@@ -715,12 +810,14 @@ class ScrcpyDeviceManager:
                 stderr=subprocess.PIPE
             )
             dev_info.scrcpy_process = proc
+            stderr_tail = _start_process_output_drainer(proc, serial)
 
             # 6. 等待并建立 video socket（第一个连接）
             for attempt in range(5):
                 time.sleep(1)
                 if proc.poll() is not None:
-                    stderr_out = proc.stderr.read().decode(errors='ignore')
+                    stderr_out = _read_process_stderr_tail(proc, stderr_tail)
+                    _terminate_scrcpy_process(proc)
                     logger.error(f"scrcpy 进程已退出 (code={proc.returncode}): {stderr_out}")
                     dev_info.error = f"scrcpy 进程退出: {stderr_out[:200]}"
                     self._release_port(local_port)
@@ -742,7 +839,7 @@ class ScrcpyDeviceManager:
             if video_sock is None:
                 logger.error("Video socket 连接超时")
                 dev_info.error = "Video socket 连接超时"
-                proc.terminate()
+                _terminate_scrcpy_process(proc)
                 self._release_port(local_port)
                 with self._lock:
                     self._devices[serial] = dev_info
@@ -759,7 +856,7 @@ class ScrcpyDeviceManager:
                 logger.error(f"Control socket 连接失败: {e}")
                 dev_info.error = f"Control socket 失败: {e}"
                 video_sock.close()
-                proc.terminate()
+                _terminate_scrcpy_process(proc)
                 self._release_port(local_port)
                 with self._lock:
                     self._devices[serial] = dev_info
@@ -774,7 +871,7 @@ class ScrcpyDeviceManager:
                 dev_info.error = f"Dummy byte 失败: {e}"
                 video_sock.close()
                 ctrl_sock.close()
-                proc.terminate()
+                _terminate_scrcpy_process(proc)
                 self._release_port(local_port)
                 with self._lock:
                     self._devices[serial] = dev_info
@@ -792,7 +889,7 @@ class ScrcpyDeviceManager:
                 dev_info.error = f"Header 读取失败: {e}"
                 video_sock.close()
                 ctrl_sock.close()
-                proc.terminate()
+                _terminate_scrcpy_process(proc)
                 self._release_port(local_port)
                 with self._lock:
                     self._devices[serial] = dev_info
@@ -838,10 +935,7 @@ class ScrcpyDeviceManager:
                     except Exception:
                         pass
             if proc:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                _terminate_scrcpy_process(proc)
             if local_port:
                 self._release_port(local_port)
 
@@ -894,10 +988,7 @@ class ScrcpyDeviceManager:
 
         # 终止 scrcpy 进程
         if dev_info.scrcpy_process:
-            try:
-                dev_info.scrcpy_process.terminate()
-            except Exception as e:
-                logger.debug("终止 scrcpy 进程失败（忽略）: serial=%s error=%s", serial, e)
+            _terminate_scrcpy_process(dev_info.scrcpy_process)
 
         # 释放端口
         self._release_port(dev_info.local_port)

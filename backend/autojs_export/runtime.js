@@ -176,6 +176,84 @@ function screenshotBase64Jpeg(ctx) {
 // ---------------------------------------------------------------------------
 // 定位（复刻 PC 侧候选链：逐个候选尝试；text 先精确 2s 再 textContains）
 // ---------------------------------------------------------------------------
+var COMPOSITE_KEY_ALIASES = {
+    id: "id",
+    resourceid: "id",
+    resource_id: "id",
+    "resource-id": "id",
+    accessibilityid: "id",
+    accessibility_id: "id",
+    text: "text",
+    label: "text",
+    description: "description",
+    desc: "description",
+    "content-desc": "description",
+    content_desc: "description",
+    contentdesc: "description",
+    name: "description",
+    class_name: "class_name",
+    classname: "class_name",
+    "class": "class_name",
+    type: "class_name"
+};
+
+function parseCompositeSelector(raw) {
+    var parsed;
+    if (raw && typeof raw === "object" && !(raw instanceof Array)) {
+        parsed = raw;
+    } else {
+        var textRaw = String(isNullish(raw) ? "" : raw).replace(/^\s+|\s+$/g, "");
+        if (!textRaw) return null;
+        try {
+            parsed = JSON.parse(textRaw);
+        } catch (e) {
+            return null;
+        }
+    }
+    if (!parsed || typeof parsed !== "object" || parsed instanceof Array) return null;
+    var normalized = {};
+    var count = 0;
+    for (var rawKey in parsed) {
+        if (!Object.prototype.hasOwnProperty.call(parsed, rawKey)) continue;
+        var canonical = COMPOSITE_KEY_ALIASES[String(rawKey || "").toLowerCase()];
+        if (!canonical) return null;
+        var rawVal = parsed[rawKey];
+        if (isNullish(rawVal)) continue;
+        if (typeof rawVal === "object" || typeof rawVal === "boolean") return null;
+        var val = String(rawVal).replace(/^\s+|\s+$/g, "");
+        if (!val) continue;
+        if (Object.prototype.hasOwnProperty.call(normalized, canonical) && normalized[canonical] !== val) {
+            return null;
+        }
+        if (!Object.prototype.hasOwnProperty.call(normalized, canonical)) {
+            count += 1;
+        }
+        normalized[canonical] = val;
+    }
+    return count > 0 ? normalized : null;
+}
+
+function chainSelectorMethod(sel, methodFn, value) {
+    return sel ? sel[methodFn](value) : global[methodFn](value);
+}
+
+function buildCompositeSelector(conditions, useTextContains) {
+    var sel = null;
+    if (conditions.id) {
+        sel = chainSelectorMethod(sel, "id", conditions.id);
+    }
+    if (conditions.text) {
+        sel = chainSelectorMethod(sel, useTextContains ? "textContains" : "text", conditions.text);
+    }
+    if (conditions.description) {
+        sel = chainSelectorMethod(sel, "desc", conditions.description);
+    }
+    if (conditions.class_name) {
+        sel = chainSelectorMethod(sel, "className", conditions.class_name);
+    }
+    return sel;
+}
+
 function buildSelector(by, selector) {
     switch (by) {
         case "id":
@@ -190,6 +268,13 @@ function buildSelector(by, selector) {
         case "desc":
         case "content-desc":
             return desc(selector);
+        case "class_name":
+        case "classname":
+        case "class":
+            return className(selector);
+        case "composite":
+            var conds = parseCompositeSelector(selector);
+            return conds ? buildCompositeSelector(conds, false) : null;
         default:
             return null;
     }
@@ -217,12 +302,31 @@ function findElement(ctx, locators, timeoutSeconds, action) {
         if (!selector) continue;
         var remain = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
         try {
+            var el = null;
+            if (by === "composite") {
+                var conds = parseCompositeSelector(selector);
+                if (!conds) {
+                    throw new StepError(ERR.E2201, action + " 组合定位格式无效: " + selector);
+                }
+                var compositeSel = buildCompositeSelector(conds, false);
+                if (conds.text) {
+                    el = compositeSel.findOne(Math.min(2, remain) * 1000);
+                    if (!el) {
+                        el = buildCompositeSelector(conds, true).findOne(Math.max(1, remain - 2) * 1000);
+                    }
+                } else {
+                    el = compositeSel.findOne(remain * 1000);
+                }
+                if (el) {
+                    return { el: el, by: by, selector: selector };
+                }
+                continue;
+            }
             var s = buildSelector(by, selector);
             if (!s) {
                 lastError = new StepError(ERR.P1002, action + " 不支持定位方式: " + by);
                 continue;
             }
-            var el = null;
             if (isTextLike(by)) {
                 el = s.findOne(Math.min(2, remain) * 1000); // findOne 单位为毫秒
                 if (!el) {
@@ -235,6 +339,9 @@ function findElement(ctx, locators, timeoutSeconds, action) {
                 return { el: el, by: by, selector: selector };
             }
         } catch (e) {
+            if (e instanceof StepError && e.code === ERR.E2201) {
+                throw e;
+            }
             // 无障碍服务不可用等环境错误直接上抛，避免被掩盖为"元素未找到"
             if (isAccessibilityError(e)) {
                 throw new StepError(
@@ -1103,6 +1210,14 @@ function runStep(ctx, rawStep) {
         output: null,
         skip_reason: null
     };
+
+    if (step.disabled === true || (step.args && step.args.disabled === true) || (step.options && step.options.disabled === true)) {
+        result.status = "SKIP";
+        result.error_code = "STEP_DISABLED";
+        applySkipReason(result, "步骤已禁用");
+        logLine(ctx, "步骤 " + order + " SKIP（已禁用）: " + description);
+        return result;
+    }
 
     if (!stepPlatformAllowed(ctx, step)) {
         result.status = "SKIP";

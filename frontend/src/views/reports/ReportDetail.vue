@@ -1,19 +1,20 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, Monitor, Timer, User, Picture, View, Switch } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ArrowLeft, Monitor, Timer, User, Picture, View, Switch, VideoPlay } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api'
 import { deviceDisplayName, deviceNameFromRecord } from '@/utils/deviceName'
 import dayjs from 'dayjs'
 import { ACTION_LABELS } from '@/utils/actionConstants'
 import { runStatusTagType as getStatusTagType, runSourceLabel } from '@/utils/statusMeta'
 import { useClientMode } from '@/composables/useClientMode'
+import { submitExecution, UNKNOWN_LAUNCH_MESSAGE } from '@/utils/executionLaunch'
 import ExecutionCompareDialog from './ExecutionCompareDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
-const id = route.params.id
+const reportId = computed(() => route.params.id)
 const { isMobileMode } = useClientMode()
 
 // Data
@@ -52,6 +53,11 @@ const revealIssue = () => {
 const showCompareDialog = ref(false)
 const compareBaseId = ref(null)
 const compareLoading = ref(false)
+const rerunning = ref(false)
+
+const canRerunExecution = computed(() =>
+    Number(execution.value?.scenario_id) > 0 && Boolean(execution.value?.device_serial)
+)
 
 const isCompletedStatus = (status) => {
     const normalized = String(status || '').toUpperCase()
@@ -67,7 +73,7 @@ const handleCompareWithPrevious = async () => {
             limit: 100,
         })
         const items = data.items || []
-        const currentId = Number(id)
+        const currentId = Number(reportId.value)
         const currentStart = execution.value.start_time
         // 列表按 start_time 倒序：取比当前执行更早的已完结记录
         const candidates = items.filter(item => (
@@ -193,11 +199,48 @@ const hasFailureScreenshot = (row) => Boolean(getFailureScreenshotPath(row))
 // 用例全部步骤都是跳过（含全部被 IGNORE 容忍）→ 归 skipped（等价后端 all_skipped 口径）
 const allStepsSkipped = (steps) => Boolean(steps?.length) && steps.every(step => normalizeStatus(step.status) === 'SKIP')
 
+const handleRerunExecution = async () => {
+    if (!canRerunExecution.value || rerunning.value) return
+    const deviceLabel = formatDeviceName(execution.value.device_serial, execution.value.device_info)
+    try {
+        await ElMessageBox.confirm(
+            `确定在设备「${deviceLabel}」上重新执行场景「${execution.value.scenario_name}」吗？`,
+            '确认重跑',
+            { type: 'info', confirmButtonText: '立即重跑', cancelButtonText: '取消' }
+        )
+    } catch {
+        return
+    }
+    rerunning.value = true
+    try {
+        const { data } = await submitExecution(api, {
+            kind: 'scenario',
+            targetId: execution.value.scenario_id,
+            envId: execution.value.env_id ?? null,
+            devices: [execution.value.device_serial],
+        })
+        const runs = Array.isArray(data?.runs) ? data.runs : []
+        const newExecutionId = runs[0]?.execution_id || data?.execution_ids?.[0]
+        ElMessage.success('已发起重新执行，可前往报告列表或刷新查看进度')
+        if (newExecutionId && Number(newExecutionId) !== Number(execution.value.id)) {
+            router.push(`/execution/reports/${newExecutionId}`)
+        }
+    } catch (err) {
+        if (err?.launchPending) {
+            ElMessage.warning(UNKNOWN_LAUNCH_MESSAGE)
+        } else {
+            ElMessage.error('重新执行失败: ' + (err.response?.data?.detail || err.message || '未知错误'))
+        }
+    } finally {
+        rerunning.value = false
+    }
+}
+
 const fetchDetail = async () => {
     loading.value = true
     loadError.value = ''
     try {
-        const res = await api.getReport(id)
+        const res = await api.getReport(reportId.value)
         if (res.data) {
             execution.value = res.data
             
@@ -310,6 +353,17 @@ onMounted(() => {
         fetchDetail()
     })
 })
+
+if (typeof watch === 'function') {
+    watch(
+        () => route.params.id,
+        (nextId, prevId) => {
+            if (nextId && nextId !== prevId) {
+                fetchDetail()
+            }
+        }
+    )
+}
 </script>
 
 <template>
@@ -429,6 +483,16 @@ onMounted(() => {
                  <span class="meta-item"><el-icon><Timer /></el-icon> {{ formatDate(execution.start_time) }}</span>
                  <span class="meta-item"><el-icon><Monitor /></el-icon> {{ formatDeviceName(execution.device_serial, execution.device_info) || 'Unknown Device' }}</span>
                  <span class="meta-item">{{ runSourceLabel(execution) }}</span>
+                 <el-button
+                    v-if="canRerunExecution"
+                    type="primary"
+                    size="small"
+                    :icon="VideoPlay"
+                    :loading="rerunning"
+                    @click="handleRerunExecution"
+                 >
+                    重新执行
+                 </el-button>
                  <el-button
                     type="primary"
                     plain
@@ -569,7 +633,7 @@ onMounted(() => {
         <ExecutionCompareDialog
             v-model="showCompareDialog"
             :base-id="compareBaseId"
-            :target-id="Number(id)"
+            :target-id="Number(reportId)"
         />
     </div>
 </template>

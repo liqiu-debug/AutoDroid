@@ -25,6 +25,8 @@ class SelectorType(str, Enum):
     TEXT = "text"
     XPATH = "xpath"
     DESCRIPTION = "description"
+    CLASS_NAME = "className"
+    COMPOSITE = "composite"
     IMAGE = "image"  # 图像路径
 
 class ErrorStrategy(str, Enum):
@@ -133,6 +135,8 @@ class InteractionRequest(BaseModel):
     # 投屏模式下前端不需要响应里的整图截图（画面由视频流承担），
     # 置 False 可为远程弱链路省掉每步一张整图的传输
     include_screenshot: bool = True
+    # 客户端模式下供本地桌面引擎直接读取当前录制定位策略（零额外 RTT）
+    locator_config: Optional[Dict[str, Any]] = None
 
 # ---- Scenario Schemas ----
 
@@ -921,6 +925,14 @@ class PlatformSelector(BaseModel):
     @classmethod
     def normalize_selector_variable_placeholders(cls, value):
         return normalize_variable_placeholders(value)
+
+    @model_validator(mode="after")
+    def validate_composite_selector(self):
+        if str(self.by or "").strip().lower() == "composite":
+            from backend.utils.composite_locator import normalize_composite_selector
+
+            self.selector = normalize_composite_selector(self.selector)
+        return self
 
 class PlatformOverrides(BaseModel):
     model_config = ConfigDict(extra="forbid")
